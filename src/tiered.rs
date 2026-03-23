@@ -148,6 +148,11 @@ pub struct TieredConfig {
     /// enabling S3 byte-range GETs for point lookups (fetch ~128KB instead of ~10MB).
     /// Set to 0 to disable seekable encoding (legacy single-frame format).
     pub sub_pages_per_frame: u32,
+    /// Enable automatic garbage collection after each checkpoint.
+    /// When true, old page group versions replaced during checkpoint are
+    /// deleted from S3 immediately after the new manifest is uploaded.
+    /// Default: false (old versions accumulate, enabling point-in-time restore).
+    pub gc_enabled: bool,
 }
 
 impl Default for TieredConfig {
@@ -176,6 +181,7 @@ impl Default for TieredConfig {
             #[cfg(feature = "zstd")]
             dictionary: None,
             sub_pages_per_frame: 32,
+            gc_enabled: false,
         }
     }
 }
@@ -632,6 +638,86 @@ impl S3Client {
         let json = serde_json::to_vec(manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.put_object_async(&key, json, Some("application/json")).await
+    }
+
+    /// Delete a batch of S3 objects by key. Handles batching (AWS limit: 1000/request).
+    fn delete_objects(&self, keys: &[String]) -> io::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        S3Client::block_on(&self.runtime, self.delete_objects_async(keys))
+    }
+
+    async fn delete_objects_async(&self, keys: &[String]) -> io::Result<()> {
+        for batch in keys.chunks(1000) {
+            let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = batch
+                .iter()
+                .map(|key| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(key)
+                        .build()
+                        .expect("ObjectIdentifier requires key")
+                })
+                .collect();
+
+            let delete = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(true)
+                .build()
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to build Delete request: {}", e),
+                    )
+                })?;
+
+            self.client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("S3 batch delete failed: {}", e),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// List all S3 object keys under this client's prefix.
+    fn list_all_keys(&self) -> io::Result<Vec<String>> {
+        S3Client::block_on(&self.runtime, self.list_all_keys_async())
+    }
+
+    async fn list_all_keys_async(&self) -> io::Result<Vec<String>> {
+        let mut all_keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut req = self.client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&self.prefix);
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = req.send().await.map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("S3 list failed: {}", e))
+            })?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    all_keys.push(key.to_string());
+                }
+            }
+            if resp.is_truncated() == Some(true) {
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+        Ok(all_keys)
     }
 }
 
@@ -1707,6 +1793,9 @@ pub struct TieredHandle {
     #[cfg(feature = "zstd")]
     decoder_dict: Option<zstd::dict::DecoderDictionary<'static>>,
 
+    /// Auto-GC: delete old page group versions after checkpoint.
+    gc_enabled: bool,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -1737,6 +1826,7 @@ impl TieredHandle {
         read_only: bool,
         prefetch_hops: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
+        gc_enabled: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     ) -> Self {
         let page_size = manifest.page_size;
@@ -1835,6 +1925,7 @@ impl TieredHandle {
             consecutive_misses: 0,
             prefetch_hops,
             prefetch_pool,
+            gc_enabled,
             #[cfg(feature = "zstd")]
             encoder_dict,
             #[cfg(feature = "zstd")]
@@ -1862,6 +1953,7 @@ impl TieredHandle {
             consecutive_misses: 0,
             prefetch_hops: vec![0.33, 0.33],
             prefetch_pool: None,
+            gc_enabled: false,
             #[cfg(feature = "zstd")]
             encoder_dict: None,
             #[cfg(feature = "zstd")]
@@ -2546,6 +2638,8 @@ impl DatabaseHandle for TieredHandle {
         let next_version = self.manifest.read().version + 1;
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut new_keys = self.manifest.read().page_group_keys.clone();
+        // Track old keys being replaced (for post-checkpoint GC)
+        let mut replaced_keys: Vec<String> = Vec::new();
 
         let page_size = *self.page_size.read();
 
@@ -2611,6 +2705,12 @@ impl DatabaseHandle for TieredHandle {
             // Extend keys vector if needed
             while new_keys.len() <= gid as usize {
                 new_keys.push(String::new());
+            }
+            // Track the old key being replaced (for GC)
+            if let Some(old_key) = new_keys.get(gid as usize) {
+                if !old_key.is_empty() {
+                    replaced_keys.push(old_key.clone());
+                }
             }
             new_keys[gid as usize] = key;
         }
@@ -2707,6 +2807,10 @@ impl DatabaseHandle for TieredHandle {
                     chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
                 );
                 chunk_uploads.push((key.clone(), encoded));
+                // Track old interior chunk key being replaced (for GC)
+                if let Some(old_key) = old_chunk_keys.get(&chunk_id) {
+                    replaced_keys.push(old_key.clone());
+                }
                 new_chunk_keys.insert(chunk_id, key);
             } else {
                 // Clean chunk — carry forward existing key
@@ -2749,6 +2853,16 @@ impl DatabaseHandle for TieredHandle {
 
         // Persist bitmap
         let _ = cache.persist_bitmap();
+
+        // Post-checkpoint GC: delete old page group/interior chunk versions
+        if self.gc_enabled && !replaced_keys.is_empty() {
+            eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
+            if let Err(e) = s3.delete_objects(&replaced_keys) {
+                eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
+            } else {
+                eprintln!("[gc] deleted {} old versions", replaced_keys.len());
+            }
+        }
 
         Ok(())
     }
@@ -3127,6 +3241,41 @@ impl TieredVfs {
         )
     }
 
+    /// Garbage collect orphaned S3 objects not referenced by the current manifest.
+    /// Lists all objects under the prefix, compares against manifest keys, and
+    /// deletes unreferenced page groups and interior chunks.
+    /// Returns the number of objects deleted.
+    pub fn gc(&self) -> io::Result<usize> {
+        let manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        let all_keys = self.s3.list_all_keys()?;
+
+        // Build set of live keys from manifest
+        let mut live_keys: HashSet<String> = HashSet::new();
+        live_keys.insert(self.s3.manifest_key());
+        for key in &manifest.page_group_keys {
+            if !key.is_empty() {
+                live_keys.insert(key.clone());
+            }
+        }
+        for key in manifest.interior_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+
+        // Find orphans (keys in S3 but not in manifest)
+        let orphans: Vec<String> = all_keys
+            .into_iter()
+            .filter(|k| !live_keys.contains(k))
+            .collect();
+
+        let count = orphans.len();
+        if count > 0 {
+            eprintln!("[gc] deleting {} orphaned S3 objects...", count);
+            self.s3.delete_objects(&orphans)?;
+            eprintln!("[gc] deleted {} orphaned objects", count);
+        }
+        Ok(count)
+    }
+
     /// Helper to destroy all S3 data for a prefix.
     pub fn destroy_s3(&self) -> io::Result<()> {
         let s3 = &self.s3;
@@ -3234,6 +3383,7 @@ impl Vfs for TieredVfs {
                 self.config.read_only,
                 self.config.prefetch_hops.clone(),
                 Some(Arc::clone(&self.prefetch_pool)),
+                self.config.gc_enabled,
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
             ))

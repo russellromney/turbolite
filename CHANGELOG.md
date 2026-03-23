@@ -1,4 +1,41 @@
-# SQLCEs Changelog
+# turbolite Changelog
+
+(Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
+
+## Page-Group Model + Seekable Sub-Chunk Range GETs + GC
+
+Major architectural upgrade: page groups with seekable zstd encoding, S3 byte-range GETs for point lookups, concurrent prefetch, and garbage collection.
+
+### Architecture
+- Page groups: 4096 pages per S3 object (~16MB uncompressed, ~8MB compressed)
+- Seekable zstd: multi-frame encoding with per-frame byte offsets in manifest
+- Inline sub-chunk range GETs: on cache miss, fetch only the ~100KB frame containing the needed page
+- Concurrent full-group fetch: submit entire group to prefetch pool alongside inline range GET
+- Interior page pinning: B-tree interior pages detected at read time, survive cache evictions
+- Fraction-based adaptive prefetch: configurable hop schedule (default 33%/33%/remaining)
+
+### Garbage Collection
+- Post-checkpoint GC (`gc_enabled`): delete replaced page group versions after manifest upload
+- Full-scan GC (`TieredVfs::gc()`): list all S3 objects, delete orphans not in manifest
+- `S3Client::delete_objects()` and `list_all_keys()` helpers
+
+### Benchmark CLI
+- `--queries` filter (e.g. `--queries post,profile`)
+- `--modes` filter (e.g. `--modes cold,arctic`)
+- `--skip-verify` to bypass COUNT(*) full scan on small machines
+
+### Tests
+- Removed all `#[ignore]` from 27 tiered integration tests (now run directly)
+- Fixed `test_page_group_cache_populates` stale path assertion
+- Added 4 GC tests: post-checkpoint, disabled, full-scan, no-orphans
+- 31 S3 integration tests + 84 unit tests = 115 total, 0 failures
+
+### README
+- Rebranded to turbolite
+- Consolidated design + architecture into single Design section
+- Added tuning section with workload-specific prefetch configs
+
+---
 
 ## Phase 6: Tiered v2 Hardening
 

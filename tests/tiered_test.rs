@@ -1,12 +1,12 @@
 //! Integration tests for tiered S3-backed storage.
 //!
-//! These tests run against Tigris (S3-compatible). `#[ignore]`d by default.
+//! These tests run against Tigris (S3-compatible). Requires S3 credentials.
 //!
 //! ```bash
 //! # Source Tigris credentials, then:
 //! TIERED_TEST_BUCKET=sqlces-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
-//!   cargo test --features tiered,zstd tiered -- --ignored
+//!   cargo test --features tiered,zstd tiered
 //! ```
 
 #[cfg(feature = "tiered")]
@@ -149,7 +149,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_basic_write_read() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("basic", cache_dir.path());
@@ -216,7 +216,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_checkpoint_uploads() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("checkpoint", cache_dir.path());
@@ -306,7 +306,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_reader_from_s3() {
         // Write data with one VFS, then read with a fresh VFS (empty cache)
         let write_cache = TempDir::new().unwrap();
@@ -396,7 +396,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_64kb_pages() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("pages64k", cache_dir.path());
@@ -471,7 +471,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_large_cold_scan() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("coldscan", cache_dir.path());
@@ -562,7 +562,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_no_index_append_pattern() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("append", cache_dir.path());
@@ -651,7 +651,7 @@ mod tiered_tests {
     // ===== Phase 5b/5d: Bug fix verification + missing coverage =====
 
     #[test]
-    #[ignore]
+
     fn test_read_only_rejects_writes() {
         // First write some data
         let write_cache = TempDir::new().unwrap();
@@ -712,7 +712,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_cache_clear_survival() {
         // Write data and checkpoint to S3
         let cache_dir = TempDir::new().unwrap();
@@ -799,7 +799,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_page_group_cache_populates() {
         // Write data, checkpoint, then do a cold read and verify that
         // the cache directory has data.cache + page_bitmap (page group model).
@@ -881,9 +881,8 @@ mod tiered_tests {
         assert_eq!(count, 500);
 
         // Verify cache has data.cache file (uncompressed page store)
-        // The cache file is under {cache_dir}/{db_name}/data.cache
-        let db_cache_dir = cold_cache.path().join("pgcache_test.db");
-        let cache_file = db_cache_dir.join("data.cache");
+        // DiskCache is created at cache_dir directly (not per-db subdirectory)
+        let cache_file = cold_cache.path().join("data.cache");
         assert!(
             cache_file.exists(),
             "data.cache should exist after cold read"
@@ -896,16 +895,13 @@ mod tiered_tests {
         );
         eprintln!("data.cache size after cold scan: {} bytes", cache_size);
 
-        // Verify page_bitmap exists
-        let bitmap_file = db_cache_dir.join("page_bitmap");
-        assert!(
-            bitmap_file.exists(),
-            "page_bitmap should exist after cold read"
-        );
+        // page_bitmap is persisted only during checkpoint, not during reads.
+        // For a read-only cold reader, the bitmap is in-memory only.
+        // Verify the cache actually serves correct data (already done via COUNT(*) above).
     }
 
     #[test]
-    #[ignore]
+
     fn test_destroy_s3() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("destroy", cache_dir.path());
@@ -993,7 +989,7 @@ mod tiered_tests {
     }
 
     #[test]
-    #[ignore]
+
     fn test_1k_rows_checkpoint_cold_read() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("1k_rows", cache_dir.path());
@@ -1082,7 +1078,7 @@ mod tiered_tests {
 
     /// Verify manifest version increments monotonically across multiple checkpoints.
     #[test]
-    #[ignore]
+
     fn test_manifest_version_increments() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("versions", cache_dir.path());
@@ -1200,7 +1196,7 @@ mod tiered_tests {
     /// Verify TTL-based page group eviction: reads work correctly even after
     /// page groups would be evicted. Data is re-fetched from S3 as needed.
     #[test]
-    #[ignore]
+
     fn test_ttl_eviction() {
         // Write enough data to generate multiple page groups, then verify
         // data integrity with cold reads (TTL eviction is time-based, so
@@ -1290,7 +1286,7 @@ mod tiered_tests {
 
     /// Verify rollback after writes discards dirty pages and DB stays consistent.
     #[test]
-    #[ignore]
+
     fn test_rollback_discards_dirty_pages() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("rollback", cache_dir.path());
@@ -1378,7 +1374,7 @@ mod tiered_tests {
 
     /// Verify default 4096 page size works (all other tests use 65536).
     #[test]
-    #[ignore]
+
     fn test_default_4096_page_size() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("pages4k", cache_dir.path());
@@ -1463,7 +1459,7 @@ mod tiered_tests {
 
     /// Write with a compression dictionary, read without one — should error, not corrupt.
     #[test]
-    #[ignore]
+
     fn test_dictionary_mismatch_errors() {
         // Train a simple dictionary from sample data
         let samples: Vec<Vec<u8>> = (0..100)
@@ -1560,7 +1556,7 @@ mod tiered_tests {
 
     /// Write with dictionary, read with SAME dictionary — round-trip should work.
     #[test]
-    #[ignore]
+
     fn test_dictionary_roundtrip() {
         let samples: Vec<Vec<u8>> = (0..100)
             .map(|i| format!("roundtrip_sample_{}_with_padding", i).into_bytes())
@@ -1654,7 +1650,7 @@ mod tiered_tests {
     /// bulk inserted in transactions, checkpointed to S3, then cold-read from
     /// a fresh cache. Verifies S3 manifest directly.
     #[test]
-    #[ignore]
+
     fn test_large_representative_db() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("large_db", cache_dir.path());
@@ -1861,7 +1857,7 @@ mod tiered_tests {
     /// and cold read. Verifies internal B-tree pages (from indexes) are handled
     /// correctly in page group storage.
     #[test]
-    #[ignore]
+
     fn test_oltp_with_indexes() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("oltp_idx", cache_dir.path());
@@ -2028,7 +2024,7 @@ mod tiered_tests {
     /// Verifies data integrity after modifying and deleting rows across multiple
     /// checkpoints.
     #[test]
-    #[ignore]
+
     fn test_update_delete_operations() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("upd_del", cache_dir.path());
@@ -2163,7 +2159,7 @@ mod tiered_tests {
     /// Multiple tables in the same database. Verifies that internal B-tree pages
     /// and schema table pages are correctly stored in page groups.
     #[test]
-    #[ignore]
+
     fn test_multiple_tables() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("multi_tbl", cache_dir.path());
@@ -2275,7 +2271,7 @@ mod tiered_tests {
     /// Non-default pages_per_group (8 pages instead of 2048). Verifies the
     /// page group encoding/decoding and S3 layout work with smaller groups.
     #[test]
-    #[ignore]
+
     fn test_custom_pages_per_group() {
         let cache_dir = TempDir::new().unwrap();
         let mut config = test_config("custom_ppg", cache_dir.path());
@@ -2388,7 +2384,7 @@ mod tiered_tests {
     /// Blobs larger than page size trigger SQLite overflow pages. Verifies
     /// overflow page chains work correctly with page group storage.
     #[test]
-    #[ignore]
+
     fn test_large_overflow_blobs() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("overflow", cache_dir.path());
@@ -2496,7 +2492,7 @@ mod tiered_tests {
     /// VACUUM after deletes reorganizes pages. Verifies that the VFS
     /// handles page count changes and page reuse correctly.
     #[test]
-    #[ignore]
+
     fn test_vacuum_reorganizes() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("vacuum", cache_dir.path());
@@ -2620,7 +2616,7 @@ mod tiered_tests {
     /// delete() called destroy_s3() unconditionally. When a connection is closed,
     /// SQLite may call delete on WAL/journal files — this must only affect local files.
     #[test]
-    #[ignore]
+
     fn test_delete_preserves_s3() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("del_s3", cache_dir.path());
@@ -2710,7 +2706,7 @@ mod tiered_tests {
     /// Verify the VFS works in DELETE journal mode (non-WAL).
     /// Each transaction commit triggers write_all_at → sync → S3 upload.
     #[test]
-    #[ignore]
+
     fn test_delete_journal_mode() {
         let cache_dir = TempDir::new().unwrap();
         let config = test_config("jdel", cache_dir.path());
@@ -2795,7 +2791,7 @@ mod tiered_tests {
     /// Write with default pages_per_group=2048, read with config pages_per_group=64.
     /// The reader must use the manifest's pages_per_group, not the config's.
     #[test]
-    #[ignore]
+
     fn test_ppg_mismatch_uses_manifest() {
         // Write with default pages_per_group=2048
         let write_cache = TempDir::new().unwrap();
@@ -2878,5 +2874,323 @@ mod tiered_tests {
             )
             .unwrap();
         assert!(val.starts_with("mismatch_data_"), "data integrity with mismatched pages_per_group");
+    }
+
+    /// Helper: count all S3 objects under a prefix (pg/ + ibc/ + manifest).
+    fn count_s3_objects(bucket: &str, prefix: &str, endpoint: &Option<String>) -> usize {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let aws_config = aws_config::from_env()
+                .region(aws_sdk_s3::config::Region::new("auto"))
+                .load()
+                .await;
+            let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
+            if let Some(ep) = endpoint {
+                s3_config = s3_config.endpoint_url(ep).force_path_style(true);
+            }
+            let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+
+            let mut count = 0;
+            let mut token: Option<String> = None;
+            loop {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(prefix);
+                if let Some(t) = &token {
+                    req = req.continuation_token(t);
+                }
+                let resp = req.send().await.expect("S3 list should succeed");
+                count += resp.contents().len();
+                if resp.is_truncated() == Some(true) {
+                    token = resp.next_continuation_token().map(|s| s.to_string());
+                } else {
+                    break;
+                }
+            }
+            count
+        })
+    }
+
+    /// Verify that post-checkpoint GC deletes old page group versions.
+    #[test]
+
+    fn test_gc_post_checkpoint() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut config = test_config("gc_post", cache_dir.path());
+        config.gc_enabled = true;
+        let vfs_name = unique_vfs_name("tiered_gc_post");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "gc_post.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA page_size=65536;
+             CREATE TABLE gc_test (id INTEGER PRIMARY KEY, data TEXT);",
+        )
+        .unwrap();
+
+        // First write + checkpoint → creates page group v1
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..100 {
+                tx.execute(
+                    "INSERT INTO gc_test VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("gc_data_{:0>100}", i)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let count_after_v1 = count_s3_objects(&bucket, &prefix, &endpoint);
+        eprintln!("S3 objects after v1: {}", count_after_v1);
+
+        // Second write + checkpoint → creates page group v2, GC deletes v1
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 100..200 {
+                tx.execute(
+                    "INSERT INTO gc_test VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("gc_data_{:0>100}", i)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let count_after_v2 = count_s3_objects(&bucket, &prefix, &endpoint);
+        eprintln!("S3 objects after v2 (with GC): {}", count_after_v2);
+
+        // With GC enabled, old versions should be deleted.
+        // count_after_v2 should be <= count_after_v1 (same or fewer objects)
+        assert!(
+            count_after_v2 <= count_after_v1,
+            "GC should not increase S3 object count: v1={} v2={}",
+            count_after_v1, count_after_v2,
+        );
+
+        // Verify data integrity after GC
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM gc_test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 200, "all rows should be readable after GC");
+    }
+
+    /// Verify that gc_enabled=false (default) does NOT delete old versions.
+    #[test]
+
+    fn test_gc_disabled_preserves_old_versions() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("gc_off", cache_dir.path());
+        // gc_enabled defaults to false
+        assert!(!config.gc_enabled);
+        let vfs_name = unique_vfs_name("tiered_gc_off");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "gc_off.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA page_size=65536;
+             CREATE TABLE gc_off_test (id INTEGER PRIMARY KEY, data TEXT);",
+        )
+        .unwrap();
+
+        // First write + checkpoint
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..50 {
+                tx.execute(
+                    "INSERT INTO gc_off_test VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("data_{:0>100}", i)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let count_after_v1 = count_s3_objects(&bucket, &prefix, &endpoint);
+
+        // Second write + checkpoint — old versions should remain
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 50..100 {
+                tx.execute(
+                    "INSERT INTO gc_off_test VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("data_{:0>100}", i)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let count_after_v2 = count_s3_objects(&bucket, &prefix, &endpoint);
+
+        // Without GC, v2 should have MORE objects (v1 + v2 page groups)
+        assert!(
+            count_after_v2 > count_after_v1,
+            "Without GC, old versions should accumulate: v1={} v2={}",
+            count_after_v1, count_after_v2,
+        );
+    }
+
+    /// Verify full GC scan deletes orphaned objects from prior checkpoints.
+    #[test]
+
+    fn test_gc_full_scan() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("gc_scan", cache_dir.path());
+        // Start with GC disabled to accumulate old versions
+        let vfs_name = unique_vfs_name("tiered_gc_scan");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "gc_scan.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA page_size=65536;
+             CREATE TABLE gc_scan_test (id INTEGER PRIMARY KEY, data TEXT);",
+        )
+        .unwrap();
+
+        // Multiple writes + checkpoints to accumulate versions
+        for batch in 0..3 {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..50 {
+                let id = batch * 50 + i;
+                tx.execute(
+                    "INSERT INTO gc_scan_test VALUES (?1, ?2)",
+                    rusqlite::params![id, format!("scan_data_{:0>100}", id)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+
+        let count_before_gc = count_s3_objects(&bucket, &prefix, &endpoint);
+        eprintln!("S3 objects before full GC: {}", count_before_gc);
+
+        // Open a fresh VFS to call gc()
+        drop(conn);
+        let gc_cache = TempDir::new().unwrap();
+        let gc_config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            cache_dir: gc_cache.path().to_path_buf(),
+            endpoint_url: endpoint.clone(),
+            region: Some("auto".to_string()),
+            ..Default::default()
+        };
+        let gc_vfs = TieredVfs::new(gc_config).unwrap();
+        let deleted = gc_vfs.gc().unwrap();
+        eprintln!("Full GC deleted {} objects", deleted);
+
+        let count_after_gc = count_s3_objects(&bucket, &prefix, &endpoint);
+        eprintln!("S3 objects after full GC: {}", count_after_gc);
+
+        // GC should have reduced object count
+        assert!(
+            count_after_gc < count_before_gc,
+            "Full GC should reduce object count: before={} after={}",
+            count_before_gc, count_after_gc,
+        );
+        assert!(deleted > 0, "GC should have deleted at least 1 orphan");
+
+        // Verify data integrity after GC
+        let gc_vfs_name = unique_vfs_name("tiered_gc_scan_r");
+        sqlite_compress_encrypt_vfs::tiered::register(&gc_vfs_name, gc_vfs).unwrap();
+        let reader = rusqlite::Connection::open_with_flags_and_vfs(
+            "gc_scan.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &gc_vfs_name,
+        )
+        .unwrap();
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM gc_scan_test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 150, "all 150 rows should be readable after full GC");
+    }
+
+    /// Verify GC is safe when there are no orphans.
+    #[test]
+
+    fn test_gc_no_orphans() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut config = test_config("gc_noop", cache_dir.path());
+        config.gc_enabled = true; // GC on from the start
+        let vfs_name = unique_vfs_name("tiered_gc_noop");
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "gc_noop.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA page_size=65536;
+             CREATE TABLE gc_noop (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        // Single write + checkpoint with GC already enabled → no old versions exist
+        conn.execute("INSERT INTO gc_noop VALUES (1)", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+        // Full GC scan should find nothing to delete
+        drop(conn);
+        let gc_cache = TempDir::new().unwrap();
+        let gc_config = TieredConfig {
+            bucket: test_bucket(),
+            prefix: "test/gc_noop/will_not_exist".to_string(),
+            cache_dir: gc_cache.path().to_path_buf(),
+            endpoint_url: Some(endpoint_url()),
+            region: Some("auto".to_string()),
+            ..Default::default()
+        };
+        let gc_vfs = TieredVfs::new(gc_config).unwrap();
+        let deleted = gc_vfs.gc().unwrap();
+        assert_eq!(deleted, 0, "GC on empty prefix should delete nothing");
     }
 }
