@@ -1,6 +1,6 @@
 # turbolite
 
-S3-native SQLite VFS with sub-50ms cold point queries on multi-GB SQLite databases served cold from S3. 
+S3-native SQLite VFS with sub-50ms cold point queries on multi-GB SQLite databases served cold from S3.
 
 turbolite is an experimental SQLite VFS where S3 is the durable store and local disk is the working copy. Writes go to the local WAL at full speed. Checkpoint compresses dirty pages into immutable S3 objects and atomically swaps a manifest. Between checkpoints, local disk is the source of truth. After checkpoint, the database can be opened cold from S3 — no volume, no running server.
 
