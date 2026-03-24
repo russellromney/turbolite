@@ -6,7 +6,7 @@ description = "turbolite - SQLite VFS with sub-50ms cold queries from S3 + page-
 license = "Apache-2.0"
 repository = "https://github.com/russellromney/turbolite"
 keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
-categories = ["database", "s3", "compression"]
+categories = ["database", "compression"]
 
 [lib]
 crate-type = ["lib", "cdylib"]
