@@ -2,6 +2,7 @@ app = "cinch-tiered-bench"
 primary_region = "iad"
 
 [build]
+  dockerfile = "benchmark/Dockerfile"
 
 [env]
   RUST_LOG = "warn"

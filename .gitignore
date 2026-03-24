@@ -1,21 +1,24 @@
 /target
+**/target/
 Cargo.lock
+
+# Database files
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
 *.dict
-/benchmark-pages
-/benches/results
 
-# Build artifacts and binaries
+# Build artifacts
 /bootstrap
 /tiered-bench
 *.zip
+turbolite.h
 
-# Benchmark scripts and results
-/scripts/
+# Benchmark
+/benchmark-pages
 
-# Debug/test binaries (use bin/sqlces.rs and bin/sqlces-bench.rs for actual tools)
+# Debug/test binaries
 /bin/debug-*.rs
 /bin/test-*.rs
 /bin/trace-*.rs
@@ -23,71 +26,22 @@ Cargo.lock
 /bin/verify-*.rs
 /bin/simple-*.rs
 /bin/basic-*.rs
-*.sh
 
-
-.venv
-
-
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-*/node_modules
-*/.pnp
-*.pnp.js
-
-# testing
-*/coverage
-
-# production
-*/build
-
-# misc
-*.DS_Store
-*.env.local
-*.env.development.local
-*.env.test.local
-*.env.production.local
-
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-
+# Python
 *__pycache__*
-*venv*
-*.pem
-*.crx
-mobile/
-.env
-
-# Database files
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-
-# Exports and migrations
-contentful_export/
-migrated_data.json
-backend-go/russell.db
-
-# Build artifacts
-*/dist/
-**/target/
-*.node
-**/node_modules/
-*.bun-build
-eighty/eighty
-backend-go/server
-
-
-coverage.html
-
-.context
-
-# Python package build artifacts
+*.egg-info/
 packages/python/build/
-packages/python/*.egg-info/
+packages/python/dist/
 packages/python/turbolite/*.so
 packages/python/turbolite/*.dylib
+.venv
+*venv*
+
+# Node
+*.node
+**/node_modules/
+npm-debug.log*
+
+# OS / editor
+*.DS_Store
+.context

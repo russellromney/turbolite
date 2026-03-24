@@ -6,11 +6,11 @@ turbolite is an experimental SQLite VFS designed from first principles to serve 
 
 turbolite also has page-level compression and encryption for efficiency and encryption at-rest and in-transit.
 
-The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. It was also triggered by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). 
+The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). 
 
 turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs). It's a standard VFS operating at the page level — most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
 
-If you want to contribute turbolite or find bugs, please open a pull request or open an issue.
+If you want to contribute to turbolite or find bugs, please open a pull request or open an issue.
 
 ## Performance
 

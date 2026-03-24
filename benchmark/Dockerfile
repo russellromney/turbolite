@@ -30,6 +30,6 @@ RUN apt-get update && apt-get install -y ca-certificates curl unzip && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/tiered-bench /usr/local/bin/tiered-bench
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY benchmark/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
