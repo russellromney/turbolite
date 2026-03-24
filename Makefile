@@ -39,14 +39,22 @@ lib-bundled: ## Build shared library with bundled SQLite (self-contained)
 
 # ── Loadable extension ────────────────────────────────────────────
 
-EXT_FEATURES ?= zstd
+EXT_FEATURES ?= zstd,tiered
 
 .PHONY: ext
-ext: ## Build SQLite loadable extension (.so / .dylib) for load_extension()
+ext: ## Build loadable extension with S3 tiered support (default)
 	cargo build --release --lib --no-default-features --features loadable-extension,$(EXT_FEATURES)
 	@cp $(TARGET_DIR)/$(LIB_FILE) $(TARGET_DIR)/turbolite.$(LIB_EXT)
 	@echo ""
 	@echo "Built loadable extension: $(TARGET_DIR)/turbolite.$(LIB_EXT)"
+	@ls -lh $(TARGET_DIR)/turbolite.$(LIB_EXT)
+
+.PHONY: ext-local
+ext-local: ## Build loadable extension (local compression only, no S3)
+	cargo build --release --lib --no-default-features --features loadable-extension,zstd
+	@cp $(TARGET_DIR)/$(LIB_FILE) $(TARGET_DIR)/turbolite.$(LIB_EXT)
+	@echo ""
+	@echo "Built loadable extension (local only): $(TARGET_DIR)/turbolite.$(LIB_EXT)"
 	@ls -lh $(TARGET_DIR)/turbolite.$(LIB_EXT)
 
 # ── C header ───────────────────────────────────────────────────────
