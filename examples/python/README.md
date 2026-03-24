@@ -27,7 +27,7 @@ curl localhost:8000/books
 
 ## How it works
 
-1. Load `libsqlite_compress_encrypt_vfs.dylib` / `.so` via `ctypes.CDLL`
+1. Load `libturbolite.dylib` / `.so` via `ctypes.CDLL`
 2. `turbolite_register_compressed` — register a zstd-compressed VFS
 3. `turbolite_open` — open a database through the VFS
 4. FastAPI routes call `turbolite_exec` (writes) and `turbolite_query_json` (reads)

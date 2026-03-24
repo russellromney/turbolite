@@ -16,7 +16,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::tiered::{TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only};
+use turbolite::tiered::{TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -819,7 +819,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         };
 
         let import_start = Instant::now();
-        let config = sqlite_compress_encrypt_vfs::tiered::TieredConfig {
+        let config = turbolite::tiered::TieredConfig {
             bucket: test_bucket(),
             prefix: s3_prefix.clone(),
             endpoint_url: endpoint_url(),
@@ -828,7 +828,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             compression_level: 1,
             ..Default::default()
         };
-        let manifest = sqlite_compress_encrypt_vfs::tiered::import_sqlite_file(
+        let manifest = turbolite::tiered::import_sqlite_file(
             &config,
             std::path::Path::new(&local_path),
         ).expect("import failed");
@@ -843,7 +843,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops));
         let vfs_name = unique_vfs_name("write");
         let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = Connection::open_with_flags_and_vfs(
             &db_name,
@@ -902,7 +902,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let bench_handle = reader_vfs.bench_handle();
     let reader_vfs_name = unique_vfs_name("reader");
     eprintln!("[bench] registering VFS '{}'", reader_vfs_name);
-    sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
     eprintln!("[bench] VFS registered, opening connection...");
 
     // Open persistent connection for warm benchmarks

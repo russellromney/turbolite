@@ -8,9 +8,9 @@ turbolite also has page-level compression and encryption for efficiency and encr
 
 The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). 
 
-turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs). It's a standard VFS operating at the page level — most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
+turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. It's a standard VFS operating at the page level — most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
 
-If you want to contribute to turbolite or find bugs, please open a pull request or open an issue.
+If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
 ## Performance
 
@@ -273,7 +273,7 @@ Note: Node uses a wrapped `Database` class (not `load_extension`) because better
 ### Rust
 
 ```rust
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 
 let vfs = CompressedVfs::new("/path/to/data", 3);  // zstd level 3
 register("turbolite", vfs)?;
@@ -388,7 +388,7 @@ cargo test --features zstd,encryption         # + encryption tests
 
 ## Notes
 
-turbolite used to be named "sqlite-compress-encrypt-vfs, aka `sqlces`.
+turbolite used to be named `sqlite-compress-encrypt-vfs`, aka `sqlces`.
 
 ## License
 

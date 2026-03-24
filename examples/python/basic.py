@@ -32,7 +32,7 @@ from pydantic import BaseModel
 ext = "dylib" if platform.system() == "Darwin" else "so"
 lib_path = os.path.join(
     os.path.dirname(__file__), "..", "..", "target", "release",
-    f"libsqlite_compress_encrypt_vfs.{ext}",
+    f"libturbolite.{ext}",
 )
 if not os.path.exists(lib_path):
     sys.exit(f"ERROR: library not found. Run `make lib-bundled` first.")

@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 
 /// Test refresh when one connection writes and another reads the new data
 #[test]

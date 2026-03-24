@@ -13,7 +13,7 @@ else
   LIB_PREFIX := lib
 endif
 
-LIB_NAME := sqlite_compress_encrypt_vfs
+LIB_NAME := turbolite
 LIB_FILE := $(LIB_PREFIX)$(LIB_NAME).$(LIB_EXT)
 TARGET_DIR := target/release
 
@@ -53,7 +53,7 @@ ext: ## Build SQLite loadable extension (.so / .dylib) for load_extension()
 
 .PHONY: header
 header: ## Generate turbolite.h C header via cbindgen
-	cbindgen --config cbindgen.toml --crate sqlite-compress-encrypt-vfs --output turbolite.h
+	cbindgen --config cbindgen.toml --crate turbolite --output turbolite.h
 	@echo "Generated: turbolite.h"
 
 # ── Install ────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ endif
 test-ffi-c: lib-bundled header ## FFI test: C (proves turbolite.h works)
 	cc -o $(TARGET_DIR)/test_ffi_c tests/test_ffi_c.c \
 		$(FFI_C_DEFINES) \
-		-L$(TARGET_DIR) -lsqlite_compress_encrypt_vfs \
+		-L$(TARGET_DIR) -lturbolite \
 		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
 	$(TARGET_DIR)/test_ffi_c
 
@@ -120,7 +120,7 @@ test-ffi-c: lib-bundled header ## FFI test: C (proves turbolite.h works)
 test-ffi-go: lib-bundled ## FFI test: Go (cgo)
 	cd tests/test_ffi_go && \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lsqlite_compress_encrypt_vfs" \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
 		go run .
 
 .PHONY: test-ffi-node
@@ -140,7 +140,7 @@ example-python: lib-bundled ## Run Python example (FastAPI server)
 .PHONY: example-c
 example-c: lib-bundled header ## Build and run C example (sensor logger)
 	cc -o $(TARGET_DIR)/example_c examples/c/basic.c \
-		-L$(TARGET_DIR) -lsqlite_compress_encrypt_vfs \
+		-L$(TARGET_DIR) -lturbolite \
 		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
 	$(TARGET_DIR)/example_c
 
@@ -148,7 +148,7 @@ example-c: lib-bundled header ## Build and run C example (sensor logger)
 example-go: lib-bundled ## Run Go example (HTTP server)
 	cd examples/go && \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lsqlite_compress_encrypt_vfs" \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
 		go run .
 
 .PHONY: example-node

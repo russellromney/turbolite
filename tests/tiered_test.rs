@@ -11,7 +11,7 @@
 
 #[cfg(feature = "tiered")]
 mod tiered_tests {
-    use sqlite_compress_encrypt_vfs::tiered::{TieredConfig, TieredVfs};
+    use turbolite::tiered::{TieredConfig, TieredVfs};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
 
@@ -159,7 +159,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let db_path = format!("basic_test.db");
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -226,7 +226,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "checkpoint_test.db",
@@ -318,7 +318,7 @@ mod tiered_tests {
         let reader_region = config.region.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create writer VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&writer_vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&writer_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "reader_test.db",
@@ -370,7 +370,7 @@ mod tiered_tests {
         let reader_vfs_name = unique_vfs_name("tiered_reader");
         let reader_vfs =
             TieredVfs::new(reader_config).expect("failed to create reader VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -406,7 +406,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "pages64k_test.db",
@@ -482,7 +482,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "coldscan_test.db",
@@ -531,7 +531,7 @@ mod tiered_tests {
         let reader_vfs_name = unique_vfs_name("tiered_coldscan_reader");
         let reader_vfs =
             TieredVfs::new(reader_config).expect("failed to create reader VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -572,7 +572,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).expect("failed to create VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "append_test.db",
@@ -663,7 +663,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&writer_vfs, vfs).unwrap();
+        turbolite::tiered::register(&writer_vfs, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "readonly_test.db",
@@ -695,7 +695,7 @@ mod tiered_tests {
         };
         let ro_vfs_name = unique_vfs_name("tiered_ro_reader");
         let ro_vfs = TieredVfs::new(ro_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&ro_vfs_name, ro_vfs).unwrap();
+        turbolite::tiered::register(&ro_vfs_name, ro_vfs).unwrap();
 
         let ro_conn = rusqlite::Connection::open_with_flags_and_vfs(
             "readonly_test.db",
@@ -724,7 +724,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "cacheclr_test.db",
@@ -773,7 +773,7 @@ mod tiered_tests {
         };
         let fresh_vfs_name = unique_vfs_name("tiered_cacheclr2");
         let fresh_vfs = TieredVfs::new(fresh_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&fresh_vfs_name, fresh_vfs)
+        turbolite::tiered::register(&fresh_vfs_name, fresh_vfs)
             .unwrap();
 
         let fresh_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -812,7 +812,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "pgcache_test.db",
@@ -864,7 +864,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_pgcache_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -911,7 +911,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "destroy_test.db",
@@ -1000,7 +1000,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "1k_rows_test.db",
@@ -1046,7 +1046,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_1k_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1088,7 +1088,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "versions_test.db",
@@ -1210,7 +1210,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ttl_evict_test.db",
@@ -1258,7 +1258,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_ttl_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1293,7 +1293,7 @@ mod tiered_tests {
         let vfs_name = unique_vfs_name("tiered_rollback");
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rollback_test.db",
@@ -1385,7 +1385,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "pages4k_test.db",
@@ -1435,7 +1435,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_4k_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1466,7 +1466,7 @@ mod tiered_tests {
             .map(|i| format!("dict_sample_row_{}_with_repeated_structure", i).into_bytes())
             .collect();
         let dict_bytes =
-            sqlite_compress_encrypt_vfs::dict::train_dictionary(&samples, 4096).unwrap();
+            turbolite::dict::train_dictionary(&samples, 4096).unwrap();
 
         // Write with dictionary
         let write_cache = TempDir::new().unwrap();
@@ -1479,7 +1479,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "dict_mismatch_test.db",
@@ -1526,7 +1526,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_dict_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         // Opening the connection reads page 0 (schema). With dict-compressed pages
@@ -1562,7 +1562,7 @@ mod tiered_tests {
             .map(|i| format!("roundtrip_sample_{}_with_padding", i).into_bytes())
             .collect();
         let dict_bytes =
-            sqlite_compress_encrypt_vfs::dict::train_dictionary(&samples, 4096).unwrap();
+            turbolite::dict::train_dictionary(&samples, 4096).unwrap();
 
         // Write with dict
         let write_cache = TempDir::new().unwrap();
@@ -1575,7 +1575,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "dict_rt_test.db",
@@ -1621,7 +1621,7 @@ mod tiered_tests {
         reader_config.dictionary = Some(dict_bytes);
         let reader_vfs_name = unique_vfs_name("tiered_drt_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1661,7 +1661,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "large_db_test.db",
@@ -1762,7 +1762,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_large_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1868,7 +1868,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "oltp_idx_test.db",
@@ -1973,7 +1973,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_oltp_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2035,7 +2035,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "upd_del_test.db",
@@ -2110,7 +2110,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_upddel_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2170,7 +2170,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "multi_tbl_test.db",
@@ -2235,7 +2235,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_multitbl_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2283,7 +2283,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "custom_ppg_test.db",
@@ -2365,7 +2365,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_ppg8_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2395,7 +2395,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "overflow_test.db",
@@ -2445,7 +2445,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_overflow_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2503,7 +2503,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "vacuum_test.db",
@@ -2585,7 +2585,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_vacuum_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2627,7 +2627,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         // Write data and checkpoint to S3
         {
@@ -2687,7 +2687,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_del_s3_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2717,7 +2717,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "jdel_test.db",
@@ -2772,7 +2772,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_jdel_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2803,7 +2803,7 @@ mod tiered_tests {
         let region = config.region.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ppg_mismatch_test.db",
@@ -2851,7 +2851,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("tiered_ppgmm_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs)
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs)
             .unwrap();
 
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
@@ -2925,7 +2925,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "gc_post.db",
@@ -3003,7 +3003,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "gc_off.db",
@@ -3071,7 +3071,7 @@ mod tiered_tests {
         let endpoint = config.endpoint_url.clone();
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "gc_scan.db",
@@ -3134,7 +3134,7 @@ mod tiered_tests {
 
         // Verify data integrity after GC
         let gc_vfs_name = unique_vfs_name("tiered_gc_scan_r");
-        sqlite_compress_encrypt_vfs::tiered::register(&gc_vfs_name, gc_vfs).unwrap();
+        turbolite::tiered::register(&gc_vfs_name, gc_vfs).unwrap();
         let reader = rusqlite::Connection::open_with_flags_and_vfs(
             "gc_scan.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -3157,7 +3157,7 @@ mod tiered_tests {
         let vfs_name = unique_vfs_name("tiered_gc_noop");
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "gc_noop.db",
@@ -3211,7 +3211,7 @@ mod tiered_tests {
         let vfs_name = unique_vfs_name("ixb");
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ixb_test.db",
@@ -3296,7 +3296,7 @@ mod tiered_tests {
         let cold_vfs_name = unique_vfs_name("ixb_cold");
         let cold_vfs = TieredVfs::new(cold_config).unwrap();
         let _bench = cold_vfs.bench_handle();
-        sqlite_compress_encrypt_vfs::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
+        turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
         let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ixb_test.db",
@@ -3346,7 +3346,7 @@ mod tiered_tests {
         let vfs_name = unique_vfs_name("ixb_ne");
 
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ixb_ne.db",
@@ -3393,7 +3393,7 @@ mod tiered_tests {
         };
         let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
         let cold_vfs = TieredVfs::new(cold_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
+        turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
         let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
             "ixb_ne.db",
@@ -3448,7 +3448,7 @@ mod tiered_tests {
 
         // ── Phase 1: Create database with benchmark schema ──
         let vfs = TieredVfs::new(config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "warm_profile.db",
@@ -3537,7 +3537,7 @@ mod tiered_tests {
         };
         let reader_vfs_name = unique_vfs_name("warm_prof_r");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
-        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let warm_conn = rusqlite::Connection::open_with_flags_and_vfs(
             "warm_profile.db",
@@ -3651,7 +3651,7 @@ mod tiered_tests {
         // Write phase
         {
             let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "encrypted_test.db",
@@ -3699,7 +3699,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_enc_read");
             let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "encrypted_test_reader.db",
@@ -3756,7 +3756,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_enc_wr");
             let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "enc_wrong_key.db",
@@ -3790,7 +3790,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_enc_wrong");
             let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "enc_wrong_key_reader.db",
@@ -3842,7 +3842,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_enc_arctic_w");
             let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "enc_arctic.db",
@@ -3885,7 +3885,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_enc_arctic_r");
             let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "enc_arctic_reader.db",
@@ -3953,7 +3953,7 @@ mod tiered_tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn test_rotate_key_cold_read_succeeds() {
-        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+        use turbolite::tiered::rotate_encryption_key;
 
         let writer_cache = TempDir::new().unwrap();
         let config = test_config_encrypted("rotate_basic", writer_cache.path());
@@ -3968,7 +3968,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_rot_wr");
             let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_test.db",
@@ -4035,7 +4035,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_rot_rd");
             let vfs = TieredVfs::new(reader_config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_reader.db",
@@ -4093,7 +4093,7 @@ mod tiered_tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn test_rotate_key_old_key_fails() {
-        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+        use turbolite::tiered::rotate_encryption_key;
 
         let writer_cache = TempDir::new().unwrap();
         let config = test_config_encrypted("rotate_old_key", writer_cache.path());
@@ -4108,7 +4108,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_rot_old_wr");
             let vfs = TieredVfs::new(config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_old_key.db",
@@ -4159,7 +4159,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_rot_old_rd");
             let vfs = TieredVfs::new(reader_config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_old_key_reader.db",
@@ -4199,7 +4199,7 @@ mod tiered_tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn test_rotate_key_gc_cleans_old_objects() {
-        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+        use turbolite::tiered::rotate_encryption_key;
 
         let writer_cache = TempDir::new().unwrap();
         let config = test_config_encrypted("rotate_gc", writer_cache.path());
@@ -4214,7 +4214,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_rot_gc_wr");
             let vfs = TieredVfs::new(config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_gc.db",
@@ -4361,7 +4361,7 @@ mod tiered_tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn test_rotate_key_data_integrity() {
-        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+        use turbolite::tiered::rotate_encryption_key;
         use std::collections::HashMap;
 
         let writer_cache = TempDir::new().unwrap();
@@ -4378,7 +4378,7 @@ mod tiered_tests {
         {
             let vfs_name = unique_vfs_name("tiered_rot_int_wr");
             let vfs = TieredVfs::new(config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_integrity.db",
@@ -4445,7 +4445,7 @@ mod tiered_tests {
             };
             let reader_vfs_name = unique_vfs_name("tiered_rot_int_rd");
             let vfs = TieredVfs::new(reader_config).unwrap();
-            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
             let conn = rusqlite::Connection::open_with_flags_and_vfs(
                 "rotate_integrity_reader.db",

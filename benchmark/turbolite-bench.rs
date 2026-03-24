@@ -14,7 +14,7 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use sqlite_compress_encrypt_vfs::{clear_all_caches, register, CompressedVfs};
+use turbolite::{clear_all_caches, register, CompressedVfs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1311,7 +1311,7 @@ fn split_into_sections(text: &str, author: &str, title: &str) -> Vec<(String, St
 
 /// Benchmark parallel vs serial compaction
 fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32, gutenberg: bool, corpus_size_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);

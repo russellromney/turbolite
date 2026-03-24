@@ -11,7 +11,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{compact, inspect_database, register, CompressedVfs};
+use turbolite::{compact, inspect_database, register, CompressedVfs};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -295,7 +295,7 @@ fn cmd_compact(db: &Path, verbose: bool) -> Result<()> {
 }
 
 fn cmd_train(db: &Path, dict_size_kb: usize, dict_out: Option<PathBuf>, level: i32) -> Result<()> {
-    use sqlite_compress_encrypt_vfs::dict;
+    use turbolite::dict;
 
     if !db.exists() {
         bail!("File not found: {}", db.display());

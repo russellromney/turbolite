@@ -7,7 +7,7 @@
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use sqlite_compress_encrypt_vfs::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TieredConfig, TieredVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -102,7 +102,7 @@ fn run_benchmark(
     let bench_handle = vfs.bench_handle();
     let vfs_name = unique_vfs_name("lambda");
     eprintln!("[lambda] registering VFS '{}'...", vfs_name);
-    sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs)?;
+    turbolite::tiered::register(&vfs_name, vfs)?;
     eprintln!("[lambda] VFS registered, opening connection...");
 
     let conn = Connection::open_with_flags_and_vfs(
