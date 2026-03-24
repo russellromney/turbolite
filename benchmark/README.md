@@ -1,6 +1,6 @@
 # Tiered VFS Benchmark Guide
 
-Warm/cold benchmark for the S3-backed page-group tiered VFS. Measures query latency against a 100K-post social network database (~165MB, 11 page groups) stored on S3-compatible object storage.
+Warm/cold benchmark for the S3-backed page-group tiered VFS. Measures query latency against social network databases stored on S3-compatible object storage. Default 64KB pages, 256 pages per group (16MB).
 
 **Queries tested:** post+user join, user profile, who-liked, mutual friends
 **Modes:** WARM (cache populated, pread only) and COLD (cache cleared, S3 fetch per iteration)
@@ -16,7 +16,8 @@ Warm/cold benchmark for the S3-backed page-group tiered VFS. Measures query late
 | `BENCH_REUSE` | no | — | Reuse existing S3 data at this prefix (skip data gen) |
 | `BENCH_NO_CLEANUP` | no | false | Keep S3 data after benchmark |
 | `BENCH_ITERATIONS` | no | `20` | Iterations per query per mode |
-| `BENCH_PPG` | no | `4096` | Pages per page group |
+| `BENCH_PPG` | no | `256` | Pages per page group |
+| `BENCH_PAGE_SIZE` | no | `65536` | Page size in bytes |
 
 ## 1. Local (against Tigris)
 
@@ -204,10 +205,30 @@ sleep 10
 - **EC2 Instance Connect keys expire in 60 seconds.** Push a new key before each SSH/SCP command.
 - **Default VPC internet gateway may be detached.** If SSH times out, check: `aws ec2 describe-route-tables --region us-east-2` — the `0.0.0.0/0` route should point to an IGW (not show `blackhole`).
 
-## Reference Results (100K posts, March 2026)
+## Reference Results (64KB pages, March 2026, local Mac against Tigris)
 
-| | cold post+user p50 | cold profile p50 | cold who-liked p50 | cold mutual p50 | warm post+user p50 |
-|---|---|---|---|---|---|
-| **Fly.io + Tigris (iad)** | 121-211ms | — | — | 239-511ms | ~20us |
-| **EC2 + S3 Express (same AZ)** | 110.8ms | 569.5ms | 320.1ms | 228.9ms | 20us |
-| **Neon (reference)** | ~500ms | — | — | — | — |
+### 100K posts (2,310 pages, 10 groups, 144MB)
+
+| | warm p50 | cold p50 | arctic p50 |
+|---|---|---|---|
+| post+user | 63μs | 36ms (1 GET, 18KB) | 270ms |
+| profile | 159μs | 457ms (11 GETs, 7.2MB) | 737ms |
+| who-liked | 1.5ms | 43ms (1 GET, 18KB) | 813ms |
+| mutual | 35μs | 51ms (1 GET, 18KB) | 495ms |
+
+### 500K posts (11,569 pages, 46 groups, 723MB)
+
+| | warm p50 | cold p50 | arctic p50 |
+|---|---|---|---|
+| post+user | 658μs | 116ms (2 GETs, 106KB) | 618ms |
+| profile | 1.1ms | 893ms (31 GETs, 33MB) | 2.4s |
+| who-liked | 1.5ms | 68ms (1 GET, 88KB) | 1.9s |
+| mutual | 39μs | 60ms (1 GET, 88KB) | 834ms |
+
+### Previous results (4KB pages, Fly.io + Tigris iad, 100K posts)
+
+| | cold post+user p50 | cold mutual p50 | warm post+user p50 |
+|---|---|---|---|
+| **Fly.io + Tigris (iad)** | 121-211ms | 239-511ms | ~20μs |
+| **EC2 + S3 Express (same AZ)** | 110.8ms | 228.9ms | 20μs |
+| **Neon (reference)** | ~500ms | — | — |

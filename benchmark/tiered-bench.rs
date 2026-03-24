@@ -110,12 +110,12 @@ struct Cli {
     #[arg(long, env = "BENCH_IMPORT")]
     import: Option<String>,
 
-    /// Page size (bytes). Default 4096.
-    #[arg(long, default_value = "4096", env = "BENCH_PAGE_SIZE")]
+    /// Page size (bytes). Default 65536 (64KB).
+    #[arg(long, default_value = "65536", env = "BENCH_PAGE_SIZE")]
     page_size: u32,
 
-    /// Pages per page group. Default 4096 (16MB uncompressed, ~8MB compressed).
-    #[arg(long, default_value = "4096", env = "BENCH_PPG")]
+    /// Pages per page group. Default 256 (16MB uncompressed at 64KB pages).
+    #[arg(long, default_value = "256", env = "BENCH_PPG")]
     ppg: u32,
 
     /// Rows per transaction commit during data generation. Default 10000.

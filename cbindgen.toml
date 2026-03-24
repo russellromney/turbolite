@@ -23,6 +23,10 @@ rename_args = "None"
 [enum]
 rename_variants = "ScreamingSnakeCase"
 
+[defines]
+"feature = encryption" = "TURBOLITE_ENCRYPTION"
+"feature = tiered" = "TURBOLITE_TIERED"
+
 [parse]
 parse_deps = false
 extra_bindings = []

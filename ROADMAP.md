@@ -4,9 +4,9 @@
 
 ## Current Status
 
-Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 4096 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~100KB) without downloading entire groups.
+Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 64KB pages, 256 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~256KB) without downloading entire groups.
 
-Cold point lookup: 40ms (2 S3 requests, 400KB). Warm: 37us. Full table scan (812MB): ~500ms on 8 threads.
+Cold point lookup: 36ms (1 S3 request, 18KB at 100k posts). Warm: 63μs. 500k-post dataset (723MB): 14 interior pages, 46 groups.
 
 Post-checkpoint GC (`gc_enabled`) and full-scan GC (`TieredVfs::gc()`) implemented. 31 S3 integration tests + 84 unit tests passing.
 
@@ -46,17 +46,17 @@ Note: this is a minor optimization. S3 is the source of truth, local disk is eph
 
 The fundamental reframe: **optimize for S3 request count, not data size.** A range GET for 64KB costs the same as 4KB — one S3 request. Everything should follow from this.
 
-### 64KB pages as default for tiered mode
-- [ ] Default `PRAGMA page_size=65536` for tiered VFS (smaller page sizes remain an option)
-- [ ] At 64KB pages, 812MB database = ~12,400 pages (vs ~200,000 at 4KB)
-- [ ] B-tree fan-out increases ~16x → shallower trees → fewer S3 hops per lookup (3-4 levels becomes 2-3)
-- [ ] Overflow threshold jumps from ~1KB to ~16KB — most rows fit in a single page, overflow chains mostly disappear
-- [ ] Default group size: 256 pages per group = 16MB (same physical size as current 4096 * 4KB)
-- [ ] Default sub-chunk frame: 4 pages per frame = 256KB uncompressed, ~128KB compressed per range GET
+### 64KB pages as default for tiered mode (DONE)
+- [x] Default `PRAGMA page_size=65536` for tiered VFS (smaller page sizes remain an option)
+- [x] At 64KB pages, 500k-post dataset = 11,569 pages (vs ~104,000 at 4KB) — 9x fewer
+- [x] B-tree fan-out increases ~16x → shallower trees → fewer S3 hops per lookup (14 interior pages for 500k vs 617)
+- [x] Overflow threshold jumps from ~1KB to ~16KB — most rows fit in a single page
+- [x] Default group size: 256 pages per group = 16MB (same physical size as old 4096 * 4KB)
+- [x] Default sub-chunk frame: 4 pages per frame = 256KB uncompressed per range GET
 
 ### Sub-chunk as the caching unit
 - [ ] Replace per-page bitmap with per-sub-chunk tracking: `HashSet<(group_id, frame_index)>`
-- [ ] 812MB at 64KB pages, 4 pages/frame = ~3,100 sub-chunks. Entire tracker fits in a few KB.
+- [ ] 1.7GB at 64KB pages, 4 pages/frame = ~6,700 sub-chunks. Entire tracker fits in a few KB.
 - [ ] Cache miss: S3 range GET for one frame → decompress → pwrite all pages to cache file at their page offsets → insert one entry in tracker
 - [ ] Cache hit: check sub-chunk tracker → pread from cache file at page offset (O(1), same as today)
 - [ ] Disk cache format unchanged — flat file, page N at offset N * page_size. Sub-chunk tracking is purely in-memory.
@@ -69,8 +69,8 @@ The fundamental reframe: **optimize for S3 request count, not data size.** A ran
 - [ ] Evict from lowest tier first, LRU within each tier
 
 ### Why this simplifies everything downstream
-- Manifest indirection (Phase 16): 12,400 page entries = ~100KB. Trivially small.
-- Hot/cold tracking: sort ~3,100 sub-chunks by temperature. Trivial.
+- Manifest indirection (Phase 16): 26,700 page entries = ~200KB. Trivially small.
+- Hot/cold tracking: sort ~6,700 sub-chunks by temperature. Trivial.
 - Write buffer groups: tracking dirty sub-chunks is a tiny bitset.
 - The "major architectural change" warnings in Phase 16 largely dissolve at this scale.
 
@@ -122,7 +122,7 @@ This is the interior bundle pattern extended to index leaves. Interior bundles a
 
 turbolite's unit of write is the page group (16MB at 256 * 64KB pages). A single dirty page forces re-upload of the entire group. Write amplification = dirty groups / dirty pages.
 
-With 64KB pages (Phase 14), group counts are naturally low: 812MB = 49 groups, so worst-case is 49 PUTs per checkpoint. This is fine for small databases. For larger databases the math changes: 10GB = 600 groups, 100GB = 6,000 groups — scattered writes at that scale mean thousands of 16MB uploads per checkpoint.
+With 64KB pages (Phase 14), group counts are naturally low: 1.7GB = 104 groups, so worst-case is 104 PUTs per checkpoint. This is fine for small databases. For larger databases the math changes: 10GB = 600 groups, 100GB = 6,000 groups — scattered writes at that scale mean thousands of 16MB uploads per checkpoint.
 
 ### Group size tuning
 - [ ] Make `pages_per_group` a meaningful tuning knob with documented tradeoffs
@@ -137,7 +137,7 @@ Low priority for databases under a few GB (group count is naturally small). Matt
 - [ ] After import or VACUUM, extend the database with "write buffer" groups — groups that are entirely freelist pages
 - [ ] SQLite's allocator pulls from the freelist for new INSERTs, so writes naturally concentrate in these groups
 - [ ] Freelist ordering: rewrite freelist trunk pages at checkpoint so free pages are ordered by group (SQLite exhausts one group before moving to the next)
-- [ ] Economics at scale: 100GB database, 100 scattered dirty pages → 100 groups dirty (1.6GB uploaded) vs 2 groups with pre-alloc (32MB uploaded). At small scale (812MB, 49 groups max) the ceiling is low enough that this barely matters.
+- [ ] Economics at scale: 100GB database, 100 scattered dirty pages → 100 groups dirty (1.6GB uploaded) vs 2 groups with pre-alloc (32MB uploaded). At small scale (1.7GB, 104 groups max) the ceiling is low enough that this barely matters.
 
 ### Write amplification metrics
 - [ ] Track per-checkpoint: dirty pages, dirty groups, bytes uploaded, write amplification ratio
@@ -207,7 +207,7 @@ Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 - [ ] Replicate WAL to S3 for zero-durability-gap (layer walrust/LiteStream on top)
 
 ### Write buffer groups + hot/cold page separation
-If Phase 16's group size tuning and freelist pre-allocation aren't enough for very large write-heavy databases (100GB+), the next step is page indirection: instead of encoding dirty pages back into their original groups, put all dirty pages into dedicated write buffer groups. Original groups stay clean and don't get re-uploaded. With 64KB pages (Phase 14), the manifest indirection is ~100KB for a 12K-page database — trivially small.
+If Phase 16's group size tuning and freelist pre-allocation aren't enough for very large write-heavy databases (100GB+), the next step is page indirection: instead of encoding dirty pages back into their original groups, put all dirty pages into dedicated write buffer groups. Original groups stay clean and don't get re-uploaded. With 64KB pages (Phase 14), the manifest indirection is ~200KB for a 27K-page database — trivially small.
 
 This is essentially a tiny LSM at the page-group level. Write buffers accumulate dirty pages across checkpoints, periodic compaction merges them back into contiguous groups. Could also enable hot/cold separation: track write frequency per page, concentrate hot pages in small frequently-uploaded groups and cold pages in large rarely-touched groups.
 

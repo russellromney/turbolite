@@ -280,6 +280,167 @@ pub extern "C" fn turbolite_invalidate_cache(path: *const c_char) -> c_int {
     0
 }
 
+// --- Database operations ---
+// Thin wrappers around rusqlite so FFI consumers (Python, Go, etc.) can
+// open databases, run queries, and read results through the VFS without
+// needing their own SQLite linkage.
+
+/// Opaque database connection handle.
+pub struct TurboliteDb {
+    conn: rusqlite::Connection,
+}
+
+/// Open a database using a previously registered VFS.
+///
+/// # Parameters
+/// - `path`: Database file path.
+/// - `vfs_name`: Name of the VFS registered via `turbolite_register_*`.
+///
+/// # Returns
+/// Opaque handle on success, NULL on error. Must be closed with `turbolite_close`.
+#[no_mangle]
+pub extern "C" fn turbolite_open(
+    path: *const c_char,
+    vfs_name: *const c_char,
+) -> *mut TurboliteDb {
+    clear_last_error();
+    let path = match cstr_to_str(path, "path") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let vfs_name = match cstr_to_str(vfs_name, "vfs_name") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+
+    match rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs_name) {
+        Ok(conn) => Box::into_raw(Box::new(TurboliteDb { conn })),
+        Err(e) => {
+            set_last_error(&format!("open failed: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Execute a SQL statement (DDL/DML) that returns no rows.
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
+    clear_last_error();
+    if db.is_null() {
+        set_last_error("db handle must not be NULL");
+        return -1;
+    }
+    let sql = match cstr_to_str(sql, "sql") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let db = unsafe { &*db };
+    match db.conn.execute_batch(sql) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("exec failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Execute a SQL query and return results as a JSON array of objects.
+///
+/// Example return: `[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]`
+///
+/// # Returns
+/// Heap-allocated JSON string on success (caller must free with `turbolite_free_string`),
+/// or NULL on error.
+#[no_mangle]
+pub extern "C" fn turbolite_query_json(
+    db: *mut TurboliteDb,
+    sql: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if db.is_null() {
+        set_last_error("db handle must not be NULL");
+        return std::ptr::null_mut();
+    }
+    let sql = match cstr_to_str(sql, "sql") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let db = unsafe { &*db };
+    let result = (|| -> Result<String, String> {
+        let mut stmt = db.conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+            .collect();
+
+        let mut rows_json = Vec::new();
+        let mut rows = stmt.query([]).map_err(|e| format!("query: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("next: {}", e))? {
+            let mut obj = serde_json::Map::new();
+            for (i, name) in col_names.iter().enumerate() {
+                let val: serde_json::Value = match row.get_ref(i) {
+                    Ok(rusqlite::types::ValueRef::Null) => serde_json::Value::Null,
+                    Ok(rusqlite::types::ValueRef::Integer(n)) => serde_json::json!(n),
+                    Ok(rusqlite::types::ValueRef::Real(f)) => serde_json::json!(f),
+                    Ok(rusqlite::types::ValueRef::Text(s)) => {
+                        serde_json::Value::String(String::from_utf8_lossy(s).into_owned())
+                    }
+                    Ok(rusqlite::types::ValueRef::Blob(b)) => {
+                        // Encode blobs as base64 for JSON safety.
+                        serde_json::Value::String(format!("blob:{} bytes", b.len()))
+                    }
+                    Err(e) => serde_json::Value::String(format!("error: {}", e)),
+                };
+                obj.insert(name.clone(), val);
+            }
+            rows_json.push(serde_json::Value::Object(obj));
+        }
+        serde_json::to_string(&rows_json).map_err(|e| format!("json: {}", e))
+    })();
+
+    match result {
+        Ok(json) => match CString::new(json) {
+            Ok(cs) => cs.into_raw(),
+            Err(e) => {
+                set_last_error(&format!("json contains null byte: {}", e));
+                std::ptr::null_mut()
+            }
+        },
+        Err(msg) => {
+            set_last_error(&msg);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Free a string returned by `turbolite_query_json`.
+#[no_mangle]
+pub extern "C" fn turbolite_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        unsafe {
+            drop(CString::from_raw(s));
+        }
+    }
+}
+
+/// Close a database connection opened with `turbolite_open`.
+#[no_mangle]
+pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
+    if !db.is_null() {
+        unsafe {
+            drop(Box::from_raw(db));
+        }
+    }
+}
+
 // --- Internal helpers ---
 
 fn cstr_to_str<'a>(ptr: *const c_char, param_name: &str) -> Result<&'a str, c_int> {

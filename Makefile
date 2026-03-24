@@ -1,8 +1,8 @@
 # turbolite build targets
 #
 # Shared library (.so / .dylib) for C FFI consumers.
-# The library links against system SQLite (not bundled) so that it shares
-# the same sqlite3 symbol table as the host application.
+# Cargo.toml declares crate-type = ["lib", "cdylib"] so both rlib and
+# shared library are produced on every build.
 
 UNAME := $(shell uname -s)
 ifeq ($(UNAME),Darwin)
@@ -65,12 +65,16 @@ build: ## Build all binaries (CLI, benchmarks) with bundled SQLite
 # ── Tests ──────────────────────────────────────────────────────────
 
 .PHONY: test
-test: ## Run all tests
+test: ## Run all tests (Rust unit + FFI)
 	cargo test --features zstd,bundled-sqlite
 
 .PHONY: test-all
 test-all: ## Run all tests including tiered/S3
 	cargo test --features zstd,tiered,bundled-sqlite
+
+.PHONY: test-ffi
+test-ffi: lib-bundled ## Build .dylib then run Python integration tests
+	python3 tests/test_ffi_python.py
 
 # ── Cleanup ────────────────────────────────────────────────────────
 
