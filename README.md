@@ -1,12 +1,14 @@
 # turbolite
 
-S3-native SQLite VFS with sub-50ms cold point queries on multi-GB SQLite databases served cold from S3.
+S3-native SQLite VFS with sub-50ms cold queries on multi-GB SQLite databases served cold from S3.
 
-turbolite is an experimental SQLite VFS where S3 is the durable store and local disk is the working copy. Writes go to the local WAL at full speed. Checkpoint compresses dirty pages into immutable S3 objects and atomically swaps a manifest. Between checkpoints, local disk is the source of truth. After checkpoint, the database can be opened cold from S3 — no volume, no running server.
+turbolite is an experimental SQLite VFS that persistes a SQLite database to S3. Spin up compute, point it at a bucket, and query immediately without downloading the database first. Point lookups fetch only the pages they need while scans are parallelized and/or prefetched. You can do point queries even if the database doesn't fit in memory or on local disk.
 
-Inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of building directly on cloud storage primitives. S3 is not a filesystem — it has its own economics (PUTs are expensive, GETs are cheap, objects are immutable, bandwidth is practically free) and turbolite's architecture is shaped entirely by them.
+It also offers page-level compression and encryption, enabling full-text search over compressed and encrypted databases. 
 
-This is for **databases that don't need a server running 24/7**: analytics results you query occasionally, per-tenant databases in a multi-tenant system, agent memory you spin up on demand, or anything where provisioning a volume per database doesn't make sense. It is not a read-scaleout layer — cold reads hit S3, which means network latency on every cache miss.
+This is for workloads where data outlives or outgrows compute: per-tenant databases, agent memory, analytics results, anything where you'd rather store $0.02/GB/month in S3 than keep a server running. Writes are local-speed while checkpoint persists to S3.
+
+Much of the design is inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 is not a filesystem — it has its own economics (PUTs are expensive, GETs are cheap, objects are immutable, bandwidth is practically free) and turbolite's architecture is shaped by them rather than traditional server constraints. 
 
 turbolite is a Rust library. Loadable extension (`.so`/`.dylib`) is planned.
 
@@ -14,6 +16,7 @@ turbolite is a Rust library. Loadable extension (`.so`/`.dylib`) is planned.
 Cold point lookup on 812MB database: 40ms (2 S3 range GETs, 400KB transferred)
 Warm queries: 37 microseconds
 Storage at rest: ~$0.02/month per GB
+(see benchmarking section)
 ```
 
 turbolite has **three features that compose at the page level:**
@@ -21,7 +24,7 @@ turbolite has **three features that compose at the page level:**
 | Feature | What it does |
 |---------|-------------|
 | **S3 storage** | Checkpoint to S3 as immutable compressed page groups. Open cold from S3 with no local state. |
-| **Seekable compression** | Multi-frame zstd with per-frame byte offsets. Point lookups fetch ~100KB from S3, not ~8MB. |
+| **Seekable compression** | Multi-frame zstd with per-frame byte offsets. Point lookups fetch the minimum necessary from S3, while scans are parallel and (relatively) fast |
 | **Page-level encryption** | AES-256-GCM per page. Composes with compression. |
 
 Because these operate at the page level, all SQLite features work transparently — FTS, R-tree, JSON, WAL mode. turbolite is a standard VFS. SQLite doesn't know the difference.
