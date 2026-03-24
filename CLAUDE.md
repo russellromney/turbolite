@@ -31,3 +31,12 @@ soup run -p sqlces -e development -- cargo test --features tiered,zstd --test ti
 - No over-engineering or premature abstractions
 - Keep files under 1000 lines — split when approaching this limit
 - Fail fast — `.expect()` not `.unwrap_or()` for critical values
+
+## Roadmap Phase Naming
+
+Phases in ROADMAP.md are named after historical battles/wars, NOT numbered. This avoids renumbering when inserting new phases.
+
+- Each phase header includes adjacency links: `> After: PhaseName · Before: PhaseName`
+- Subphases within a phase use letters or numbers (a, b, c or 1, 2, 3)
+- New phases pick any unique battle name; ordering is by adjacency links, not chronology
+- When referencing phases in code comments or docs, use the battle name (e.g., "see Midway" not "see Phase 16")
