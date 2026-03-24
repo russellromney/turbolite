@@ -2,6 +2,32 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Verdun: Tiered Encryption
+
+One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache metadata.
+
+### Two-tier encryption model
+- **S3 path (GCM)**: AES-256-GCM with random 12-byte nonce per frame, prepended to ciphertext. Authenticated encryption with tamper detection. +28 bytes/frame overhead (negligible on ~256KB frames). Random nonces prevent catastrophic GCM nonce reuse across checkpoint re-encodes.
+- **Local path (CTR)**: AES-256-CTR for cache pages, WAL/journal files, and SubChunkTracker metadata. Zero size overhead, preserves 64KB OS page alignment.
+
+### Encryption pipeline
+- Encode path: plaintext → zstd compress → GCM encrypt (S3) or CTR encrypt (local)
+- Decode path: GCM decrypt → zstd decompress (S3) or CTR decrypt → read (local)
+- `encryption_key: Option<[u8; 32]>` in `TieredConfig` threads through all paths
+
+### What's encrypted
+- Page groups (seekable per-frame GCM, nonce prepended per frame)
+- Interior and index bundles (whole-blob GCM, random nonce)
+- Local disk cache pages (CTR, nonce = page_num)
+- WAL/journal passthrough files (CTR, nonce = byte offset)
+- SubChunkTracker persistence file (CTR, random 16-byte nonce prefix per persist)
+
+### Tests
+- 21 encryption unit tests: roundtrip, on-disk not plaintext, wrong key rejection, nonce uniqueness, bulk ops
+- 3 S3 integration tests: encrypted write + cold read, wrong key cold read fails, arctic start with all page types
+
+---
+
 ## Agincourt: Index Bundles + Lazy Prefetch + Page-Size-Aware Chunking
 
 3-7x arctic improvement through three compounding changes:

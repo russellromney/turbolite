@@ -6,17 +6,58 @@
 
 Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 64KB pages, 256 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~256KB) without downloading entire groups.
 
+Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything.
+
 1M-row social media dataset (1.46GB, 91 page groups, 64KB pages):
 - Arctic point lookup: 143ms (true cold start, zero cache)
 - Cold point lookup: 23ms (interior + index pages cached)
 - Warm point lookup: 98μs
 
-Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 34 S3 integration tests + 138 unit tests passing.
+Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 37 S3 integration tests + 164 unit tests passing.
+
+---
+
+## Ypres: Encryption Key Rotation
+> After: Verdun · Before: Marne
+
+Re-encrypt all S3 data with a new key. The local VFS already has dictionary rotation via `compact_with_recompression()` — this extends the pattern to encryption keys in tiered mode.
+
+### Flow
+- [ ] `TieredVfs::rotate_key(old_key, new_key)` — one-shot key rotation
+- [ ] Download each page group, decrypt with old key, re-encrypt with new key, upload as new version
+- [ ] Same for interior bundles and index bundles
+- [ ] Write new manifest (with new version)
+- [ ] Re-encrypt local cache file pages in place (read with old CTR nonce, write with new CTR nonce)
+- [ ] Re-encrypt SubChunkTracker persistence file
+- [ ] Old S3 objects added to `replaced_keys` for GC
+- [ ] Test: rotate key, cold read with new key succeeds
+- [ ] Test: cold read with old key after rotation fails
+- [ ] Test: rotation is atomic — manifest swap is the commit point
+
+### Future
+- [ ] `from_password(password, salt)` — Argon2id KDF convenience method. Salt stored in manifest or dedicated S3 object.
+- [ ] Local cache nonce hardening: random nonce per page write, stored in a per-page counter file. Eliminates CTR nonce reuse for multi-snapshot attackers.
+- [ ] WAL nonce hardening: per-truncation generation counter persisted alongside WAL. Eliminates CTR nonce reuse across WAL checkpoint cycles.
+
+---
+
+## Marne: Dirty Page Memory Optimization
+> After: Ypres · Before: Thermopylae
+
+`write_all_at()` stores a full page copy in `dirty_pages: HashMap<u64, Vec<u8>>` AND writes it to the cache file. The HashMap copy is only needed at checkpoint to know which groups to re-encode — but the data is already in the cache. Holding it twice wastes memory: 1000 dirty 64KB pages = 64MB in the HashMap alone.
+
+### Fix
+- [ ] Replace `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>` (8 bytes per page instead of 64KB)
+- [ ] At checkpoint, read dirty pages back from cache file via `cache.read_page()` (microsecond pread, trivial vs S3 PUT)
+- [ ] Remove the `dirty_snapshot.clone()` in `sync()` — just clone the HashSet
+- [ ] Update `read_exact_at()` to check cache instead of HashMap for dirty page reads (cache is already up-to-date from `write_all_at`)
+- [ ] Test: write 1000 pages, verify memory usage doesn't scale with page count
+- [ ] Test: checkpoint after dirty page optimization still produces correct S3 data
 
 ---
 
 ## Thermopylae: Tunable GC + Autovacuum Integration
-> After: (start) · Before: Marathon
+> After: Marne · Before: Marathon
 
 ### a. Tunable GC policy
 - [ ] `gc_keep_versions: u32` — number of old page group versions to retain (default 0 = delete all). Enables point-in-time restore window.
@@ -31,6 +72,12 @@ Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks
 ### c. CLI
 - [ ] `turbolite gc --bucket X --prefix Y` — one-shot full GC scan
 - [ ] `turbolite gc --dry-run` — list orphans without deleting
+
+### d. Msgpack manifest
+- [ ] Replace JSON manifest with msgpack (`rmp-serde`). Smaller, faster serialize/deserialize.
+- [ ] S3 key: `manifest.msgpack` (content type `application/msgpack`)
+- [ ] Automigrate: `get_manifest` tries msgpack first, falls back to JSON. Next `put_manifest` writes msgpack. Old `manifest.json` cleaned up by GC.
+- [ ] `SubChunkTracker` local persistence can stay JSON (local-only, not worth changing)
 
 ---
 
@@ -116,20 +163,60 @@ Low priority for databases under a few GB (group count is naturally small). Matt
 
 ---
 
-## Normandy: Shared Library Distribution (.so / .dylib)
+## Normandy: SQLite Loadable Extension + Language Packages
 > After: Stalingrad · Before: Inchon
 
-Offer turbolite as a shared library for C FFI consumers (Python ctypes, Go cgo, Node ffi-napi, etc.).
+Ship turbolite as a SQLite loadable extension so Python/Go/Ruby/etc. users can `load_extension()` into their existing `sqlite3` connections. The extension registers the compressed VFS and exposes SQL helper functions. Language packages bundle the platform-specific binary and provide a `load(conn)` helper (sqlite-vec pattern).
 
-- [ ] SQLite loadable extension (`sqlite3_turbolite_init` entry point) — enables `SELECT load_extension('turbolite')`
-- [ ] Cross-compile CI: build .so/.dylib for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
-- [ ] Python wheel wrapping the .so (turbolite-python)
+### a. Loadable extension core
+- [x] C shim (`src/ext_entry.c`): `sqlite3_turbolite_init` entry point using `sqlite3ext.h` + `SQLITE_EXTENSION_INIT1/2` macros. Receives the extension API table and routes `sqlite3_vfs_register` through it.
+- [x] Rust `ext_init()` called from C shim: registers compressed VFS via the extension API's `vfs_register` (not the direct C symbol — loadable extensions must use the API table)
+- [x] SQL functions registered by the extension:
+  - `turbolite_version()` → returns version string
+- [ ] `SELECT turbolite_register('vfs_name', '/path/to/base', 3)` → registers a compressed VFS with given name, base directory, and zstd level
+- [x] `Cargo.toml`: `loadable-extension` feature, `cc` build dep, conditional build.rs
+- [x] Makefile target: `make ext` builds the loadable extension .so/.dylib
+- [x] Vendored `sqlite3.h`/`sqlite3ext.h` in `vendor/sqlite3/` (macOS SDK defines `SQLITE_OMIT_LOAD_EXTENSION`)
+
+### b. Tests — loadable extension
+- [x] `sqlite3_turbolite_init` loads successfully, VFS is registered
+- [x] `turbolite_version()` SQL function returns correct version
+- [x] Integration: Python `sqlite3.load_extension()` → open compressed DB via URI `?vfs=turbolite` → full CRUD roundtrip
+- [x] Data persists across close/reopen
+- [x] Multiple tables, UPDATE, DELETE, transaction rollback
+- [x] All column types (NULL, integer, float, text, blob)
+- [x] Index creation and index-based lookups
+- [x] Large text/blob values, unicode roundtrip
+- [x] Edge: load extension twice → idempotent (no crash)
+- [x] Edge: file on disk has compressed magic (SQLCEvfS)
+- [x] Edge: uncompressed DB not readable with turbolite VFS
+- [ ] Integration: C program loads extension → registers VFS → roundtrip
+
+### c. Python package (sqlite-vec pattern)
+- [x] Rewrite `packages/python/` to sqlite-vec pattern: pure Python package that bundles the platform .so/.dylib
+- [x] `turbolite/__init__.py`: `load(conn)` helper that finds bundled binary and calls `conn.load_extension(path)`
+- [x] `turbolite/__init__.py`: `connect(path, vfs="turbolite")` convenience wrapper
+- [x] Platform binary bundled at `turbolite/turbolite.dylib` (or `.so`)
+- [x] `pyproject.toml`: setuptools with package-data for .so/.dylib
+- [x] Test: `import turbolite; turbolite.load(conn)` → VFS available → compressed CRUD roundtrip
+- [x] Test: `turbolite.connect()` convenience → works end to end
+- [ ] Test: missing .so → clear error message
+
+### d. Node package (wrapped approach — better-sqlite3 can't select VFS via URI)
+- [ ] Keep existing napi-rs `Database` wrapper in `packages/node/`
+- [ ] Document why: better-sqlite3 compiles with `SQLITE_USE_URI=0`, no VFS selection via URI
+- [ ] If better-sqlite3 adds URI support in the future, switch to loadable extension pattern
+
+### e. Cross-compile CI
+- [ ] GitHub Actions workflow: build loadable extension for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
+- [ ] Publish platform-specific Python wheels to PyPI
+- [ ] Publish Node package to npm
 - [ ] pkg-config `.pc` file for system install discovery
 
 ---
 
 ## Inchon: Rename to turbolite
-> After: Normandy · Before: (future)
+> After: Normandy · Before: Somme
 
 Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 
@@ -141,10 +228,52 @@ Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 
 ---
 
+## Somme: Built-in WAL Shipping
+> After: Inchon · Before: (future)
+
+Close the durability gap between checkpoints. The VFS already intercepts every WAL write via `write_all_at()` and has an S3 client + tokio runtime. Ship WAL frames to S3 in the background so writes are durable before checkpoint.
+
+### a. WAL frame capture + upload
+- [ ] Intercept WAL `write_all_at()` — still write to local disk (SQLite needs it), also buffer frame bytes
+- [ ] Batch frames into segments (e.g. every 100 frames or N ms) to amortize PUT cost
+- [ ] Upload segments to `{prefix}/wal/{sequence_number}` via existing S3 client
+- [ ] Monotonic sequence numbers for replay ordering
+
+### b. Recovery
+- [ ] On arctic open: after manifest download, list `{prefix}/wal/` objects newer than manifest version
+- [ ] Replay WAL frames into local cache before serving queries
+- [ ] Test: write data, kill before checkpoint, recover from S3 WAL segments
+
+### c. Cleanup
+- [ ] After checkpoint uploads page groups + new manifest, WAL segments older than manifest version are garbage
+- [ ] Integrate with existing GC — add WAL segment keys to the "not in manifest = garbage" rule
+
+### d. WAL write callback (future)
+- [ ] `TieredConfig::on_wal_write(fn(&[u8]))` — optional hook for external tools (walrust, custom replication)
+- [ ] turbolite doesn't care what the callback does — just observes and forwards
+
+---
+
 ## Future
 
-### Encryption in tiered mode
-- [ ] Compose page-level encrypt/decrypt into TieredHandle read/write path
+### mmap cache
+The local cache currently uses `pread`/`pwrite`. Memory-mapping the cache file would eliminate syscall overhead for warm reads — the kernel serves pages directly from the page cache.
+
+- [ ] `mmap` the cache file instead of `pread` for reads
+- [ ] Keep `pwrite` for cache population (writing pages from S3 fetches)
+- [ ] `madvise(MADV_RANDOM)` — access pattern is random, not sequential
+- [ ] Handle cache file growth: `mremap` on Linux, re-map on macOS
+- [ ] Benchmark: warm lookup latency with mmap vs pread (expect ~10-50us → ~1-5us)
+
+### CLI + rename
+The project is still `sqlite-compress-encrypt-vfs` / `sqlces` in code. Ship the rename alongside a usable CLI.
+
+- [ ] Rename: directory, `Cargo.toml` package name, all `use` paths, binary names
+- [ ] `turbolite bench` — move tiered-bench into a CLI subcommand
+- [ ] `turbolite gc --bucket X --prefix Y` — one-shot GC (currently in Thermopylae roadmap)
+- [ ] `turbolite import --bucket X --prefix Y --db local.db` — import a local SQLite DB to S3
+- [ ] `turbolite info --bucket X --prefix Y` — print manifest summary (page count, groups, size)
+- [ ] Soup project rename: `sqlces` → `turbolite`
 
 ### Bidirectional prefetch
 - Track access direction, prefetch backward for DESC queries
@@ -160,9 +289,6 @@ Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 
 ### Multi-writer coordination
 - [ ] Distributed locks for concurrent writers (if needed)
-
-### WAL replication
-- [ ] Replicate WAL to S3 for zero-durability-gap (layer walrust/LiteStream on top)
 
 ### Write buffer groups + hot/cold page separation
 If Stalingrad's group size tuning and freelist pre-allocation aren't enough for very large write-heavy databases (100GB+), the next step is page indirection: instead of encoding dirty pages back into their original groups, put all dirty pages into dedicated write buffer groups. Original groups stay clean and don't get re-uploaded. With 64KB pages, the manifest indirection is ~200KB for a 27K-page database — trivially small.

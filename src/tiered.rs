@@ -206,6 +206,11 @@ pub struct TieredConfig {
     /// so the first indexed query pays zero index-fetch latency.
     /// Same pattern as interior bundle loading.
     pub eager_index_load: bool,
+    /// AES-256-GCM encryption key. When set, all data is encrypted:
+    /// S3 page groups (per-frame), interior/index bundles, and local cache pages.
+    /// The manifest is NOT encrypted (it contains only S3 keys and byte offsets, no user data).
+    /// Requires the `encryption` feature for actual encryption; without it, the key is ignored.
+    pub encryption_key: Option<[u8; 32]>,
 }
 
 impl Default for TieredConfig {
@@ -236,6 +241,7 @@ impl Default for TieredConfig {
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: false,
             eager_index_load: true,
+            encryption_key: None,
         }
     }
 }
@@ -906,12 +912,15 @@ struct SubChunkTracker {
     sub_pages_per_frame: u32,
     /// Path for persistence.
     path: PathBuf,
+    /// Optional encryption key for CTR-encrypting the persistence file.
+    #[cfg(feature = "encryption")]
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl SubChunkTracker {
     fn new(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32) -> Self {
-        // Try to load from disk
-        let (present, tiers) = Self::load_from_disk(&path);
+        // Try to load from disk (no encryption key yet — loaded as plaintext or fails gracefully)
+        let (present, tiers) = Self::load_from_disk(&path, None);
         let now = Instant::now();
         let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
         Self {
@@ -921,6 +930,24 @@ impl SubChunkTracker {
             pages_per_group,
             sub_pages_per_frame,
             path,
+            #[cfg(feature = "encryption")]
+            encryption_key: None,
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn new_encrypted(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32, encryption_key: Option<[u8; 32]>) -> Self {
+        let (present, tiers) = Self::load_from_disk(&path, encryption_key.as_ref());
+        let now = Instant::now();
+        let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
+        Self {
+            present,
+            tiers,
+            access_times,
+            pages_per_group,
+            sub_pages_per_frame,
+            path,
+            encryption_key,
         }
     }
 
@@ -1111,7 +1138,8 @@ impl SubChunkTracker {
     }
 
     /// Persist tracker state to disk for crash recovery.
-    /// Serializes as JSON: vec of (SubChunkId, tier).
+    /// Serializes as JSON: vec of (SubChunkId, tier). CTR-encrypted with random nonce if key present.
+    /// File format when encrypted: [8-byte random nonce][CTR-encrypted JSON]
     fn persist(&self) -> io::Result<()> {
         let entries: Vec<(SubChunkId, u8)> = self.present.iter()
             .map(|id| {
@@ -1122,17 +1150,46 @@ impl SubChunkTracker {
         let data = serde_json::to_vec(&entries).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("serialize sub-chunk tracker: {}", e))
         })?;
+        #[cfg(feature = "encryption")]
+        let data = if let Some(ref key) = self.encryption_key {
+            use rand::RngCore;
+            // Random nonce per persist — prevents CTR nonce reuse across updates
+            let mut nonce_bytes = [0u8; 8];
+            rand::thread_rng().fill_bytes(&mut nonce_bytes);
+            let nonce_u64 = u64::from_le_bytes(nonce_bytes);
+            let encrypted = compress::encrypt_ctr(&data, nonce_u64, key)?;
+            let mut result = Vec::with_capacity(8 + encrypted.len());
+            result.extend_from_slice(&nonce_bytes);
+            result.extend_from_slice(&encrypted);
+            result
+        } else {
+            data
+        };
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, &data)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 
-    /// Load tracker state from disk.
-    fn load_from_disk(path: &Path) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>) {
+    /// Load tracker state from disk. Decrypts with CTR if key provided.
+    /// Encrypted format: [8-byte random nonce][CTR-encrypted JSON]
+    fn load_from_disk(path: &Path, _encryption_key: Option<&[u8; 32]>) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>) {
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(_) => return (HashSet::new(), HashMap::new()),
+        };
+        #[cfg(feature = "encryption")]
+        let data = if let Some(key) = _encryption_key {
+            if data.len() < 8 {
+                return (HashSet::new(), HashMap::new());
+            }
+            let nonce_u64 = u64::from_le_bytes(data[..8].try_into().unwrap());
+            match compress::decrypt_ctr(&data[8..], nonce_u64, key) {
+                Ok(d) => d,
+                Err(_) => return (HashSet::new(), HashMap::new()),
+            }
+        } else {
+            data
         };
         let entries: Vec<(SubChunkId, u8)> = match serde_json::from_slice(&data) {
             Ok(e) => e,
@@ -1202,13 +1259,15 @@ struct DiskCache {
     pages_per_group: u32,
     sub_pages_per_frame: u32,
     page_size: std::sync::atomic::AtomicU32,
+    /// Encryption key for cache-at-rest. Uses CTR mode (no size overhead).
+    encryption_key: Option<[u8; 32]>,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
 static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DiskCache {
-    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64) -> io::Result<Self> {
+    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
         let cache_file_path = cache_dir.join("data.cache");
@@ -1230,6 +1289,13 @@ impl DiskCache {
         // Sub-chunk tracker (primary tracking mechanism)
         let spf = if sub_pages_per_frame > 0 { sub_pages_per_frame } else { pages_per_group };
         let tracker_path = cache_dir.join("sub_chunk_tracker");
+        #[cfg(feature = "encryption")]
+        let tracker = if encryption_key.is_some() {
+            SubChunkTracker::new_encrypted(tracker_path, pages_per_group, spf, encryption_key)
+        } else {
+            SubChunkTracker::new(tracker_path, pages_per_group, spf)
+        };
+        #[cfg(not(feature = "encryption"))]
         let tracker = SubChunkTracker::new(tracker_path, pages_per_group, spf);
 
         // Legacy bitmap (kept for backward compat during migration)
@@ -1287,21 +1353,39 @@ impl DiskCache {
             pages_per_group,
             sub_pages_per_frame: spf,
             page_size: std::sync::atomic::AtomicU32::new(page_size),
+            encryption_key,
         })
     }
 
-    /// Read a single page from the cache file (pread, no decompression).
+    /// Read a single page from the cache file (pread, decrypt with CTR if encrypted).
     fn read_page(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
         let file = self.cache_file.read();
-        file.read_exact_at(buf, offset)
+        file.read_exact_at(buf, offset)?;
+        #[cfg(feature = "encryption")]
+        if let Some(ref key) = self.encryption_key {
+            let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
+            buf.copy_from_slice(&decrypted);
+        }
+        Ok(())
     }
 
-    /// Write a single uncompressed page to the cache file.
+    /// Write a single uncompressed page to the cache file (encrypt with CTR if key set).
     fn write_page(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+
+        // CTR encryption: same size, no overhead
+        let write_data: Vec<u8>;
+        #[cfg(feature = "encryption")]
+        let data = if let Some(ref key) = self.encryption_key {
+            write_data = compress::encrypt_ctr(data, page_num, key)?;
+            write_data.as_slice()
+        } else {
+            data
+        };
+
         let needed = offset + data.len() as u64;
 
         // Extend file if needed (exclusive lock), then pwrite (shared lock)
@@ -1331,7 +1415,25 @@ impl DiskCache {
     /// Uses RwLock: read lock for pwrite (concurrent), write lock only if file needs extending.
     fn write_pages_bulk(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
-        let offset = start_page * self.page_size.load(Ordering::Acquire) as u64;
+        let page_sz = self.page_size.load(Ordering::Acquire) as usize;
+
+        // CTR encryption: encrypt each page in-place (same size, no overhead)
+        #[cfg(feature = "encryption")]
+        let data = if let Some(ref key) = self.encryption_key {
+            let mut encrypted = Vec::with_capacity(data.len());
+            for i in 0..num_pages {
+                let start = i as usize * page_sz;
+                let end = (start + page_sz).min(data.len());
+                encrypted.extend_from_slice(&compress::encrypt_ctr(&data[start..end], start_page + i, key)?);
+            }
+            encrypted
+        } else {
+            data.to_vec()
+        };
+        #[cfg(feature = "encryption")]
+        let data = data.as_slice();
+
+        let offset = start_page * page_sz as u64;
         let needed = offset + data.len() as u64;
 
         // Try read lock first (concurrent pwrite). Only upgrade to write lock if file too small.
@@ -1603,6 +1705,16 @@ impl DiskCache {
 // Each page is exactly page_size bytes. Empty trailing pages are omitted
 // (page_count tells us how many pages are in the group).
 
+/// Decrypt data if an encryption key is provided, otherwise return as-is (zero-copy).
+fn decrypt_if_needed(data: &[u8], encryption_key: Option<&[u8; 32]>) -> io::Result<Vec<u8>> {
+    #[cfg(feature = "encryption")]
+    if let Some(key) = encryption_key {
+        return compress::decrypt_gcm_random_nonce(data, key);
+    }
+    let _ = encryption_key; // suppress unused warnings when encryption feature is off
+    Ok(data.to_vec())
+}
+
 /// Encode a page group: pack raw pages and compress as single zstd frame.
 /// `pages` is a slice of Option<Vec<u8>> — None means empty (zero-filled) page.
 /// Returns the compressed blob for S3.
@@ -1611,6 +1723,7 @@ fn encode_page_group(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     // Find last non-empty page to avoid trailing zeros
     let page_count = pages
@@ -1642,14 +1755,21 @@ fn encode_page_group(
         }
     }
 
-    compress::compress(
+    let compressed = compress::compress(
         &raw,
         compression_level,
         #[cfg(feature = "zstd")]
         encoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
-    )
+    )?;
+
+    #[cfg(feature = "encryption")]
+    if let Some(key) = encryption_key {
+        return compress::encrypt_gcm_random_nonce(&compressed, key);
+    }
+
+    Ok(compressed)
 }
 
 /// Encode a page group as multiple independently-decompressible sub-chunk frames.
@@ -1662,6 +1782,7 @@ fn encode_page_group_seekable(
     sub_ppg: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(Vec<u8>, Vec<FrameEntry>)> {
     // Find last non-empty page to avoid trailing zeros
     let page_count = pages
@@ -1696,7 +1817,7 @@ fn encode_page_group_seekable(
         }
 
         let offset = blob.len() as u64;
-        let compressed = compress::compress(
+        let mut frame_data = compress::compress(
             &raw,
             compression_level,
             #[cfg(feature = "zstd")]
@@ -1704,11 +1825,18 @@ fn encode_page_group_seekable(
             #[cfg(not(feature = "zstd"))]
             None,
         )?;
+
+        // Per-frame encryption: random nonce prepended to each frame
+        #[cfg(feature = "encryption")]
+        if let Some(key) = encryption_key {
+            frame_data = compress::encrypt_gcm_random_nonce(&frame_data, key)?;
+        }
+
         frame_table.push(FrameEntry {
             offset,
-            len: compressed.len() as u32,
+            len: frame_data.len() as u32,
         });
-        blob.extend_from_slice(&compressed);
+        blob.extend_from_slice(&frame_data);
     }
 
     Ok((blob, frame_table))
@@ -1719,9 +1847,11 @@ fn encode_page_group_seekable(
 fn decode_seekable_subchunk(
     compressed_frame: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
+    let data = decrypt_if_needed(compressed_frame, encryption_key)?;
     compress::decompress(
-        compressed_frame,
+        &data,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
@@ -1739,6 +1869,7 @@ fn decode_page_group_seekable_full(
     total_page_count: u64,
     group_start: u64,
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
     let actual_pages = std::cmp::min(
         pages_per_group as u64,
@@ -1746,7 +1877,7 @@ fn decode_page_group_seekable_full(
     ) as u32;
     let mut output = Vec::with_capacity(actual_pages as usize * page_size as usize);
 
-    for entry in frame_table {
+    for (_frame_idx, entry) in frame_table.iter().enumerate() {
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
         if end > data.len() {
@@ -1755,8 +1886,9 @@ fn decode_page_group_seekable_full(
                 format!("frame extends beyond data: {}..{} > {}", start, end, data.len()),
             ));
         }
+        let decrypted = decrypt_if_needed(&data[start..end], encryption_key)?;
         let decompressed = compress::decompress(
-            &data[start..end],
+            &decrypted,
             #[cfg(feature = "zstd")]
             decoder_dict,
             #[cfg(not(feature = "zstd"))]
@@ -1777,9 +1909,11 @@ fn decode_page_group_seekable_full(
 fn decode_page_group(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<Vec<u8>>)> {
+    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
     let raw = compress::decompress(
-        compressed,
+        &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
@@ -1823,9 +1957,11 @@ fn decode_page_group(
 fn decode_page_group_bulk(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
+    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
     let raw = compress::decompress(
-        compressed,
+        &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
@@ -1874,6 +2010,7 @@ fn encode_interior_bundle(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     let page_count = pages.len() as u32;
     let header_len = 8 + pages.len() * 8; // 2×u32 + page_count×u64
@@ -1896,23 +2033,32 @@ fn encode_interior_bundle(
         }
     }
 
-    compress::compress(
+    let compressed = compress::compress(
         &raw,
         compression_level,
         #[cfg(feature = "zstd")]
         encoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
-    )
+    )?;
+
+    #[cfg(feature = "encryption")]
+    if let Some(key) = encryption_key {
+        return compress::encrypt_gcm_random_nonce(&compressed, key);
+    }
+
+    Ok(compressed)
 }
 
 /// Decode an interior bundle: returns Vec of (page_number, raw_page_data).
 fn decode_interior_bundle(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
     let raw = compress::decompress(
-        compressed,
+        &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
@@ -1989,6 +2135,7 @@ impl PrefetchPool {
         pages_per_group: u32,
         page_count: Arc<AtomicU64>,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
+        encryption_key: Option<[u8; 32]>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PrefetchJob>();
         let rx = Arc::new(Mutex::new(rx));
@@ -1997,6 +2144,8 @@ impl PrefetchPool {
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
+
+        let encryption_key = Arc::new(encryption_key);
 
         for _ in 0..num_workers {
             let rx = Arc::clone(&rx);
@@ -2007,6 +2156,7 @@ impl PrefetchPool {
             let ppg = pages_per_group;
             #[cfg(feature = "zstd")]
             let dictionary = dictionary.clone();
+            let encryption_key = Arc::clone(&encryption_key);
 
             workers.push(std::thread::spawn(move || {
                 loop {
@@ -2076,12 +2226,14 @@ impl PrefetchPool {
                             start_page,
                             #[cfg(feature = "zstd")]
                             decoder_dict.as_ref(),
+                            encryption_key.as_ref().as_ref(),
                         )
                     } else {
                         decode_page_group_bulk(
                             &pg_data,
                             #[cfg(feature = "zstd")]
                             decoder_dict.as_ref(),
+                            encryption_key.as_ref().as_ref(),
                         )
                     };
                     let (pg_count, _pg_size, page_data) = match decode_result {
@@ -2244,6 +2396,9 @@ pub struct TieredHandle {
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
 
+    /// AES-256-GCM encryption key for S3 data and local cache.
+    encryption_key: Option<[u8; 32]>,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -2277,6 +2432,7 @@ impl TieredHandle {
         gc_enabled: bool,
         eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+        encryption_key: Option<[u8; 32]>,
     ) -> Self {
         let page_size = manifest.page_size;
 
@@ -2297,6 +2453,7 @@ impl TieredHandle {
                                 ft,
                                 #[cfg(feature = "zstd")]
                                 dictionary,
+                                encryption_key.as_ref(),
                             );
                             cache.mark_group_present(0);
                             cache.touch_group(0);
@@ -2331,6 +2488,7 @@ impl TieredHandle {
                             data,
                             #[cfg(feature = "zstd")]
                             ib_decoder.as_ref(),
+                            encryption_key.as_ref(),
                         ) {
                             Ok(pages) => {
                                 total_pages += pages.len();
@@ -2365,6 +2523,7 @@ impl TieredHandle {
             #[cfg(feature = "zstd")]
             let dict_bg = dictionary.map(|d| d.to_vec());
             let n_chunks = chunk_keys.len();
+            let encryption_key_bg = encryption_key;
             eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
             std::thread::spawn(move || {
                 match s3_bg.get_page_groups_by_key(&chunk_keys) {
@@ -2379,6 +2538,7 @@ impl TieredHandle {
                                 data,
                                 #[cfg(feature = "zstd")]
                                 ix_decoder.as_ref(),
+                                encryption_key_bg.as_ref(),
                             ) {
                                 Ok(pages) => {
                                     total_pages += pages.len();
@@ -2428,6 +2588,7 @@ impl TieredHandle {
             prefetch_hops,
             prefetch_pool,
             gc_enabled,
+            encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict,
             #[cfg(feature = "zstd")]
@@ -2441,7 +2602,7 @@ impl TieredHandle {
     }
 
     /// Create a passthrough handle for WAL/journal files (local file I/O).
-    fn new_passthrough(file: File, db_path: PathBuf) -> Self {
+    fn new_passthrough(file: File, db_path: PathBuf, encryption_key: Option<[u8; 32]>) -> Self {
         Self {
             s3: None,
             cache: None,
@@ -2456,6 +2617,7 @@ impl TieredHandle {
             prefetch_hops: vec![0.33, 0.33],
             prefetch_pool: None,
             gc_enabled: false,
+            encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict: None,
             #[cfg(feature = "zstd")]
@@ -2511,6 +2673,7 @@ impl TieredHandle {
         page_count: u64,
         frame_table: Option<&[FrameEntry]>,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+        encryption_key: Option<&[u8; 32]>,
     ) -> io::Result<()> {
         #[cfg(feature = "zstd")]
         let decoder_dict = dictionary.map(zstd::dict::DecoderDictionary::copy);
@@ -2529,6 +2692,7 @@ impl TieredHandle {
                     start_page,
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    encryption_key,
                 )?;
                 (c, d)
             }
@@ -2537,6 +2701,7 @@ impl TieredHandle {
                     pg_data,
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    encryption_key,
                 )?;
                 (c, d)
             }
@@ -2571,6 +2736,7 @@ impl TieredHandle {
             pg_data,
             #[cfg(feature = "zstd")]
             self.decoder_dict.as_ref(),
+            self.encryption_key.as_ref(),
         )?;
 
         let start_page = group_start_page(gid, self.pages_per_group);
@@ -2718,7 +2884,13 @@ impl DatabaseHandle for TieredHandle {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
             let file = self.passthrough_file.as_ref().unwrap().read();
-            return file.read_exact_at(buf, offset);
+            file.read_exact_at(buf, offset)?;
+            #[cfg(feature = "encryption")]
+            if let Some(ref key) = self.encryption_key {
+                let decrypted = compress::decrypt_ctr(buf, offset, key)?;
+                buf[..decrypted.len()].copy_from_slice(&decrypted);
+            }
+            return Ok(());
         }
 
         // Determine page number
@@ -2803,6 +2975,7 @@ impl DatabaseHandle for TieredHandle {
                             &compressed_frame,
                             #[cfg(feature = "zstd")]
                             self.decoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
                         )?;
                         let decode_ms = decode_start.elapsed().as_millis();
 
@@ -2917,12 +3090,14 @@ impl DatabaseHandle for TieredHandle {
                                         start_page,
                                         #[cfg(feature = "zstd")]
                                         self.decoder_dict.as_ref(),
+                                        self.encryption_key.as_ref(),
                                     )
                                 } else {
                                     decode_page_group_bulk(
                                         &pg_data,
                                         #[cfg(feature = "zstd")]
                                         self.decoder_dict.as_ref(),
+                                        self.encryption_key.as_ref(),
                                     )
                                 };
                                 let (pg_count, pg_size, page_data) = decode_result?;
@@ -3018,6 +3193,11 @@ impl DatabaseHandle for TieredHandle {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
             let file = self.passthrough_file.as_ref().unwrap().read();
+            #[cfg(feature = "encryption")]
+            if let Some(ref key) = self.encryption_key {
+                let encrypted = compress::encrypt_ctr(buf, offset, key)?;
+                return file.write_all_at(&encrypted, offset);
+            }
             return file.write_all_at(buf, offset);
         }
 
@@ -3225,6 +3405,7 @@ impl DatabaseHandle for TieredHandle {
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
                                 self.decoder_dict.as_ref(),
+                                self.encryption_key.as_ref(),
                             ) {
                                 for (j, existing_page) in existing_pages.into_iter().enumerate() {
                                     let jpnum = start + j as u64;
@@ -3248,6 +3429,7 @@ impl DatabaseHandle for TieredHandle {
                 self.compression_level,
                 #[cfg(feature = "zstd")]
                 self.encoder_dict.as_ref(),
+                self.encryption_key.as_ref(),
             )?;
             let key = s3.page_group_key(gid, next_version);
             uploads.push((key.clone(), encoded));
@@ -3350,6 +3532,7 @@ impl DatabaseHandle for TieredHandle {
                     self.compression_level,
                     #[cfg(feature = "zstd")]
                     self.encoder_dict.as_ref(),
+                    self.encryption_key.as_ref(),
                 )?;
                 let key = s3.interior_chunk_key(chunk_id, next_version);
                 eprintln!(
@@ -3470,6 +3653,7 @@ impl DatabaseHandle for TieredHandle {
                     self.compression_level,
                     #[cfg(feature = "zstd")]
                     self.encoder_dict.as_ref(),
+                    self.encryption_key.as_ref(),
                 )?;
                 let key = s3.index_chunk_key(chunk_id, next_version);
                 eprintln!(
@@ -3825,6 +4009,7 @@ impl TieredVfs {
             config.sub_pages_per_frame,
             page_size,
             manifest.page_count,
+            config.encryption_key,
         )?;
 
         let s3 = Arc::new(s3);
@@ -3839,6 +4024,7 @@ impl TieredVfs {
             Arc::clone(&page_count),
             #[cfg(feature = "zstd")]
             config.dictionary.clone(),
+            config.encryption_key,
         ));
 
         Ok(Self {
@@ -4077,6 +4263,7 @@ impl Vfs for TieredVfs {
                 self.config.eager_index_load,
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
+                self.config.encryption_key,
             ))
         } else {
             if let Some(parent) = path.parent() {
@@ -4087,7 +4274,7 @@ impl Vfs for TieredVfs {
                 .write(true)
                 .create(true)
                 .open(&path)?;
-            Ok(TieredHandle::new_passthrough(file, path))
+            Ok(TieredHandle::new_passthrough(file, path, self.config.encryption_key))
         }
     }
 
@@ -4340,6 +4527,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
+                config.encryption_key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(ft);
@@ -4350,6 +4538,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
+                config.encryption_key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(Vec::new());
@@ -4393,6 +4582,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
+            config.encryption_key.as_ref(),
         )?;
         let key = s3.interior_chunk_key(chunk_id, version);
         eprintln!(
@@ -4428,6 +4618,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
+            config.encryption_key.as_ref(),
         )?;
         let key = s3.index_chunk_key(chunk_id, version);
         eprintln!(
@@ -4744,6 +4935,7 @@ mod tests {
             3,
             #[cfg(feature = "zstd")]
             None,
+            None,
         )
         .unwrap()
     }
@@ -4753,6 +4945,7 @@ mod tests {
         decode_page_group(
             compressed,
             #[cfg(feature = "zstd")]
+            None,
             None,
         )
         .unwrap()
@@ -4841,6 +5034,7 @@ mod tests {
             &short,
             #[cfg(feature = "zstd")]
             None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -4850,6 +5044,7 @@ mod tests {
         let result = decode_page_group(
             &[],
             #[cfg(feature = "zstd")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -4943,7 +5138,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_and_read_page() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         let data = vec![42u8; 64];
         cache.write_page(5, &data).unwrap();
         assert!(cache.is_present(5));
@@ -4956,7 +5151,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_multiple_pages() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         for i in 0..16u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
         }
@@ -4971,7 +5166,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_page_overwrite() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         cache.write_page(3, &vec![0xAA; 64]).unwrap();
         cache.write_page(3, &vec![0xBB; 64]).unwrap(); // overwrite
         let mut buf = vec![0u8; 64];
@@ -4982,7 +5177,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_extends_file() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0).unwrap(); // page_count=0
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None).unwrap(); // page_count=0
         // Writing page 10 should extend the file
         cache.write_page(10, &vec![42u8; 64]).unwrap();
         assert!(cache.is_present(10));
@@ -4994,7 +5189,7 @@ mod tests {
     #[test]
     fn test_disk_cache_read_uncached_page_returns_zeros() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         // Page exists in sparse file but not marked in bitmap
         let mut buf = vec![0xFFu8; 64];
         cache.read_page(0, &mut buf).unwrap();
@@ -5004,7 +5199,7 @@ mod tests {
     #[test]
     fn test_disk_cache_creates_cache_file() {
         let dir = TempDir::new().unwrap();
-        let _cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 100).unwrap();
+        let _cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 100, None).unwrap();
         assert!(dir.path().join("data.cache").exists());
         let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
         assert_eq!(meta.len(), 100 * 64); // page_count * page_size
@@ -5014,14 +5209,14 @@ mod tests {
     fn test_disk_cache_creates_dir_if_missing() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
-        let _cache = DiskCache::new(&nested, 3600, 4, 2, 64, 8).unwrap();
+        let _cache = DiskCache::new(&nested, 3600, 4, 2, 64, 8, None).unwrap();
         assert!(nested.join("data.cache").exists());
     }
 
     #[test]
     fn test_disk_cache_group_states() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         assert_eq!(cache.group_state(0), GroupState::None);
         assert_eq!(cache.group_state(1), GroupState::None);
         assert!(cache.try_claim_group(0));
@@ -5034,7 +5229,7 @@ mod tests {
     #[test]
     fn test_disk_cache_try_claim_present_fails() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         assert!(!cache.try_claim_group(0)); // Already Present
@@ -5043,7 +5238,7 @@ mod tests {
     #[test]
     fn test_disk_cache_group_state_out_of_bounds() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap(); // 2 groups
         // Out of bounds should return None
         assert_eq!(cache.group_state(100), GroupState::None);
         assert_eq!(cache.group_state(u64::MAX), GroupState::None);
@@ -5052,7 +5247,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_present() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         // Should return immediately
@@ -5062,7 +5257,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_none() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         // State is None — should return immediately
         cache.wait_for_group(0);
     }
@@ -5070,7 +5265,7 @@ mod tests {
     #[test]
     fn test_disk_cache_touch_group_updates_access() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         assert!(!cache.group_access.lock().contains_key(&0));
         cache.touch_group(0);
         assert!(cache.group_access.lock().contains_key(&0));
@@ -5081,7 +5276,7 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_interior_group() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         assert!(!cache.interior_groups.lock().contains(&0));
         cache.mark_interior_group(0, 0);
         assert!(cache.interior_groups.lock().contains(&0));
@@ -5093,7 +5288,7 @@ mod tests {
     #[test]
     fn test_disk_cache_eviction_skips_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 0, 4, 2, 64, 8).unwrap(); // TTL=0 = disabled
+        let cache = DiskCache::new(dir.path(), 0, 4, 2, 64, 8, None).unwrap(); // TTL=0 = disabled
         cache.mark_interior_group(0, 0);
         cache.touch_group(0);
         cache.touch_group(1);
@@ -5105,7 +5300,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_clears_bitmap_and_state() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         // Write pages in group 0 (pages 0-3)
         for i in 0..4u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5128,7 +5323,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_preserves_other_groups() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         // Write pages in groups 0 and 1
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5143,7 +5338,7 @@ mod tests {
     fn test_disk_cache_evict_expired_with_real_ttl() {
         let dir = TempDir::new().unwrap();
         // TTL = 1 second
-        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None).unwrap();
 
         // Write and touch group 0
         for i in 0..4u64 {
@@ -5166,7 +5361,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_expired_protects_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16).unwrap(); // TTL = 1s
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None).unwrap(); // TTL = 1s
 
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5190,7 +5385,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_expired_skips_recent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 10, 4, 2, 64, 8).unwrap(); // TTL = 10s
+        let cache = DiskCache::new(dir.path(), 10, 4, 2, 64, 8, None).unwrap(); // TTL = 10s
         cache.touch_group(0);
         cache.evict_expired();
         // Group should NOT be evicted (only 0ms elapsed, TTL = 10s)
@@ -5200,7 +5395,7 @@ mod tests {
     #[test]
     fn test_disk_cache_ensure_group_capacity() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap(); // 2 groups
         assert_eq!(cache.group_states.lock().len(), 2);
         cache.ensure_group_capacity(10);
         assert_eq!(cache.group_states.lock().len(), 10);
@@ -5212,11 +5407,11 @@ mod tests {
     fn test_disk_cache_bitmap_persistence() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
             cache.write_page(3, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         assert!(cache2.is_present(3));
         assert!(!cache2.is_present(4));
     }
@@ -5225,7 +5420,7 @@ mod tests {
     fn test_disk_cache_reopen_initializes_group_states_from_bitmap() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
             // Write ALL pages in group 0 (pages 0-3)
             for i in 0..4u64 {
                 cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5233,7 +5428,7 @@ mod tests {
             cache.persist_bitmap().unwrap();
         }
         // Reopen — group 0 should be Present (all 4 pages marked)
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         assert_eq!(cache2.group_state(0), GroupState::Present);
         // Group 1 should be None (no pages)
         assert_eq!(cache2.group_state(1), GroupState::None);
@@ -5243,13 +5438,13 @@ mod tests {
     fn test_disk_cache_reopen_partial_group_is_none() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
             // Write only 2 of 4 pages in group 0
             cache.write_page(0, &vec![0u8; 64]).unwrap();
             cache.write_page(1, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
         // Partial group should be None (not all pages present)
         assert_eq!(cache2.group_state(0), GroupState::None);
         // But individual pages should still be present
@@ -5261,7 +5456,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_page_count() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
         assert_eq!(cache.group_state(0), GroupState::None);
     }
@@ -5269,7 +5464,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_ppg() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 0, 0, 64, 100).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 0, 0, 64, 100, None).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
     }
 
@@ -5419,6 +5614,7 @@ mod tests {
             3, // compression level
             #[cfg(feature = "zstd")]
             None,
+            None,
         )
         .expect("encode seekable");
 
@@ -5434,6 +5630,7 @@ mod tests {
             total_pages as u64,
             0,
             #[cfg(feature = "zstd")]
+            None,
             None,
         )
         .expect("full decode");
@@ -5458,6 +5655,7 @@ mod tests {
             frame_bytes,
             #[cfg(feature = "zstd")]
             None,
+            None,
         )
         .expect("subchunk decode");
 
@@ -5475,6 +5673,7 @@ mod tests {
         let subchunk2 = decode_seekable_subchunk(
             frame_bytes2,
             #[cfg(feature = "zstd")]
+            None,
             None,
         )
         .expect("subchunk2 decode");
@@ -5621,7 +5820,7 @@ mod tests {
     #[test]
     fn test_disk_cache_concurrent_claim() {
         let dir = TempDir::new().unwrap();
-        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap());
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap());
 
         // Simulate two threads trying to claim the same group
         let claimed1 = cache.try_claim_group(0);
@@ -5633,7 +5832,7 @@ mod tests {
     #[test]
     fn test_disk_cache_multiple_groups_independent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32).unwrap(); // 8 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32, None).unwrap(); // 8 groups
 
         // Claim different groups — all should succeed
         for gid in 0..8u64 {
@@ -5654,7 +5853,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ppg = 4u32;
         let page_size = 64u32;
-        let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64, None).unwrap();
 
         // Create page group with known data
         let pages: Vec<Option<Vec<u8>>> = (0..ppg)
@@ -6106,7 +6305,7 @@ mod tests {
     fn test_disk_cache_write_pages_bulk_marks_sub_chunks() {
         let dir = TempDir::new().unwrap();
         // ppg=8, spf=2, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         // Write 2 pages (a complete sub-chunk frame)
         let data = vec![42u8; 128]; // 2 pages * 64 bytes
         cache.write_pages_bulk(0, &data, 2).unwrap();
@@ -6122,7 +6321,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_page_does_not_mark_sub_chunk() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         let data = vec![42u8; 64];
         cache.write_page(0, &data).unwrap();
 
@@ -6135,7 +6334,7 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_interior_promotes_to_pinned() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         // Write a complete sub-chunk
         let data = vec![42u8; 128];
         cache.write_pages_bulk(0, &data, 2).unwrap();
@@ -6161,7 +6360,7 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_index_promotes_to_index_tier() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         let data = vec![42u8; 128];
         cache.write_pages_bulk(2, &data, 2).unwrap();
 
@@ -6185,7 +6384,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_clears_tracker() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
         // Write all sub-chunks in group 0 (4 frames * 2 pages = 8 pages)
         let data = vec![42u8; 512]; // 8 pages * 64 bytes
         cache.write_pages_bulk(0, &data, 8).unwrap();
@@ -6209,7 +6408,7 @@ mod tests {
         // Test that pages at sub-chunk boundaries are correctly assigned
         let dir = TempDir::new().unwrap();
         // ppg=4, spf=2: 2 frames per group
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
 
         // Write frame 0 of group 0 (pages 0,1)
         cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();
@@ -6346,7 +6545,7 @@ mod tests {
         // Should call clear_data_only() to keep Index + Pinned.
         let dir = TempDir::new().unwrap();
         // ppg=8, spf=2, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
 
         // Write some frames via bulk (marks tracker)
         cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();  // frame (0,0) - pages 0,1
@@ -6498,7 +6697,7 @@ mod tests {
         // written without their sub-chunk neighbors.
         let dir = tempfile::tempdir().unwrap();
         // ppg=4, sub_ppf=2, page_size=64, page_count=8 → 2 groups, 2 sub-chunks/group
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
         let data = vec![0xAA; 64];
 
         // Write page 0 individually (simulates eager index load)
@@ -6530,7 +6729,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ppg=8, sub_ppf=4, page_size=64, page_count=16
         // Sub-chunk 0 = pages 0-3, Sub-chunk 1 = pages 4-7
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Simulate eager load: write pages 0, 5 (scattered across sub-chunks)
         let index_data = vec![0xBB; 64];
@@ -6559,7 +6758,7 @@ mod tests {
         // present in the tracker. If called after write_page (bitmap only),
         // it does NOT poison the tracker.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Write only page 0 (simulates eager index load)
         let data = vec![0xCC; 64];
@@ -6584,7 +6783,7 @@ mod tests {
         // Same fix as mark_index_page: mark_interior_group only calls
         // mark_pinned if the sub-chunk is already in the tracker.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Write only page 0 (simulates eager interior load)
         let data = vec![0xDD; 64];
@@ -6621,7 +6820,7 @@ mod tests {
         // This is the correct path used by on-demand S3 fetch.
         let dir = tempfile::tempdir().unwrap();
         // ppg=8, sub_ppf=4, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Write a complete sub-chunk (pages 0-3) via bulk
         let bulk_data = vec![0xDD; 64 * 4];
@@ -6647,7 +6846,7 @@ mod tests {
         // Raw bitmap clear (without index_pages re-marking) loses index pages.
         // This tests the low-level bitmap behavior.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Simulate eager load: write individual page via write_page (bitmap only)
         let data = vec![0xEE; 64];
@@ -6665,7 +6864,7 @@ mod tests {
         // Index pages tracked in index_pages set must survive clear_cache.
         // clear_cache re-marks them in the bitmap after clearing.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
 
         // Simulate eager index load: write pages and register in index_pages
         let data = vec![0xEE; 64];
@@ -6701,5 +6900,514 @@ mod tests {
         let mut buf = vec![0u8; 64];
         cache.read_page(5, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0xEE), "index page data must be intact");
+    }
+
+    // ---- Encryption tests ----
+
+    #[cfg(feature = "encryption")]
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+        key
+    }
+
+    #[cfg(feature = "encryption")]
+    fn wrong_key() -> [u8; 32] {
+        [0xFFu8; 32]
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_write_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+
+        let page_data = vec![0xABu8; 64];
+        cache.write_page(3, &page_data).unwrap();
+
+        let mut buf = vec![0u8; 64];
+        cache.read_page(3, &mut buf).unwrap();
+        assert_eq!(buf, page_data, "decrypted data must match original");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
+        use std::os::unix::fs::FileExt;
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+
+        let page_data = vec![0xABu8; 64];
+        cache.write_page(3, &page_data).unwrap();
+
+        // Read raw bytes from cache file — should NOT be plaintext
+        let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
+        let mut raw = vec![0u8; 64];
+        file.read_exact_at(&mut raw, 3 * 64).unwrap();
+        assert_ne!(&raw[..], &page_data[..], "on-disk data must be encrypted, not plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_wrong_key_returns_garbage() {
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+
+        let page_data = vec![0xCDu8; 64];
+        cache.write_page(5, &page_data).unwrap();
+        drop(cache);
+
+        // Reopen with wrong key — CTR decrypts to garbage (no auth tag to reject)
+        let bad_cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(wrong_key())).unwrap();
+        let mut buf = vec![0u8; 64];
+        bad_cache.read_page(5, &mut buf).unwrap();
+        assert_ne!(buf, page_data, "wrong key must not produce correct plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_bulk_write_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+
+        // Write 4 pages at once (one full group)
+        let mut bulk_data = Vec::with_capacity(4 * 64);
+        for i in 0u8..4 {
+            bulk_data.extend_from_slice(&[i + 1; 64]);
+        }
+        cache.write_pages_bulk(0, &bulk_data, 4).unwrap();
+
+        // Read each page back individually
+        for i in 0u8..4 {
+            let mut buf = vec![0u8; 64];
+            cache.read_page(i as u64, &mut buf).unwrap();
+            assert_eq!(buf, vec![i + 1; 64], "page {} data mismatch", i);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_different_pages_different_ciphertext() {
+        use std::os::unix::fs::FileExt;
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+
+        // Write identical data to two different pages — ciphertext must differ (different nonces)
+        let page_data = vec![0xFFu8; 64];
+        cache.write_page(0, &page_data).unwrap();
+        cache.write_page(1, &page_data).unwrap();
+
+        let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
+        let page_sz = 64usize;
+        let mut raw0 = vec![0u8; page_sz];
+        let mut raw1 = vec![0u8; page_sz];
+        file.read_exact_at(&mut raw0, 0).unwrap();
+        file.read_exact_at(&mut raw1, page_sz as u64).unwrap();
+        assert_ne!(raw0, raw1, "same plaintext at different pages must produce different ciphertext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_cache_file_size_matches_page_size() {
+        // Cache file size = page_count * page_size (no overhead from encryption)
+        let dir = TempDir::new().unwrap();
+        let key = test_key();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, Some(key)).unwrap();
+        let _ = cache;
+        let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
+        assert_eq!(meta.len(), 8 * 64); // page_count * page_size, no overhead
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encode_decode_seekable_encrypted_roundtrip() {
+        let key = test_key();
+        let page_size = 64u32;
+        let spf = 2u32;
+
+        // Build 4 pages as Option<Vec<u8>>
+        let pages: Vec<Option<Vec<u8>>> = (0u8..4)
+            .map(|i| Some(vec![i + 1; 64]))
+            .collect();
+
+        let (blob, frames) = encode_page_group_seekable(
+            &pages, page_size, spf, 3,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+
+        // Decode each frame
+        for (frame_idx, fe) in frames.iter().enumerate() {
+            let frame_data = &blob[fe.offset as usize..(fe.offset + fe.len as u64) as usize];
+            let decoded = decode_seekable_subchunk(
+                frame_data,
+                #[cfg(feature = "zstd")] None,
+                Some(&key),
+            ).unwrap();
+
+            // decoded is a flat vec of bytes: spf pages * page_size
+            let start_page = frame_idx * spf as usize;
+            for j in 0..spf as usize {
+                if start_page + j >= 4 { break; }
+                let page_start = j * page_size as usize;
+                let page_end = page_start + page_size as usize;
+                if page_end <= decoded.len() {
+                    let expected = vec![(start_page + j + 1) as u8; 64];
+                    assert_eq!(&decoded[page_start..page_end], &expected[..], "frame {} page {} mismatch", frame_idx, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encode_decode_seekable_wrong_key_fails() {
+        let key = test_key();
+        let page_size = 64u32;
+        let spf = 2u32;
+
+        let pages: Vec<Option<Vec<u8>>> = (0..4).map(|_| Some(vec![0xABu8; 64])).collect();
+
+        let (blob, frames) = encode_page_group_seekable(
+            &pages, page_size, spf, 3,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+
+        // Try decoding first frame with wrong key — GCM must reject
+        let fe = &frames[0];
+        let frame_data = &blob[fe.offset as usize..(fe.offset + fe.len as u64) as usize];
+        let result = decode_seekable_subchunk(
+            frame_data,
+            #[cfg(feature = "zstd")] None,
+            Some(&wrong_key()),
+        );
+        assert!(result.is_err(), "wrong key must produce GCM auth error");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
+        let key = test_key();
+        let page_size = 64u32;
+
+        // Interior bundle input: Vec<(page_num, page_data)>
+        let page_data_0 = vec![0xDDu8; 64];
+        let page_data_1 = vec![0xEEu8; 64];
+        let pages: Vec<(u64, &[u8])> = vec![
+            (10, &page_data_0),
+            (20, &page_data_1),
+        ];
+
+        let encoded = encode_interior_bundle(
+            &pages, page_size, 3,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+
+        // Decode
+        let decoded = decode_interior_bundle(
+            &encoded,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].0, 10);
+        assert_eq!(decoded[0].1, page_data_0);
+        assert_eq!(decoded[1].0, 20);
+        assert_eq!(decoded[1].1, page_data_1);
+
+        // Wrong key must fail
+        let result = decode_interior_bundle(
+            &encoded,
+            #[cfg(feature = "zstd")] None,
+            Some(&wrong_key()),
+        );
+        assert!(result.is_err(), "wrong key must produce GCM auth error");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_gcm_random_nonce_produces_unique_ciphertext() {
+        // Same data encrypted twice must produce different ciphertext (random nonce)
+        let key = test_key();
+        let data = vec![0xAAu8; 256];
+        let enc1 = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+        let enc2 = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+
+        // Nonce is first 12 bytes — must differ
+        assert_ne!(&enc1[..12], &enc2[..12], "random nonces must differ between encryptions");
+        // Full ciphertext must differ
+        assert_ne!(enc1, enc2, "same plaintext must produce different ciphertext");
+
+        // Both must decrypt to the same original data
+        let dec1 = compress::decrypt_gcm_random_nonce(&enc1, &key).unwrap();
+        let dec2 = compress::decrypt_gcm_random_nonce(&enc2, &key).unwrap();
+        assert_eq!(dec1, data);
+        assert_eq!(dec2, data);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_gcm_random_nonce_wrong_key_fails() {
+        let key = test_key();
+        let data = vec![0xBBu8; 128];
+        let encrypted = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+
+        // Wrong key must produce GCM auth tag failure
+        let result = compress::decrypt_gcm_random_nonce(&encrypted, &wrong_key());
+        assert!(result.is_err(), "wrong key must fail GCM authentication");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_gcm_random_nonce_tamper_detection() {
+        // Flipping a bit in the ciphertext must be caught by GCM
+        let key = test_key();
+        let data = vec![0xCCu8; 64];
+        let mut encrypted = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
+
+        // Flip a bit in the ciphertext body (after the 12-byte nonce prefix)
+        encrypted[20] ^= 0x01;
+
+        let result = compress::decrypt_gcm_random_nonce(&encrypted, &key);
+        assert!(result.is_err(), "tampered ciphertext must fail GCM authentication");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_seekable_encode_twice_produces_different_ciphertext() {
+        // Encoding the same page group twice must produce different blobs (random nonces per frame)
+        let key = test_key();
+        let pages: Vec<Option<Vec<u8>>> = (0u8..4).map(|i| Some(vec![i + 1; 64])).collect();
+
+        let (blob1, _) = encode_page_group_seekable(
+            &pages, 64, 2, 3,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+        let (blob2, _) = encode_page_group_seekable(
+            &pages, 64, 2, 3,
+            #[cfg(feature = "zstd")] None,
+            Some(&key),
+        ).unwrap();
+
+        assert_ne!(blob1, blob2, "same data encoded twice must produce different S3 blobs");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_sub_chunk_tracker_persist_twice_different_ciphertext() {
+        // Same tracker state persisted twice must produce different on-disk bytes
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_nonce");
+        let key = test_key();
+
+        let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        t.mark_present(id, SubChunkTier::Pinned);
+
+        t.persist().unwrap();
+        let bytes1 = std::fs::read(&path).unwrap();
+
+        t.persist().unwrap();
+        let bytes2 = std::fs::read(&path).unwrap();
+
+        assert_ne!(bytes1, bytes2, "same tracker data persisted twice must produce different ciphertext");
+    }
+
+    // ===== WAL/journal passthrough encryption tests =====
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_write_read_roundtrip_encrypted() {
+        // Passthrough files (WAL/journal) should CTR-encrypt on write and decrypt on read
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        // Write data at various offsets
+        let data1 = vec![0xAAu8; 128];
+        let data2 = vec![0xBBu8; 256];
+        handle.write_all_at(&data1, 0).unwrap();
+        handle.write_all_at(&data2, 128).unwrap();
+
+        // Read back — should get plaintext back through CTR decrypt
+        let mut buf1 = vec![0u8; 128];
+        let mut buf2 = vec![0u8; 256];
+        handle.read_exact_at(&mut buf1, 0).unwrap();
+        handle.read_exact_at(&mut buf2, 128).unwrap();
+
+        assert_eq!(buf1, data1, "read at offset 0 must match written data");
+        assert_eq!(buf2, data2, "read at offset 128 must match written data");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_on_disk_not_plaintext() {
+        // WAL file bytes on disk must NOT be plaintext when encryption enabled
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        let plaintext = vec![0xCCu8; 512];
+        handle.write_all_at(&plaintext, 0).unwrap();
+
+        // Read raw bytes from disk (bypassing VFS)
+        let raw = std::fs::read(&path).unwrap();
+        assert_ne!(&raw[..512], &plaintext[..], "on-disk bytes must NOT be plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_wrong_key_returns_garbage() {
+        // Reading with a different key must return garbage, not the original data
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+
+        // Write with correct key
+        {
+            let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+            let key = test_key();
+            let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+            handle.write_all_at(&vec![0xDDu8; 256], 0).unwrap();
+        }
+
+        // Read with wrong key
+        let file = FsOpenOptions::new().read(true).open(&path).unwrap();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(wrong_key()));
+        let mut buf = vec![0u8; 256];
+        handle.read_exact_at(&mut buf, 0).unwrap(); // CTR doesn't fail, just produces wrong data
+        assert_ne!(buf, vec![0xDDu8; 256], "wrong key must not produce original plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_no_encryption_is_plaintext() {
+        // Without encryption key, passthrough should be plain read/write
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), None);
+
+        let plaintext = vec![0xEEu8; 128];
+        handle.write_all_at(&plaintext, 0).unwrap();
+
+        // On-disk should be plaintext
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..128], &plaintext[..], "without encryption, on-disk must be plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_different_offsets_different_ciphertext() {
+        // Same data written at different offsets must produce different ciphertext (nonce = offset)
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        let data = vec![0xFFu8; 64];
+        handle.write_all_at(&data, 0).unwrap();
+        handle.write_all_at(&data, 64).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_ne!(&raw[..64], &raw[64..128], "same data at different offsets must produce different ciphertext");
+    }
+
+    // ===== SubChunkTracker persistence encryption tests =====
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_sub_chunk_tracker_encrypted_persist_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_enc");
+        let key = test_key();
+
+        // Create tracker with encryption, add some sub-chunks
+        {
+            let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
+            let id1 = SubChunkId { group_id: 0, frame_index: 0 };
+            let id2 = SubChunkId { group_id: 1, frame_index: 2 };
+            t.mark_present(id1, SubChunkTier::Pinned);
+            t.mark_present(id2, SubChunkTier::Data);
+            t.persist().unwrap();
+        }
+
+        // Reload with same key — data must survive
+        let t2 = SubChunkTracker::new_encrypted(path, 8, 2, Some(key));
+        let id1 = SubChunkId { group_id: 0, frame_index: 0 };
+        let id2 = SubChunkId { group_id: 1, frame_index: 2 };
+        assert!(t2.is_sub_chunk_present(&id1), "sub-chunk 0:0 must survive persist+reload");
+        assert!(t2.is_sub_chunk_present(&id2), "sub-chunk 1:2 must survive persist+reload");
+        assert_eq!(t2.tiers.get(&id1).copied(), Some(SubChunkTier::Pinned), "tier must survive");
+        assert_eq!(t2.tiers.get(&id2).copied(), Some(SubChunkTier::Data), "tier must survive");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_sub_chunk_tracker_encrypted_on_disk_not_plaintext() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_enc");
+        let key = test_key();
+
+        let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
+        let id = SubChunkId { group_id: 5, frame_index: 3 };
+        t.mark_present(id, SubChunkTier::Index);
+        t.persist().unwrap();
+
+        // Raw file should not be valid JSON (it's encrypted)
+        let raw = std::fs::read(&path).unwrap();
+        let parse_result: Result<Vec<(SubChunkId, u8)>, _> = serde_json::from_slice(&raw);
+        assert!(parse_result.is_err(), "encrypted tracker file must not be valid JSON");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_sub_chunk_tracker_wrong_key_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_enc");
+        let key = test_key();
+
+        // Write with correct key
+        {
+            let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
+            let id = SubChunkId { group_id: 0, frame_index: 0 };
+            t.mark_present(id, SubChunkTier::Pinned);
+            t.persist().unwrap();
+        }
+
+        // Load with wrong key — should fail gracefully (empty tracker, not crash)
+        let t2 = SubChunkTracker::new_encrypted(path, 8, 2, Some(wrong_key()));
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        assert!(!t2.is_sub_chunk_present(&id), "wrong key must not load data");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_sub_chunk_tracker_no_encryption_stays_plaintext() {
+        // Without encryption, tracker persist is still plain JSON
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_plain");
+
+        let mut t = SubChunkTracker::new(path.clone(), 8, 2);
+        let id = SubChunkId { group_id: 2, frame_index: 1 };
+        t.mark_present(id, SubChunkTier::Data);
+        t.persist().unwrap();
+
+        // Raw file should be valid JSON
+        let raw = std::fs::read(&path).unwrap();
+        let parse_result: Result<Vec<(SubChunkId, u8)>, _> = serde_json::from_slice(&raw);
+        assert!(parse_result.is_ok(), "unencrypted tracker file must be valid JSON");
     }
 }

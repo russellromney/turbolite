@@ -163,6 +163,47 @@ pub fn decrypt_gcm(data: &[u8], page_num: u64, key: &[u8; 32]) -> io::Result<Vec
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
 }
 
+// ===== AES-GCM Encryption with random nonce (for S3 — nonce-reuse safe) =====
+// Output: [12-byte random nonce][ciphertext + 16-byte GCM tag]
+// Total overhead: 28 bytes per frame (negligible on ~256KB frames)
+
+#[cfg(feature = "encryption")]
+pub fn encrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
+    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
+    use rand::RngCore;
+
+    let cipher = Aes256Gcm::new(key.into());
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
+
+    // Prepend nonce to ciphertext
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+#[cfg(feature = "encryption")]
+pub fn decrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
+    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
+
+    if data.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "encrypted data too short for nonce"));
+    }
+
+    let nonce = Nonce::from_slice(&data[..12]);
+    let cipher = Aes256Gcm::new(key.into());
+
+    cipher
+        .decrypt(nonce, &data[12..])
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
+}
+
 // ===== AES-CTR Encryption (for WAL passthrough — no size overhead) =====
 
 #[cfg(feature = "encryption")]
