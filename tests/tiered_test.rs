@@ -3617,4 +3617,324 @@ mod tiered_tests {
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
+
+    // ---- Encrypted tiered tests ----
+
+    #[cfg(feature = "encryption")]
+    fn test_encryption_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(7); }
+        key
+    }
+
+    /// Create a TieredConfig with encryption key set.
+    #[cfg(feature = "encryption")]
+    fn test_config_encrypted(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
+        let mut config = test_config(prefix, cache_dir);
+        config.encryption_key = Some(test_encryption_key());
+        config
+    }
+
+    /// Write encrypted data to S3, then read it back from a fresh cold cache.
+    /// Verifies the full encrypt/decrypt pipeline: encode → S3 → cold read → decode.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_write_cold_read() {
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("encrypted_basic", writer_cache.path());
+        let vfs_name = unique_vfs_name("tiered_enc");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+
+        // Write phase
+        {
+            let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "encrypted_test.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            ).expect("failed to open connection");
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT);",
+            ).expect("failed to create table");
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..200 {
+                    tx.execute(
+                        "INSERT INTO secrets (id, data) VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("secret_{}", i)],
+                    ).unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint failed");
+
+            // Verify manifest exists in S3
+            verify_s3_manifest(&bucket, &prefix, &endpoint, 1, 65536);
+        }
+
+        // Cold read phase: fresh cache, same encryption key
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(test_encryption_key()),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_enc_read");
+            let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "encrypted_test_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            ).expect("failed to open reader connection");
+
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM secrets", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 200, "expected 200 rows from cold read");
+
+            let value: String = conn
+                .query_row(
+                    "SELECT data FROM secrets WHERE id = 99",
+                    [],
+                    |row| row.get(0),
+                ).unwrap();
+            assert_eq!(value, "secret_99", "row content mismatch on cold read");
+        }
+
+        // Cleanup S3
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(test_encryption_key()),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// Verify that reading encrypted S3 data with the wrong key fails gracefully.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_wrong_key_cold_read_fails() {
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("encrypted_wrong_key", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+
+        // Write with correct key
+        {
+            let vfs_name = unique_vfs_name("tiered_enc_wr");
+            let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "enc_wrong_key.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            ).expect("failed to open connection");
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY);
+                 INSERT INTO t VALUES (1);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            ).unwrap();
+        }
+
+        // Cold read with WRONG key — should fail
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let wrong_key = [0xFFu8; 32];
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(wrong_key),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_enc_wrong");
+            let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "enc_wrong_key_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            ).expect("failed to open reader connection");
+
+            // With wrong key, any operation that reads encrypted pages should fail.
+            // This might fail at PRAGMA, or at the query — either way, it's an error.
+            let pragma_result = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            let query_result = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0));
+            assert!(
+                pragma_result.is_err() || query_result.is_err(),
+                "wrong encryption key must cause failure, not return garbage"
+            );
+        }
+
+        // Cleanup
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(test_encryption_key()),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// Arctic start with encrypted DB: completely fresh cache, verify all page types
+    /// (interior, index leaf, data) decrypt correctly from S3.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypted_arctic_start_all_page_types() {
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("encrypted_arctic", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+
+        // Write: create a table with an index (exercises interior, index leaf, and data pages)
+        {
+            let vfs_name = unique_vfs_name("tiered_enc_arctic_w");
+            let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "enc_arctic.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            ).expect("failed to open connection");
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, value REAL);
+                 CREATE INDEX idx_name ON items(name);",
+            ).unwrap();
+
+            // Insert enough rows to exercise multiple page types
+            conn.execute_batch("BEGIN;").unwrap();
+            for i in 0..500 {
+                conn.execute(
+                    "INSERT INTO items VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, format!("item_{:05}", i), i as f64 * 1.5],
+                ).unwrap();
+            }
+            conn.execute_batch("COMMIT;").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+
+        // Arctic read: completely fresh cache, no data cached at all
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(test_encryption_key()),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_enc_arctic_r");
+            let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "enc_arctic_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            ).expect("failed to open reader connection");
+
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+            // Verify data pages: count and content
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 500, "expected 500 rows from arctic encrypted read");
+
+            // Verify index pages: use the index to look up by name
+            let value: f64 = conn
+                .query_row(
+                    "SELECT value FROM items WHERE name = 'item_00250'",
+                    [],
+                    |row| row.get(0),
+                ).unwrap();
+            assert!((value - 375.0).abs() < 0.001, "indexed lookup value mismatch: {}", value);
+
+            // Verify interior pages: point lookup by PK (traverses interior B-tree)
+            let name: String = conn
+                .query_row(
+                    "SELECT name FROM items WHERE id = 499",
+                    [],
+                    |row| row.get(0),
+                ).unwrap();
+            assert_eq!(name, "item_00499", "PK lookup mismatch on arctic encrypted read");
+        }
+
+        // Cleanup S3
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(test_encryption_key()),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
 }
