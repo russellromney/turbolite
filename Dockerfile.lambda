@@ -1,0 +1,15 @@
+FROM debian:bookworm-slim AS builder
+RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev cmake && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src/ src/
+COPY bin/ bin/
+RUN cargo build --release --features tiered,zstd --bin tiered-bench
+
+FROM public.ecr.aws/lambda/provided:al2023
+COPY --from=builder /app/target/release/tiered-bench /var/task/tiered-bench
+COPY lambda-bootstrap.sh /var/runtime/bootstrap
+RUN chmod +x /var/runtime/bootstrap /var/task/tiered-bench
+CMD ["handler"]

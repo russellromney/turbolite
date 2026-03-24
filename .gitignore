@@ -7,6 +7,11 @@ Cargo.lock
 /benchmark-pages
 /benches/results
 
+# Build artifacts and binaries
+/bootstrap
+/tiered-bench
+*.zip
+
 # Benchmark scripts and results
 /scripts/
 
