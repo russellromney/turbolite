@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs, clear_all_caches};
+use turbolite::{register, CompressedVfs, clear_all_caches};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;

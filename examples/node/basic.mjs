@@ -25,7 +25,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const ext = process.platform === "darwin" ? "dylib" : "so";
 const lib = koffi.load(
-  resolve(__dirname, `../../target/release/libsqlite_compress_encrypt_vfs.${ext}`)
+  resolve(__dirname, `../../target/release/libturbolite.${ext}`)
 );
 
 const turbolite_version = lib.func("turbolite_version", "str", []);

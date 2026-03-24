@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TieredConfig, TieredVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -486,7 +486,7 @@ fn bench_cold_query(
         let vfs_name = unique_vfs_name("cold_q");
         let config = make_reader_config(s3_prefix, cache.path());
         let vfs = TieredVfs::new(config).expect("cold VFS");
-        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let start = Instant::now();
         let conn = open_reader(db_name, &vfs_name, 1);
         let mut stmt = conn.prepare(sql).expect("prepare failed");
@@ -529,7 +529,7 @@ fn main() {
     let s3_prefix = config.prefix.clone();
     let vfs_name = unique_vfs_name("write");
     let vfs = TieredVfs::new(config).expect("failed to create VFS");
-    sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+    turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_name = format!("tpch_sf{}.db", scale);
     let conn = Connection::open_with_flags_and_vfs(
@@ -575,7 +575,7 @@ fn main() {
     let warm_vfs_name = unique_vfs_name("warm");
     let warm_config = make_reader_config(&s3_prefix, cache_dir.path());
     let warm_vfs = TieredVfs::new(warm_config).expect("warm VFS");
-    sqlite_compress_encrypt_vfs::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
+    turbolite::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
 
     let cache_pages = (est_db_mb * 1024.0 * 1024.0 * 0.2 / 65536.0) as i64;
     let warm_conn = open_reader(&db_name, &warm_vfs_name, cache_pages);
@@ -608,7 +608,7 @@ fn main() {
             let vn = unique_vfs_name("cold_pt");
             let cfg = make_reader_config(&s3_prefix, cache.path());
             let v = TieredVfs::new(cfg).expect("cold VFS");
-            sqlite_compress_encrypt_vfs::tiered::register(&vn, v).unwrap();
+            turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
             c.query_row(Q_POINT, [orderkey], |_| Ok(())).unwrap();
@@ -629,7 +629,7 @@ fn main() {
             let vn = unique_vfs_name("cold_rng");
             let cfg = make_reader_config(&s3_prefix, cache.path());
             let v = TieredVfs::new(cfg).expect("cold VFS");
-            sqlite_compress_encrypt_vfs::tiered::register(&vn, v).unwrap();
+            turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
             c.query_row(Q_RANGE, [&d1, &d2], |_| Ok(())).unwrap();

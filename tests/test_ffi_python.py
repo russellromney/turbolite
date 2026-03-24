@@ -22,7 +22,7 @@ import tempfile
 def find_lib():
     """Find the turbolite shared library."""
     ext = "dylib" if platform.system() == "Darwin" else "so"
-    name = f"libsqlite_compress_encrypt_vfs.{ext}"
+    name = f"libturbolite.{ext}"
     # Check release and debug build dirs.
     for profile in ("release", "debug"):
         path = os.path.join(

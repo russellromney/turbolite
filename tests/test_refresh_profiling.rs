@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 use std::path::PathBuf;
 
 /// Simple test to verify refresh profiling works

@@ -1,7 +1,7 @@
 //! Integration tests using the VFS with SQLite
 
 use rusqlite::Connection;
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 use std::sync::Once;
 
 static INIT: Once = Once::new();
@@ -298,7 +298,7 @@ fn test_compressed_encrypted_mode() {
 /// Test dictionary compression improves compression and works correctly
 #[test]
 fn test_dictionary_compression() {
-    use sqlite_compress_encrypt_vfs::dict::train_dictionary;
+    use turbolite::dict::train_dictionary;
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -429,7 +429,7 @@ fn test_all_four_modes_comparison() {
 /// Test compact_with_recompression with parallel compression
 #[test]
 fn test_compact_with_recompression() {
-    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
 
     let dir = tempfile::tempdir().unwrap();
     let vfs = CompressedVfs::new(dir.path(), 3);
@@ -530,7 +530,7 @@ fn test_compact_with_recompression() {
 /// Test compact_if_needed helper
 #[test]
 fn test_compact_if_needed() {
-    use sqlite_compress_encrypt_vfs::{compact_if_needed, inspect_database};
+    use turbolite::{compact_if_needed, inspect_database};
 
     let dir = tempfile::tempdir().unwrap();
     let vfs = CompressedVfs::new(dir.path(), 3);
@@ -593,7 +593,7 @@ fn test_compact_if_needed() {
 /// Test parallel vs serial compaction produces same results
 #[test]
 fn test_parallel_serial_consistency() {
-    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
 
     let dir = tempfile::tempdir().unwrap();
 

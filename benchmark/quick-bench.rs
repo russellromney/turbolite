@@ -5,7 +5,7 @@
 //! Uses realistic data from benchmark/corpora/ (sessions, logs, API responses, Redis users)
 
 use rusqlite::Connection;
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};

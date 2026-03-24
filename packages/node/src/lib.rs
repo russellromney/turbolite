@@ -1,7 +1,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);

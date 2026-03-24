@@ -4,7 +4,7 @@
 //! that power the CLI tool.
 
 use rusqlite::Connection;
-use sqlite_compress_encrypt_vfs::{compact, inspect_database, register, CompressedVfs};
+use turbolite::{compact, inspect_database, register, CompressedVfs};
 use std::fs;
 use tempfile::TempDir;
 

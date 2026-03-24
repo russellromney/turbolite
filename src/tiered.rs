@@ -3942,7 +3942,7 @@ impl DatabaseHandle for TieredHandle {
 ///
 /// # Usage
 /// ```ignore
-/// use sqlite_compress_encrypt_vfs::tiered::{TieredVfs, TieredConfig};
+/// use turbolite::tiered::{TieredVfs, TieredConfig};
 ///
 /// let config = TieredConfig {
 ///     bucket: "my-bucket".into(),
@@ -3951,7 +3951,7 @@ impl DatabaseHandle for TieredHandle {
 ///     ..Default::default()
 /// };
 /// let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
-/// sqlite_compress_encrypt_vfs::tiered::register("tiered", vfs).unwrap();
+/// turbolite::tiered::register("tiered", vfs).unwrap();
 /// ```
 pub struct TieredVfs {
     s3: Arc<S3Client>,
@@ -4424,26 +4424,36 @@ impl TieredBenchHandle {
     }
 }
 
-/// Re-encrypt all S3 data with a new encryption key.
+/// Re-encrypt, encrypt, or decrypt all S3 data.
 ///
-/// Downloads each S3 object, decrypts with the old key (from `config.encryption_key`),
-/// re-encrypts with the new key, and uploads as new versioned objects.
+/// Three modes based on `config.encryption_key` (old) and `new_key`:
+/// - `Some(old) → Some(new)`: key rotation (decrypt with old, re-encrypt with new)
+/// - `Some(old) → None`: remove encryption (decrypt, upload plaintext compressed data)
+/// - `None → Some(new)`: add encryption (encrypt previously plaintext data)
+///
+/// Downloads each S3 object, transforms it, and uploads as a new versioned object.
 /// The manifest upload is the atomic commit point. Old objects are GC'd after.
 /// Local cache is cleared (ephemeral, repopulates on next open).
 ///
-/// This does NOT decompress/recompress, only decrypt/re-encrypt. GCM overhead
-/// is constant (28 bytes/frame), so frame table offsets are preserved.
+/// This does NOT decompress/recompress, only changes the encryption layer.
+/// Frame table offsets are recalculated (GCM adds 28 bytes/frame).
+///
+/// **Offline operation**: close all connections before rotating. Open connections
+/// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
+/// keys, uncached reads from stale connections will fail with NotFound.
 #[cfg(feature = "encryption")]
 pub fn rotate_encryption_key(
     config: &TieredConfig,
-    new_key: [u8; 32],
+    new_key: Option<[u8; 32]>,
 ) -> io::Result<()> {
-    let old_key = config.encryption_key.ok_or_else(|| {
-        io::Error::new(
+    let old_key = config.encryption_key;
+
+    if old_key.is_none() && new_key.is_none() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "rotate_encryption_key requires an existing encryption key in config",
-        )
-    })?;
+            "rotate_encryption_key: both old and new keys are None (nothing to do)",
+        ));
+    }
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -4464,41 +4474,11 @@ pub fn rotate_encryption_key(
         io::Error::new(io::ErrorKind::NotFound, "No manifest found in S3")
     })?;
 
-    // Validate old key by trying to decrypt the first non-empty page group
-    if let Some((gid, first_key)) = manifest
-        .page_group_keys
-        .iter()
-        .enumerate()
-        .find(|(_, k)| !k.is_empty())
-    {
-        let blob = s3.get_page_group(first_key)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page group {} not found", first_key),
-            )
-        })?;
-
-        // Try decrypting the first frame (seekable) or whole blob (non-seekable)
-        let test_data =
-            if gid < manifest.frame_tables.len() && !manifest.frame_tables[gid].is_empty() {
-                let frame = &manifest.frame_tables[gid][0];
-                &blob[frame.offset as usize..(frame.offset + frame.len as u64) as usize]
-            } else {
-                &blob[..]
-            };
-
-        compress::decrypt_gcm_random_nonce(test_data, &old_key).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Old encryption key failed to decrypt existing data. Wrong key?",
-            )
-        })?;
-    }
-
     let mut new_manifest = manifest.clone();
     new_manifest.version += 1;
     let new_version = new_manifest.version;
     let mut replaced_keys: Vec<String> = Vec::new();
+    let mut validated_old_key = false;
 
     let pg_count = manifest
         .page_group_keys
@@ -4524,6 +4504,25 @@ pub fn rotate_encryption_key(
                 format!("Page group {} not found", old_s3_key),
             )
         })?;
+
+        // Validate old key on first page group (fail fast before uploading anything)
+        if !validated_old_key {
+            let has_ft =
+                gid < manifest.frame_tables.len() && !manifest.frame_tables[gid].is_empty();
+            let test_data = if has_ft {
+                let frame = &manifest.frame_tables[gid][0];
+                &blob[frame.offset as usize..(frame.offset as usize + frame.len as usize)]
+            } else {
+                &blob[..]
+            };
+            compress::decrypt_gcm_random_nonce(test_data, &old_key).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Old encryption key failed to decrypt existing data. Wrong key?",
+                )
+            })?;
+            validated_old_key = true;
+        }
 
         let has_frames =
             gid < manifest.frame_tables.len() && !manifest.frame_tables[gid].is_empty();

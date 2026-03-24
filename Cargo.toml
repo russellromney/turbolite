@@ -1,12 +1,12 @@
 [package]
-name = "sqlite-compress-encrypt-vfs"
-version = "0.1.0"
+name = "turbolite"
+version = "0.2.19"
 edition = "2021"
-description = "SQLCEs (cinco seis) - SQLite VFS with compression + encryption, custom compression dictionary support, WAL mode, full-text search"
+description = "turbolite - SQLite VFS with sub-50ms cold queries from S3 + page-level compression and encryption"
 license = "Apache-2.0"
-repository = "https://github.com/russellromney/sqlite-compress-encrypt-vfs"
+repository = "https://github.com/russellromney/turbolite"
 keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
-categories = ["database", "compression", "cryptography"]
+categories = ["database", "s3", "compression"]
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -73,8 +73,8 @@ cc = "1"
 rayon = "1.10"
 
 [[bin]]
-name = "sqlces"
-path = "bin/sqlces.rs"
+name = "turbolite"
+path = "bin/turbolite.rs"
 
 [[bin]]
 name = "turbolite-bench"

@@ -1568,7 +1568,7 @@ impl CompressedVfs {
     ///
     /// # Example
     /// ```ignore
-    /// use sqlite_compress_encrypt_vfs::{CompressedVfs, dict::train_from_database};
+    /// use turbolite::{CompressedVfs, dict::train_from_database};
     ///
     /// // Train a dictionary from existing data
     /// let dict = train_from_database("sample.db", 100 * 1024)?;

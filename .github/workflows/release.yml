@@ -68,7 +68,7 @@ jobs:
 
       - name: Copy extension into Python package
         run: |
-          cp target/${{ matrix.target }}/release/${{ steps.lib.outputs.prefix }}sqlite_compress_encrypt_vfs.${{ steps.lib.outputs.ext }} \
+          cp target/${{ matrix.target }}/release/${{ steps.lib.outputs.prefix }}turbolite.${{ steps.lib.outputs.ext }} \
             packages/python/turbolite/turbolite.${{ steps.lib.outputs.ext }}
 
       - uses: actions/setup-python@v5

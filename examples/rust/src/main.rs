@@ -6,7 +6,7 @@
 //!   cd examples/rust && cargo run
 
 use rusqlite::{params, Connection, OpenFlags};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use turbolite::{register, CompressedVfs};
 use tempfile::TempDir;
 
 fn main() {

@@ -5,7 +5,7 @@
 
 use std::ffi::CString;
 
-use sqlite_compress_encrypt_vfs::ffi::*;
+use turbolite::ffi::*;
 
 // --- Version ---
 

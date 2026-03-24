@@ -12,7 +12,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../target/release -lsqlite_compress_encrypt_vfs
+#cgo LDFLAGS: -L${SRCDIR}/../../target/release -lturbolite
 #include <stdlib.h>
 
 extern const char* turbolite_version();
