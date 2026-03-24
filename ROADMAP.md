@@ -35,7 +35,7 @@ Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks
 ---
 
 ## Marathon: Local Disk Compaction
-> After: Thermopylae · Before: Cannae
+> After: Thermopylae · Before: Midway
 
 The local cache file is a sparse file sized to `page_count * page_size`. After VACUUM reduces page_count, a fresh reader creates a smaller cache, but the existing cache doesn't shrink in-place.
 
@@ -47,65 +47,8 @@ Note: this is a minor optimization. S3 is the source of truth, local disk is eph
 
 ---
 
-## Cannae: 64KB Pages + Sub-Chunk Caching Model (DONE)
-> After: Marathon · Before: Agincourt
-
-The fundamental reframe: **optimize for S3 request count, not data size.** A range GET for 64KB costs the same as 4KB — one S3 request. Everything should follow from this.
-
-### a. 64KB pages as default for tiered mode (DONE)
-- [x] Default `PRAGMA page_size=65536` for tiered VFS (smaller page sizes remain an option)
-- [x] At 64KB pages, 500k-post dataset = 11,569 pages (vs ~104,000 at 4KB) — 9x fewer
-- [x] B-tree fan-out increases ~16x → shallower trees → fewer S3 hops per lookup (14 interior pages for 500k vs 617)
-- [x] Overflow threshold jumps from ~1KB to ~16KB — most rows fit in a single page
-- [x] Default group size: 256 pages per group = 16MB (same physical size as old 4096 * 4KB)
-- [x] Default sub-chunk frame: 4 pages per frame = 256KB uncompressed per range GET
-
-### b. Sub-chunk caching (DONE)
-
-Sub-chunk caching model fully implemented:
-- `SubChunkId(group_id, frame_index)` + `SubChunkTier(Pinned/Index/Data)` + `SubChunkTracker` with tiered LRU eviction
-- DiskCache uses tracker alongside legacy PageBitmap for backward compat
-- `write_pages_bulk` (S3 frames) marks sub-chunks; `write_page` (individual) marks bitmap only
-- Read path detects page types: 0x05/0x02 → Pinned, 0x0A → Index, else Data
-- `clear_cache` removes Data+Index; `clear_cache_data_only` removes Data only; `clear_cache_all` clears everything
-- Tracker persists to disk with tier info, reloads on restart
-- 25 unit tests covering math, tier promotion, eviction order, LRU, persistence, DiskCache integration
-
-### c. Remaining tests
-- [ ] Benchmark: 64KB vs 4KB pages on same dataset — cold point lookup, scan, write amplification
-- [ ] Test: evicted sub-chunk → re-fetch from S3 → stale disk bytes correctly overwritten
-- [ ] Test: mixed page sizes (verify 4KB still works as non-default option)
-
----
-
-## Agincourt: Index Bundles (DONE)
-> After: Cannae · Before: Midway
-
-Index access patterns are fundamentally different from data access: once you touch an index, you're scanning most or all of it. Data pages are point lookups — fetch exactly what you need. Indexes want minimum time to having the entire index cached.
-
-This is the interior bundle pattern extended to index leaves. Interior bundles already proved the concept: separate S3 storage, eager parallel fetch, permanent pinning.
-
-### Implementation (DONE)
-
-- Manifest field `index_chunk_keys: HashMap<u32, String>` — page-size-aware chunking via `bundle_chunk_range()`
-- S3 key format: `{prefix}/ixb/{chunk_id}_v{version}`
-- Index leaf pages (0x0A) detected at checkpoint, collected from dirty snapshot + cache's Index-tier sub-chunks
-- Same `encode_interior_bundle`/`decode_interior_bundle` format (reused, not duplicated)
-- Lazy background prefetch: VFS open spawns background thread, first query serves index pages from data groups via inline range GET
-- Index pages survive cache eviction via `index_pages` bitmap re-mark in `clear_cache`/`clear_cache_data_only`
-- GC includes index chunk keys in live key set
-- Import path also collects and uploads index leaf bundles
-- **Skip redundant page group uploads**: groups where ALL dirty pages are interior (0x05/0x02) or index leaf (0x0A) are skipped — those pages are served from bundles
-
-### Remaining tests
-- [ ] Benchmark: cold indexed lookup with/without index bundles (expect ~50% latency reduction)
-- [ ] Test: REINDEX → checkpoint → verify no data page group uploads (only index bundles)
-- [ ] Test: interior page split → checkpoint → verify no data page group re-upload
-
----
-
 ## Midway: Two-Layer Index Storage (Base + Delta)
-> After: Agincourt · Before: Stalingrad
+> After: Marathon · Before: Stalingrad
 
 Index chunks are currently rewritten in full on every checkpoint that touches an index page. A single dirty index page forces re-upload of the entire ~14MB chunk. This is the write amplification bottleneck for index-heavy workloads (frequent INSERTs into indexed tables).
 
@@ -178,19 +121,6 @@ Low priority for databases under a few GB (group count is naturally small). Matt
 
 Offer turbolite as a shared library for C FFI consumers (Python ctypes, Go cgo, Node ffi-napi, etc.).
 
-### a. C FFI layer (DONE)
-- [x] `src/ffi.rs` — `extern "C"` functions for VFS registration + error handling
-- [x] `turbolite_register_compressed`, `turbolite_register_passthrough`, `turbolite_register_encrypted`
-- [x] `turbolite_register_tiered` (feature-gated)
-- [x] `turbolite_last_error` — thread-local error string
-- [x] `turbolite_clear_caches`, `turbolite_invalidate_cache`
-
-### b. Build infrastructure (DONE)
-- [x] `Cargo.toml`: `crate-type = ["lib", "cdylib"]`, `bundled-sqlite` feature flag
-- [x] `cbindgen.toml` + `make header` → generates `turbolite.h`
-- [x] `Makefile`: `make lib` (system SQLite), `make lib-bundled` (self-contained), `make install`
-
-### c. Remaining
 - [ ] SQLite loadable extension (`sqlite3_turbolite_init` entry point) — enables `SELECT load_extension('turbolite')`
 - [ ] Cross-compile CI: build .so/.dylib for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
 - [ ] Python wheel wrapping the .so (turbolite-python)
@@ -203,7 +133,6 @@ Offer turbolite as a shared library for C FFI consumers (Python ctypes, Go cgo, 
 
 Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 
-### Files to update
 - Directory rename
 - `Cargo.toml`: package name
 - All `use sqlite_compress_encrypt_vfs::` → `use turbolite::` in bin/, tests/

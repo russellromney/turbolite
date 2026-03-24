@@ -2,6 +2,77 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Agincourt: Index Bundles + Lazy Prefetch + Page-Size-Aware Chunking
+
+3-7x arctic improvement through three compounding changes:
+
+### Index bundles
+- Manifest field `index_chunk_keys: HashMap<u32, String>` — page-size-aware chunking via `bundle_chunk_range()` (~32MB target per chunk)
+- Index leaf pages (0x0A) detected at checkpoint, collected from dirty snapshot + cache's Index-tier sub-chunks
+- Reuses `encode_interior_bundle`/`decode_interior_bundle` format
+- Skip redundant page group uploads: groups where ALL dirty pages are interior (0x05/0x02) or index leaf (0x0A) are skipped
+- GC includes index chunk keys in live key set
+- Import path also collects and uploads index leaf bundles
+
+### Lazy background prefetch
+- VFS open spawns background thread for index bundle fetch instead of blocking
+- First query serves index pages from data groups via inline range GET while background populates full cache
+- Eliminates synchronous 107-144MB fetch that dominated cold latency
+
+### Index page cache survival
+- `index_pages: HashSet<u64>` tracks index pages in DiskCache
+- Bitmap re-marks index pages in `clear_cache`/`clear_cache_data_only`
+- `clear_cache_all` (arctic) properly clears them for true cold testing
+
+### Page-size-aware bundle chunking
+- `bundle_chunk_range()` targets ~32MB uncompressed per chunk instead of fixed 32768 page range
+- At 64KB pages: 512 page range per chunk (was 32768 — everything in 1 chunk for any DB under 2GB)
+- 1M rows now produces 46 index chunks that interleave with data fetches
+
+### Results (1M rows, 1.46GB, Fly iad → Tigris, 8 vCPU, 16GB RAM)
+- Arctic point lookup: 468ms → 143ms (3.3x)
+- Arctic profile join: 822ms → 419ms (2.0x)
+- Cold point lookup: 54ms → 23ms
+- Cold mutual friends: 27ms → 11ms
+- Warm point lookup: 98μs
+
+---
+
+## Cannae: 64KB Pages + Sub-Chunk Caching Model
+
+Fundamental reframe: optimize for S3 request count, not data size.
+
+### 64KB pages as default
+- Default `PRAGMA page_size=65536` for tiered VFS
+- 500k-post dataset: 11,569 pages (vs ~104,000 at 4KB) — 9x fewer
+- B-tree fan-out increases ~16x → shallower trees → fewer S3 hops
+- Default group size: 256 pages per group = 16MB uncompressed
+- Default sub-chunk frame: 4 pages per frame = 256KB per range GET
+
+### Sub-chunk caching
+- `SubChunkId(group_id, frame_index)` + `SubChunkTier(Pinned/Index/Data)` + `SubChunkTracker` with tiered LRU eviction
+- DiskCache uses tracker alongside legacy PageBitmap for backward compat
+- Read path detects page types: 0x05/0x02 → Pinned, 0x0A → Index, else Data
+- Tracker persists to disk with tier info, reloads on restart
+- 25 unit tests for math, tier promotion, eviction order, LRU, persistence
+
+---
+
+## Normandy (partial): C FFI + Build Infrastructure
+
+### C FFI layer
+- `src/ffi.rs` — `extern "C"` functions for VFS registration + error handling
+- `turbolite_register_compressed`, `turbolite_register_passthrough`, `turbolite_register_encrypted`, `turbolite_register_tiered`
+- `turbolite_last_error` — thread-local error string
+- `turbolite_clear_caches`, `turbolite_invalidate_cache`
+
+### Build infrastructure
+- `Cargo.toml`: `crate-type = ["lib", "cdylib"]`, `bundled-sqlite` feature flag
+- `cbindgen.toml` + `make header` → generates `turbolite.h`
+- `Makefile`: `make lib` (system SQLite), `make lib-bundled` (self-contained), `make install`
+
+---
+
 ## Page-Group Model + Seekable Sub-Chunk Range GETs + GC
 
 Major architectural upgrade: page groups with seekable zstd encoding, S3 byte-range GETs for point lookups, concurrent prefetch, and garbage collection.
@@ -17,95 +88,54 @@ Major architectural upgrade: page groups with seekable zstd encoding, S3 byte-ra
 ### Garbage Collection
 - Post-checkpoint GC (`gc_enabled`): delete replaced page group versions after manifest upload
 - Full-scan GC (`TieredVfs::gc()`): list all S3 objects, delete orphans not in manifest
-- `S3Client::delete_objects()` and `list_all_keys()` helpers
-
-### Benchmark CLI
-- `--queries` filter (e.g. `--queries post,profile`)
-- `--modes` filter (e.g. `--modes cold,arctic`)
-- `--skip-verify` to bypass COUNT(*) full scan on small machines
-
-### Tests
-- Removed all `#[ignore]` from 27 tiered integration tests (now run directly)
-- Fixed `test_page_group_cache_populates` stale path assertion
-- Added 4 GC tests: post-checkpoint, disabled, full-scan, no-orphans
-- 31 S3 integration tests + 84 unit tests = 115 total, 0 failures
-
-### README
-- Rebranded to turbolite
-- Consolidated design + architecture into single Design section
-- Added tuning section with workload-specific prefetch configs
 
 ---
 
-## Phase 6: Tiered v2 Hardening
+## Tiered v2 Hardening
 
-Bug fixes and correctness improvements found during code review. 27 tests pass against Tigris.
+Bug fixes and correctness improvements. 27 tests pass against Tigris.
 
 ### Bug fixes
-- Fixed `delete()` calling `destroy_s3()` unconditionally — SQLite calls delete for WAL/journal files during VACUUM and journal mode switch, which destroyed the entire S3 dataset. Now only deletes local files.
-- Fixed `exists()` returning true for WAL/journal/SHM files — it checked S3 manifest for all files, causing SQLite to enter recovery mode in DELETE journal mode and skip writing pages to the main DB.
-- Fixed chunk_size mismatch → silent corruption — `open()` now uses manifest's chunk_size for existing databases, not config. Only config chunk_size for new DBs.
-- Fixed cache serving stale pages after truncation — moved page_count bounds check before cache lookup in `read_exact_at`.
-- Fixed dirty chunks evicted during read-path — `put_chunk` in read path now passes dirty chunk IDs to eviction.
-- Fixed `Manifest::empty()` hardcoding chunk_size=128 — now uses 0, allowing custom chunk_size to be recorded on first write.
+- Fixed `delete()` calling `destroy_s3()` unconditionally — SQLite calls delete for WAL/journal files during VACUUM and journal mode switch, which destroyed the entire S3 dataset
+- Fixed `exists()` returning true for WAL/journal/SHM files — caused SQLite to enter recovery mode in DELETE journal mode
+- Fixed chunk_size mismatch → silent corruption — `open()` now uses manifest's chunk_size for existing databases
+- Fixed cache serving stale pages after truncation — moved page_count bounds check before cache lookup
+- Fixed dirty chunks evicted during read-path — `put_chunk` now passes dirty chunk IDs to eviction
+- Fixed `Manifest::empty()` hardcoding chunk_size=128
 
 ### Improvements
-- Batch S3 deletes in `destroy_s3` — uses `DeleteObjects` in batches of 1000 instead of one-by-one.
-- LRU rebuild on restart uses file mtime instead of `Instant::now()` — preserves eviction order across restarts.
-- DELETE journal mode support — VFS now works in both WAL and DELETE modes.
-
-### Tests added
-- `test_delete_preserves_s3` — connection close doesn't destroy S3 data
-- `test_delete_journal_mode` — full write/read/cold-read cycle in DELETE mode
-- `test_chunk_size_mismatch_uses_manifest` — manifest chunk_size overrides config
-- `test_oltp_with_indexes` — 3 indexes, INSERT/UPDATE/DELETE, cold queries
-- `test_update_delete_operations` — UPDATE/DELETE across checkpoints
-- `test_multiple_tables` — 4 tables + JOIN queries
-- `test_custom_chunk_size` — chunk_size=8, manifest validation
-- `test_large_overflow_blobs` — overflow pages with blobs up to 100KB
-- `test_vacuum_reorganizes` — VACUUM page count reduction, cold read
+- Batch S3 deletes in `destroy_s3` — `DeleteObjects` in batches of 1000
+- LRU rebuild on restart uses file mtime instead of `Instant::now()`
+- DELETE journal mode support
 
 ---
 
-## Phase 5: S3-Backed Tiered Storage
+## S3-Backed Tiered Storage
 
-Page-level tiered storage where S3 is source of truth and local disk is a cache. Inspired by turbopuffer. Designed for append-oriented workloads (time-series, logs, streams).
+Page-level tiered storage where S3 is source of truth and local disk is a cache.
 
-### Core implementation
+- `TieredVfs`, `TieredHandle`, `S3Client`, `DiskCache` in `src/tiered.rs`
 - Extracted compression/encryption to `src/compress.rs` free functions
-- Added `tiered` feature flag + aws-sdk-s3/tokio/crc32fast deps
-- Implemented `TieredVfs`, `TieredHandle`, `S3Client`, `DiskCache` in `src/tiered.rs`
-- 10 integration tests (basic, checkpoint, reader, 64kb, cold scan, append, read-only, cache-clear, prefetch, destroy_s3)
-- 1 Tigris integration test (real S3, `TIGRIS_TEST=1`)
-
-### Bug fixes
-- Fixed `sync()` — manifest version only increments after successful S3 upload (prevents version drift on failure)
-- Added 3-retry with exponential backoff to `put_manifest()`
-- Fixed `DiskCache::put()` .tmp file leak on rename failure
-- Fixed `exists()` to check local cache first, then S3
-- Fixed read-only WAL passthrough — always create WAL/journal files locally (prevents `SQLITE_READONLY_CANTINIT`)
-
-### Features
-- Added zstd dictionary support to `TieredConfig`/`TieredHandle`
-- Support `region: "auto"` for Tigris compatibility
+- `tiered` feature flag + aws-sdk-s3/tokio/crc32fast deps
+- zstd dictionary support in `TieredConfig`/`TieredHandle`
+- 3-retry with exponential backoff on `put_manifest()`
 
 ---
 
-## Phase 4: Client-Controlled Compaction Helpers
+## Client-Controlled Compaction Helpers
 
 - `compact_if_needed(path, threshold_pct)` — compact if dead_space exceeds threshold
 
 ---
 
-## Phase 2: Parallel Compression in Compaction
+## Parallel Compression in Compaction
 
 - `rayon` optional dependency with `parallel` feature flag
-- `compact_with_recompression()` with `CompactionConfig` (compression level, dictionary, parallel toggle)
-- Original `compact()` preserved for simple dead-space removal
+- `compact_with_recompression()` with `CompactionConfig`
 
 ---
 
-## Phase 1: Dictionary Compression Integration
+## Dictionary Compression Integration
 
 - Pre-compiled `EncoderDictionary`/`DecoderDictionary` in `CompressedHandle`
 - VFS constructors: `new_with_dict()`, `compressed_encrypted_with_dict()`
@@ -116,10 +146,8 @@ Page-level tiered storage where S3 is source of truth and local disk is a cache.
 ## Foundation
 
 - Single magic "SQLCEvfS" format with inline page index
-- Header with dict_size and flags fields
 - zstd compression (levels 1-22)
 - AES-256-GCM encryption
 - WAL mode support
 - Byte-range locking (SQLite protocol)
 - Atomic write_end for concurrent access
-- Debug lock tracing (`SQLCES_DEBUG_LOCKS=1`)
