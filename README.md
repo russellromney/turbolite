@@ -1,436 +1,265 @@
-# sqlite-compress-encrypt-vfs
+# turbolite
 
-**SQLCEs** (pronounced "sequel seis" like "cinco seis") - SQLite VFS with page-level compression and encryption.
+S3-native SQLite VFS with sub-50ms cold point queries on multi-GB SQLite databases served cold from S3.
 
-[![Crates.io](https://img.shields.io/crates/v/sqlite-compress-encrypt-vfs.svg)](https://crates.io/crates/sqlite-compress-encrypt-vfs)
-[![License](https://img.shields.io/crates/l/sqlite-compress-encrypt-vfs.svg)](LICENSE)
+turbolite is an experimental SQLite VFS where S3 is the durable store and local disk is the working copy. Writes go to the local WAL at full speed. Checkpoint compresses dirty pages into immutable S3 objects and atomically swaps a manifest. Between checkpoints, local disk is the source of truth. After checkpoint, the database can be opened cold from S3 — no volume, no running server.
 
-## Features
+Inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of building directly on cloud storage primitives. S3 is not a filesystem — it has its own economics (PUTs are expensive, GETs are cheap, objects are immutable, bandwidth is practically free) and turbolite's architecture is shaped entirely by them.
 
-**Four VFS Modes:**
+This is for **databases that don't need a server running 24/7**: analytics results you query occasionally, per-tenant databases in a multi-tenant system, agent memory you spin up on demand, or anything where provisioning a volume per database doesn't make sense. It is not a read-scaleout layer — cold reads hit S3, which means network latency on every cache miss.
 
-| Mode | Constructor | Use Case |
-|------|-------------|----------|
-| **Compressed** | `CompressedVfs::new(dir, level)` | Maximum storage savings |
-| **Passthrough** | `CompressedVfs::passthrough(dir)` | Benchmarking, no overhead |
-| **Encrypted** | `CompressedVfs::encrypted(dir, password)` | Security without compression |
-| **Compressed+Encrypted** | `CompressedVfs::compressed_encrypted(dir, level, password)` | Both savings and security |
+turbolite is a Rust library. Loadable extension (`.so`/`.dylib`) is planned.
 
-**Compression Algorithms:**
-- `zstd` (default) - Best compression ratio, dictionary support
-- `lz4` - Fastest compression/decompression
-- `snappy` - Very fast, moderate compression
-- `gzip` - Wide compatibility
-
-**Encryption:**
-- AES-256-GCM authenticated encryption
-- Password-based key derivation (SHA-256)
-- Deterministic nonces (page-based)
-- Wrong password detection
-
-**File Format:**
-- Magic: `SQLCEvfS` (8 bytes)
-- 64-byte header with metadata
-- Variable-size page slots
-- Optional embedded dictionary support
-
-## Installation
-
-```toml
-[dependencies]
-sqlite-compress-encrypt-vfs = "0.1"
+```
+Cold point lookup on 812MB database: 40ms (2 S3 range GETs, 400KB transferred)
+Warm queries: 37 microseconds
+Storage at rest: ~$0.02/month per GB
 ```
 
-With encryption:
-```toml
-[dependencies]
-sqlite-compress-encrypt-vfs = { version = "0.1", features = ["encryption"] }
-```
+turbolite has **three features that compose at the page level:**
 
-With parallel compaction (uses rayon):
-```toml
-[dependencies]
-sqlite-compress-encrypt-vfs = { version = "0.1", features = ["parallel"] }
-```
+| Feature | What it does |
+|---------|-------------|
+| **S3 storage** | Checkpoint to S3 as immutable compressed page groups. Open cold from S3 with no local state. |
+| **Seekable compression** | Multi-frame zstd with per-frame byte offsets. Point lookups fetch ~100KB from S3, not ~8MB. |
+| **Page-level encryption** | AES-256-GCM per page. Composes with compression. |
 
-All features:
-```toml
-[dependencies]
-sqlite-compress-encrypt-vfs = { version = "0.1", features = ["encryption", "parallel"] }
-```
-
-Alternative compressors:
-```toml
-# Use LZ4 instead of zstd
-sqlite-compress-encrypt-vfs = { version = "0.1", default-features = false, features = ["lz4"] }
-```
+Because these operate at the page level, all SQLite features work transparently — FTS, R-tree, JSON, WAL mode. turbolite is a standard VFS. SQLite doesn't know the difference.
 
 ## Quick Start
 
-### Compressed Mode
-
 ```rust
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
-use rusqlite::Connection;
+let config = TieredConfig {
+    bucket: "my-bucket".into(),
+    prefix: "my-database".into(),
+    cache_dir: "/tmp/cache".into(),
+    ..Default::default()
+};
+let vfs = TieredVfs::new(config)?;
+turbolite::tiered::register("turbolite", vfs)?;
 
-// Register VFS
-let vfs = CompressedVfs::new("./data", 3); // compression level 1-22
-register("compressed", vfs)?;
-
-// Use with rusqlite
-let conn = Connection::open_with_flags_and_vfs(
-    "./data/app.db",
+let conn = rusqlite::Connection::open_with_flags_and_vfs(
+    "mydb.db",
     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-    "compressed",
+    "turbolite",
 )?;
-
-// Use normally - compression is transparent
-conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", [])?;
-conn.execute("INSERT INTO users VALUES (1, 'Alice')", [])?;
 ```
 
-### Encrypted Mode
+## Performance
 
-```rust
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+Benchmarked on Fly.io (iad region) against Tigris S3, 1M-row social media dataset (812MB, 51 page groups):
 
-let vfs = CompressedVfs::encrypted("./data", "my-secret-password");
-register("encrypted", vfs)?;
+### 8 vCPU, 16GB RAM, 8 prefetch threads
 
-let conn = Connection::open_with_flags_and_vfs(
-    "./data/secure.db",
-    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-    "encrypted",
-)?;
+| Query | Warm | Cold | Arctic |
+|-------|------|------|--------|
+| Point lookup | 37us | 40ms | 165ms |
+| Profile (joins) | 131us | 376ms | 487ms |
+| Who-liked | 119us | 123ms | 417ms |
+| Mutual friends | 55us | 157ms | 170ms |
 
-// Data is encrypted at rest
-conn.execute("CREATE TABLE secrets (data TEXT)", [])?;
+### shared-cpu-1x, 256MB RAM, 1 prefetch thread
+
+| Query | Cold |
+|-------|------|
+| Point lookup | 153ms |
+
+**Warm** = all data in local cache. Zero S3 requests.
+
+**Cold** = data pages evicted from cache, but B-tree interior pages and the root page stay pinned. A point lookup traverses the B-tree using pinned interior pages (cache hits), then fetches only the leaf page from S3. This is the common case — interior pages are loaded once on first query and survive cache evictions.
+
+**Arctic** = everything evicted, including interior pages. The VFS must re-fetch interior page bundles from S3 before any query. This only happens on a completely fresh start with an empty cache.
+
+### When turbolite is fast
+
+**Point lookups are the sweet spot.** A cold point lookup needs 1-2 S3 range GETs (~100KB each) to fetch the leaf page. Interior pages are already pinned. This works on any machine size.
+
+**Scans with enough cores.** A full table scan over 812MB completes in ~500ms on 8 threads — the prefetch pool saturates S3 bandwidth and caches everything in 3 hops. But this requires cores to parallelize the S3 fetches.
+
+### When turbolite is slow
+
+**Scans on small machines.** With 1 prefetch thread, a cold scan over 812MB takes seconds, not milliseconds. The bottleneck is S3 round trips — each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful.
+
+**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need 8+ threads.
+
+**First query penalty.** The first query on a cold cache always pays for interior page loading (~50-200ms depending on database size) plus at least one data fetch. Subsequent queries benefit from pinned interior pages.
+
+## Design
+
+turbolite's architecture has six pieces that work together:
+
+### 1. Immutable Page Groups
+
+Pages are batched into groups (default: 4096 pages = ~16MB uncompressed, ~8MB compressed). Each group is stored as a single S3 object. On checkpoint, dirty groups are written as new versioned objects — the old version is never modified.
+
+This is the fundamental optimization for S3: **one PUT per group instead of one PUT per page.** Writing 4096 pages costs $0.000005 instead of $0.02. And because objects are immutable, there's no partial-write corruption — a group either exists completely or doesn't.
+
+### 2. Manifest
+
+A single JSON manifest tracks which S3 keys hold which page ranges. The manifest is the atomic commit point: upload new page groups first, then swap the manifest. Until the new manifest lands, readers see the old consistent state. If the process crashes mid-checkpoint, the old manifest is still valid.
+
+This gives you write atomicity, crash safety, and point-in-time restore (old page groups still exist in S3 until GC).
+
+### 3. Seekable Compression
+
+This is the killer feature for point queries.
+
+Each page group is encoded as multiple zstd frames (one per ~32 pages). The manifest stores a frame table with byte offsets and sizes. On a cache miss, turbolite issues an S3 byte-range GET for just the frame containing the needed page (~100KB) instead of downloading the entire group (~8MB).
+
+A range GET costs the same as a full GET ($0.40/M requests) — you pay per request, not per byte. So seekable compression gives you the write efficiency of large objects (fewer PUTs) with the read granularity of small ones (fewer bytes per point lookup).
+
+### 4. Aggressive Prefetch with Minimal Hops
+
+On a cache miss, turbolite does two things concurrently:
+1. **Inline range GET**: fetch the specific sub-chunk containing the needed page. Returns to SQLite immediately.
+2. **Background prefetch**: submit the full group (and neighboring groups) to a thread pool for parallel download.
+
+Consecutive misses escalate prefetch aggressively via a hop schedule. Default: first miss fetches 33% of all groups, second miss another 33%, third miss everything remaining. A cache hit resets the counter.
+
+This means a full table scan over 812MB caches the entire database in 3 round trips to S3. Point lookups stay cheap (1 inline range GET + background prefetch of the current group).
+
+### 5. S3 Connection Pool
+
+The prefetch pool is a fixed set of worker threads (default: `num_cpus + 1`), each with its own S3 connection. Groups are dispatched to workers via a channel. The extra thread over CPU count keeps the pipeline full: when one thread blocks on S3 I/O, the extra thread uses that core for decompression and cache writes.
+
+### 6. Interior Page Bundles
+
+B-tree interior pages (type 0x05, 0x02) are the pages SQLite touches on every single query — they're the index nodes that route lookups to leaf pages. Normally, these pages are distributed randomly throughout the pages (and thus the page groups). This means that top-leaf operations would constantly have to fetch random page groups (prefetch is sequential, note). turbolite detects interior pages at read time using the data vs interior page bit and:
+
+- **Pins them** so they survive cache evictions
+- **Stores them separately** in compressed bundles in S3 (not mixed into data page groups)
+- **Loads them eagerly** on VFS open — one parallel fetch of all interior bundles
+
+After this initial load, every B-tree traversal is a cache hit. Cold queries only need to fetch leaf data from S3. Interior pages within data groups are just ignored — they're already cached from the bundles.
+
+### Read Path
+
+```
+SQLite read_page(N)
+    |
+    v
+[Page bitmap] --> hit? --> pread from cache file --> done
+    |
+    miss
+    |
+    v
+[Inline range GET] --> decompress sub-chunk --> write to cache --> return page
+    |
+    (concurrently)
+    v
+[Prefetch pool] --> fetch full group + neighbors --> cache all pages
 ```
 
-### Compressed + Encrypted Mode
+### Write Path
 
-```rust
-let vfs = CompressedVfs::compressed_encrypted("./data", 3, "password");
-register("both", vfs)?;
-
-// Compress THEN encrypt for maximum security and savings
+```
+SQLite writes --> local WAL (source of truth)
+    |
+    checkpoint
+    |
+    v
+[Group dirty pages] --> [Compress + PUT to S3] --> [Upload manifest] --> done
+                         (immutable, versioned)     (atomic commit point)
 ```
 
-### Passthrough Mode
+Between checkpoints, local disk is the source of truth. The WAL contains all uncommitted changes. Checkpoint is when data becomes durable in S3.
 
-```rust
-let vfs = CompressedVfs::passthrough("./data");
-register("passthrough", vfs)?;
+The gap between "WAL committed locally" and "manifest uploaded to S3" is the data-at-risk window. For zero-loss, layer WAL shipping (walrust, LiteStream) on top.
 
-// No compression or encryption, useful for benchmarking
+### Storage Management
+
+Immutable writes mean old page group versions accumulate in S3. This is cheap ($0.02/GB/month) and useful (point-in-time restore), but eventually needs cleanup.
+
+**Garbage collection** (implemented):
+- **Post-checkpoint GC** (`gc_enabled=true`): delete replaced versions immediately after checkpoint.
+- **Full GC scan** (`TieredVfs::gc()`): list all S3 objects, delete anything not in the current manifest. Catches crash orphans.
+
+**VACUUM and autovacuum** work transparently through the VFS. VACUUM rewrites the database, producing new compact page groups at checkpoint. Autovacuum reclaims freed pages incrementally.
+
+**Planned**: tunable GC retention (keep N old versions for PITR window), hole tracking, CLI.
+
+## Tuning
+
+| Parameter | What it controls | Default |
+|-----------|-----------------|---------|
+| `prefetch_threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
+| `prefetch_hops` | Fraction of total groups to fetch per consecutive miss | `0.33, 0.33` (3 hops) |
+| `pages_per_group` | Pages per S3 object — larger = fewer PUTs, more bytes per fetch | 4096 |
+| `gc_enabled` | Delete old page group versions after checkpoint | false |
+
+**Recommended configs:**
+
+| Workload | Config | Why |
+|----------|--------|-----|
+| Point lookups, small machine | `prefetch_threads=1, prefetch_hops=0.01,0.02,0.97` | Minimal background work. Rely on inline sub-chunk range GET. |
+| Mixed OLTP | `prefetch_threads=4, prefetch_hops=0.33,0.33` | Balanced. Good for most workloads. |
+| Scan-heavy analytics | `prefetch_threads=8+, prefetch_hops=0.5,0.5` | Aggressive. Saturate S3 bandwidth. |
+| Bursty serverless | `prefetch_threads=1-2, prefetch_hops=0.1,0.2,0.7` | Conservative start, ramp on sustained misses. |
+
+**Limitation**: prefetch is per-connection. Each new connection starts with a cold hop counter. The cache is shared, so a second connection benefits from pages cached by the first.
+
+## Local Mode (no S3)
+
+turbolite also works as a purely local compressed/encrypted VFS:
+
+Compression: zstd (default), lz4, snappy, gzip. Encryption: AES-256-GCM per page.
+
+Page-level operation means all SQLite features work — FTS, R-tree, JSON, WAL mode. Most other SQLite compression/encryption extensions operate at the file level or require custom builds.
+
+## Installation
+
+**Rust** (library):
+```toml
+[dependencies]
+turbolite = "0.1"                                              # local compressed VFS
+turbolite = { version = "0.1", features = ["tiered"] }         # + S3 storage
+turbolite = { version = "0.1", features = ["encryption"] }     # + encryption
 ```
+
+## Comparison
+
+turbolite aims to be the most efficient S3-native SQLite VFS. 
+
+| | turbolite | sql.js-httpvfs | SQLCipher | sqlite_zstd_vfs | LiteFS |
+|---|---|---|---|---|---|
+| S3 storage | page-level range GETs | HTTP range on whole file | no | no | FUSE proxy |
+| Compression | page-level, seekable | no | no | page-level | no |
+| Encryption | page-level AES-256-GCM | no | page-level | no | no |
+| Prefetch | adaptive, parallel | fixed readahead | n/a | n/a | n/a |
+| Cold point lookup | 40ms | ~200-500ms | n/a | n/a | n/a |
+| Writes | checkpoint-to-S3 | read-only | local | local | replicated |
+| Language | Rust | JS/WASM | C | C++ | Go |
 
 ## Benchmarking
 
-### Quick Benchmark
+The `tiered-bench` binary generates a social media dataset (users, posts, likes, friendships) and benchmarks warm/cold/arctic queries against S3.
 
 ```bash
-# Benchmark VFS modes (read/write throughput)
-cargo run --example quick_bench --features encryption --release
+# Basic benchmark: 100K posts, default settings
+TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://t3.storage.dev \
+  cargo run --features zstd,tiered --bin tiered-bench --release -- \
+    --sizes 100000
 
-# Benchmark parallel vs serial compaction
-cargo run --release --bin sqlces-bench --features "encryption parallel" -- \
-  bench-compact --rows 10000 --iterations 3
+# 1M posts, 8 prefetch threads, only cold point queries
+cargo run --features zstd,tiered --bin tiered-bench --release -- \
+    --sizes 1000000 --prefetch-threads 8 --queries post --modes cold
+
+# Tiny machine config: 1 thread, conservative prefetch
+cargo run --features zstd,tiered --bin tiered-bench --release -- \
+    --sizes 100000 --prefetch-threads 1 --prefetch-hops 0.01,0.02,0.97 \
+    --queries post --modes cold --skip-verify
 ```
 
-### sqlces-bench CLI
-
-The `sqlces-bench` tool provides comprehensive benchmarking:
-
-```bash
-# Benchmark parallel compaction speedup
-cargo run --release --bin sqlces-bench --features "encryption parallel" -- \
-  bench-compact --rows 50000 --iterations 3 --compression-level 3
-
-# Benchmark VFS modes with an existing database
-cargo run --release --bin sqlces-bench --features encryption -- \
-  --database path/to/db.db \
-  --duration-secs 10 \
-  --reader-threads 4 \
-  --writer-threads 2
-```
-
-### Expected Results
-
-**Compression Ratios** (by data type):
-| Data Type | Typical Ratio | Notes |
-|-----------|---------------|-------|
-| JSON/XML | 5-10x | Great for structured data |
-| Repeated text (logs) | 10-20x | Excellent compression |
-| Structured data | 3-7x | Good for typical workloads |
-| Binary/random | 1.0x | No benefit |
-
-**Performance Overhead** (WAL mode):
-| Mode | Write | Read | Notes |
-|------|-------|------|-------|
-| Passthrough | baseline | baseline | No overhead |
-| Compressed | ~2-3x slower | ~1.5-2x slower | CPU-bound |
-| Encrypted | ~1.2x slower | ~1.2x slower | AES-NI accelerated |
-| Both | ~2.5-3x slower | ~2x slower | Compress then encrypt |
-
-**Parallel Compaction Speedup** (M-series Mac, 8 cores):
-| Rows | File Size | Serial | Parallel | Speedup |
-|------|-----------|--------|----------|---------|
-| 10k | 0.7 MB | 0.73s | 0.24s | **3.0x** |
-| 50k | 3.6 MB | 3.82s | 1.31s | **2.9x** |
-| 100k | 7.2 MB | 8.22s | 2.46s | **3.3x** |
-
-Speedup scales with core count - expect 4-8x on servers with more cores.
-
-## Migration Guide
-
-### Between VFS Modes
-
-**Use SQLite's `VACUUM INTO` for safe, atomic migration:**
-
-```sql
--- Example: Migrate from compressed to encrypted
-ATTACH DATABASE 'new_encrypted.db' AS new USING encrypted_vfs;
-VACUUM main INTO new;
-DETACH DATABASE new;
-
--- Then atomically rename:
--- mv new_encrypted.db production.db
-```
-
-This works for **all mode transitions:**
-- Compressed → Encrypted
-- Encrypted → Compressed+Encrypted
-- Passthrough → Compressed
-- Any → Any
-
-**Why VACUUM INTO?**
-- ✅ Atomic operation (no partial migration)
-- ✅ Guaranteed data integrity
-- ✅ Uses SQLite's battle-tested code
-- ✅ Works across any VFS modes
-- ❌ Requires 2x disk space temporarily
-
-**⚠️ IMPORTANT: Always backup before migration!**
-
-### Dictionary Compression (Future)
-
-Train a custom compression dictionary from your data:
-
-```rust
-use sqlite_compress_vfs::dict::train_from_database;
-
-// Train from existing database
-let dict = train_from_database("prod.db", 100 * 1024)?; // 100KB dict
-std::fs::write("prod.dict", &dict)?;
-
-// TODO: API to use dictionary with VFS (coming in v0.2)
-```
-
-## Architecture
-
-### File Format
-
-```
-[64-byte header]
-├─ Magic: "SQLCEvfS"
-├─ Version: 1
-├─ Page size, page count
-├─ Flags (compressed, encrypted, dict_embedded)
-├─ Index offset
-├─ Dict hash (SHA-256, first 8 bytes)
-├─ Encryption key version
-├─ Compression algorithm
-└─ Reserved bytes
-
-[Dictionary data - optional, dynamic size]
-
-[Page index]
-└─ Entries: page_num → (offset, size)
-
-[Page data]
-└─ Variable-size slots (compressed and/or encrypted)
-```
-
-### Data Pipeline
-
-**Write:**
-```
-SQLite Page → Compress (if enabled) → Encrypt (if enabled) → Disk
-```
-
-**Read:**
-```
-Disk → Decrypt (if enabled) → Decompress (if enabled) → SQLite Page
-```
-
-### WAL Files
-
-WAL and journal files are **always stored uncompressed** for compatibility and performance. Only the main database file uses the VFS format.
-
-## Future: `sqlces` CLI Tool
-
-Planned commands for managing databases:
-
-```bash
-# Inspect database metadata
-sqlces inspect data.db
-# Output: Mode, compression, encryption, dict info, page count
-
-# Train dictionary from database (not just samples!)
-sqlces dict train --from-db prod.db --output prod.dict --size 100KB
-
-# Train from samples
-sqlces dict train --samples ./logs/*.json --output app.dict
-
-# Embed dictionary in database
-sqlces dict embed --source data.db --dict app.dict --output data-with-dict.db
-
-# Extract embedded dictionary
-sqlces dict extract --source data.db --output extracted.dict
-
-# Migrate between modes (wraps VACUUM INTO with safety checks)
-sqlces migrate \
-  --from-mode compressed \
-  --to-mode encrypted \
-  --source old.db \
-  --dest new.db \
-  --password "secret"
-# Interactive with sensible defaults if flags missing
-
-# Benchmark modes
-sqlces bench --modes compressed,encrypted,passthrough,both --data ./samples/
-```
-
-**Design Principles:**
-- Safety first (VACUUM INTO for all migrations, no in-place rekey)
-- Interactive with sensible defaults
-- Train dictionaries from databases, not just samples
-- Embed dictionaries by default (foolproof, portable)
-- Clear error messages
-
-## Security Considerations
-
-**Encryption:**
-- AES-256-GCM (authenticated encryption with tamper detection)
-- 12-byte deterministic nonces (page number based)
-- Key derivation: Currently SHA-256(password) - TODO: Argon2 with salt
-- Key versioning support in header for future rotation
-
-**Limitations:**
-- File-level metadata is NOT encrypted (page count, index structure)
-- Database schema is NOT encrypted
-- For maximum security, use full-disk encryption + this VFS
-
-**Wrong Password Detection:**
-Decryption fails immediately with clear error - no silent corruption.
-
-## Performance Tips
-
-1. **Use WAL mode:** Much faster than default rollback journal
-   ```sql
-   PRAGMA journal_mode=WAL;
-   PRAGMA synchronous=NORMAL;
-   ```
-
-2. **Batch writes:** Use transactions for bulk inserts
-   ```rust
-   conn.execute("BEGIN", [])?;
-   // ... many inserts
-   conn.execute("COMMIT", [])?;
-   ```
-
-3. **Choose compression level wisely:**
-   - Level 1-3: Fast, good for hot data
-   - Level 10-15: Balanced
-   - Level 20-22: Maximum compression, slow
-
-4. **Compression works best on:**
-   - JSON/XML data
-   - Repeated text (logs, sessions)
-   - Structured data with patterns
-
-5. **Compression doesn't help:**
-   - Already compressed data (images, videos)
-   - Encrypted data
-   - Random binary data
-
-## Examples
-
-See `examples/` directory:
-- `quick_bench.rs` - Benchmark all 4 modes
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-hops`, `--queries` (post/profile/who-liked/mutual), `--modes` (warm/cold/arctic), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`.
 
 ## Testing
 
 ```bash
-# Without encryption
-cargo test
-
-# With encryption
-cargo test --features encryption
-
-# All features
-cargo test --all-features
+cargo test --features zstd                    # local VFS tests
+cargo test --features zstd,tiered             # + S3 integration tests (31 tests)
+cargo test --features zstd,encryption         # + encryption tests
 ```
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for detailed plans.
-
-**v0.1 (Current):**
-- [x] Four VFS modes (compressed, encrypted, both, passthrough)
-- [x] Dictionary compression support
-- [x] Parallel compaction with rayon (`parallel` feature)
-- [x] `compact_if_needed()` helper
-- [x] `sqlces-bench` CLI tool
-
-**v0.2 (Planned):**
-- [ ] Dictionary embedding in database files
-- [ ] `sqlces` CLI tool (inspect, migrate, dict commands)
-- [ ] Argon2 key derivation with salt
-- [ ] Key rotation support
-
-**v0.3 (Future):**
-- [ ] Encryption key wrapping
-- [ ] Page-level checksums (CRC32)
-- [ ] Multi-version dictionary support
-
-## Contributing
-
-Contributions welcome! Please:
-1. Add tests for new features
-2. Update documentation
-3. Run `cargo fmt` and `cargo clippy`
-4. Ensure `cargo test --all-features` passes
 
 ## License
 
 Apache-2.0
-
-## Acknowledgements
-
-This implementation was inspired by concepts from:
-- [mlin/sqlite_zstd_vfs](https://github.com/mlin/sqlite_zstd_vfs) - C++ SQLite VFS with zstd (MIT)
-- [apersson/redis-compression-module](https://github.com/apersson/redis-compression-module) - Dictionary compression concepts
-- [Twitter cache traces](https://github.com/twitter/cache-trace) - Public cache workload data (CC-BY)
-
-## FAQ
-
-**Q: Can I change modes after creating a database?**
-A: Use `VACUUM INTO` to migrate between any modes. See Migration Guide above.
-
-**Q: Does encryption slow things down a lot?**
-A: ~20% overhead on modern CPUs with AES-NI acceleration. Compression overhead is larger (~2-3x).
-
-**Q: Can I use this in production?**
-A: The code is tested but still v0.1. Recommended: thorough testing + backups.
-
-**Q: How does this compare to SQLCipher?**
-A: SQLCipher encrypts pages before SQLite sees them. This VFS encrypts after, allowing composition with compression. Different design, different tradeoffs.
-
-**Q: Why "SQLCEs" / "cinco seis"?**
-A: SQL Compression & Encryption → SQLCE → "C"(cinco) "E"(seis) → cinco seis 😄
-
----
-
-**Built with ❤️ for the SQLite community**

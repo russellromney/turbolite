@@ -373,6 +373,7 @@ fn test_dictionary_compression() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn test_all_four_modes_comparison() {
     let dir = tempfile::tempdir().unwrap();
 

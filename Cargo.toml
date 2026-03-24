@@ -16,6 +16,8 @@ snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
 parallel = ["dep:rayon"]
+tiered = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:tokio", "dep:crc32fast", "dep:libc"]
+lambda = ["dep:lambda_runtime", "tiered", "zstd"]
 
 [dependencies]
 sqlite-vfs = "0.2"
@@ -39,14 +41,23 @@ rand = { version = "0.8", optional = true }
 # Parallel compression (optional)
 rayon = { version = "1.10", optional = true }
 
+# Tiered S3 storage (optional)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+aws-smithy-runtime = { version = "1", features = ["client"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+crc32fast = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+
 # CLI dependencies
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.35", features = ["bundled"] }
 tempfile = "3"
 ureq = "2"
+lambda_runtime = { version = "0.13", optional = true }
 
 [dev-dependencies]
 rayon = "1.10"
@@ -58,3 +69,18 @@ path = "bin/sqlces.rs"
 [[bin]]
 name = "sqlces-bench"
 path = "bin/sqlces-bench.rs"
+
+[[bin]]
+name = "tiered-bench"
+path = "bin/tiered-bench.rs"
+required-features = ["tiered"]
+
+[[bin]]
+name = "tpch-bench"
+path = "bin/tpch-bench.rs"
+required-features = ["tiered", "zstd"]
+
+[[bin]]
+name = "tiered-bench-lambda"
+path = "bin/tiered-bench-lambda.rs"
+required-features = ["lambda"]
