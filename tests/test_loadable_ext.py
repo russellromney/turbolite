@@ -60,7 +60,7 @@ def _():
     conn = sqlite3.connect(":memory:")
     load_ext(conn)
     version = conn.execute("SELECT turbolite_version()").fetchone()[0]
-    assert version == "0.1.0", f"expected 0.1.0, got {version}"
+    assert version == "0.2.19", f"expected 0.2.19, got {version}"
     conn.close()
 
 
@@ -255,7 +255,7 @@ def _():
     # Loading again should not crash — VFS already registered, just no-op
     load_ext(conn)
     version = conn.execute("SELECT turbolite_version()").fetchone()[0]
-    assert version == "0.1.0"
+    assert version == "0.2.19"
     conn.close()
 
 
