@@ -39,42 +39,38 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 
 ## Performance
 
-Benchmarked on Fly.io (iad region) against Tigris S3, 1M-row social media dataset (1.7GB, 104 page groups):
+Benchmarked on Fly.io (iad region) against Tigris S3. 1M-row social media dataset (1.46GB uncompressed, 23,294 pages, 91 page groups, 64KB pages).
 
 ### 8 vCPU, 16GB RAM, 8 prefetch threads
 
 | Query | Warm | Cold | Arctic |
 |-------|------|------|--------|
-| Point lookup | 37us | 40ms | 165ms |
-| Profile (joins) | 131us | 376ms | 487ms |
-| Who-liked | 119us | 123ms | 417ms |
-| Mutual friends | 55us | 157ms | 170ms |
+| Point lookup | 98us | 23ms | 143ms |
+| Profile (5 joins) | 404us | 252ms | 419ms |
+| Who-liked | 203us | 11ms | 221ms |
+| Mutual friends | 100us | 11ms | 142ms |
+| Indexed filter | 65us | 10ms | 155ms |
+| Full scan + filter | 287ms | 642ms | 812ms |
 
-### shared-cpu-1x, 256MB RAM, 1 prefetch thread
+**Warm** = all data in local cache, no connection open, no pages in memory.
 
-| Query | Cold |
-|-------|------|
-| Point lookup | 153ms |
+**Cold** = data pages evicted from cache, but B-tree interior pages and index leaf pages stay cached. A point lookup traverses the B-tree using cached interior pages (cache hits), then fetches only the leaf page from S3. This is the common case: interior and index pages are loaded once and survive cache evictions.
 
-**Warm** = all data in local cache, but no connectin is open and there are no pages in memory
-
-**Cold** = data pages evicted from cache, but B-tree interior pages and the root page stay pinned. A point lookup traverses the B-tree using pinned interior pages (cache hits), then fetches only the leaf page from S3. This is the common case: interior pages are loaded once on first query and survive cache evictions.
-
-**Arctic** = everything evicted, including interior pages. The VFS must re-fetch interior page bundles from S3 before any query. This only happens on a completely fresh start with an empty cache.
+**Arctic** = everything evicted, including interior and index pages. The VFS re-fetches interior bundles synchronously (~570KB) and spawns a background thread for index bundles (~144MB in 46 parallel chunks). The first query serves index pages from data page groups via inline range GET while the background thread populates the full index cache. This only happens on a completely fresh start with an empty cache.
 
 ### When turbolite is fast
 
-**Point lookups are the sweet spot.** A cold point lookup needs 1-2 S3 range GETs (~100KB each) to fetch the leaf page. Interior pages are already pinned. This works on any machine size.
+**Point lookups are the sweet spot.** A cold point lookup fetches 1-2 sub-chunks via S3 range GET (~100KB each). Interior and index pages are already cached. Arctic adds ~120ms for interior re-fetch + first data page. This works on any machine size.
 
-**Scans with enough cores.** A full table scan over 1.7GB completes in ~500ms on 8 threads — the prefetch pool saturates S3 bandwidth and caches everything in 3 hops. But this requires cores to parallelize the S3 fetches.
+**Scans with enough cores.** The prefetch pool saturates S3 bandwidth with adaptive hop scheduling (default: 33%/33%/remaining of all groups per consecutive miss). 8 threads cache the entire 1.46GB database in 2-3 hops.
 
 ### When turbolite is slow
 
-**Scans on small machines.** With 1 prefetch thread, a cold scan over 1.7GB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful, as in many seconds to minutes. 
+**Scans on small machines.** With 1 prefetch thread, a cold scan over 1.46GB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful.
 
-**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need a lot of CPUs
+**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need more CPUs.
 
-**First query penalty.** The first query on a cold cache always pays for interior page loading (~50-200ms depending on database size) plus at least one data fetch. Subsequent queries benefit from pinned interior pages.
+**First query penalty.** The first query on an arctic cache pays for interior page loading (~50-200ms depending on database size) plus at least one data fetch. Index pages load in background — if the query needs an index page before the background fetch completes, it falls back to an inline range GET from the data page group.
 
 ## Design
 
