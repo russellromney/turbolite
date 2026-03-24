@@ -5,6 +5,7 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY bin/ bin/
+COPY benchmark/ benchmark/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -16,6 +17,7 @@ RUN cargo chef cook --release --features tiered,zstd --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY bin/ bin/
+COPY benchmark/ benchmark/
 RUN cargo build --release --features tiered,zstd --bin tiered-bench
 
 FROM debian:bookworm-slim

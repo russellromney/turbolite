@@ -64,10 +64,14 @@ const DEFAULT_PAGES_PER_GROUP: u32 = 256;
 /// At 64KB page size: 4 × 64KB = 256KB per frame, ~128KB compressed per range GET.
 const DEFAULT_SUB_PAGES_PER_FRAME: u32 = 4;
 
-/// Interior chunk range: each chunk covers this many page numbers.
-/// At ~1% interior page density → ~327 interior pages per chunk → ~1.3MB uncompressed.
-/// Stable boundaries: adding/removing an interior page only affects one chunk.
-const INTERIOR_CHUNK_RANGE: u64 = 32768;
+/// Target ~32MB uncompressed per bundle chunk.
+/// Chunk range = how many page numbers each chunk covers.
+/// At 64KB pages: 512 page range → worst case 32MB per chunk.
+/// At  4KB pages: 8192 page range → worst case 32MB per chunk.
+fn bundle_chunk_range(page_size: impl Into<u64>) -> u64 {
+    const TARGET_BYTES: u64 = 32 * 1024 * 1024;
+    TARGET_BYTES / page_size.into()
+}
 
 /// When true, `sync()` skips S3 upload and just records which page groups are dirty.
 /// Pages are already in disk cache from `write_all_at()`. This keeps WAL small during
@@ -231,13 +235,7 @@ impl Default for TieredConfig {
             dictionary: None,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: false,
-            // TODO: eager index loading causes "database disk image is malformed" on warm queries
-            // with databases > ~40K pages (100K posts). Works fine for small databases (10K posts)
-            // and works fine in cold mode (cache cleared between queries). Suspect cache file
-            // corruption when writing many index leaf pages to high offsets in sparse cache file.
-            // Disable until root cause is found. Index pages are still stored as S3 bundles and
-            // loaded on each cold-start connection open (after clear_cache).
-            eager_index_load: false,
+            eager_index_load: true,
         }
     }
 }
@@ -259,7 +257,7 @@ pub struct Manifest {
     /// Map groupId → S3 key. Versioned: "pg/{gid}_v{version}"
     #[serde(default)]
     pub page_group_keys: Vec<String>,
-    /// Chunked interior bundle: chunk_id → S3 key. Each chunk covers INTERIOR_CHUNK_RANGE page numbers.
+    /// Chunked interior bundle: chunk_id → S3 key. Each chunk covers bundle_chunk_range(page_size) page numbers.
     /// Fetched in parallel on connection open so B-tree traversal is all cache hits.
     #[serde(default)]
     pub interior_chunk_keys: HashMap<u32, String>,
@@ -1196,6 +1194,8 @@ struct DiskCache {
     interior_groups: parking_lot::Mutex<HashSet<u64>>,
     /// Individual interior page numbers (for precise cache preservation)
     interior_pages: parking_lot::Mutex<HashSet<u64>>,
+    /// Individual index leaf page numbers (for cache preservation across clear_cache)
+    index_pages: parking_lot::Mutex<HashSet<u64>>,
     /// TTL tracking: group_id → last_access
     group_access: parking_lot::Mutex<HashMap<u64, Instant>>,
     ttl_secs: u64,
@@ -1281,6 +1281,7 @@ impl DiskCache {
             group_condvar_mutex: parking_lot::Mutex::new(()),
             interior_groups: parking_lot::Mutex::new(HashSet::new()),
             interior_pages: parking_lot::Mutex::new(HashSet::new()),
+            index_pages: parking_lot::Mutex::new(HashSet::new()),
             group_access: parking_lot::Mutex::new(HashMap::new()),
             ttl_secs,
             pages_per_group,
@@ -1498,18 +1499,29 @@ impl DiskCache {
     fn mark_interior_group(&self, gid: u64, page_num: u64) {
         self.interior_groups.lock().insert(gid);
         self.interior_pages.lock().insert(page_num);
-        // Promote sub-chunk to Pinned tier
+        // Only promote to Pinned if the sub-chunk is already fully cached
+        // (present in the tracker via write_pages_bulk). If the page was loaded
+        // individually via write_page() (e.g. eager interior load), marking
+        // pinned would add the sub-chunk to the tracker's present set, causing
+        // adjacent pages to be falsely reported as cached (they contain zeros).
         let mut tracker = self.tracker.lock();
         let id = tracker.sub_chunk_for_page(page_num);
-        tracker.mark_pinned(id);
+        if tracker.is_sub_chunk_present(&id) {
+            tracker.mark_pinned(id);
+        }
     }
 
     /// Mark a page's sub-chunk as Index tier (evicted after Data, before Pinned).
     /// Called when we detect an index leaf page (0x0A) during page scanning.
+    /// Only upgrades tier if the sub-chunk is already present in the tracker
+    /// (i.e., all pages in the sub-chunk were written via write_pages_bulk).
     fn mark_index_page(&self, page_num: u64) {
+        self.index_pages.lock().insert(page_num);
         let mut tracker = self.tracker.lock();
         let id = tracker.sub_chunk_for_page(page_num);
-        tracker.mark_index(id);
+        if tracker.is_sub_chunk_present(&id) {
+            tracker.mark_index(id);
+        }
     }
 
     /// Evict page groups that haven't been accessed within TTL.
@@ -2340,41 +2352,57 @@ impl TieredHandle {
             }
         }
 
-        // Eagerly fetch index leaf bundles (same pattern as interior).
-        // Index pages are fetched in parallel so the first indexed query pays zero latency.
-        if eager_index_load && !manifest.index_chunk_keys.is_empty() {
+        // Index leaf bundles: lazy-aggressive prefetch.
+        // Instead of blocking connection open on potentially large index bundles
+        // (107MB at 750k rows), spawn a background thread. The first query serves
+        // index pages from data page groups via inline range GET (~100KB), while
+        // the background thread populates the full index cache.
+        let index_already_cached = !cache.index_pages.lock().is_empty();
+        if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
+            let cache_bg = Arc::clone(&cache);
+            let s3_bg = Arc::clone(&s3);
             let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-            eprintln!("[tiered] fetching {} index leaf chunks in parallel...", chunk_keys.len());
-            match s3.get_page_groups_by_key(&chunk_keys) {
-                Ok(results) => {
-                    #[cfg(feature = "zstd")]
-                    let ix_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                    let mut total_pages = 0usize;
-                    let mut total_bytes = 0usize;
-                    for (key, data) in &results {
-                        total_bytes += data.len();
-                        match decode_interior_bundle(
-                            data,
-                            #[cfg(feature = "zstd")]
-                            ix_decoder.as_ref(),
-                        ) {
-                            Ok(pages) => {
-                                total_pages += pages.len();
-                                for (pnum, pdata) in &pages {
-                                    let _ = cache.write_page(*pnum, pdata);
-                                    cache.mark_index_page(*pnum);
+            #[cfg(feature = "zstd")]
+            let dict_bg = dictionary.map(|d| d.to_vec());
+            let n_chunks = chunk_keys.len();
+            eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
+            std::thread::spawn(move || {
+                match s3_bg.get_page_groups_by_key(&chunk_keys) {
+                    Ok(results) => {
+                        #[cfg(feature = "zstd")]
+                        let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
+                        let mut total_pages = 0usize;
+                        let mut total_bytes = 0usize;
+                        for (key, data) in &results {
+                            total_bytes += data.len();
+                            match decode_interior_bundle(
+                                data,
+                                #[cfg(feature = "zstd")]
+                                ix_decoder.as_ref(),
+                            ) {
+                                Ok(pages) => {
+                                    total_pages += pages.len();
+                                    for (pnum, pdata) in &pages {
+                                        let _ = cache_bg.write_page(*pnum, pdata);
+                                        cache_bg.index_pages.lock().insert(*pnum);
+                                    }
                                 }
+                                Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
                             }
-                            Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
                         }
+                        eprintln!(
+                            "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
+                            total_pages, results.len(), total_bytes as f64 / 1024.0,
+                        );
                     }
-                    eprintln!(
-                        "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                        total_pages, results.len(), total_bytes as f64 / 1024.0,
-                    );
+                    Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
                 }
-                Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
-            }
+            });
+        } else if index_already_cached {
+            eprintln!(
+                "[tiered] index pages already cached ({} pages), skipping chunk fetch",
+                cache.index_pages.lock().len(),
+            );
         }
 
         #[cfg(feature = "zstd")]
@@ -3290,7 +3318,7 @@ impl DatabaseHandle for TieredHandle {
         // Group interior pages by chunk_id
         let mut chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for (pnum, data) in all_interior {
-            let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+            let chunk_id = (pnum / bundle_chunk_range(page_size)) as u32;
             chunks.entry(chunk_id).or_default().push((pnum, data));
         }
         // Sort pages within each chunk by page number
@@ -3304,7 +3332,7 @@ impl DatabaseHandle for TieredHandle {
                 let type_byte = if pnum == 0 { dirty_snapshot[&pnum].get(100) } else { dirty_snapshot[&pnum].get(0) };
                 type_byte.map_or(false, |&b| b == 0x05 || b == 0x02)
             })
-            .map(|&pnum| (pnum / INTERIOR_CHUNK_RANGE) as u32)
+            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
             .collect();
 
         // Build new chunk keys: dirty chunks get re-uploaded, clean chunks carry forward
@@ -3411,7 +3439,7 @@ impl DatabaseHandle for TieredHandle {
         // Group index leaf pages by chunk_id
         let mut index_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for (pnum, data) in all_index_leaves {
-            let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+            let chunk_id = (pnum / bundle_chunk_range(page_size)) as u32;
             index_chunks.entry(chunk_id).or_default().push((pnum, data));
         }
         for pages in index_chunks.values_mut() {
@@ -3426,7 +3454,7 @@ impl DatabaseHandle for TieredHandle {
                 let type_byte = data.get(hdr_off);
                 type_byte.map_or(false, |&b| b == 0x0A && is_valid_btree_page(data, hdr_off))
             })
-            .map(|&pnum| (pnum / INTERIOR_CHUNK_RANGE) as u32)
+            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
             .collect();
 
         let old_index_chunk_keys = self.manifest.read().index_chunk_keys.clone();
@@ -3855,12 +3883,16 @@ impl TieredVfs {
 
         self.cache.group_access.lock().clear();
 
-        // Clear bitmap except for interior pages and group 0
+        // Clear bitmap except for interior pages, index pages, and group 0
         {
+            let index_pages = self.cache.index_pages.lock().clone();
             let mut bitmap = self.cache.bitmap.lock();
             let total_pages = bitmap.bits.len() as u64 * 8;
             bitmap.bits.fill(0);
             for &page in &pinned_pages {
+                bitmap.mark_present(page);
+            }
+            for &page in &index_pages {
                 bitmap.mark_present(page);
             }
             let g0_end = ppg.min(total_pages);
@@ -4134,12 +4166,16 @@ impl TieredBenchHandle {
 
         self.cache.group_access.lock().clear();
 
-        // Clear bitmap except for interior pages and group 0
+        // Clear bitmap except for interior pages, index pages, and group 0
         {
+            let index_pages = self.cache.index_pages.lock().clone();
             let mut bitmap = self.cache.bitmap.lock();
             let total_pages = bitmap.bits.len() as u64 * 8;
             bitmap.bits.fill(0);
             for &page in &pinned_pages {
+                bitmap.mark_present(page);
+            }
+            for &page in &index_pages {
                 bitmap.mark_present(page);
             }
             let g0_end = ppg.min(total_pages);
@@ -4170,6 +4206,7 @@ impl TieredBenchHandle {
         self.cache.group_access.lock().clear();
         self.cache.interior_pages.lock().clear();
         self.cache.interior_groups.lock().clear();
+        self.cache.index_pages.lock().clear();
 
         {
             let mut bitmap = self.cache.bitmap.lock();
@@ -4339,7 +4376,7 @@ pub fn import_sqlite_file(
     // Build interior chunks
     let mut chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
     for (pnum, data) in interior_pages {
-        let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+        let chunk_id = (pnum / bundle_chunk_range(page_size)) as u32;
         chunks.entry(chunk_id).or_default().push((pnum, data));
     }
     for pages in chunks.values_mut() {
@@ -4374,7 +4411,7 @@ pub fn import_sqlite_file(
     // Build index leaf chunks (same pattern as interior)
     let mut ix_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
     for (pnum, data) in index_leaf_pages {
-        let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+        let chunk_id = (pnum / bundle_chunk_range(page_size)) as u32;
         ix_chunks.entry(chunk_id).or_default().push((pnum, data));
     }
     for pages in ix_chunks.values_mut() {
@@ -6444,5 +6481,225 @@ mod tests {
         page[5] = 0x0F; page[6] = 0xF0;
         page[7] = 200; // frag > 128
         assert!(!is_valid_btree_page(&page, 0));
+    }
+
+    // ── Eager load tracker poisoning regression tests ──
+    // Root cause: write_page() + mark_index_page()/mark_interior_group() would
+    // mark the entire sub-chunk as present in the tracker, but only 1 of 4 pages
+    // in the sub-chunk was actually written. Adjacent pages read as zeros →
+    // silent corruption ("database disk image is malformed").
+    // Fix: mark_index_page and mark_interior_group only upgrade the tracker
+    // tier if the sub-chunk is already present (i.e., loaded via write_pages_bulk).
+
+    #[test]
+    fn test_write_page_does_not_mark_sub_chunk_tracker() {
+        // write_page should only update the bitmap, not the sub-chunk tracker.
+        // This is critical for eager index loading where individual pages are
+        // written without their sub-chunk neighbors.
+        let dir = tempfile::tempdir().unwrap();
+        // ppg=4, sub_ppf=2, page_size=64, page_count=8 → 2 groups, 2 sub-chunks/group
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+        let data = vec![0xAA; 64];
+
+        // Write page 0 individually (simulates eager index load)
+        cache.write_page(0, &data).unwrap();
+
+        // Bitmap should mark page 0 present
+        assert!(cache.bitmap.lock().is_present(0));
+
+        // Sub-chunk tracker should NOT mark sub-chunk as present
+        let tracker = cache.tracker.lock();
+        let sc = tracker.sub_chunk_for_page(0);
+        assert!(!tracker.is_sub_chunk_present(&sc),
+            "write_page must not mark sub-chunk as present in tracker");
+        drop(tracker);
+
+        // is_present should still find page 0 via bitmap fallback
+        assert!(cache.is_present(0));
+
+        // Page 1 (same sub-chunk) should NOT be present
+        assert!(!cache.is_present(1),
+            "adjacent page in same sub-chunk must not be reported as cached");
+    }
+
+    #[test]
+    fn test_eager_index_load_no_false_cache_hits() {
+        // Simulates the eager index load scenario: scattered index pages are
+        // written individually. Adjacent non-index pages in the same sub-chunk
+        // must NOT be reported as cached.
+        let dir = tempfile::tempdir().unwrap();
+        // ppg=8, sub_ppf=4, page_size=64, page_count=16
+        // Sub-chunk 0 = pages 0-3, Sub-chunk 1 = pages 4-7
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Simulate eager load: write pages 0, 5 (scattered across sub-chunks)
+        let index_data = vec![0xBB; 64];
+        cache.write_page(0, &index_data).unwrap();
+        cache.write_page(5, &index_data).unwrap();
+        // NOTE: we intentionally do NOT call mark_index_page() — that's the fix
+
+        // Pages 0 and 5 should be found (via bitmap)
+        assert!(cache.is_present(0));
+        assert!(cache.is_present(5));
+
+        // Pages 1,2,3 (same sub-chunk as 0) must NOT be present
+        assert!(!cache.is_present(1));
+        assert!(!cache.is_present(2));
+        assert!(!cache.is_present(3));
+
+        // Pages 4,6,7 (same sub-chunk as 5) must NOT be present
+        assert!(!cache.is_present(4));
+        assert!(!cache.is_present(6));
+        assert!(!cache.is_present(7));
+    }
+
+    #[test]
+    fn test_mark_index_page_safe_when_sub_chunk_not_in_tracker() {
+        // After fix: mark_index_page only upgrades tier if sub-chunk is already
+        // present in the tracker. If called after write_page (bitmap only),
+        // it does NOT poison the tracker.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Write only page 0 (simulates eager index load)
+        let data = vec![0xCC; 64];
+        cache.write_page(0, &data).unwrap();
+
+        // Sub-chunk is NOT in tracker (write_page doesn't mark tracker)
+        assert!(!cache.is_present(1));
+
+        // mark_index_page should be a no-op (sub-chunk not in tracker)
+        cache.mark_index_page(0);
+
+        // Page 1 must still NOT be present (no poisoning)
+        assert!(!cache.is_present(1),
+            "mark_index_page must not poison sub-chunk when not in tracker");
+
+        // Page 0 still findable via bitmap
+        assert!(cache.is_present(0));
+    }
+
+    #[test]
+    fn test_mark_interior_group_safe_when_sub_chunk_not_in_tracker() {
+        // Same fix as mark_index_page: mark_interior_group only calls
+        // mark_pinned if the sub-chunk is already in the tracker.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Write only page 0 (simulates eager interior load)
+        let data = vec![0xDD; 64];
+        cache.write_page(0, &data).unwrap();
+
+        // Sub-chunk NOT in tracker
+        assert!(!cache.is_present(1));
+
+        // mark_interior_group should add to interior_pages/groups
+        // but NOT poison the tracker
+        cache.mark_interior_group(0, 0);
+
+        // interior_pages set updated
+        assert!(cache.interior_pages.lock().contains(&0));
+        assert!(cache.interior_groups.lock().contains(&0));
+
+        // Page 1 must still NOT be present (no poisoning)
+        assert!(!cache.is_present(1),
+            "mark_interior_group must not poison sub-chunk when not in tracker");
+
+        // Page 0 still findable via bitmap
+        assert!(cache.is_present(0));
+
+        // Tracker should NOT have the sub-chunk
+        let tracker = cache.tracker.lock();
+        let id = tracker.sub_chunk_for_page(0);
+        assert!(!tracker.is_sub_chunk_present(&id),
+            "sub-chunk must not be added to tracker by mark_interior_group");
+    }
+
+    #[test]
+    fn test_write_pages_bulk_correctly_marks_tracker() {
+        // write_pages_bulk writes complete sub-chunks and should mark the tracker.
+        // This is the correct path used by on-demand S3 fetch.
+        let dir = tempfile::tempdir().unwrap();
+        // ppg=8, sub_ppf=4, page_size=64, page_count=16
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Write a complete sub-chunk (pages 0-3) via bulk
+        let bulk_data = vec![0xDD; 64 * 4];
+        cache.write_pages_bulk(0, &bulk_data, 4).unwrap();
+
+        // All 4 pages in the sub-chunk should be present
+        assert!(cache.is_present(0));
+        assert!(cache.is_present(1));
+        assert!(cache.is_present(2));
+        assert!(cache.is_present(3));
+
+        // Pages in next sub-chunk should not be present
+        assert!(!cache.is_present(4));
+
+        // Verify actual data was written
+        let mut buf = vec![0u8; 64];
+        cache.read_page(2, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xDD));
+    }
+
+    #[test]
+    fn test_bitmap_fallback_after_clear_cache_index() {
+        // Raw bitmap clear (without index_pages re-marking) loses index pages.
+        // This tests the low-level bitmap behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Simulate eager load: write individual page via write_page (bitmap only)
+        let data = vec![0xEE; 64];
+        cache.write_page(5, &data).unwrap();
+        assert!(cache.is_present(5));
+
+        // Raw bitmap clear (no index_pages re-mark) — page disappears
+        cache.bitmap.lock().bits.fill(0);
+        assert!(!cache.is_present(5),
+            "after raw bitmap clear, eagerly loaded page should not be present");
+    }
+
+    #[test]
+    fn test_index_pages_survive_clear_cache() {
+        // Index pages tracked in index_pages set must survive clear_cache.
+        // clear_cache re-marks them in the bitmap after clearing.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16).unwrap();
+
+        // Simulate eager index load: write pages and register in index_pages
+        let data = vec![0xEE; 64];
+        cache.write_page(5, &data).unwrap();
+        cache.write_page(9, &data).unwrap();
+        cache.index_pages.lock().insert(5);
+        cache.index_pages.lock().insert(9);
+        assert!(cache.is_present(5));
+        assert!(cache.is_present(9));
+
+        // Simulate clear_cache: clear bitmap, then re-mark interior + index + group 0
+        let pinned = cache.interior_pages.lock().clone();
+        let idx = cache.index_pages.lock().clone();
+        let ppg = cache.pages_per_group as u64;
+        {
+            let mut bitmap = cache.bitmap.lock();
+            let total_pages = bitmap.bits.len() as u64 * 8;
+            bitmap.bits.fill(0);
+            for &p in &pinned { bitmap.mark_present(p); }
+            for &p in &idx { bitmap.mark_present(p); }
+            let g0_end = ppg.min(total_pages);
+            for p in 0..g0_end { bitmap.mark_present(p); }
+        }
+
+        // Index pages must still be present
+        assert!(cache.is_present(5), "index page 5 must survive clear_cache");
+        assert!(cache.is_present(9), "index page 9 must survive clear_cache");
+
+        // Non-index page outside group 0 must NOT be present
+        assert!(!cache.is_present(10), "non-index page must not survive clear_cache");
+
+        // Verify data is readable and correct
+        let mut buf = vec![0u8; 64];
+        cache.read_page(5, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xEE), "index page data must be intact");
     }
 }

@@ -80,10 +80,9 @@ Benchmarked on Fly.io (iad region) against Tigris S3, 1M-row social media datase
 
 turbolite's architecture ignores filesystem constraints when limited by S3 constraints:
 
-* Round trips are expensive.
-* Bandwidth is constrained
-* Ping time matters
-* Storage size is cheap and should essentially be ignored
+1. Round trips are expensive. Any network time is the enemy.
+2. Bandwidth is constrained
+3. Cloud storage is cheap and should essentially be ignored
 * GETs and PUTs charge per-operation not per-byte
 
 The following are core to turbolite's design:
@@ -124,12 +123,14 @@ This means a full table scan over 1.7GB caches the entire database in 3 round tr
 
 The prefetch pool is a fixed set of worker threads (default: `num_cpus + 1`), each with its own S3 connection. Groups are dispatched to workers via a channel. The extra thread over CPU count keeps the pipeline full: when one thread blocks on S3 I/O, the extra thread uses that core for decompression and cache writes.
 
-### 6. Interior Page Bundles
+### 6. Separate file chunks for each page type
+
+SQLite has a few types of pages. We care about interior, index, and table pages.
 
 B-tree interior pages (type 0x05, 0x02) are the pages SQLite touches on every single query. They're the index nodes that route lookups to leaf pages. Normally, these pages are distributed randomly throughout the pages (and thus the page groups). This means that top-leaf operations would constantly have to fetch random page groups (prefetch is sequential, note). turbolite detects interior pages at read time using the data vs interior page bit and:
 
 - **Pins them** so they survive cache evictions
-- **Stores them separately** in compressed bundles in S3 (not mixed into data page groups)
+- **Stores them separately** in compsressed bundles in S3 (not mixed into data page groups)
 - **Loads them eagerly** on VFS open (one parallel fetch of all interior bundles)
 
 After this initial load, every B-tree traversal is a cache hit. Cold queries only need to fetch leaf data from S3. Interior pages within data groups are just ignored, as they're already cached from the bundles.

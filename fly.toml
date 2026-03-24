@@ -11,8 +11,8 @@ primary_region = "iad"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --ppg 4096 --prefetch-threads 1 --prefetch-hops 0.01,0.02,0.97 --iterations 3 --queries post --modes cold,arctic --skip-verify"
+  app = "--sizes 1000000 --iterations 5 --skip-verify --import auto"
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256"
+  size = "performance-8x"
+  memory = "16384"

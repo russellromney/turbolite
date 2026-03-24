@@ -3422,4 +3422,199 @@ mod tiered_tests {
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
+
+    /// Regression test: warm profile query corruption from eager load tracker poisoning.
+    ///
+    /// Reproduces the exact scenario from the benchmark:
+    /// 1. Write data with indexes (users + posts + idx_posts_user)
+    /// 2. Checkpoint to S3
+    /// 3. Open reader VFS with FRESH cache (triggers eager interior + index load)
+    /// 4. Run COUNT(*) to populate full cache (warm mode)
+    /// 5. Run profile query (JOIN with ORDER BY on indexed column)
+    /// 6. Verify no "database disk image is malformed" error
+    ///
+    /// Root cause: mark_interior_group() during eager interior load called
+    /// tracker.mark_pinned() which marked the entire sub-chunk (4 pages) as
+    /// present, but only 1 page was written. Adjacent pages read as zeros.
+    #[test]
+    fn test_warm_profile_query_no_corruption_after_eager_load() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("warm_profile", cache_dir.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let vfs_name = unique_vfs_name("warm_prof_w");
+
+        // ── Phase 1: Create database with benchmark schema ──
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "warm_profile.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        // Use 64KB pages (same as benchmark default)
+        conn.execute_batch(
+            "PRAGMA page_size=65536;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE users (
+                 id INTEGER PRIMARY KEY,
+                 first_name TEXT NOT NULL,
+                 last_name TEXT NOT NULL,
+                 school TEXT,
+                 city TEXT,
+                 bio TEXT
+             );
+             CREATE TABLE posts (
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 like_count INTEGER DEFAULT 0,
+                 FOREIGN KEY (user_id) REFERENCES users(id)
+             );
+             CREATE INDEX idx_posts_user ON posts(user_id);",
+        )
+        .unwrap();
+
+        // Insert enough data to create real interior and index pages.
+        // 200 users, 2000 posts = ~10 posts per user.
+        // At 64KB pages this creates multiple page groups with scattered
+        // interior and index pages.
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..200 {
+                tx.execute(
+                    "INSERT INTO users VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        i,
+                        format!("First_{}", i),
+                        format!("Last_{}", i),
+                        format!("School_{}", i % 20),
+                        format!("City_{}", i % 50),
+                        format!("Bio for user {} with some padding text to make pages bigger", i),
+                    ],
+                )
+                .unwrap();
+            }
+            for i in 0..2000 {
+                tx.execute(
+                    "INSERT INTO posts VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        i,
+                        i % 200, // user_id
+                        format!("Post content {} with some text to take up space in the page", i),
+                        format!("2024-01-{:02}T12:00:00Z", (i % 28) + 1),
+                        i % 100,
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Checkpoint to S3
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+
+        // ── Phase 2: Fresh reader VFS (simulates benchmark reader) ──
+        let reader_cache = TempDir::new().unwrap();
+        let reader_config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            cache_dir: reader_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint.clone(),
+            read_only: true,
+            region: region.clone(),
+            eager_index_load: true,
+            ..Default::default()
+        };
+        let reader_vfs_name = unique_vfs_name("warm_prof_r");
+        let reader_vfs = TieredVfs::new(reader_config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
+
+        let warm_conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "warm_profile.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &reader_vfs_name,
+        )
+        .unwrap();
+
+        // ── Phase 3: Warm up cache (same as benchmark COUNT(*)) ──
+        let count: i64 = warm_conn
+            .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2000, "COUNT(*) should return 2000 posts");
+
+        // ── Phase 4: Run the profile query (the one that was corrupted) ──
+        // This is the EXACT query from the benchmark that produced
+        // "database disk image is malformed" before the fix.
+        let profile_result: Result<Vec<(String, String, i64)>, _> = warm_conn
+            .prepare(
+                "SELECT u.first_name, u.last_name, p.id, p.content, p.created_at, p.like_count
+                 FROM users u
+                 JOIN posts p ON p.user_id = u.id
+                 WHERE u.id = 42
+                 ORDER BY p.created_at DESC
+                 LIMIT 10",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            });
+
+        assert!(
+            profile_result.is_ok(),
+            "profile query must not return 'database disk image is malformed': {:?}",
+            profile_result.err()
+        );
+        let rows = profile_result.unwrap();
+        assert_eq!(rows.len(), 10, "profile should return 10 posts for user 42");
+        assert_eq!(rows[0].0, "First_42");
+        assert_eq!(rows[0].1, "Last_42");
+
+        // ── Phase 5: Run additional queries to stress test ──
+        // who-liked pattern (different index path)
+        let user_count: i64 = warm_conn
+            .query_row("SELECT COUNT(*) FROM users WHERE id < 100", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_count, 100);
+
+        // Verify all index paths work
+        let post_by_user: i64 = warm_conn
+            .query_row(
+                "SELECT COUNT(*) FROM posts WHERE user_id = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_by_user, 10, "index scan on idx_posts_user should find 10 posts");
+
+        drop(warm_conn);
+
+        // Cleanup
+        let cleanup_config = TieredConfig {
+            bucket,
+            prefix,
+            cache_dir: reader_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint,
+            region,
+            ..Default::default()
+        };
+        let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+        cleanup_vfs.destroy_s3().unwrap();
+    }
 }

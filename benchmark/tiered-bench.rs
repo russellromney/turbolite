@@ -567,6 +567,16 @@ JOIN users u ON u.id = f1.user_b
 WHERE f1.user_a = ?1 AND f2.user_a = ?2
 LIMIT 20";
 
+/// Indexed filter: uses idx_posts_user. On cold, only the matching index leaf
+/// + data page need fetching. Shows index benefit for selective queries.
+const Q_IDX_FILTER: &str = "\
+SELECT COUNT(*) FROM posts WHERE user_id = ?1";
+
+/// Full scan filter: no index on like_count. Must scan all data pages.
+/// On cold, this forces multiple group fetches. Shows cost of no index.
+const Q_SCAN_FILTER: &str = "\
+SELECT COUNT(*) FROM posts WHERE like_count > ?1";
+
 // =========================================================================
 // Benchmark runners
 // =========================================================================
@@ -968,6 +978,23 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                     rusqlite::types::Value::Integer(a as i64),
                     rusqlite::types::Value::Integer(b as i64),
                 ]
+            }),
+        },
+        QueryDef {
+            label: "idx-filter",
+            sql: Q_IDX_FILTER,
+            param_fn: Box::new(move |i| {
+                let uid = phash(i as u64 + 600) % n_users as u64;
+                vec![rusqlite::types::Value::Integer(uid as i64)]
+            }),
+        },
+        QueryDef {
+            label: "scan-filter",
+            sql: Q_SCAN_FILTER,
+            param_fn: Box::new(move |i| {
+                // like_count > threshold — selects ~half the posts
+                let threshold = (phash(i as u64 + 700) % 50) as i64;
+                vec![rusqlite::types::Value::Integer(threshold)]
             }),
         },
     ];
