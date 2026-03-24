@@ -40,13 +40,10 @@ pip install turbolite
 ```
 
 ```python
-import sqlite3
 import turbolite
 
-# convenience wrapper for manually loading the extension
+# Local compressed database
 conn = turbolite.connect("my.db")
-
-# execute queries
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
 conn.execute("INSERT INTO users VALUES (1, 'alice', 'alice@example.com')")
 conn.commit()
@@ -56,15 +53,22 @@ print(alice[1])
 >>> "alice"
 ```
 
-You can also manually load the extension:
+```python
+# S3 tiered database — serve cold queries from S3
+conn = turbolite.connect("my.db", mode="s3",
+    bucket="my-bucket",
+    endpoint="https://t3.storage.dev")
+```
 
 ```python
-# Load the extension (registers the "turbolite" VFS process-wide)
+# Or manually load the extension for full control
+import sqlite3
 conn = sqlite3.connect(":memory:")
 turbolite.load(conn)
 conn.close()
 
-conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)
+conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
+conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
 ```
 
 See (installation details below) for Node, Go, Rust, and using the `.so` loadable extension directly
@@ -95,7 +99,7 @@ SQLite: "read page 4,271"
 Manifest: "page 4,271 is in group 16, sub-chunk 3, bytes 81,920-106,496"
     |
     v
-turbolite check local storage: "page not in cache"
+turbolite: check local storage -> cache miss
     |
     v
 S3: GET for ~256KB compressed sub-chunk → decompress → return page
@@ -151,7 +155,9 @@ let config = TieredConfig {
 
 **Encrypt after compress, decrypt before decompress.** Compression operates on plaintext (compressing ciphertext is useless). On the S3 path: `plaintext → zstd compress → GCM encrypt → S3 PUT`. On read: `S3 GET → GCM decrypt → zstd decompress → plaintext`.
 
-**Security model:** S3 data uses authenticated encryption (GCM) with unique nonces per frame - the strongest path for long-lived data. Local files use CTR with deterministic nonces (page number / byte offset), providing confidentiality against single-snapshot disk-at-rest attackers. CTR's deterministic nonces mean that an attacker who can capture multiple snapshots of the same file (e.g., via filesystem snapshots or NVMe wear leveling) could potentially recover XOR of plaintexts at reused offsets. This matches the trade-off made by SQLite's own SEE extension in OFB mode. For most deployments, the local cache is ephemeral and recreatable from S3, so this is acceptable.
+**Security model:** S3 data uses GCM with unique nonces per frame (authenticated, tamper-detecting). Local files use CTR with deterministic nonces (page number / byte offset), providing confidentiality against disk-at-rest attackers. CTR's deterministic nonces mean multi-snapshot attackers could recover XOR of plaintexts at reused offsets, matching SQLite's own SEE extension tradeoff. The local cache is ephemeral and recreatable from S3.
+
+**Key rotation:** `rotate_encryption_key(config, new_key)` re-encrypts, adds, or removes encryption on all S3 data without decompressing. `Some` to `Some` rotates keys, `Some` to `None` removes encryption, `None` to `Some` adds it. Crash-safe: old objects are never overwritten, the manifest upload is the atomic commit point, and a verification step confirms new data is readable before committing. Orphans from partial runs are cleaned by `gc()`.
 
 ## Strengths and Limitations
 

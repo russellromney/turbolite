@@ -3,20 +3,18 @@
 //! Exports `turbolite_ext_register_vfs()` which is called from the C entry
 //! point in `ext_entry.c` after `SQLITE_EXTENSION_INIT2` stores the API table.
 //!
-//! The C shim provides symbol shims for `sqlite3_vfs_register` etc. that route
-//! through the extension API table, so `sqlite_vfs::register()` works correctly
-//! inside a loadable extension.
+//! ## VFS registration
 //!
-//! ## VFS selection
+//! Always registers **"turbolite"** — local compressed VFS (zstd).
 //!
-//! If `TURBOLITE_BUCKET` is set, registers a **tiered S3 VFS** (requires the
-//! `tiered` feature). Otherwise, registers a **local compressed VFS**.
+//! If `TURBOLITE_BUCKET` is set, also registers **"turbolite-s3"** — tiered
+//! S3 VFS. Fails hard if bucket is set but configuration is invalid.
 //!
 //! ### Environment variables (tiered mode)
 //!
 //! | Variable | Required | Default | Description |
 //! |---|---|---|---|
-//! | `TURBOLITE_BUCKET` | yes | — | S3 bucket name |
+//! | `TURBOLITE_BUCKET` | yes | — | S3 bucket name (triggers S3 VFS registration) |
 //! | `TURBOLITE_PREFIX` | no | `"turbolite"` | S3 key prefix |
 //! | `TURBOLITE_CACHE_DIR` | no | `"/tmp/turbolite"` | Local cache directory |
 //! | `TURBOLITE_ENDPOINT_URL` | no | — | Custom S3 endpoint (Tigris, MinIO) |
@@ -30,29 +28,38 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-static VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
+static LOCAL_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
+static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
+///
+/// Always registers "turbolite" (local compressed VFS).
+/// If TURBOLITE_BUCKET is set, also registers "turbolite-s3" (tiered VFS).
+/// Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
 #[no_mangle]
 pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
-    if VFS_REGISTERED.swap(true, Ordering::SeqCst) {
-        return 0;
-    }
-
-    let result = if std::env::var("TURBOLITE_BUCKET").is_ok() {
-        register_tiered()
-    } else {
-        register_local()
-    };
-
-    match result {
-        Ok(()) => 0,
-        Err(_) => {
-            VFS_REGISTERED.store(false, Ordering::SeqCst);
-            1
+    // Register local VFS (always)
+    if !LOCAL_VFS_REGISTERED.swap(true, Ordering::SeqCst) {
+        if let Err(e) = register_local() {
+            LOCAL_VFS_REGISTERED.store(false, Ordering::SeqCst);
+            eprintln!("turbolite: failed to register local VFS: {e}");
+            return 1;
         }
     }
+
+    // Register tiered VFS if TURBOLITE_BUCKET is set
+    if std::env::var("TURBOLITE_BUCKET").is_ok()
+        && !TIERED_VFS_REGISTERED.swap(true, Ordering::SeqCst)
+    {
+        if let Err(e) = register_tiered() {
+            TIERED_VFS_REGISTERED.store(false, Ordering::SeqCst);
+            eprintln!("turbolite: TURBOLITE_BUCKET is set but tiered VFS failed: {e}");
+            return 1;
+        }
+    }
+
+    0
 }
 
 fn register_local() -> Result<(), std::io::Error> {
@@ -86,7 +93,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     let prefetch_threads = std::env::var("TURBOLITE_PREFETCH_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0); // 0 = use default (num_cpus + 1)
+        .unwrap_or(0);
     let compression_level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -110,13 +117,14 @@ fn register_tiered() -> Result<(), std::io::Error> {
     }
 
     let vfs = TieredVfs::new(config)?;
-    crate::tiered::register("turbolite", vfs)
+    crate::tiered::register("turbolite-s3", vfs)
 }
 
 #[cfg(not(feature = "tiered"))]
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "TURBOLITE_BUCKET is set but this extension was built without the 'tiered' feature",
+        "TURBOLITE_BUCKET is set but this extension was built without the 'tiered' feature. \
+         Rebuild with: make ext  (includes tiered by default)",
     ))
 }

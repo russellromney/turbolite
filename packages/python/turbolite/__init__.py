@@ -1,20 +1,16 @@
 """
-turbolite — compressed SQLite for Python.
+turbolite — compressed SQLite with S3 tiered storage for Python.
 
-Usage::
+Local mode (default)::
 
-    import sqlite3
     import turbolite
-
-    conn = sqlite3.connect(":memory:")
-    turbolite.load(conn)
-
-    # Open a compressed database via URI
-    conn2 = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)
-
-Or use the convenience wrapper::
-
     conn = turbolite.connect("my.db")
+
+S3 tiered mode::
+
+    conn = turbolite.connect("my.db", mode="s3",
+        bucket="my-bucket",
+        endpoint="https://t3.storage.dev")
 """
 
 from __future__ import annotations
@@ -24,7 +20,7 @@ import platform
 import sqlite3
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.2.19"
 
 
 def _find_ext() -> str:
@@ -41,7 +37,6 @@ def _find_ext() -> str:
 
     path = os.path.join(pkg_dir, name)
     if os.path.isfile(path):
-        # Return without extension — sqlite3.load_extension appends it
         return os.path.splitext(path)[0]
 
     raise FileNotFoundError(
@@ -57,10 +52,9 @@ def load(conn: sqlite3.Connection) -> None:
     """
     Load the turbolite extension into a sqlite3 connection.
 
-    After loading, the "turbolite" VFS is registered process-wide.
-    Open compressed databases with::
-
-        sqlite3.connect("file:path.db?vfs=turbolite", uri=True)
+    After loading, the "turbolite" VFS (local compressed) is always
+    registered. If TURBOLITE_BUCKET is set in the environment,
+    "turbolite-s3" (tiered S3) is also registered.
 
     Args:
         conn: Any open sqlite3.Connection (can be :memory:).
@@ -75,28 +69,71 @@ def load(conn: sqlite3.Connection) -> None:
 def connect(
     path: str,
     *,
-    vfs: str = "turbolite",
+    mode: str = "local",
+    bucket: str | None = None,
+    prefix: str | None = None,
+    endpoint: str | None = None,
+    region: str | None = None,
+    cache_dir: str | None = None,
+    compression_level: int | None = None,
+    prefetch_threads: int | None = None,
+    read_only: bool = False,
 ) -> sqlite3.Connection:
     """
-    Convenience: load the extension and open a compressed database.
-
-    Equivalent to::
-
-        conn = sqlite3.connect(":memory:")
-        turbolite.load(conn)
-        conn.close()
-        return sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+    Open a turbolite database.
 
     Args:
         path: Path to the database file.
-        vfs: VFS name (default "turbolite").
+        mode: "local" for compressed VFS, "s3" for S3 tiered VFS.
+        bucket: S3 bucket (required for mode="s3", or set TURBOLITE_BUCKET).
+        prefix: S3 key prefix (default "turbolite").
+        endpoint: S3 endpoint URL (Tigris, MinIO). Falls back to AWS_ENDPOINT_URL.
+        region: AWS region. Falls back to AWS_REGION.
+        cache_dir: Local cache directory (default /tmp/turbolite).
+        compression_level: Zstd level 1-22 (default 3).
+        prefetch_threads: Prefetch worker threads (default num_cpus + 1).
+        read_only: Open in read-only mode.
 
     Returns:
-        An open sqlite3.Connection using the compressed VFS.
+        An open sqlite3.Connection.
+
+    Raises:
+        ValueError: If mode="s3" but no bucket is configured.
+        RuntimeError: If the tiered VFS fails to initialize.
     """
+    if mode not in ("local", "s3"):
+        raise ValueError(f"mode must be 'local' or 's3', got {mode!r}")
+
+    if mode == "s3":
+        # Set env vars for the extension before loading.
+        # Fail fast if bucket is missing.
+        effective_bucket = bucket or os.environ.get("TURBOLITE_BUCKET")
+        if not effective_bucket:
+            raise ValueError(
+                "mode='s3' requires a bucket. Pass bucket= or set TURBOLITE_BUCKET."
+            )
+        os.environ["TURBOLITE_BUCKET"] = effective_bucket
+        if prefix is not None:
+            os.environ["TURBOLITE_PREFIX"] = prefix
+        if endpoint is not None:
+            os.environ["TURBOLITE_ENDPOINT_URL"] = endpoint
+        if region is not None:
+            os.environ["TURBOLITE_REGION"] = region
+        if cache_dir is not None:
+            os.environ["TURBOLITE_CACHE_DIR"] = cache_dir
+        if read_only:
+            os.environ["TURBOLITE_READ_ONLY"] = "true"
+
+    if compression_level is not None:
+        os.environ["TURBOLITE_COMPRESSION_LEVEL"] = str(compression_level)
+    if prefetch_threads is not None:
+        os.environ["TURBOLITE_PREFETCH_THREADS"] = str(prefetch_threads)
+
     global _loaded
     if not _loaded:
         bootstrap = sqlite3.connect(":memory:")
         load(bootstrap)
         bootstrap.close()
+
+    vfs = "turbolite-s3" if mode == "s3" else "turbolite"
     return sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
