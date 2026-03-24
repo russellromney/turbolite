@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turbolite"
+version = "0.2.19"
+description = "Compressed SQLite — transparent zstd compression via a custom VFS"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+keywords = ["sqlite", "compression", "zstd", "database", "vfs"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+
+[tool.setuptools.packages.find]
+include = ["turbolite*"]
+
+[tool.setuptools.package-data]
+turbolite = ["*.so", "*.dylib"]

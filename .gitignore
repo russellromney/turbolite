@@ -85,3 +85,9 @@ backend-go/server
 coverage.html
 
 .context
+
+# Python package build artifacts
+packages/python/build/
+packages/python/*.egg-info/
+packages/python/turbolite/*.so
+packages/python/turbolite/*.dylib

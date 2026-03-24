@@ -1,0 +1,8 @@
+{
+  "name": "turbolite-example",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "koffi": "^2"
+  }
+}

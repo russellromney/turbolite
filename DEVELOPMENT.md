@@ -1,4 +1,4 @@
-# Claude Development Guidelines
+# Development Guidelines
 
 ## Secrets
 
@@ -14,6 +14,8 @@ Secrets stored:
 - `AWS_ENDPOINT_URL` — Tigris endpoint (`https://t3.storage.dev`)
 - `AWS_REGION` — `auto`
 - `TIERED_TEST_BUCKET` — S3 bucket for integration tests (`sqlces-test`)
+
+You can use these as environment variables as well.
 
 ## Running Tests
 

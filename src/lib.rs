@@ -35,7 +35,10 @@
 
 pub mod compress;
 pub mod dict;
+#[cfg(not(feature = "loadable-extension"))]
 pub mod ffi;
+#[cfg(feature = "loadable-extension")]
+pub mod ext;
 #[cfg(feature = "tiered")]
 pub mod tiered;
 

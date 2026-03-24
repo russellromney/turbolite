@@ -1,0 +1,9 @@
+[package]
+name = "turbolite-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqlite-compress-encrypt-vfs = { path = "../..", features = ["zstd", "bundled-sqlite"] }
+rusqlite = "0.35"
+tempfile = "3"

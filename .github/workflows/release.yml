@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Python wheels (loadable extension) ────────────────────────────
+  python-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            plat-name: manylinux2014_x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            plat-name: manylinux2014_aarch64
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            plat-name: macosx_13_0_x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            plat-name: macosx_14_0_arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build loadable extension
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: |
+          cargo build --release --lib --target ${{ matrix.target }} \
+            --no-default-features --features loadable-extension,zstd
+
+      - name: Determine library filename
+        id: lib
+        run: |
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
+            echo "ext=dylib" >> "$GITHUB_OUTPUT"
+            echo "prefix=lib" >> "$GITHUB_OUTPUT"
+          else
+            echo "ext=so" >> "$GITHUB_OUTPUT"
+            echo "prefix=lib" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy extension into Python package
+        run: |
+          cp target/${{ matrix.target }}/release/${{ steps.lib.outputs.prefix }}sqlite_compress_encrypt_vfs.${{ steps.lib.outputs.ext }} \
+            packages/python/turbolite/turbolite.${{ steps.lib.outputs.ext }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        run: |
+          pip install setuptools wheel
+          cd packages/python
+          python setup.py bdist_wheel --plat-name ${{ matrix.plat-name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: packages/python/dist/*.whl
+
+  python-publish:
+    needs: python-build
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  # ── Node.js native addon (napi-rs) ───────────────────────────────
+  node-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            node-arch: linux-x64-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            node-arch: linux-arm64-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            node-arch: linux-x64-musl
+          - os: macos-13
+            target: x86_64-apple-darwin
+            node-arch: darwin-x64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            node-arch: darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (aarch64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install dependencies
+        working-directory: packages/node
+        run: npm install
+
+      - name: Build native addon
+        working-directory: packages/node
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.node-arch }}
+          path: packages/node/turbolite.*.node
+
+  node-publish:
+    needs: node-build
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: packages/node
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la packages/node/turbolite.*.node
+
+      - name: Publish to npm
+        working-directory: packages/node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

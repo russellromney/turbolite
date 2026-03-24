@@ -1,0 +1,17 @@
+[package]
+name = "turbolite-node"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["serde-json"] }
+napi-derive = "2"
+rusqlite = "0.35"
+serde_json = "1"
+sqlite-compress-encrypt-vfs = { path = "../..", default-features = false, features = ["zstd", "bundled-sqlite"] }
+
+[build-dependencies]
+napi-build = "2"

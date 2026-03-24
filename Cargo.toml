@@ -13,7 +13,8 @@ crate-type = ["lib", "cdylib"]
 
 [features]
 default = ["zstd", "bundled-sqlite"]
-bundled-sqlite = ["rusqlite/bundled", "dep:libsqlite3-sys"]
+bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "dep:libsqlite3-sys"]
+loadable-extension = []
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
@@ -58,7 +59,7 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.35" }
+rusqlite = { version = "0.35", optional = true }
 libsqlite3-sys = { version = "0.33", features = ["bundled"], optional = true }
 tempfile = "3"
 ureq = "2"
@@ -66,6 +67,7 @@ lambda_runtime = { version = "0.13", optional = true }
 
 [build-dependencies]
 cbindgen = "0.27"
+cc = "1"
 
 [dev-dependencies]
 rayon = "1.10"
