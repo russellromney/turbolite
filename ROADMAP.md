@@ -227,25 +227,30 @@ Phase e3 stopped marking the tracker to prevent positional pollution. With manif
 
 #### f2. Performance investigation (B-tree groups slower than positional)
 
-B-tree-aware groups are theoretically optimal but benchmarks show 3-10x slower than positional groups at 100K. Need to find whether the gap is an implementation bug, encoding issue, or fundamental problem.
+B-tree-aware groups are theoretically optimal but benchmarks show 2-6x slower than positional groups at 100K. The gap is real: fair local-only comparison confirms it.
 
-**Observed**: 100K INDEX post+user
-- Main (positional): 126ms / 2 GETs / 36KB
-- B-tree (restructured): 448ms / 7 GETs / 11.9MB
+**Fair local comparison** (100K, 64KB pages, ppg=256, macOS to Tigris, same machine):
 
-**Hypotheses to test**:
-- [ ] **H1: Sub-chunk size mismatch.** Are B-tree group sub-chunks bigger than positional? Compare `frame_table[i].len` across both. If B-tree groups compress worse (heterogeneous page types in same group), sub-chunks are larger.
-- [ ] **H2: More groups touched per query.** Does a point query actually touch fewer groups with B-tree packing? Log `gid` per read in BENCH_VERBOSE, compare unique groups touched per query between main and B-tree branch.
-- [ ] **H3: Background prefetch bandwidth contention.** The 11.9MB total is dominated by background full-group downloads, not range GETs. Disable trigger_prefetch entirely and benchmark: if latency drops but bytes drop to ~256KB, the prefetch is the bottleneck.
-- [ ] **H4: B-tree walk produces wrong group assignment.** Verify import: for each group, are the pages actually from the same B-tree? Dump `group_pages` and cross-reference with `sqlite_master` root pages.
-- [ ] **H5: Sub-chunk range GET fetches correct data but from wrong offset.** Verify: after range GET, does the decoded page match a direct `pread` from the original SQLite file? Content mismatch = encoding/offset bug.
-- [ ] **H6: Disable prefetch entirely.** Pure range-GET-only (no background downloads at all). This is the lower bound. If still slower than main, the issue is group layout, not prefetch.
+INDEX level (most revealing: index cached, only data from S3):
+| Query      | Main p50 | Main GETs | Main bytes | B-tree p50 | B-tree GETs | B-tree bytes |
+|------------|----------|-----------|------------|------------|-------------|--------------|
+| post+user  | 138ms    | 2.0       | 36KB       | 382ms      | 7.0         | 11.9MB       |
+| profile    | 403ms    | 11.7      | 12.3MB     | 1.0s       | 11.0        | 14.7MB       |
+| who-liked  | 66ms     | 1.0       | 18KB       | 430ms      | 5.0         | 13.3MB       |
+| mutual     | 171ms    | 1.0       | 18KB       | 103ms      | 2.3         | 2.9MB        |
+| idx-filter | 98ms     | 1.0       | 18KB       | 104ms      | 2.0         | 40KB         |
+| scan-filt  | 1.5s     | 33.0      | 26.3MB     | 743ms      | 11.3        | 9.7MB        |
 
-**Experiment plan**:
-1. H6 first (disable prefetch): establishes baseline for range-GET-only performance
-2. H2 (log groups per query): understand the access pattern difference
-3. H1 (compare sub-chunk sizes): check if compression is the issue
-4. H3 (prefetch bandwidth): if H6 shows range-GET-only is fast, prefetch is the bottleneck
+**Root cause: over-eager background prefetch.** After the inline range GET serves the needed page, the B-tree branch downloads the full group (~8-16MB) + sibling groups in the background. For a point query needing 1-2 data pages (36-128KB), the branch downloads 11.9MB. This saturates the local-to-Tigris bandwidth (~100Mbps) and slows subsequent range GETs.
+
+**Where B-tree wins**: scan-filter (1.5s vs 743ms at INDEX, 2.2s vs 1.3s at NONE). Full-group + sibling prefetch pays off when SQLite needs many sequential pages from the same B-tree.
+
+**Fix direction**: make prefetch conditional on access pattern:
+- [ ] **Point queries** (1-2 data page misses): range-GET only, no full-group download, no sibling prefetch
+- [ ] **Scan queries** (consecutive misses in same B-tree): escalate to full-group + sibling prefetch
+- [ ] Threshold: `consecutive_misses_in_same_btree >= 3` triggers full-group mode
+- [ ] Or: cap background download concurrency to 1-2 concurrent groups (prevent bandwidth saturation)
+- [ ] Validate on S3 Express (10Gbps) where bandwidth contention may not exist
 
 #### g. Compaction
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
