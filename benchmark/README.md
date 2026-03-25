@@ -1,6 +1,6 @@
 # Tiered VFS Benchmark Guide
 
-Benchmark for the S3-backed page-group tiered VFS. Measures query latency against social network databases stored on S3-compatible object storage.
+Core reference benchmark for the S3-backed page-group tiered VFS. Measures query latency against social network databases stored on S3-compatible object storage.
 
 **Queries:** post+user join, profile (5 joins), who-liked, mutual friends, indexed filter, full scan + filter
 
@@ -84,21 +84,21 @@ CREATE INDEX idx_users_school ON users(school);
 
 ## 1. Local (against Tigris)
 
-Credentials come from Soup:
+Set `TIERED_TEST_BUCKET`, `AWS_REGION`, `AWS_ENDPOINT_URL`, and AWS credentials as environment variables, then run:
 
 ```bash
 # Generate 100K rows, upload to S3, run all cache levels
-soup run -p turbolite -e development -- \
+TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   cargo run --release --features tiered,zstd --bin tiered-bench -- \
     --sizes 100000 --import auto
 
 # Reuse existing 1M-row data on S3
-soup run -p turbolite -e development -- \
+TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   cargo run --release --features tiered,zstd --bin tiered-bench -- \
     --sizes 1000000 --modes interior,index
 
 # Quick: just point lookups at interior level
-soup run -p turbolite -e development -- \
+TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   cargo run --release --features tiered,zstd --bin tiered-bench -- \
     --sizes 1000000 --modes interior --queries post
 ```
@@ -139,13 +139,11 @@ The process args in `fly.toml` control what runs:
 Results are uploaded to S3 by the entrypoint:
 
 ```bash
-soup run -p turbolite -e development -- \
-  aws s3 ls s3://turbolite-test/bench/logs/ --endpoint-url https://fly.storage.tigris.dev
+aws s3 ls s3://$TIERED_TEST_BUCKET/bench/logs/ --endpoint-url $AWS_ENDPOINT_URL
 
 # Download latest
-soup run -p turbolite -e development -- \
-  aws s3 cp s3://turbolite-test/bench/logs/<filename>.log /tmp/bench.log \
-    --endpoint-url https://fly.storage.tigris.dev
+aws s3 cp s3://$TIERED_TEST_BUCKET/bench/logs/<filename>.log /tmp/bench.log \
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Parse results
 grep -E '\[data\]|\[index\]|\[interior\]|\[none\]' /tmp/bench.log
