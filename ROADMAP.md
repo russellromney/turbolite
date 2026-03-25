@@ -59,7 +59,7 @@ Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks
 ---
 
 ## Marathon: Local Disk Compaction
-> After: Thermopylae · Before: Midway
+> After: Thermopylae · Before: Midway (B-Tree-Aware Page Groups)
 
 The local cache file is a sparse file sized to `page_count * page_size`. After VACUUM reduces page_count, a fresh reader creates a smaller cache, but the existing cache doesn't shrink in-place.
 
@@ -71,142 +71,112 @@ Note: this is a minor optimization. S3 is the source of truth, local disk is eph
 
 ---
 
-## Midway: Two-Layer Index Storage (Base + Delta)
-> After: Marathon · Before: Stalingrad
+## Midway: B-Tree-Aware Page Groups
+> After: Marathon · Before: Normandy
 
-Index chunks are currently rewritten in full on every checkpoint that touches an index page. A single dirty index page forces re-upload of the entire ~14MB chunk. This is the write amplification bottleneck for index-heavy workloads (frequent INSERTs into indexed tables).
+Replaces the old Midway (two-layer index deltas) and Stalingrad (write amplification) phases. B-tree-aware packing solves both problems as one feature: the manifest becomes a structural map of the database, page groups are packed by B-tree, prefetch becomes demand-driven instead of speculative, and write amplification drops dramatically.
 
-### Design: base chunks + per-page deltas
+Currently, page groups are assigned by page number order (pages 0-255 in group 0, 256-511 in group 1, etc.). SQLite doesn't allocate pages by B-tree contiguously, so a single index's pages are scattered across dozens of groups. This causes two problems: (1) prefetching an index means fetching pages from many groups, and (2) a dirty index page dirties a group that also contains unrelated pages.
 
-Two layers, manifest as the merge point:
+### Design
 
-- **Base layer**: dense-packed index chunks (~32MB uncompressed, ~8 chunks for 1M rows). Written at import and compaction. Efficient for cold bulk load (one round trip on 8 threads).
-- **Delta layer**: individual per-page S3 objects (64KB each). Written at checkpoint for dirty index pages only. Manifest maps `page_num → S3 key` for overrides.
-- **Read path**: check `index_page_overrides` in manifest first, fall back to base chunk.
-- **Compaction**: when delta count exceeds threshold (e.g., 500 pages or 50% of base size), merge deltas into new base chunks, GC old base + deltas.
+**B-tree map in manifest.** At import, walk each B-tree from its root page (read `sqlite_master` for root page numbers) to enumerate all pages per B-tree. Store the mapping:
 
-### Economics
+```
+btrees: {
+  5: { name: "idx_posts_user", type: "index", groups: [12, 13] },
+  2: { name: "posts", type: "table", groups: [20, 21, ..., 35] },
+}
+groups: {
+  12: { s3_key: "pg/12_v1", pages: [100, 200, 350, 500, ...] },
+}
+```
 
-- Write: 1 dirty index page = 1 PUT of 64KB + manifest update. Was: re-encode + re-upload 14MB chunk.
-- Read (cold): fetch 8 base chunks (1 round trip) + N delta pages (1 more round trip if <8 deltas). Negligible overhead.
-- Manifest: at 64KB pages, 500 delta entries = ~40KB. Trivially small.
-- S3 cost: PUTs are per-operation not per-byte. 50 individual 64KB PUTs costs the same as 50 batched PUTs.
+On manifest load, build in-memory reverse index: `page_num -> (group_id, position)`. For 23K pages, ~370KB. Trivial.
+
+**B-tree-aware packing.** Pages from the same B-tree go into the same groups. All of `idx_posts_user` into groups 12-13, all of `posts` data into groups 20-35. Small B-trees (< ~50 pages) can share a group. Leave slack per group (~200 of 256 slots) so writes have room.
+
+**Demand-driven prefetch.** When SQLite reads a root page, look up that B-tree's groups and prefetch them. A point lookup on `posts` fetches 2 groups (12MB) for `idx_posts_user`, not all 3800 index pages (144MB). The relevant index is fully cached after 1-2 S3 GETs (~3-5ms on S3 Express).
+
+**Write amplification solved.** INSERT 100 rows into `posts` dirties pages in `posts` data groups + `idx_posts_user` group + `idx_posts_created` group = 4-5 groups. Currently those pages are scattered across 15-20 groups. ~4x less write amplification, and the improvement scales with index count.
+
+**Checkpoint rebuilds the map.** Re-walk B-trees from `sqlite_master` (microsecond pread of page headers from cache). New pages go into their B-tree's last group (if slack available) or a new group. Freed pages become dead space, cleaned up by compaction.
+
+### Economics (1M rows, 1.46GB, S3 Express)
+
+Current prefetch: 3800 index pages across 46 chunks (144MB). With B-tree packing: 300 pages in 2 groups (12MB) for the relevant index. 12x less bandwidth, prefetch completes in ~5ms instead of hundreds of ms.
+
+Current write amplification: INSERT touching 3 indexes dirties 15-20 groups (240-320MB uploaded). With B-tree packing: 4-5 groups (64-80MB). 4x improvement.
+
+The gap between "interior" and "index" cache levels nearly disappears. With targeted prefetch, index pages for the active query arrive in single-digit ms. Combined with S3 Express, sub-50ms complex joins from cold storage become realistic.
 
 ### Implementation
 
-- [ ] Add `index_page_overrides: HashMap<u64, String>` to Manifest
-- [ ] S3 key format: `{prefix}/ixp/{page_num}_v{version}` (individual index pages)
-- [ ] Checkpoint: dirty index pages uploaded as individual objects, added to `index_page_overrides`
-- [ ] Skip chunk rewrite if only delta pages changed in that chunk's range
-- [ ] Read path: `index_page_overrides` lookup before base chunk fetch
-- [ ] Background prefetch: fetch base chunks in parallel, then fetch any delta pages
-- [ ] Compaction trigger: delta count > threshold → merge into new base chunks
-- [ ] Compaction: read base chunks + deltas → dense-pack → upload new base chunks → clear deltas → update manifest
-- [ ] GC: old base chunks + consumed delta objects added to replaced_keys
-- [ ] Tests: checkpoint with index updates → verify only delta objects uploaded, cold read correctness, compaction merges correctly
+#### a. B-tree map construction
+- [ ] Read `sqlite_master` to get root pages, names, types (table vs index)
+- [ ] Walk each B-tree from root to enumerate all pages (interior + leaf + overflow)
+- [ ] Handle freelist pages (pack separately, or skip upload since they hold no useful data)
+- [ ] Handle page 1 (sqlite_master) and other system pages
 
-### Dense packing (deferred)
+#### b. Manifest format change
+- [ ] Replace positional page-to-group mapping with explicit mapping
+- [ ] Add `btrees` section: root_page -> { name, type, groups }
+- [ ] Add `pages` list per group (ordered, defines position within group)
+- [ ] Build reverse index on manifest load: page_num -> (group_id, position)
+- [ ] Automigrate: detect old positional manifest, convert to explicit on first checkpoint
 
-Current chunking uses page-number-range bucketing which produces uneven chunks. Dense packing (collect all index pages, split every N) would give exactly `ceil(total_index_pages / pages_per_chunk)` chunks regardless of page number distribution. Implement when the range-based approach proves insufficient.
+#### c. B-tree-aware packing (import)
+- [ ] Pack pages by B-tree into groups during import
+- [ ] Large B-trees (> pages_per_group pages) span multiple groups
+- [ ] Small B-trees (< ~50 pages) share a group
+- [ ] Leave slack per group for future growth (~200 of 256 slots)
+- [ ] Existing seekable zstd sub-chunk encoding works unchanged (position is per-group, not per-page-number)
+
+#### d. Demand-driven prefetch
+- [ ] On root page read, look up B-tree's groups in manifest
+- [ ] Prefetch those groups (whole-group GETs, not scattered sub-chunk range GETs)
+- [ ] Remove current "prefetch all index chunks" behavior
+- [ ] Optional: access history (track which B-trees were accessed, prefetch those eagerly on next open)
+
+#### e. Checkpoint with B-tree awareness
+- [ ] Re-walk B-trees at checkpoint to rebuild page-to-btree map
+- [ ] New pages: append to B-tree's last group if slack available, else create new group
+- [ ] Freed pages: mark as dead space in group
+- [ ] Only re-encode and upload groups containing dirty pages
+- [ ] Write amplification metrics: track dirty pages, dirty groups, bytes uploaded per checkpoint
+
+#### f. Compaction
+- [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
+- [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
+- [ ] GC old groups after manifest swap
+- [ ] VACUUM triggers full repack (all page numbers change)
+
+#### g. Tests
+- [ ] Import: verify pages packed by B-tree, manifest mapping correct
+- [ ] Read: page lookup via explicit mapping matches page content
+- [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
+- [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
+- [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
+- [ ] Compaction: dead space reclaimed, B-tree groups repacked optimally
+- [ ] VACUUM: full repack produces correct mapping
+- [ ] Automigration: old positional manifest upgraded to explicit on first checkpoint
 
 ---
 
-## Stalingrad: Write Amplification Optimization
-> After: Midway · Before: Normandy
+## Gallipoli: Normandy Leftovers
+> After: Midway (B-Tree-Aware Page Groups) · Before: Somme
 
-turbolite's unit of write is the page group (16MB at 256 * 64KB pages). A single dirty page forces re-upload of the entire group. Write amplification = dirty groups / dirty pages.
+Small items remaining from Phase Normandy (loadable extension + language packages).
 
-With 64KB pages, group counts are naturally low: 1.7GB = 104 groups, so worst-case is 104 PUTs per checkpoint. This is fine for small databases. For larger databases the math changes: 10GB = 600 groups, 100GB = 6,000 groups — scattered writes at that scale mean thousands of 16MB uploads per checkpoint.
-
-### a. Group size tuning
-- [ ] Make `pages_per_group` a meaningful tuning knob with documented tradeoffs
-- [ ] Write-heavy workloads: smaller groups (64-128 pages at 64KB = 4-8MB) → less wasted bandwidth per dirty page, more PUTs
-- [ ] Scan-heavy workloads: larger groups (512+ pages at 64KB = 32MB+) → fewer S3 objects, amortize request overhead
-- [ ] Point lookups: group size mostly irrelevant (seekable sub-chunk range GETs)
-- [ ] Benchmark write amplification at different group sizes with INSERT/UPDATE/DELETE workloads
-
-### b. Freelist pre-allocation (S3 over-provisioning)
-Low priority for databases under a few GB (group count is naturally small). Matters for 10GB+ write-heavy workloads.
-
-- [ ] After import or VACUUM, extend the database with "write buffer" groups — groups that are entirely freelist pages
-- [ ] SQLite's allocator pulls from the freelist for new INSERTs, so writes naturally concentrate in these groups
-- [ ] Freelist ordering: rewrite freelist trunk pages at checkpoint so free pages are ordered by group (SQLite exhausts one group before moving to the next)
-- [ ] Economics at scale: 100GB database, 100 scattered dirty pages → 100 groups dirty (1.6GB uploaded) vs 2 groups with pre-alloc (32MB uploaded). At small scale (1.7GB, 104 groups max) the ceiling is low enough that this barely matters.
-
-### c. Write amplification metrics
-- [ ] Track per-checkpoint: dirty pages, dirty groups, bytes uploaded, write amplification ratio
-- [ ] Surface in logs and optionally in manifest metadata
-- [ ] Use to validate that group size tuning and freelist pre-allocation are helping
-
----
-
-## Normandy: SQLite Loadable Extension + Language Packages
-> After: Stalingrad · Before: Inchon
-
-Ship turbolite as a SQLite loadable extension so Python/Go/Ruby/etc. users can `load_extension()` into their existing `sqlite3` connections. The extension registers the compressed VFS and exposes SQL helper functions. Language packages bundle the platform-specific binary and provide a `load(conn)` helper (sqlite-vec pattern).
-
-### a. Loadable extension core
-- [x] C shim (`src/ext_entry.c`): `sqlite3_turbolite_init` entry point using `sqlite3ext.h` + `SQLITE_EXTENSION_INIT1/2` macros. Receives the extension API table and routes `sqlite3_vfs_register` through it.
-- [x] Rust `ext_init()` called from C shim: registers compressed VFS via the extension API's `vfs_register` (not the direct C symbol — loadable extensions must use the API table)
-- [x] SQL functions registered by the extension:
-  - `turbolite_version()` → returns version string
-- [ ] `SELECT turbolite_register('vfs_name', '/path/to/base', 3)` → registers a compressed VFS with given name, base directory, and zstd level
-- [x] `Cargo.toml`: `loadable-extension` feature, `cc` build dep, conditional build.rs
-- [x] Makefile target: `make ext` builds the loadable extension .so/.dylib
-- [x] Vendored `sqlite3.h`/`sqlite3ext.h` in `vendor/sqlite3/` (macOS SDK defines `SQLITE_OMIT_LOAD_EXTENSION`)
-
-### b. Tests — loadable extension
-- [x] `sqlite3_turbolite_init` loads successfully, VFS is registered
-- [x] `turbolite_version()` SQL function returns correct version
-- [x] Integration: Python `sqlite3.load_extension()` → open compressed DB via URI `?vfs=turbolite` → full CRUD roundtrip
-- [x] Data persists across close/reopen
-- [x] Multiple tables, UPDATE, DELETE, transaction rollback
-- [x] All column types (NULL, integer, float, text, blob)
-- [x] Index creation and index-based lookups
-- [x] Large text/blob values, unicode roundtrip
-- [x] Edge: load extension twice → idempotent (no crash)
-- [x] Edge: file on disk has compressed magic (SQLCEvfS)
-- [x] Edge: uncompressed DB not readable with turbolite VFS
-- [ ] Integration: C program loads extension → registers VFS → roundtrip
-
-### c. Python package (sqlite-vec pattern)
-- [x] Rewrite `packages/python/` to sqlite-vec pattern: pure Python package that bundles the platform .so/.dylib
-- [x] `turbolite/__init__.py`: `load(conn)` helper that finds bundled binary and calls `conn.load_extension(path)`
-- [x] `turbolite/__init__.py`: `connect(path, vfs="turbolite")` convenience wrapper
-- [x] Platform binary bundled at `turbolite/turbolite.dylib` (or `.so`)
-- [x] `pyproject.toml`: setuptools with package-data for .so/.dylib
-- [x] Test: `import turbolite; turbolite.load(conn)` → VFS available → compressed CRUD roundtrip
-- [x] Test: `turbolite.connect()` convenience → works end to end
-- [ ] Test: missing .so → clear error message
-
-### d. Node package (wrapped approach — better-sqlite3 can't select VFS via URI)
-- [ ] Keep existing napi-rs `Database` wrapper in `packages/node/`
-- [ ] Document why: better-sqlite3 compiles with `SQLITE_USE_URI=0`, no VFS selection via URI
-- [ ] If better-sqlite3 adds URI support in the future, switch to loadable extension pattern
-
-### e. Cross-compile CI
-- [ ] GitHub Actions workflow: build loadable extension for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
-- [ ] Publish platform-specific Python wheels to PyPI
-- [ ] Publish Node package to npm
+- [ ] `SELECT turbolite_register('vfs_name', '/path/to/base', 3)` SQL function for runtime VFS registration
+- [ ] Integration test: C program loads extension, registers VFS, roundtrip
+- [ ] Test: missing .so in Python package produces clear error message
 - [ ] pkg-config `.pc` file for system install discovery
 
 ---
 
-## Inchon: Rename to turbolite
-> After: Normandy · Before: Somme
-
-Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
-
-- Directory rename
-- `Cargo.toml`: package name
-- All `use sqlite_compress_encrypt_vfs::` → `use turbolite::` in bin/, tests/
-- Binary names: `sqlces` → `turbolite`
-- Soup project, Fly app name
-
----
-
 ## Somme: Built-in WAL Shipping
-> After: Inchon · Before: (future)
+> After: Gallipoli · Before: (future)
 
 Close the durability gap between checkpoints. The VFS already intercepts every WAL write via `write_all_at()` and has an S3 client + tokio runtime. Ship WAL frames to S3 in the background so writes are durable before checkpoint.
 
@@ -242,15 +212,11 @@ The local cache currently uses `pread`/`pwrite`. Memory-mapping the cache file w
 - [ ] Handle cache file growth: `mremap` on Linux, re-map on macOS
 - [ ] Benchmark: warm lookup latency with mmap vs pread (expect ~10-50us → ~1-5us)
 
-### CLI + rename
-The project is still `sqlite-compress-encrypt-vfs` / `sqlces` in code. Ship the rename alongside a usable CLI.
-
-- [ ] Rename: directory, `Cargo.toml` package name, all `use` paths, binary names
+### CLI subcommands
 - [ ] `turbolite bench` — move tiered-bench into a CLI subcommand
 - [ ] `turbolite gc --bucket X --prefix Y` — one-shot GC (currently in Thermopylae roadmap)
 - [ ] `turbolite import --bucket X --prefix Y --db local.db` — import a local SQLite DB to S3
 - [ ] `turbolite info --bucket X --prefix Y` — print manifest summary (page count, groups, size)
-- [ ] Soup project rename: `sqlces` → `turbolite`
 
 ### Bidirectional prefetch
 - Track access direction, prefetch backward for DESC queries
@@ -267,7 +233,27 @@ The project is still `sqlite-compress-encrypt-vfs` / `sqlces` in code. Ship the 
 ### Multi-writer coordination
 - [ ] Distributed locks for concurrent writers (if needed)
 
-### Write buffer groups + hot/cold page separation
-If Stalingrad's group size tuning and freelist pre-allocation aren't enough for very large write-heavy databases (100GB+), the next step is page indirection: instead of encoding dirty pages back into their original groups, put all dirty pages into dedicated write buffer groups. Original groups stay clean and don't get re-uploaded. With 64KB pages, the manifest indirection is ~200KB for a 27K-page database — trivially small.
+### Predictive cross-tree prefetch
+Depends on Phase Midway (B-tree-aware page groups). B-tree packing solves "fetch one tree fast" (~5ms). But multi-join queries touch 3-4 trees sequentially. Without prediction, each tree is fetched on-demand as SQLite traverses into it: posts index (5ms), then users data (5ms), then likes index (5ms). Serial chain = 15ms of waiting.
 
-This is essentially a tiny LSM at the page-group level. Write buffers accumulate dirty pages across checkpoints, periodic compaction merges them back into contiguous groups. Could also enable hot/cold separation: track write frequency per page, concentrate hot pages in small frequently-uploaded groups and cold pages in large rarely-touched groups.
+Predictive prefetch eliminates the serial chain. When SQLite reads the posts root page, the prediction table fires "this pattern always needs users data + likes index too" and all three trees prefetch in parallel. 15ms serial collapses to 5ms parallel. The difference between "fast" and "feels local."
+
+**Observation layer.** The VFS sees every `read_exact_at` call. Record page access bursts (clustered reads separated by idle gaps) in a ring buffer: `[(page_num, timestamp), ...]`. With the B-tree map from Midway, translate page numbers into B-tree identities (root page numbers). Each burst becomes a B-tree access sequence.
+
+**Prediction table.** Derived from the ring buffer with time-weighted aggregation. Key = first K page reads of a burst (the access fingerprint). Value = full set of B-tree groups needed. When a new burst starts and the first 2-3 page reads match a known fingerprint, speculatively prefetch all predicted groups in parallel.
+
+**Confidence scoring with decay.**
+- Time decay: older observations lose weight naturally
+- Write decay: when a page in B-tree X is dirtied, multiply X's prediction confidence by a factor (e.g., 0.7). A single delete barely hurts. Bulk deletes fade predictions to zero.
+- Reinforcement: when a prediction fires and the pages ARE subsequently requested, bump confidence. Correct predictions get stronger.
+- At checkpoint: rebuild the ring buffer baseline. Predictions that survived write decay carry forward; stale ones are dropped.
+
+**Graceful degradation.** If predictions are wrong or stale, the fallback is demand-driven prefetch from Midway (still fast, ~5ms per tree). Predictions are purely additive. The workloads where predictions matter most (repeated query patterns, read-heavy) are the workloads where they're most stable.
+
+- [ ] Ring buffer for page access bursts with timestamps
+- [ ] B-tree access sequence derivation from page reads + Midway B-tree map
+- [ ] Prediction table: access fingerprint -> predicted B-tree groups
+- [ ] Confidence scoring: time decay + write decay + reinforcement
+- [ ] Speculative parallel prefetch when fingerprint matches
+- [ ] Persistence: store prediction table in manifest sidecar, rebuilt after VACUUM/schema change
+- [ ] Benchmark: measure serial vs parallel tree fetch latency for multi-join queries

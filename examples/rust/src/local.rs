@@ -1,9 +1,10 @@
-//! turbolite basic example — Rust (native API)
+//! turbolite example — Rust local compressed (native API)
 //!
-//! A small CLI that stores and queries books in a compressed SQLite database.
+//! A small CLI that stores and queries books in a compressed SQLite database (local mode).
+//! See tiered.rs for S3 tiered storage.
 //!
 //! Run:
-//!   cd examples/rust && cargo run
+//!   cd examples/rust && cargo run --bin local
 
 use rusqlite::{params, Connection, OpenFlags};
 use turbolite::{register, CompressedVfs};

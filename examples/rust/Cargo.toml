@@ -3,7 +3,15 @@ name = "turbolite-example"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "local"
+path = "src/local.rs"
+
+[[bin]]
+name = "tiered"
+path = "src/tiered.rs"
+
 [dependencies]
-turbolite = { path = "../..", features = ["zstd", "bundled-sqlite"] }
+turbolite = { path = "../..", features = ["zstd", "tiered", "bundled-sqlite"] }
 rusqlite = "0.35"
 tempfile = "3"

@@ -2,6 +2,62 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Inchon: Rename to turbolite
+
+Full project rename from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
+
+- Cargo.toml package name, all `use` paths, binary names (`sqlces` -> `turbolite`)
+- Git remote URL updated to `russellromney/turbolite`
+- Makefile, linker flags, .gitignore all updated
+- Published to crates.io as `turbolite` 0.2.19
+
+---
+
+## Normandy: SQLite Loadable Extension + Language Packages
+
+Ship turbolite as a SQLite loadable extension and language packages for Python, Node, C, Go, and Rust. Published to PyPI, npm, and crates.io at version 0.2.19.
+
+### Loadable extension
+- C shim (`src/ext_entry.c`): `sqlite3_turbolite_init` entry point using `sqlite3ext.h` macros, routes `sqlite3_vfs_register` through the extension API table
+- Dual VFS registration: "turbolite" (local compressed, always) and "turbolite-s3" (tiered, when TURBOLITE_BUCKET is set)
+- Fail-fast: if TURBOLITE_BUCKET is set but tiered VFS fails to initialize, returns error (no silent fallback)
+- `turbolite_version()` SQL function
+- Vendored `sqlite3.h`/`sqlite3ext.h` in `vendor/sqlite3/`
+- `make ext` builds the .so/.dylib
+
+### Python package (PyPI)
+- sqlite-vec pattern: pure Python wrapper bundling platform-specific .so/.dylib
+- `turbolite.load(conn)`: finds bundled binary, calls `conn.load_extension()`
+- `turbolite.connect(path, mode="local"|"s3", bucket=..., ...)`: explicit mode selection, fail-fast if mode="s3" without bucket
+- Platform-specific wheels via `setup.py` PlatformWheel override
+- Published to PyPI as `turbolite` 0.2.19
+
+### Node package (npm)
+- napi-rs `Database` wrapper (better-sqlite3 compiles with `SQLITE_USE_URI=0`, can't select VFS via URI)
+- `exec`, `query`, `prepare` API
+- Published to npm as `turbolite` 0.2.19
+
+### Cross-compile CI
+- `.github/workflows/release.yml`: builds Python wheels and Node addons for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
+- PyPI: trusted publisher (OIDC, no token)
+- npm: provenance publishing (requires NPM_TOKEN secret)
+- `.github/workflows/ci.yml`: cargo test, build ext, build node on push/PR
+
+### Examples
+- All 5 languages (Python, Node, Rust, C, Go) with both local and tiered examples
+- Python/Node use package APIs; C/Go use FFI; Rust uses native API
+- Makefile targets: `make example-<lang>` (local) and `make example-<lang>-tiered` (S3)
+
+### Tests
+- Extension loads successfully, VFS registered, idempotent reload
+- `turbolite_version()` returns correct version
+- Python `sqlite3.load_extension()` full CRUD roundtrip via URI `?vfs=turbolite`
+- Data persists across close/reopen, multiple tables, UPDATE, DELETE, rollback
+- All column types, index creation, large text/blob, unicode roundtrip
+- Compressed magic on disk, uncompressed DB rejected
+
+---
+
 ## Ypres: Encryption Key Rotation + Add/Remove Encryption
 
 Rotate, add, or remove encryption on all S3 data without decompressing/recompressing.
@@ -109,7 +165,7 @@ Fundamental reframe: optimize for S3 request count, not data size.
 
 ---
 
-## Normandy (partial): C FFI + Build Infrastructure
+## Normandy (early): C FFI + Build Infrastructure
 
 ### C FFI layer
 - `src/ffi.rs` — `extern "C"` functions for VFS registration + error handling

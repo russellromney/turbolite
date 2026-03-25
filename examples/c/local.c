@@ -1,7 +1,8 @@
 /*
- * turbolite example — C
+ * turbolite example — C local compressed
  *
- * A sensor data logger that writes readings to compressed SQLite.
+ * A sensor data logger that writes readings to compressed SQLite (local mode).
+ * See tiered.c for S3 tiered storage.
  *
  * Build & run:
  *   make lib-bundled header

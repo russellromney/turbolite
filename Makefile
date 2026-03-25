@@ -138,30 +138,56 @@ test-ffi-node: lib-bundled ## FFI test: Node.js (koffi)
 # ── Examples ──────────────────────────────────────────────────────
 
 .PHONY: example-rust
-example-rust: ## Run Rust example (native API, no shared lib needed)
-	cd examples/rust && cargo run
+example-rust: ## Run Rust local example (native API, no shared lib needed)
+	cd examples/rust && cargo run --bin local
+
+.PHONY: example-rust-tiered
+example-rust-tiered: ## Run Rust S3 tiered example
+	cd examples/rust && cargo run --bin tiered
 
 .PHONY: example-python
-example-python: lib-bundled ## Run Python example (FastAPI server)
-	uv run examples/python/basic.py
+example-python: lib-bundled ## Run Python local example (FastAPI server)
+	uv run examples/python/local.py
+
+.PHONY: example-python-tiered
+example-python-tiered: lib-bundled ## Run Python S3 tiered example
+	uv run examples/python/tiered.py
 
 .PHONY: example-c
-example-c: lib-bundled header ## Build and run C example (sensor logger)
-	cc -o $(TARGET_DIR)/example_c examples/c/basic.c \
+example-c: lib-bundled header ## Build and run C local example (sensor logger)
+	cc -o $(TARGET_DIR)/example_c examples/c/local.c \
 		-L$(TARGET_DIR) -lturbolite \
 		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
 	$(TARGET_DIR)/example_c
 
+.PHONY: example-c-tiered
+example-c-tiered: lib-bundled header ## Build and run C S3 tiered example
+	cc -o $(TARGET_DIR)/example_c_tiered examples/c/tiered.c \
+		-L$(TARGET_DIR) -lturbolite \
+		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
+	$(TARGET_DIR)/example_c_tiered
+
 .PHONY: example-go
-example-go: lib-bundled ## Run Go example (HTTP server)
+example-go: lib-bundled ## Run Go local example (HTTP server)
 	cd examples/go && \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
 		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
-		go run .
+		go run local.go
+
+.PHONY: example-go-tiered
+example-go-tiered: lib-bundled ## Run Go S3 tiered example (HTTP server)
+	cd examples/go && \
+		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
+		go run tiered.go
 
 .PHONY: example-node
-example-node: lib-bundled ## Run Node.js example (HTTP server)
-	cd examples/node && npm install --silent 2>/dev/null && node basic.mjs
+example-node: lib-bundled ## Run Node.js local example (HTTP server)
+	cd examples/node && npm install --silent 2>/dev/null && node local.mjs
+
+.PHONY: example-node-tiered
+example-node-tiered: lib-bundled ## Run Node.js S3 tiered example (HTTP server)
+	cd examples/node && npm install --silent 2>/dev/null && node tiered.mjs
 
 # ── Packages ─────────────────────────────────────────────────────
 

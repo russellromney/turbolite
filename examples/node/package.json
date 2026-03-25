@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "koffi": "^2"
+    "turbolite": "^0.2"
   }
 }

@@ -1,6 +1,9 @@
-// turbolite example — Go (net/http + cgo)
+//go:build ignore
+
+// turbolite example — Go local compressed (net/http + cgo)
 //
-// A small HTTP API server backed by turbolite-compressed SQLite.
+// A small HTTP API server backed by turbolite-compressed SQLite (local mode).
+// See tiered.go for S3 tiered storage.
 //
 // Run:
 //   make lib-bundled

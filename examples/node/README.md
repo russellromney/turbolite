@@ -1,12 +1,26 @@
-# turbolite — Node.js example
+# turbolite — Node.js examples
 
-An HTTP API server backed by turbolite-compressed SQLite. Uses stdlib `http` + [koffi](https://koffi.dev) for FFI.
+HTTP API servers backed by turbolite-compressed SQLite.
 
-## Run
+## Local compressed (`local.mjs`)
 
 ```bash
-make lib-bundled
-make example-node
+npm install turbolite
+node examples/node/local.mjs
+```
+
+## S3 tiered (`tiered.mjs`)
+
+```bash
+npm install turbolite
+TURBOLITE_BUCKET=my-bucket node examples/node/tiered.mjs
+```
+
+Or via Make:
+
+```bash
+make example-node          # local
+make example-node-tiered   # S3 tiered
 ```
 
 ## Try it
@@ -18,7 +32,6 @@ curl localhost:3000/books
 
 ## How it works
 
-1. `koffi.load(libPath)` — load the turbolite `.dylib` / `.so`
-2. `turbolite_register_compressed` — register a zstd-compressed VFS
-3. `turbolite_open` — open a database through the VFS
-4. HTTP handlers call `turbolite_exec` (writes) and `turbolite_query_json` (reads)
+1. `new Database(path)` - open a compressed database (local mode)
+2. `new Database(path, { mode: "s3", bucket: "..." })` - open an S3 tiered database
+3. Standard better-sqlite3-compatible API from there - `exec`, `query`, `prepare`

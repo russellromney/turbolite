@@ -1,18 +1,26 @@
-# turbolite — Python example
+# turbolite — Python examples
 
-A FastAPI server backed by turbolite-compressed SQLite. Uses `uv` for dependency management.
+FastAPI servers backed by turbolite-compressed SQLite.
 
-## Run
+## Local compressed (`local.py`)
 
 ```bash
-make lib-bundled
-uv run examples/python/basic.py
+pip install turbolite fastapi[standard]
+python examples/python/local.py
+```
+
+## S3 tiered (`tiered.py`)
+
+```bash
+pip install turbolite fastapi[standard]
+TURBOLITE_BUCKET=my-bucket python examples/python/tiered.py
 ```
 
 Or via Make:
 
 ```bash
-make example-python
+make example-python          # local
+make example-python-tiered   # S3 tiered
 ```
 
 ## Try it
@@ -27,7 +35,6 @@ curl localhost:8000/books
 
 ## How it works
 
-1. Load `libturbolite.dylib` / `.so` via `ctypes.CDLL`
-2. `turbolite_register_compressed` — register a zstd-compressed VFS
-3. `turbolite_open` — open a database through the VFS
-4. FastAPI routes call `turbolite_exec` (writes) and `turbolite_query_json` (reads)
+1. `turbolite.connect(path)` - open a compressed database (local mode)
+2. `turbolite.connect(path, mode="s3", bucket="...")` - open an S3 tiered database
+3. Standard `sqlite3` API from there - `execute`, `fetchall`, `commit`
