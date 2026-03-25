@@ -1,7 +1,34 @@
 # turbolite Roadmap
 
+## Kursk: Write & Checkpoint Benchmarks (done)
+> After: Ypres · Before: Tannenberg
+
+Standalone `benchmark/write-bench.rs` binary with 7 scenarios, all passing against Tigris.
+Default page_size=4096, ppg=8 to force multi-group behavior at modest row counts.
+
+### Bug found and fixed: sync page-group skip corruption
+Sync skipped uploading page groups where all dirty pages were interior/index (0x05/0x02/0x0A),
+assuming bundles would serve them. But cold readers could read those pages before background
+bundle loading completed, getting zeros. Fixed by removing the skip optimization: every dirty
+page group is now uploaded regardless of page type. Regression test: `test_small_ppg_index_integrity`.
+
+### Bug found and fixed: S3 PUT counters missing
+S3Client only had GET counters (`fetch_count`/`fetch_bytes`). Added `put_count`/`put_bytes`
+and `TieredBenchHandle::s3_put_counters()` for write benchmarking.
+
+### Scenarios implemented
+- `sustained`: INSERT with auto-checkpoints (low threshold=20 pages), tracks S3 PUTs inline
+- `checkpoint-latency`: Seed DB, dirty N pages, checkpoint, measure. Varies 1-500 dirty pages
+- `incremental`: Write-checkpoint cycles with cold reader verification each cycle
+- `update`: UPDATE 10% of existing rows (scattered), cold verify
+- `delete`: DELETE 50% of rows, cold verify
+- `realistic`: Randomized bursty mix (30% INSERT, 25% UPDATE, 10% DELETE, 15% UPSERT, 20% SELECT)
+- `cold-write`: First write on cold DB (102ms, 2 S3 GETs) vs warm (6ms, 0 GETs)
+
+---
+
 ## Tannenberg: File Size Cleanup
-> After: Ypres · Before: Marne
+> After: Kursk · Before: Marne
 
 `tiered.rs` is 8,758 lines and `lib.rs` is 2,595 lines. Both far exceed the 1,000-line limit. Split by domain into focused modules. Pure refactor, no behavior changes.
 
@@ -252,6 +279,23 @@ INDEX level (most revealing: index cached, only data from S3):
 - [ ] Or: cap background download concurrency to 1-2 concurrent groups (prevent bandwidth saturation)
 - [ ] Validate on S3 Express (10Gbps) where bandwidth contention may not exist
 
+#### f3. GroupingStrategy (Positional vs BTreeAware)
+
+Enable both page grouping strategies in the same codebase for A/B benchmarking. The Manifest becomes the strategy: dispatch methods compute positions arithmetically (Positional) or via explicit lookup (BTreeAware).
+
+- [ ] `GroupingStrategy` enum in config.rs: `Positional`, `BTreeAware`
+- [ ] `PrefetchNeighbors` enum: `RadialFanout` (positional) vs `BTreeSiblings` (btree)
+- [ ] `grouping_strategy` field on `TieredConfig` (default: BTreeAware)
+- [ ] Manifest dispatch: `page_location()`, `group_page_nums()`, `prefetch_neighbors()` branch on `strategy`
+- [ ] Positional: empty `group_pages` in manifest, computed on the fly
+- [ ] handle.rs: replace all `manifest.group_pages.get()` with `manifest.group_page_nums()`
+- [ ] handle.rs: `trigger_prefetch()` radial fan-out for Positional, sibling groups for BTreeAware
+- [ ] handle.rs: `assign_new_pages_to_groups()` no-op for Positional
+- [ ] import.rs: Positional path (sequential chunking, no btree walk)
+- [ ] disk_cache.rs: `evict_group()` and `new()` handle empty `group_pages`
+- [ ] vfs.rs: `detect_and_normalize_strategy()` on manifest load
+- [ ] Benchmark: `--grouping positional` and `--grouping btree` flags in tiered-bench
+
 #### g. Compaction
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
 - [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
@@ -345,80 +389,366 @@ Each `TieredHandle` is per-connection, so concurrent readers track patterns inde
 
 **Graceful degradation.** Wrong or stale predictions fall back to demand-driven prefetch from Midway (still fast, ~5ms per tree). Predictions are purely additive: they submit extra prefetch jobs but never block the read path. The workloads where predictions matter most (repeated transaction patterns, read-heavy CRUD) are the workloads where they're most stable.
 
-### a. Lock session tracking infrastructure
+### a. Lock session tracking infrastructure ✅
 
-Add per-connection state to track B-tree touches within a lock session.
+Per-connection state to track B-tree touches within a lock session.
 
-- [ ] Add to `TieredHandle`: `session_btrees: HashSet<u64>` (B-tree roots touched in current lock session)
-- [ ] Add to `TieredHandle`: `session_active: bool` (true between lock acquire and release)
-- [ ] In `read_exact_at`: after resolving `page_num` to B-tree root via manifest, insert into `session_btrees`
-- [ ] Need reverse index: `page_num -> btree_root`. Build from `manifest.btrees` (root -> pages) into `HashMap<u64, u64>` (page -> root). Build alongside `page_index` in `build_page_index()`
-- [ ] In `lock()`: when transitioning from NONE to SHARED/RESERVED, set `session_active = true`, clear `session_btrees`
-- [ ] In `unlock()` / lock downgrade to NONE: set `session_active = false`, flush session pattern
+- [x] `prediction.rs`: `LockSession` (btrees HashSet, active, prediction_fired, fired_pattern)
+- [x] `prediction.rs`: `PredictionTable` with pair index, confidence math, persist/restore
+- [x] `prediction.rs`: `AccessHistory` with frequency tracking, decay, top-N
+- [x] `manifest.rs`: `page_to_btree: HashMap<u64, u64>` reverse index (built in `build_page_index()`)
+- [x] `manifest.rs`: `btree_access_freq` and `prediction_patterns` fields (serde, manifest-persisted)
+- [x] `handle.rs`: `lock_session`, `prediction`, `dirty_btrees` fields on `TieredHandle`
+- [x] `handle.rs`: `read_exact_at` hook for B-tree touch tracking via `page_to_btree`
+- [x] `handle.rs`: `write_all_at` hook for dirty B-tree tracking
+- [x] `handle.rs`: `lock()` hook: NONE->SHARED starts session, *->NONE flushes session
+- [x] `handle.rs`: `flush_lock_session()` with write decay + reinforcement via `fired_pattern`
+- [x] `config.rs`: `prediction_enabled: bool` (default false)
+- [x] `vfs.rs`: `SharedPrediction` on `TieredVfs`, initialized from manifest, passed to handles
+- [x] `build_page_index()` auto-detects BTreeAware when group_pages is populated (fixed 13 pre-existing test failures)
+- [x] 16 unit tests (LockSession lifecycle, PredictionTable math, AccessHistory decay, pair index, persist roundtrip)
 
-### b. Access history (eager prefetch on open)
+### b. Access history (frequency tracking) ✅
 
-Track B-tree usage frequency across sessions. Prefetch hot trees on connection open.
+Wire AccessHistory into flush + checkpoint path. Manifest fields already exist from (a).
 
-- [ ] Add to `Manifest`: `btree_access_freq: HashMap<u64, f32>` (root page -> frequency score)
-- [ ] On lock session flush: for each root in `session_btrees`, increment `btree_access_freq[root] += 1.0`
-- [ ] On checkpoint (`sync()`): apply decay `*= 0.9` to all entries, prune entries below 0.1, serialize into manifest
-- [ ] In `new_tiered()`: after manifest download, sort B-trees by frequency, prefetch top N groups eagerly via prefetch pool
-- [ ] Config: `eager_btree_count: u32` (default 5) controls how many hot B-trees to prefetch on open
-- [ ] Test: open DB, run queries touching 3 B-trees, checkpoint, reopen, verify those 3 B-trees' groups are prefetched before any query
-- [ ] Test: B-tree that stops being accessed decays below threshold after ~20 sessions
+- [x] `SharedAccessHistory` type alias (`Arc<RwLock<AccessHistory>>`) on `TieredVfs`, initialized from `manifest.btree_access_freq`
+- [x] Passed to `TieredHandle` via `new_tiered()` parameter
+- [x] In `flush_lock_session`: call `access_history.record(&session.btrees)` for every non-empty session
+- [x] In `sync()` (checkpoint): call `access_history.decay_and_prune()`, serialize into manifest `btree_access_freq`
+- [x] 4 new unit tests: concurrent shared history, init from manifest freq, decay preserves hot trees, prune on checkpoint
 
-### c. Prediction table
+### c. Prediction persistence in checkpoint ✅
 
-Learn which B-trees appear together in transactions. Fire parallel prefetch on partial match.
+Wire prediction table serialization into the checkpoint path.
 
-- [ ] `PredictionEntry { predicted_roots: BTreeSet<u64>, confidence: f32, hit_count: u32 }`
-- [ ] `PredictionTable { patterns: HashMap<BTreeSet<u64>, PredictionEntry> }` shared via `Arc<RwLock<>>`
-- [ ] On lock session flush: if `session_btrees.len() >= 2`, upsert pattern. New pattern gets confidence 0.3. Existing pattern: apply time decay (*0.95) then reinforcement (+0.25 if prediction fired and was correct)
-- [ ] Store prediction table in `TieredVfs` (shared across all connections for this VFS instance)
-- [ ] Manifest field: `prediction_patterns: Vec<(BTreeSet<u64>, f32)>` for persistence across restarts
-- [ ] On checkpoint: serialize prediction table to manifest. Prune patterns below confidence 0.1
-- [ ] On VFS open: deserialize prediction table from manifest into shared `Arc<RwLock<>>`
+- [x] `PredictionTable` struct with observe/predict/reinforce/write_decay/prune (done in a)
+- [x] `PredictionTable::to_persisted()` / `from_persisted()` (done in a)
+- [x] In `sync()` (checkpoint): serialize prediction table to manifest (`prediction_patterns`), call `prune()`
 
-### d. Prediction firing
+### d. Prediction firing ✅
 
 Trigger parallel prefetch when a partial match is detected during a lock session.
 
-- [ ] Add to `TieredHandle`: `prediction_fired: bool` (prevent re-firing within same session)
-- [ ] In `read_exact_at`, after adding a new B-tree root to `session_btrees`: if `session_btrees.len() >= 2` and `!prediction_fired`, scan prediction table for any pattern where `session_btrees` is a subset and confidence >= 0.5
-- [ ] On match: submit all groups for predicted roots NOT already in `session_btrees` to prefetch pool
-- [ ] Set `prediction_fired = true` for this session
-- [ ] Prediction scan optimization: index patterns by pairs. `HashMap<(u64, u64), Vec<usize>>` mapping each pair of roots to pattern indices. On 2nd B-tree touch, look up the pair directly instead of scanning all patterns
+- [x] `prediction_fired` and `fired_pattern` fields on `LockSession` (done in a)
+- [x] Pair index on `PredictionTable` for O(1) pattern lookup (done in a)
+- [x] In `read_exact_at`, after B-tree touch: if `tree_count() >= 2` and `!prediction_fired`, call `table.predict(&session.btrees)`
+- [x] On match: look up predicted roots' group IDs from manifest `btrees`, submit to prefetch pool
+- [x] Set `prediction_fired = true`, store matched pattern key in `fired_pattern`
+- [x] 4 new unit tests: end-to-end prediction firing, reinforcement on correct fire, no reinforcement on partial touch, concurrent read/write safety
 
-### e. Write decay
+### e. Write decay ✅ (done in a)
 
-Dirty pages reduce confidence for predictions involving that B-tree.
+- [x] `write_all_at` resolves dirty page to B-tree root via `page_to_btree`
+- [x] `dirty_btrees` HashSet tracks per-session (not per-page)
+- [x] `flush_lock_session` applies `write_decay()` once per dirty root
+- [ ] Test: write-heavy workload fades predictions below threshold; read-only workload keeps them stable (see g2)
 
-- [ ] In `write_all_at`: resolve dirty page to B-tree root (same reverse index as read path)
-- [ ] For each prediction containing that root: `confidence *= 0.7`
-- [ ] Bulk writes (100 dirty pages in same B-tree) apply decay once per B-tree per lock session, not per page
-- [ ] Test: write-heavy workload fades predictions below threshold; read-only workload keeps them stable
+### f. Reinforcement ✅ (done in a)
 
-### f. Reinforcement
+- [x] `flush_lock_session`: if `fired_pattern` is set and all predicted roots were touched, call `reinforce()`
+- [x] `reinforce()`: confidence += 0.25, capped at 1.0, increments hit_count
+- [ ] Test: reinforcement increases confidence across sessions; no-reinforcement decays (see g2)
 
-Correct predictions get stronger. Wrong predictions decay naturally.
+### g. Unit tests ✅ (25 tests)
 
-- [ ] On lock session flush: if `prediction_fired`, check whether predicted roots were actually touched in `session_btrees`
-- [ ] If all predicted roots were touched: `confidence += 0.25` (capped at 1.0)
-- [ ] If some predicted roots were NOT touched: no reinforcement (time decay handles the fade)
-- [ ] Track `hit_count` for observability
+- [x] Unit: lock session tracking accumulates correct B-tree roots
+- [x] Unit: prediction table upsert/decay/reinforcement math
+- [x] Unit: pair index correctly maps to patterns
+- [x] Unit: predict() returns None when all roots already seen
+- [x] Unit: fired_pattern cleared on session start
+- [x] Unit: page_to_btree reverse index correctness
+- [x] Unit: shared access history concurrent record
+- [x] Unit: access history from manifest freq
+- [x] Unit: prediction table prune on checkpoint
+- [x] Unit: access history decay preserves hot B-trees
+- [x] Unit: prediction firing end-to-end
+- [x] Unit: reinforcement on correct fire
+- [x] Unit: no reinforcement on partial touch
+- [x] Unit: shared prediction concurrent access
+- [x] Unit: 2-root pattern does not decay below threshold (observation boost regression)
 
-### g. Tests
+### g2. Comprehensive integration + edge case tests
 
-- [ ] Unit: lock session tracking accumulates correct B-tree roots
-- [ ] Unit: prediction table upsert/decay/reinforcement math
-- [ ] Unit: pair index correctly maps to patterns
-- [ ] Integration: 3-table join pattern learned after 2 observations, fires on 3rd
-- [ ] Integration: pattern decays below threshold after ~10 sessions without reinforcement
-- [ ] Integration: write decay drops prediction after bulk writes
-- [ ] Integration: access history prefetches hot B-trees on reopen
-- [ ] Integration: concurrent readers learn independent patterns without interference
+S3 integration tests (require TIERED_TEST_BUCKET):
+
+**Checkpoint roundtrip:**
+- [ ] Prediction patterns survive checkpoint -> S3 manifest -> reopen with prediction_enabled=true
+- [ ] Access history frequencies survive checkpoint -> reopen, top_roots returns correct order
+- [ ] Checkpoint with no patterns produces empty prediction_patterns in manifest (no bloat)
+- [ ] Checkpoint with prediction_enabled=false preserves existing patterns/history from manifest (passthrough)
+
+**Real query prediction firing:**
+- [ ] 3-table join (CREATE TABLE a,b,c with indexes; JOIN all three): pattern learned after 2 lock sessions, fires on 3rd
+- [ ] Prediction submits correct group IDs to prefetch pool (verify via S3 fetch counters)
+- [ ] Reinforcement fires when predicted groups are subsequently read in same session
+
+**Decay + write behavior:**
+- [ ] Pattern decays below threshold after ~10 sessions without reinforcement (time decay only)
+- [ ] Write decay: bulk INSERT into a predicted B-tree drops confidence below threshold within 3 dirty sessions
+- [ ] Read-only workload: patterns stabilize around 0.85-0.95 confidence after 10+ sessions
+- [ ] Mixed workload: read patterns survive while write-heavy patterns fade
+
+**Strategy edge cases:**
+- [ ] Positional strategy: prediction fields exist in manifest but page_to_btree is empty, no panics
+- [ ] Positional strategy: prediction_enabled=true is harmless (no B-tree roots detected, no patterns)
+- [ ] BTreeAware with single-table DB: no predictions fire (only 1 B-tree root), no overhead
+
+**Negative tests:**
+- [ ] Single-tree query never fires predictions (tree_count < 2 guard)
+- [ ] Prediction with unknown B-tree root (not in manifest.btrees) is silently skipped
+- [ ] max_patterns cap enforced: insert MAX+1 unique patterns, oldest/lowest confidence pruned
+
+**Manifest bloat prevention:**
+- [ ] 100 unique patterns: manifest size stays under 10KB for prediction fields
+- [ ] 1000 unique patterns: prune() reduces to max_patterns, manifest size bounded
+- [ ] Patterns with confidence < PRUNE_THRESHOLD removed on checkpoint
+
+**VACUUM / schema change:**
+- [ ] After VACUUM (all root page IDs change): old patterns reference stale IDs, no crash, predictions become no-ops
+- [ ] After DROP TABLE + CREATE TABLE: prediction table handles missing B-tree roots gracefully
+- [ ] After ADD INDEX: new B-tree root appears, prediction table learns it in subsequent sessions
+
+**Concurrency:**
+- [ ] 4 concurrent readers learning independent patterns: no deadlocks, all patterns recorded
+- [ ] 2 readers + 1 writer: write decay applies only to writer's patterns, readers unaffected
+
+### h. Prediction benchmark
+
+Measure impact of predictive prefetch on multi-join query latency. Add `--predicted` mode to tiered-bench.
+
+Three-phase benchmark:
+1. **Learn**: run full query suite 5-10x with `prediction_enabled=true`. Patterns accumulate. Checkpoint persists patterns + access history to manifest.
+2. **Baseline**: `prediction_enabled=false`, clear cache to interior level, run query suite, record per-query latency + S3 fetches.
+3. **Predicted**: reopen VFS with `prediction_enabled=true` (loads patterns from manifest). Clear cache to interior level. Run query suite, record latency + S3 fetches. Prediction firing triggers parallel cross-tree prefetch during queries on cache miss.
+
+Compare Baseline vs Predicted.
+
+**Expected impact by query type:**
+
+| Query | Trees | Expected improvement |
+|-------|-------|---------------------|
+| Point lookup | 1 | None (single tree) |
+| Profile (5 joins) | 3-4 | Big (15ms serial -> 5ms parallel) |
+| Who-liked | 2 | Moderate (10ms -> 5ms) |
+| Mutual friends | 2-3 | Moderate |
+| Indexed filter | 1-2 | Small |
+| Full scan | all | None (not a join pattern) |
+
+**Metrics to capture:**
+- Per-query latency (median, p95) with and without prediction
+- S3 fetches per query (count + bytes)
+- Prediction stats: patterns learned, fire rate, hit rate
+**Isolating the effect:**
+- Start with warm interior+index, measure multi-join queries (effect of parallel cross-tree prefetch on cache miss)
+
+Implementation:
+- [ ] Add `--predicted` flag to tiered-bench
+- [ ] Learning phase: run query suite N times, checkpoint
+- [ ] Measurement phase: A/B test with prediction on/off at each cache level
+- [ ] Report prediction stats (patterns, fire rate, hit rate) alongside latency
+- [ ] Compare "interior" cache level with and without prediction (the production-relevant comparison)
 - [ ] Benchmark: measure serial vs parallel tree fetch latency for multi-join queries (standard S3 + Express)
+
+### i. Name-based prediction keys + trie storage
+
+Refactor prediction keys from `u64` root page IDs to `String` table/index names. Switch internal storage from flat `HashMap<BTreeSet<u64>, PredictionEntry>` to a sorted trie. Solves VACUUM resilience (names survive page renumbering) and reduces manifest size (shared prefixes stored once).
+
+#### i1. Name resolution infrastructure ✅
+
+Add name-based lookup paths so the read hot path can translate page -> tree name -> prediction.
+
+- [x] `manifest.rs`: add `page_to_tree_name: HashMap<u64, String>` (skip serde, rebuilt in `build_page_index()`)
+  - Built from `btrees` map: for each `(root, BTreeManifestEntry { name, .. })`, iterate `group_pages[gid]` for each gid in entry, map every page_num -> name
+  - Replaces `page_to_btree: HashMap<u64, u64>` (root ID) with a name string
+- [x] `manifest.rs`: add `tree_name_to_groups: HashMap<String, Vec<u64>>` (skip serde, rebuilt in `build_page_index()`)
+  - Built from `btrees` map: for each entry, map name -> group_ids
+  - Used at prediction fire time to resolve predicted tree names back to group IDs for prefetch submission
+- [x] Update `build_page_index()` to populate both new maps
+- [x] Removed `page_to_btree` (replaced by `page_to_tree_name`, no backward compat needed)
+
+#### i2. Prediction table: BTreeSet<String> keys ✅
+
+Replace `u64` root IDs with `String` names throughout the prediction system.
+
+- [x] `prediction.rs`: `LockSession.btrees` changes from `HashSet<u64>` to `HashSet<String>`
+- [x] `prediction.rs`: `LockSession.touch()` takes `&str` instead of `u64`
+- [x] `prediction.rs`: `LockSession.fired_pattern` changes from `BTreeSet<u64>` to `BTreeSet<String>`
+- [x] `prediction.rs`: `PredictionEntry.roots` renamed to `PredictionEntry.names`, type `BTreeSet<String>`
+- [x] `prediction.rs`: `PredictionTable.patterns` key type changes to `BTreeSet<String>`
+- [x] `prediction.rs`: `PredictionTable.pair_index` key type changes to `(String, String)` (sorted pair)
+- [x] `prediction.rs`: `observe()`, `predict()`, `reinforce()`, `write_decay()` all take `&str` / `&HashSet<String>`
+- [x] `prediction.rs`: `AccessHistory.freq` changes from `HashMap<u64, f32>` to `HashMap<String, f32>`
+- [x] `prediction.rs`: `AccessHistory.record()` takes `&HashSet<String>`
+- [x] `prediction.rs`: `AccessHistory.top_roots()` renamed to `top_trees()`, returns `Vec<String>`
+- [x] `manifest.rs`: `btree_access_freq` changes from `HashMap<u64, f32>` to `HashMap<String, f32>`
+- [x] `manifest.rs`: `prediction_patterns` changes from `Vec<(BTreeSet<u64>, f32)>` to `Vec<(BTreeSet<String>, f32)>`
+- [x] `handle.rs`: `read_exact_at` B-tree touch: `page_to_tree_name.get(&page_num)` -> `session.touch(name)`
+- [x] `handle.rs`: `write_all_at` dirty tracking: `dirty_btrees` changes to `HashSet<String>`
+- [x] `handle.rs`: prediction firing: `predict()` returns `Vec<String>`, resolve via `tree_name_to_groups`
+- [x] `handle.rs`: `flush_lock_session()`: write_decay and reinforce use `&str` names
+- [x] `handle.rs`: removed eager prefetch on open (prediction only fires on real cache misses)
+- [x] `vfs.rs`: initialization from manifest uses new String-based types (no code change needed)
+- [x] `import.rs`: manifest construction updated for new field names
+- [x] `mod.rs`: test `test_manifest_serde_roundtrip_btree_groups` updated for `page_to_tree_name` and `tree_name_to_groups`
+- [x] Updated all 25 existing unit tests to use String names (28 total with 3 new)
+- [x] New test: `name_based_pattern_survives_conceptual_vacuum`
+- [x] New test: `rename_table_old_patterns_become_dead`
+- [x] New test: `drop_create_same_name_carries_over`
+- [x] 235 lib tests pass, 28 prediction tests pass
+
+#### i3. Trie storage
+
+Replace `HashMap<BTreeSet<String>, PredictionEntry>` with a sorted trie. Nodes keyed by tree name (alphabetically sorted within each pattern). Each node carries confidence + count. Pair index derived from trie structure.
+
+**Trie structure:**
+
+```rust
+struct PredictionTrie {
+    root: TrieNode,
+}
+
+struct TrieNode {
+    children: HashMap<String, TrieNode>,
+    /// Non-None if this node represents a complete observed pattern.
+    /// e.g. node at path ["idx_posts_user", "posts"] has entry if
+    /// {idx_posts_user, posts} was observed as a pattern.
+    entry: Option<TrieEntry>,
+}
+
+struct TrieEntry {
+    confidence: f32,
+    hit_count: u32,
+    miss_count: u32,
+}
+```
+
+- [ ] `prediction.rs`: `PredictionTrie` struct with insert, lookup, prune, serialize/deserialize
+- [ ] Trie insert: sort pattern names alphabetically, walk/create nodes, set entry at leaf
+- [ ] Trie lookup (K=2 trigger): given 2 names (sorted), traverse `root -> name_a -> name_b`. If that node has children with entry.confidence > threshold, collect those children's names as predictions. Also check if the node itself has an entry (2-element pattern).
+- [ ] Trie observe: walk to the node for the full pattern, update confidence with time decay + observation boost
+- [ ] Trie reinforce: walk to the node for fired_pattern, apply reinforcement boost
+- [ ] Trie prune: DFS, remove nodes where entry.confidence < PRUNE_THRESHOLD and no children. Enforce max_patterns by collecting all entries, sorting by confidence, removing lowest.
+- [ ] Pair index elimination: the trie IS the index. Given sorted pair (A, B), traverse `root -> A -> B` in O(2) hash lookups. No separate HashMap needed.
+- [ ] Serialization: `to_persisted()` returns `Vec<(Vec<String>, f32, u32)>` (path, confidence, hit_count). `from_persisted()` rebuilds trie.
+- [ ] Manifest field: `prediction_patterns` changes from `Vec<(BTreeSet<String>, f32)>` to `Vec<(Vec<String>, f32, u32)>`
+  - Vec<String> instead of BTreeSet because trie paths are already sorted, no need for BTreeSet overhead in serde
+- [ ] Replace `PredictionTable` with `PredictionTrie` throughout handle.rs and vfs.rs
+- [ ] Test: trie produces identical predictions as flat HashMap for same input patterns
+- [ ] Test: trie with shared prefixes uses less memory than flat HashMap (100 patterns with common 2-element prefixes)
+- [ ] Test: prune removes empty branches, max_patterns enforced
+- [ ] Test: serialize/deserialize roundtrip preserves all entries and structure
+- [ ] Test: K=2 lookup traverses trie in O(2), returns correct predictions
+
+#### i4. Cleanup
+
+- [ ] Remove `page_to_btree: HashMap<u64, u64>` from manifest (replaced by `page_to_tree_name`)
+- [ ] Remove `PredictionTable` (replaced by `PredictionTrie`)
+- [ ] Remove `pair_index` (trie is the index)
+- [ ] Update all doc comments referencing root page IDs to reference tree names
+- [ ] Verify all 25+ unit tests pass with trie backend
+- [ ] Run S3 integration tests: checkpoint roundtrip with trie-serialized patterns
+
+### j. Frame-level correlation (precision prefetch)
+
+Extends tree-level prediction (subphase i) with frame-level granularity. Instead of "fetch all of tree B", predict "fetch frame 7 of tree B's group 3". Reduces prefetch bandwidth by 10-1000x for large tables.
+
+**Motivation.** With B-tree-aware groups, frames (sub-chunks within a group) cluster pages from the same tree. A point query on a large table needs 1-2 frames, not all 50 groups. If we learn that frame X of index A correlates with frame Y of data table B, we can issue a single S3 range GET for ~256KB instead of downloading all of tree B.
+
+**Key insight.** Index leaf -> data leaf correlations are structurally stable. An index sorted by user_id consistently points to the same data pages for a given user_id range. The correlation only changes on compaction/VACUUM (rare), and time decay handles drift.
+
+#### j1. Frame-level access tracking
+
+Extend lock session to record which frames (not just trees) are accessed.
+
+- [ ] Derive frame index from page position: `frame_idx = index_in_group / sub_pages_per_frame`
+- [ ] `LockSession`: add `frame_touches: Vec<(String, u64, u32)>` (tree_name, group_id, frame_idx)
+- [ ] `read_exact_at`: after tree name lookup, also record `(name, gid, frame_idx)` in `frame_touches`
+- [ ] `frame_touches` is append-only within a session, flushed on lock release
+- [ ] Test: frame touches accumulate correct (tree, group, frame) triples
+
+#### j2. Frame correlation table
+
+Learn which frames of tree B are accessed given which frames of tree A were accessed in the same session.
+
+```rust
+struct FrameCorrelation {
+    /// (source_tree, target_tree) -> frame mapping
+    correlations: HashMap<(String, String), FrameMap>,
+}
+
+struct FrameMap {
+    /// source (gid, frame_idx) -> target (gid, frame_idx) with confidence
+    entries: HashMap<(u64, u32), Vec<FrameTarget>>,
+    /// Total observation count for decay
+    observation_count: u32,
+}
+
+struct FrameTarget {
+    group_id: u64,
+    frame_idx: u32,
+    confidence: f32,
+}
+```
+
+- [ ] On session flush: for each pair of trees (A, B) in the session, cross-correlate their frame touches
+  - For each frame of A that was read, record which frames of B were read in the same session
+  - Increment confidence for seen correlations, apply time decay to unseen ones
+- [ ] Confidence scoring: same as tree-level (initial 0.3, reinforce +0.25, decay *0.95, threshold 0.5)
+- [ ] `max_correlations_per_pair: u32` config (default 200): cap frame entries per tree pair, prune lowest confidence
+- [ ] Test: point query on indexed table records correct frame correlation (index leaf frame -> data frame)
+- [ ] Test: range query records multiple frame correlations (10 index frames -> 10-20 data frames)
+- [ ] Test: correlations survive checkpoint roundtrip via manifest
+
+#### j3. Precision prefetch firing
+
+When tree-level prediction fires (from trie), use frame correlations to narrow the prefetch to specific frames.
+
+- [ ] On prediction fire: for each predicted tree C, look up `FrameCorrelation[(current_tree, C)]`
+  - Given current frame(s) of current_tree, collect correlated frames of C
+  - If correlations exist and confidence > threshold: submit individual frame range GETs (not full groups)
+  - If no frame-level data: fall back to full-group prefetch (tree-level, same as before)
+- [ ] S3 range GET for a single frame: `bytes={frame.offset}-{frame.offset + frame.len - 1}`
+  - Already supported by seekable page groups + frame tables in manifest
+  - Decode single frame, write to cache via `write_pages_scattered`
+- [ ] Track frame-level prediction accuracy: did we actually read the predicted frames? Reinforce or decay.
+- [ ] Test: frame-level prediction fires range GET for 1 frame (~256KB) instead of full group (~8MB)
+- [ ] Test: fallback to full-group when no frame correlations exist
+- [ ] Test: frame-level reinforcement increases correlation confidence
+
+#### j4. Manifest persistence for frame correlations
+
+- [ ] New manifest field: `frame_correlations: Vec<FrameCorrelationEntry>`
+  - `FrameCorrelationEntry { source_tree: String, target_tree: String, source_gid: u64, source_frame: u32, target_gid: u64, target_frame: u32, confidence: f32 }`
+  - Flat list, rebuilt into `FrameCorrelation` HashMap on load
+- [ ] Serialize in `sync()` alongside prediction patterns and access history
+- [ ] Prune on checkpoint: remove entries below threshold, enforce max per pair
+- [ ] Size budget: 200 correlations * ~60 bytes = 12KB. Bounded by `max_correlations_per_pair`.
+- [ ] Test: manifest roundtrip preserves frame correlations
+- [ ] Test: prune reduces correlation count to max on checkpoint
+
+#### j5. Staleness handling
+
+Frame correlations reference (group_id, frame_idx) which can change on compaction or VACUUM.
+
+- [ ] On VACUUM/re-import: frame correlations referencing old group IDs become stale
+  - Option A: clear all frame correlations on VACUUM (they'll be relearned quickly)
+  - Option B: remap correlations using old_gid -> new_gid from the re-import manifest diff
+  - Recommendation: Option A (simpler, correlations relearn within 2-3 sessions)
+- [ ] On checkpoint with group repacking: if a group's frame table changes, invalidate correlations for that group
+- [ ] Time decay handles gradual drift from INSERT/DELETE reshuffling pages within frames
+- [ ] Test: correlations invalidated after VACUUM, relearned within 3 sessions
+- [ ] Test: time decay removes stale correlations that no longer fire
+
+#### j6. Benchmark (frame-level)
+
+Measure the bandwidth savings of frame-level vs tree-level prediction.
+
+- [ ] Add `--frame-predict` flag to tiered-bench (requires `--predicted`)
+- [ ] Compare for point queries: S3 bytes fetched with tree-level vs frame-level prediction
+- [ ] Compare for range queries: verify frame-level doesn't under-fetch (falls back to full group correctly)
+- [ ] Expected: point query on 1M-row table with 50 groups: tree-level fetches ~400MB, frame-level fetches ~256KB (1000x reduction)
+- [ ] Report: per-query (bytes_tree_level, bytes_frame_level, latency_tree, latency_frame)
 
 ---
 
