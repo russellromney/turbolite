@@ -103,6 +103,11 @@ pub struct TieredConfig {
     /// then 50% on miss 2, remaining 50% on miss 3, everything on miss 4+.
     /// Higher floor, lower volatility: scans pay one extra miss but point queries are clean.
     pub btree_prefetch_hops: Vec<f32>,
+    /// Maximum inline range GETs per B-tree before waiting for full-group prefetch.
+    /// Default 2: point queries (1 GET per tree in a join) stay fast; scans
+    /// (2+ GETs to same tree) switch to bulk prefetch after 2 range GETs.
+    /// Set to 0 for always-wait, u8::MAX to disable.
+    pub max_range_gets_per_tree: u8,
     /// Number of prefetch worker threads (default: num_cpus + 1).
     /// N+1 keeps the pipeline full: when a thread blocks on S3 I/O,
     /// the extra thread uses that core for decompression/cache writes.
@@ -160,6 +165,7 @@ impl Default for TieredConfig {
             cache_ttl_secs: 3600,
             prefetch_hops: vec![0.33, 0.33],
             btree_prefetch_hops: vec![0.0, 0.5, 0.5],
+            max_range_gets_per_tree: 2,
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())

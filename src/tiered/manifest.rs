@@ -69,6 +69,11 @@ pub struct Manifest {
     #[serde(skip)]
     pub tree_name_to_groups: HashMap<String, Vec<u64>>,
 
+    /// Phase Midway-i: reverse index group_id -> B-tree name.
+    /// Built on load from `btrees`, not serialized. Used by range-GET budget per tree.
+    #[serde(skip)]
+    pub group_to_tree_name: HashMap<u64, String>,
+
     /// Phase Verdun: B-tree access frequency for prediction confidence and decay.
     /// Keyed by tree name (survives VACUUM).
     #[serde(default)]
@@ -117,6 +122,7 @@ impl Manifest {
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            group_to_tree_name: HashMap::new(),
             btree_access_freq: HashMap::new(),
             prediction_patterns: Vec::new(),
         }
@@ -140,6 +146,7 @@ impl Manifest {
         self.btree_groups.clear();
         self.page_to_tree_name.clear();
         self.tree_name_to_groups.clear();
+        self.group_to_tree_name.clear();
 
         // Auto-detect: if group_pages is populated, this is BTreeAware
         if !self.group_pages.is_empty() && self.strategy == GroupingStrategy::Positional {
@@ -173,6 +180,10 @@ impl Manifest {
             }
             // Phase Verdun-i: tree name -> group IDs
             self.tree_name_to_groups.insert(entry.name.clone(), entry.group_ids.clone());
+            // Phase Midway-i: group ID -> tree name (for range-GET budget per tree)
+            for &gid in &entry.group_ids {
+                self.group_to_tree_name.insert(gid, entry.name.clone());
+            }
         }
     }
 

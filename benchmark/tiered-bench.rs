@@ -139,6 +139,12 @@ struct Cli {
     #[arg(long, default_value = "0.0,0.5,0.5", env = "BENCH_BTREE_HOPS")]
     btree_hops: String,
 
+    /// Max inline range GETs per B-tree before switching to prefetch-wait.
+    /// Default 2: point queries (1 GET/tree) stay fast, scans switch to bulk prefetch.
+    /// Set to 255 to disable (unlimited range GETs).
+    #[arg(long, default_value = "2", env = "BENCH_MAX_RANGE_GETS")]
+    max_range_gets: u8,
+
     /// Which queries to run (comma-separated). Default: all.
     /// Options: post, profile, who-liked, mutual
     #[arg(long, env = "BENCH_QUERIES")]

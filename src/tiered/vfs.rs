@@ -477,6 +477,7 @@ impl Vfs for TieredVfs {
                 self.config.sync_mode,
                 self.config.prefetch_hops.clone(),
                 self.config.btree_prefetch_hops.clone(),
+                self.config.max_range_gets_per_tree,
                 Some(Arc::clone(&self.prefetch_pool)),
                 self.config.gc_enabled,
                 self.config.eager_index_load,

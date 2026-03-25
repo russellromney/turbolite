@@ -26,6 +26,11 @@ pub struct TieredHandle {
     sync_mode: SyncMode,
     /// Consecutive cache misses (for fraction-based prefetch).
     consecutive_misses: u8,
+    /// Per-tree range GET count. When count >= max_range_gets_per_tree,
+    /// skip inline range GETs and wait for full-group prefetch.
+    tree_range_get_count: HashMap<String, u8>,
+    /// Maximum inline range GETs per B-tree before switching to prefetch-wait.
+    max_range_gets_per_tree: u8,
     /// Radial prefetch schedule (Positional strategy).
     prefetch_hops: Vec<f32>,
     /// B-tree sibling prefetch schedule (BTreeAware strategy).
@@ -87,6 +92,7 @@ impl TieredHandle {
         sync_mode: SyncMode,
         prefetch_hops: Vec<f32>,
         btree_prefetch_hops: Vec<f32>,
+        max_range_gets_per_tree: u8,
         prefetch_pool: Option<Arc<PrefetchPool>>,
         gc_enabled: bool,
         eager_index_load: bool,
@@ -254,6 +260,8 @@ impl TieredHandle {
             read_only,
             sync_mode,
             consecutive_misses: 0,
+            tree_range_get_count: HashMap::new(),
+            max_range_gets_per_tree,
             prefetch_hops,
             btree_prefetch_hops,
             prefetch_pool,
@@ -289,6 +297,8 @@ impl TieredHandle {
             read_only: false,
             sync_mode: SyncMode::Durable,
             consecutive_misses: 0,
+            tree_range_get_count: HashMap::new(),
+            max_range_gets_per_tree: 2,
             prefetch_hops: vec![0.33, 0.33],
             btree_prefetch_hops: vec![0.0, 0.5, 0.5],
             prefetch_pool: None,
@@ -900,6 +910,65 @@ impl DatabaseHandle for TieredHandle {
                     }
                 }
                 self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
+
+                // Range-GET budget per tree: after N range GETs to the same B-tree,
+                // submit all of that tree's groups to prefetch and wait instead.
+                let tree_name = manifest.group_to_tree_name.get(&gid);
+                let budget_exhausted = if let Some(name) = tree_name {
+                    let count = self.tree_range_get_count.entry(name.clone()).or_insert(0);
+                    if *count >= self.max_range_gets_per_tree {
+                        true
+                    } else {
+                        *count += 1;
+                        false
+                    }
+                } else {
+                    false // Unknown tree (Positional strategy), no budget
+                };
+
+                if budget_exhausted {
+                    // Submit ALL of this tree's remaining groups to prefetch pool.
+                    if let (Some(pool), Some(name)) = (&self.prefetch_pool, tree_name) {
+                        if let Some(tree_groups) = manifest.tree_name_to_groups.get(name) {
+                            for &sibling_gid in tree_groups {
+                                if cache.group_state(sibling_gid) == GroupState::None {
+                                    if let Some(sib_key) = manifest.page_group_keys.get(sibling_gid as usize) {
+                                        if !sib_key.is_empty() {
+                                            let sib_ft = manifest.frame_tables.get(sibling_gid as usize)
+                                                .map(|v| v.to_vec()).unwrap_or_default();
+                                            let sib_gp = manifest.group_page_nums(sibling_gid).into_owned();
+                                            pool.submit(sibling_gid, sib_key.clone(), sib_ft,
+                                                manifest.page_size, manifest.sub_pages_per_frame, sib_gp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Wait for current group from prefetch worker.
+                    let state = cache.group_state(gid);
+                    if state == GroupState::None {
+                        let _ = cache.try_claim_group(gid);
+                    }
+                    cache.wait_for_group(gid);
+
+                    if std::env::var("BENCH_VERBOSE").is_ok() {
+                        eprintln!(
+                            "  [budget-wait] page={} gid={} tree={:?} waited={}ms",
+                            page_num, gid, tree_name, miss_start.elapsed().as_millis(),
+                        );
+                    }
+
+                    if cache.is_present(page_num) {
+                        self.consecutive_misses = 0;
+                        cache.read_page(page_num, buf)?;
+                        self.detect_interior_page(buf, page_num, cache);
+                        cache.touch_group(gid);
+                        return Ok(());
+                    }
+                    // Fall through to legacy path if page not present (worker failure)
+                }
 
                 let s3_start = Instant::now();
                 match s3_arc.range_get(key, entry.offset, entry.len) {

@@ -272,12 +272,7 @@ INDEX level (most revealing: index cached, only data from S3):
 
 **Where B-tree wins**: scan-filter (1.5s vs 743ms at INDEX, 2.2s vs 1.3s at NONE). Full-group + sibling prefetch pays off when SQLite needs many sequential pages from the same B-tree.
 
-**Fix direction**: make prefetch conditional on access pattern:
-- [ ] **Point queries** (1-2 data page misses): range-GET only, no full-group download, no sibling prefetch
-- [ ] **Scan queries** (consecutive misses in same B-tree): escalate to full-group + sibling prefetch
-- [ ] Threshold: `consecutive_misses_in_same_btree >= 3` triggers full-group mode
-- [ ] Or: cap background download concurrency to 1-2 concurrent groups (prevent bandwidth saturation)
-- [ ] Validate on S3 Express (10Gbps) where bandwidth contention may not exist
+**Fix (Phase Midway i):** range-GET budget per group caps inline range GETs, then waits for prefetch. See subphase i below.
 
 #### f3. GroupingStrategy (Positional vs BTreeAware)
 
@@ -301,6 +296,20 @@ Enable both page grouping strategies in the same codebase for A/B benchmarking. 
 - [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
 - [ ] GC old groups after manifest swap
 - [ ] VACUUM triggers full repack (all page numbers change)
+
+#### i. Range-GET Budget Per Tree
+
+At 1M posts, scans are 3-4x slower than necessary because every cache miss triggers an individual range GET (~3-20ms each), producing ~390 S3 requests when ~51 full-group prefetch downloads would suffice. The old no-skip schedule `[.33,.33,.34]` proved this: scans dropped from 2.4s to 642ms on S3 Express.
+
+**Mechanism:** per-tree budget (default 2). After N inline range GETs to any groups in the same B-tree, submit ALL of that tree's remaining groups to prefetch and wait. 1 GET per tree = point query (fast). 2 GETs to same tree = scan (switch to bulk prefetch).
+
+- [ ] `group_to_tree_name: HashMap<u64, String>` on Manifest (built on load, not serialized)
+- [ ] `max_range_gets_per_tree: u8` field on `TieredConfig` (default 2)
+- [ ] `tree_range_get_count: HashMap<String, u8>` on `TieredHandle` (per-connection, per-tree count)
+- [ ] In seekable path: after prefetch submission, before range GET, check tree count. If >= max, submit all tree's groups to prefetch pool, `wait_for_group` instead of range GET.
+- [ ] `--max-range-gets` CLI flag in tiered-bench
+- [ ] Tests: count increment, per-tree independence, max=0 always waits, max=255 unlimited, Positional graceful degradation
+- [ ] Benchmark: 1M posts, compare max=2 vs max=255 on scan-filter (expect 3-4x improvement)
 
 #### h. Tests
 - [x] Import: manifest mapping verified via IMPORT_VERIFY env (encode/decode roundtrip per group)
@@ -353,7 +362,7 @@ Close the durability gap between checkpoints. The VFS already intercepts every W
 ---
 
 ## Verdun: Predictive Cross-Tree Prefetch + Access History
-> After: Somme · Before: (future)
+> After: Somme · Before: Marne
 
 Depends on Phase Midway (B-tree-aware page groups + demand-driven prefetch). Midway solves "fetch one tree fast" (~5ms on Express). But multi-join queries touch 3-4 trees sequentially. Without prediction, each tree is fetched on-demand as SQLite traverses into it: posts index (5ms), then users data (5ms), then likes index (5ms). Serial chain = 15ms of waiting.
 
@@ -749,6 +758,45 @@ Measure the bandwidth savings of frame-level vs tree-level prediction.
 - [ ] Compare for range queries: verify frame-level doesn't under-fetch (falls back to full group correctly)
 - [ ] Expected: point query on 1M-row table with 50 groups: tree-level fetches ~400MB, frame-level fetches ~256KB (1000x reduction)
 - [ ] Report: per-query (bytes_tree_level, bytes_frame_level, latency_tree, latency_frame)
+
+---
+
+## Marne: Query-Plan-Aware Prefetch
+> After: Verdun · Before: (future)
+
+SQLite extension that intercepts the query plan BEFORE execution and tells the VFS exactly which B-trees will be accessed. Eliminates the hop schedule tradeoff entirely: the VFS knows the access pattern before the first page request.
+
+Verdun learns patterns from past transactions (reactive). Marne knows the plan for the current query (proactive). Together they cover 100% of cases: Marne handles known queries, Verdun handles dynamic/ad-hoc patterns.
+
+### Design
+
+**Query plan interception.** Two options:
+1. `sqlite3_set_authorizer` callback: fires for every table/index access in query compilation. Lightweight, synchronous, available before first page read.
+2. `EXPLAIN QUERY PLAN` wrapper: run EQP on the SQL string, parse output for SCAN/SEARCH + table/index names, pass to VFS via shared channel.
+
+Option 1 is preferred: zero overhead, no extra query, fires during `sqlite3_prepare_v2`.
+
+**VFS communication channel.** Shared `Arc<Mutex<PendingPlan>>` between the authorizer callback and the VFS handle. Authorizer populates the plan (which tables, which indices, SCAN vs SEARCH). VFS `read_exact_at` checks the plan on first page request.
+
+**Prefetch strategy per access type:**
+- SEARCH (index lookup): prefetch index groups only (point query, 1-2 groups)
+- SCAN (full table scan): prefetch ALL groups for the table (bulk, aggressive first-miss)
+- JOIN: prefetch all participating tables/indices in parallel
+
+**Integration with hop schedule:** When a query plan is available, the hop schedule is bypassed entirely. The VFS issues parallel group fetches for all planned B-trees on first page request. No hops, no budget, no waiting.
+
+### Implementation
+
+- [ ] SQLite loadable extension with `sqlite3_set_authorizer` hook
+- [ ] `PendingPlan` struct: `Vec<PlannedAccess>` where `PlannedAccess { btree_name, access_type: Scan|Search }`
+- [ ] Shared channel: `Arc<Mutex<Option<PendingPlan>>>` on TieredHandle
+- [ ] VFS checks plan on first cache miss: if plan exists, submit all planned groups to prefetch pool
+- [ ] Authorizer resets plan on each new `prepare` call
+- [ ] Test: SEARCH query prefetches only index groups
+- [ ] Test: SCAN query prefetches all table groups
+- [ ] Test: JOIN prefetches all participating B-trees in parallel
+- [ ] Test: without extension loaded, VFS falls back to hop schedule (backward compatible)
+- [ ] Benchmark: compare plan-aware vs hop-schedule on 1M posts, all query types
 
 ---
 
