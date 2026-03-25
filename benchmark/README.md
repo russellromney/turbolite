@@ -107,7 +107,7 @@ Data is stored at `social_{size}/` in the bucket and reused across runs automati
 
 ## 2. Fly.io (against Tigris)
 
-The Fly app `cinch-tiered-bench` is pre-configured in `fly.toml`:
+The Fly app `turbolite-tiered-bench` is pre-configured in `fly.toml`:
 - Region: `iad`
 - VM: `performance-8x` (8 dedicated vCPU, 16GB RAM)
 - Volume: 40GB at `/data`
@@ -117,14 +117,14 @@ The Fly app `cinch-tiered-bench` is pre-configured in `fly.toml`:
 
 ```bash
 # From project root (not benchmark/)
-fly deploy --app cinch-tiered-bench \
+fly deploy --app turbolite-tiered-bench \
   --config benchmark/fly.toml \
   --dockerfile benchmark/Dockerfile \
   --remote-only
 
 # Machine starts automatically, runs the benchmark, then stops.
 # If it doesn't start, kick it manually:
-fly machine start <machine-id> --app cinch-tiered-bench
+fly machine start <machine-id> --app turbolite-tiered-bench
 ```
 
 The process args in `fly.toml` control what runs:
@@ -152,7 +152,7 @@ grep -E '\[data\]|\[index\]|\[interior\]|\[none\]' /tmp/bench.log
 Or check Fly logs directly:
 
 ```bash
-fly logs --app cinch-tiered-bench --no-tail | grep -E '\[data\]|\[index\]|\[interior\]|\[none\]'
+fly logs --app turbolite-tiered-bench --no-tail | grep -E '\[data\]|\[index\]|\[interior\]|\[none\]'
 ```
 
 ## 3. EC2 (against S3 Express or S3 Standard)
@@ -163,8 +163,8 @@ S3 Express One Zone provides single-digit ms latency from the same availability 
 
 | Resource | Value |
 |----------|-------|
-| S3 Express bucket | `cinch-bench--use2-az1--x-s3` |
-| S3 Standard bucket | `cinch-bench-regular` |
+| S3 Express bucket | `turbolite-bench--use2-az1--x-s3` |
+| S3 Standard bucket | `turbolite-bench-regular` |
 | Region | `us-east-2` |
 | AZ | `us-east-2a` (zone ID: `use2-az1`) |
 | Security group | `sg-07069137083c088b7` (SSH open) |
@@ -200,7 +200,7 @@ INSTANCE_ID=$(aws ec2 run-instances --region us-east-2 \
   --image-id $AMI --instance-type t3.medium --key-name russellromney \
   --security-group-ids sg-07069137083c088b7 \
   --placement AvailabilityZone=us-east-2a \
-  --iam-instance-profile Name=cinch-bench-ec2 \
+  --iam-instance-profile Name=turbolite-bench-ec2 \
   --associate-public-ip-address \
   --query 'Instances[0].InstanceId' --output text)
 
@@ -223,11 +223,11 @@ aws ec2-instance-connect send-ssh-public-key --region us-east-2 \
 
 ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -i ~/.ssh/id_rsa ec2-user@$IP \
   'chmod +x /home/ec2-user/tiered-bench && \
-   BUCKET_NAME=cinch-bench--use2-az1--x-s3 AWS_REGION=us-east-2 \
+   BUCKET_NAME=turbolite-bench--use2-az1--x-s3 AWS_REGION=us-east-2 \
    /home/ec2-user/tiered-bench --sizes 100000 --import auto 2>&1'
 
 # Or use regular S3 instead of S3 Express:
-#  BUCKET_NAME=cinch-bench-regular AWS_REGION=us-east-2 \
+#  BUCKET_NAME=turbolite-bench-regular AWS_REGION=us-east-2 \
 #  /home/ec2-user/tiered-bench --sizes 100000 --import auto 2>&1'
 
 # Terminate when done
@@ -237,14 +237,14 @@ aws ec2 terminate-instances --region us-east-2 --instance-ids $INSTANCE_ID
 ## Recreating the IAM Instance Profile (if deleted)
 
 ```bash
-aws iam create-role --role-name cinch-bench-ec2-role \
+aws iam create-role --role-name turbolite-bench-ec2-role \
   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
-aws iam put-role-policy --role-name cinch-bench-ec2-role --policy-name s3-express-access \
-  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3express:CreateSession","s3:GetObject","s3:PutObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3express:us-east-2:462570052286:bucket/cinch-bench--use2-az1--x-s3","arn:aws:s3express:us-east-2:462570052286:bucket/cinch-bench--use2-az1--x-s3/*","arn:aws:s3:::cinch-bench-regular","arn:aws:s3:::cinch-bench-regular/*"]}]}'
+aws iam put-role-policy --role-name turbolite-bench-ec2-role --policy-name s3-express-access \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3express:CreateSession","s3:GetObject","s3:PutObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3express:us-east-2:462570052286:bucket/turbolite-bench--use2-az1--x-s3","arn:aws:s3express:us-east-2:462570052286:bucket/turbolite-bench--use2-az1--x-s3/*","arn:aws:s3:::turbolite-bench-regular","arn:aws:s3:::turbolite-bench-regular/*"]}]}'
 
-aws iam create-instance-profile --instance-profile-name cinch-bench-ec2
-aws iam add-role-to-instance-profile --instance-profile-name cinch-bench-ec2 --role-name cinch-bench-ec2-role
+aws iam create-instance-profile --instance-profile-name turbolite-bench-ec2
+aws iam add-role-to-instance-profile --instance-profile-name turbolite-bench-ec2 --role-name turbolite-bench-ec2-role
 sleep 10
 ```
 
