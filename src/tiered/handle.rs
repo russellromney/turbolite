@@ -50,6 +50,10 @@ pub struct TieredHandle {
     /// AES-256-GCM encryption key for S3 data and local cache.
     encryption_key: Option<[u8; 32]>,
 
+    // --- Phase Marne: query-plan-aware prefetch ---
+    /// When true, the VFS drains the global plan queue on first read after step().
+    query_plan_prefetch: bool,
+
     // --- Phase Verdun: predictive prefetch ---
     /// Per-connection lock session tracker (B-tree touches within a lock lifecycle).
     lock_session: prediction::LockSession,
@@ -100,6 +104,7 @@ impl TieredHandle {
         encryption_key: Option<[u8; 32]>,
         prediction: Option<prediction::SharedPrediction>,
         access_history: Option<prediction::SharedAccessHistory>,
+        query_plan_prefetch: bool,
     ) -> Self {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
@@ -271,6 +276,7 @@ impl TieredHandle {
             encoder_dict,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            query_plan_prefetch,
             lock_session: prediction::LockSession::new(),
             prediction,
             access_history,
@@ -308,6 +314,7 @@ impl TieredHandle {
             encoder_dict: None,
             #[cfg(feature = "zstd")]
             decoder_dict: None,
+            query_plan_prefetch: false,
             lock_session: prediction::LockSession::new(),
             prediction: None,
             access_history: None,
@@ -855,6 +862,46 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
+        // 3d. Phase Marne: query-plan-aware prefetch.
+        //
+        // Drain the global plan queue and submit ALL planned groups to the
+        // prefetch pool in EQP order: all groups for tree 1, then all groups
+        // for tree 2, etc. The pool's FIFO channel preserves this order, so
+        // worker threads fetch what SQLite needs first.
+        //
+        // Runs on every read (before cache hit check) so the first read after
+        // step() triggers submission. First reads are always interior page
+        // hits (pinned, ~microseconds), giving the pool a head start before
+        // SQLite needs leaf pages.
+        //
+        // The drain is a no-op (empty Vec, one mutex check) when no plan is
+        // queued, which is the common case for cached reads within a query.
+        if self.query_plan_prefetch {
+            let planned = query_plan::drain_planned_accesses();
+            if !planned.is_empty() {
+                if let Some(pool) = &self.prefetch_pool {
+                    let manifest_snap = self.manifest.read();
+                    let sub_ppf = manifest_snap.sub_pages_per_frame;
+                    let cache_ref = self.cache.as_ref().expect("disk cache required");
+                    for access in &planned {
+                        if let Some(group_ids) = manifest_snap.tree_name_to_groups.get(&access.tree_name) {
+                            for &plan_gid in group_ids {
+                                if cache_ref.group_state(plan_gid) == GroupState::None {
+                                    if let Some(key) = manifest_snap.page_group_keys.get(plan_gid as usize) {
+                                        if !key.is_empty() {
+                                            let ft = manifest_snap.frame_tables.get(plan_gid as usize).cloned().unwrap_or_default();
+                                            let gp = manifest_snap.group_page_nums(plan_gid).into_owned();
+                                            pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Check page bitmap (cache hit = direct pread, no decompression)
         let cache_arc = Arc::clone(self.cache.as_ref().expect("disk cache required"));
         let cache = cache_arc.as_ref();
@@ -916,32 +963,61 @@ impl DatabaseHandle for TieredHandle {
                 let tree_name = manifest.group_to_tree_name.get(&gid);
                 let budget_exhausted = if let Some(name) = tree_name {
                     let count = self.tree_range_get_count.entry(name.clone()).or_insert(0);
-                    if *count >= self.max_range_gets_per_tree {
-                        true
-                    } else {
-                        *count += 1;
-                        false
-                    }
+                    *count = count.saturating_add(1);
+                    *count > self.max_range_gets_per_tree
                 } else {
                     false // Unknown tree (Positional strategy), no budget
                 };
 
                 if budget_exhausted {
-                    // Submit ALL of this tree's remaining groups to prefetch pool.
+                    // Submit this tree's remaining groups using the hop schedule.
+                    // The hop index is the per-tree overshoot: how many GETs past the budget.
+                    // First exhaustion (count == max): hop_idx=0.
+                    // With [0, 0.5, 0.5]: 1st over-budget = wait only, 2nd = 50%, 3rd = 50%, 4th+ = all.
+                    // Profile (few GETs/tree) gets moderate prefetch; scans escalate quickly to all.
                     if let (Some(pool), Some(name)) = (&self.prefetch_pool, tree_name) {
                         if let Some(tree_groups) = manifest.tree_name_to_groups.get(name) {
-                            for &sibling_gid in tree_groups {
-                                if cache.group_state(sibling_gid) == GroupState::None {
-                                    if let Some(sib_key) = manifest.page_group_keys.get(sibling_gid as usize) {
-                                        if !sib_key.is_empty() {
-                                            let sib_ft = manifest.frame_tables.get(sibling_gid as usize)
-                                                .map(|v| v.to_vec()).unwrap_or_default();
-                                            let sib_gp = manifest.group_page_nums(sibling_gid).into_owned();
-                                            pool.submit(sibling_gid, sib_key.clone(), sib_ft,
-                                                manifest.page_size, manifest.sub_pages_per_frame, sib_gp);
+                            let eligible: Vec<u64> = tree_groups.iter()
+                                .copied()
+                                .filter(|&sg| sg != gid && cache.group_state(sg) == GroupState::None)
+                                .collect();
+
+                            // Per-tree overshoot count as hop index
+                            let tree_count = self.tree_range_get_count.get(name).copied().unwrap_or(0);
+                            let overshoot = tree_count.saturating_sub(self.max_range_gets_per_tree) as usize;
+                            let fraction = if overshoot < self.btree_prefetch_hops.len() {
+                                self.btree_prefetch_hops[overshoot]
+                            } else {
+                                1.0 // Past end of schedule: fetch everything remaining
+                            };
+                            let max_submit = if fraction >= 1.0 {
+                                eligible.len()
+                            } else {
+                                ((eligible.len() as f32) * fraction).ceil() as usize
+                            };
+
+                            let mut submitted = 0usize;
+                            for &sibling_gid in &eligible {
+                                if submitted >= max_submit { break; }
+                                if let Some(sib_key) = manifest.page_group_keys.get(sibling_gid as usize) {
+                                    if !sib_key.is_empty() {
+                                        let sib_ft = manifest.frame_tables.get(sibling_gid as usize)
+                                            .map(|v| v.to_vec()).unwrap_or_default();
+                                        let sib_gp = manifest.group_page_nums(sibling_gid).into_owned();
+                                        if pool.submit(sibling_gid, sib_key.clone(), sib_ft,
+                                            manifest.page_size, manifest.sub_pages_per_frame, sib_gp) {
+                                            submitted += 1;
                                         }
                                     }
                                 }
+                            }
+
+                            if std::env::var("BENCH_VERBOSE").is_ok() {
+                                eprintln!(
+                                    "  [budget-prefetch] tree={:?} overshoot={} hop_frac={:.0}% eligible={} submitted={}",
+                                    name, overshoot, fraction * 100.0,
+                                    eligible.len(), submitted,
+                                );
                             }
                         }
                     }
@@ -1766,6 +1842,7 @@ impl DatabaseHandle for TieredHandle {
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            group_to_tree_name: HashMap::new(),
             // Phase Verdun (c): serialize access history + prediction patterns
             btree_access_freq: self.access_history.as_ref().map(|ah| {
                 let mut h = ah.write();
@@ -1854,6 +1931,10 @@ impl DatabaseHandle for TieredHandle {
         match lock {
             LockKind::None => {
                 self.active_db_locks.clear();
+                // Reset per-tree range-GET budget: each transaction starts fresh.
+                // Without this, a scan's exhausted budget persists and penalizes
+                // subsequent point queries after cache eviction.
+                self.tree_range_get_count.clear();
             }
             LockKind::Shared => {
                 self.active_db_locks.clear();
@@ -2031,6 +2112,125 @@ impl DatabaseHandle for TieredHandle {
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, io::Error> {
         let shm_path = self.db_path.with_extension("db-shm");
         Ok(FileWalIndex::new(shm_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs::OpenOptions as FsOpenOptions;
+
+    fn test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+        key
+    }
+
+    fn wrong_key() -> [u8; 32] {
+        [0xFFu8; 32]
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_write_read_roundtrip_encrypted() {
+        // Passthrough files (WAL/journal) should CTR-encrypt on write and decrypt on read
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        // Write data at various offsets
+        let data1 = vec![0xAAu8; 128];
+        let data2 = vec![0xBBu8; 256];
+        handle.write_all_at(&data1, 0).unwrap();
+        handle.write_all_at(&data2, 128).unwrap();
+
+        // Read back — should get plaintext back through CTR decrypt
+        let mut buf1 = vec![0u8; 128];
+        let mut buf2 = vec![0u8; 256];
+        handle.read_exact_at(&mut buf1, 0).unwrap();
+        handle.read_exact_at(&mut buf2, 128).unwrap();
+
+        assert_eq!(buf1, data1, "read at offset 0 must match written data");
+        assert_eq!(buf2, data2, "read at offset 128 must match written data");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_on_disk_not_plaintext() {
+        // WAL file bytes on disk must NOT be plaintext when encryption enabled
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        let plaintext = vec![0xCCu8; 512];
+        handle.write_all_at(&plaintext, 0).unwrap();
+
+        // Read raw bytes from disk (bypassing VFS)
+        let raw = std::fs::read(&path).unwrap();
+        assert_ne!(&raw[..512], &plaintext[..], "on-disk bytes must NOT be plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_wrong_key_returns_garbage() {
+        // Reading with a different key must return garbage, not the original data
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+
+        // Write with correct key
+        {
+            let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+            let key = test_key();
+            let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+            handle.write_all_at(&vec![0xDDu8; 256], 0).unwrap();
+        }
+
+        // Read with wrong key
+        let file = FsOpenOptions::new().read(true).open(&path).unwrap();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(wrong_key()));
+        let mut buf = vec![0u8; 256];
+        handle.read_exact_at(&mut buf, 0).unwrap(); // CTR doesn't fail, just produces wrong data
+        assert_ne!(buf, vec![0xDDu8; 256], "wrong key must not produce original plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_no_encryption_is_plaintext() {
+        // Without encryption key, passthrough should be plain read/write
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), None);
+
+        let plaintext = vec![0xEEu8; 128];
+        handle.write_all_at(&plaintext, 0).unwrap();
+
+        // On-disk should be plaintext
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..128], &plaintext[..], "without encryption, on-disk must be plaintext");
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_passthrough_different_offsets_different_ciphertext() {
+        // Same data written at different offsets must produce different ciphertext (nonce = offset)
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.wal");
+        let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+        let key = test_key();
+        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+
+        let data = vec![0xFFu8; 64];
+        handle.write_all_at(&data, 0).unwrap();
+        handle.write_all_at(&data, 64).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_ne!(&raw[..64], &raw[64..128], "same data at different offsets must produce different ciphertext");
     }
 }
 

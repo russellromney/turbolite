@@ -486,6 +486,7 @@ impl Vfs for TieredVfs {
                 self.config.encryption_key,
                 self.prediction.clone(),
                 self.access_history.clone(),
+                self.config.query_plan_prefetch,
             ))
         } else {
             if let Some(parent) = path.parent() {

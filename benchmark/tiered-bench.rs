@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only};
+use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -168,6 +168,13 @@ struct Cli {
     /// BTree: B-tree-aware bin-packing by B-tree structure.
     #[arg(long, default_value = "btree", env = "BENCH_GROUPING")]
     grouping: String,
+
+    /// Phase Marne: query-plan-aware prefetch. Before each query, runs
+    /// EXPLAIN QUERY PLAN and pushes planned B-tree accesses to the global
+    /// queue. The VFS drains the queue on first read and prefetches all
+    /// planned groups immediately instead of waiting for the hop schedule.
+    #[arg(long, env = "BENCH_PLAN_AWARE")]
+    plan_aware: bool,
 }
 
 // =========================================================================
@@ -621,11 +628,38 @@ SELECT COUNT(*) FROM posts WHERE like_count > ?1";
 // Benchmark runners
 // =========================================================================
 
+/// Phase Marne: run EXPLAIN QUERY PLAN via rusqlite and push planned
+/// accesses to the global queue. The VFS drains the queue on first read.
+fn push_query_plan(conn: &Connection, sql: &str) {
+    let eqp_sql = format!("EXPLAIN QUERY PLAN {}", sql);
+    let mut stmt = match conn.prepare(&eqp_sql) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut output = String::new();
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(detail) = row.get::<_, String>(3) {
+            output.push_str(&detail);
+            output.push('\n');
+        }
+    }
+    let accesses = parse_eqp_output(&output);
+    push_planned_accesses(accesses);
+}
+
 fn run_query(
     conn: &Connection,
     sql: &str,
     params: &[rusqlite::types::Value],
+    plan_aware: bool,
 ) -> Result<usize, rusqlite::Error> {
+    if plan_aware {
+        push_query_plan(conn, sql);
+    }
     let mut stmt = conn.prepare_cached(sql)?;
     let rows: Vec<Vec<rusqlite::types::Value>> = stmt
         .query_map(rusqlite::params_from_iter(params), |row| {
@@ -650,11 +684,12 @@ fn bench_data(
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
     iterations: usize,
+    plan_aware: bool,
 ) -> BenchResult {
     // Prime: run query once to populate cache, then reuse same params
     // to measure true cache-hit latency (no S3 fetches)
     let params = param_fn(0);
-    let _ = run_query(conn, sql, &params);
+    let _ = run_query(conn, sql, &params, false);
     handle.reset_s3_counters();
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -664,7 +699,7 @@ fn bench_data(
     for i in 0..iterations {
         handle.reset_s3_counters();
         let start = Instant::now();
-        match run_query(conn, sql, &params) {
+        match run_query(conn, sql, &params, plan_aware) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -688,6 +723,7 @@ fn bench_index(
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
     warmup: usize,
     iterations: usize,
+    plan_aware: bool,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_data_only();
@@ -696,7 +732,7 @@ fn bench_index(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("index-level connection");
-        if let Err(e) = run_query(&conn, sql, &params) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
             eprintln!("    [index] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -715,7 +751,7 @@ fn bench_index(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("index-level connection");
-        match run_query(&conn, sql, &params) {
+        match run_query(&conn, sql, &params, plan_aware) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -741,6 +777,7 @@ fn bench_interior(
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
     warmup: usize,
     iterations: usize,
+    plan_aware: bool,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_interior_only();
@@ -749,7 +786,7 @@ fn bench_interior(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("interior-level connection");
-        if let Err(e) = run_query(&conn, sql, &params) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
             eprintln!("    [interior] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -768,7 +805,7 @@ fn bench_interior(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("interior-level connection");
-        match run_query(&conn, sql, &params) {
+        match run_query(&conn, sql, &params, plan_aware) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -794,6 +831,7 @@ fn bench_none(
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
     warmup: usize,
     iterations: usize,
+    plan_aware: bool,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_all();
@@ -802,7 +840,7 @@ fn bench_none(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("none-level connection");
-        if let Err(e) = run_query(&conn, sql, &params) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
             eprintln!("    [none] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -821,7 +859,7 @@ fn bench_none(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("none-level connection");
-        match run_query(&conn, sql, &params) {
+        match run_query(&conn, sql, &params, plan_aware) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -1122,12 +1160,17 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     ];
     let queries: Vec<QueryDef> = all_queries.into_iter().filter(|q| should_run_query(q.label)).collect();
 
+    let plan_aware = cli.plan_aware;
+    if plan_aware {
+        println!("  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)");
+    }
+
     if should_run_mode("data") {
         println!();
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations));
+            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware));
         }
     }
 
@@ -1138,7 +1181,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
         }
     }
 
@@ -1147,7 +1190,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
         }
     }
 
@@ -1156,7 +1199,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
         }
     }
 
@@ -1198,6 +1241,9 @@ fn main() {
     println!("Pages/group:  {} ({:.1} MB uncompressed per group)", cli.ppg, cli.ppg as f64 * cli.page_size as f64 / (1024.0 * 1024.0));
     println!("Iterations:   {} measured + {} warmup per cold query, {} per warm query", cli.iterations, cli.warmup, cli.iterations);
     println!("Queries:      post detail, profile, who-liked, mutual friends");
+    if cli.plan_aware {
+        println!("Plan-aware:   ENABLED (Phase Marne query-plan prefetch)");
+    }
 
     for size in sizes {
         run_benchmark(size, &cli);

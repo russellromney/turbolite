@@ -759,44 +759,146 @@ Measure the bandwidth savings of frame-level vs tree-level prediction.
 - [ ] Expected: point query on 1M-row table with 50 groups: tree-level fetches ~400MB, frame-level fetches ~256KB (1000x reduction)
 - [ ] Report: per-query (bytes_tree_level, bytes_frame_level, latency_tree, latency_frame)
 
+### k. Split mod.rs tests into source files
+
+mod.rs is ~5450 lines, of which ~5270 are tests (lines 187-5459). All tests live in a single `#[cfg(test)] mod tests {}` block. Move each test section to `#[cfg(test)] mod tests {}` in the file it actually tests. This improves locality and brings mod.rs under the 1000-line guideline.
+
+#### Target mapping
+
+| Section | Lines | Target file | Notes |
+|---------|-------|-------------|-------|
+| PageBitmap | 208-377 | disk_cache.rs | |
+| Coordinate Math | 378-445 | mod.rs (stays) | Tests `group_id()`, `local_idx_in_group()` defined in mod.rs |
+| GroupState | 446-463 | disk_cache.rs | |
+| Page Group Encoding | 464-614 | encoding.rs | Includes `test_encode()`/`test_decode()` helpers |
+| Page Type Detection | 615-671 | encoding.rs | |
+| DiskCache | 672-1110 | disk_cache.rs | |
+| Manifest | 1111-1222 | manifest.rs | |
+| Seekable Encode/Decode | 1223-1357 | encoding.rs | `#[cfg(feature = "zstd")]` guards |
+| TieredConfig | 1358-1389 | config.rs | |
+| S3Client key format | 1390-1402 | s3_client.rs | |
+| Concurrent group state | 1403-1433 | disk_cache.rs | |
+| Encode-cache roundtrip | 1434-1465 | disk_cache.rs | Reuses `test_encode()` from encoding; inline the calls |
+| Local-checkpoint-only | 1466-1536 | flush.rs | Tests `set_local_checkpoint_only()` |
+| SubChunkTracker | 1537-1907 | cache_tracking.rs | Already has `#[cfg(test)]`, append |
+| DiskCache + SubChunkTracker | 1908-2040 | disk_cache.rs | Uses `positional_group_pages()` helper |
+| Regression (eviction) | 2041-2219 | cache_tracking.rs | Tests `evict_one()` |
+| is_valid_btree_page | 2220-2835 | encoding.rs | Large section (~600 lines) |
+| WAL passthrough encryption | 2836-2939 | handle.rs | `#[cfg(feature = "encryption")]` |
+| SubChunkTracker encryption | 2940-3025 | cache_tracking.rs | `#[cfg(feature = "encryption")]` |
+| Key rotation | 3026-4360 | rotation.rs | `#[cfg(feature = "encryption")]`, largest section (~1300 lines) |
+| Prefetch btree_groups | 4361-4594 | prefetch.rs | |
+| Prefetch GroupState+claim | 4595-4854 | disk_cache.rs | Tests `try_claim_group()` etc. |
+| Fraction-based prefetch | 4855-4996 | prefetch.rs | |
+| GroupingStrategy dispatch | 4997-5294 | manifest.rs | Tests `page_location()`, `group_page_nums()` etc. |
+| Range-GET budget | 5295-5459 | manifest.rs | Tests `group_to_tree_name`, `build_page_index()` |
+
+#### Shared test helpers
+
+- `positional_group_pages()` (lines 193-206): 14 lines. Duplicate in disk_cache.rs tests.
+- `test_encode()` / `test_decode()` (lines 469-490): ~20 lines. Move to encoding.rs tests. The one disk_cache.rs test that uses them inlines the calls directly.
+- `test_key()` / `wrong_key()`: ~3 lines each. Duplicate in each encryption test file (rotation.rs, handle.rs, cache_tracking.rs).
+- `test_key_2()` (line 3029): Only used in rotation tests. Move to rotation.rs.
+
+#### File size projections
+
+| Target file | Current lines | Added test lines | Projected |
+|-------------|--------------|-----------------|-----------|
+| disk_cache.rs | 581 | ~1100 | ~1680 |
+| encoding.rs | 414 | ~1400 | ~1810 |
+| manifest.rs | 269 | ~500 | ~770 |
+| cache_tracking.rs | 451 | ~750 | ~1200 |
+| rotation.rs | 322 | ~1330 | ~1650 |
+| config.rs | 217 | ~30 | ~250 |
+| s3_client.rs | 504 | ~10 | ~515 |
+| prefetch.rs | 267 | ~500 | ~770 |
+| handle.rs | 2084 | ~100 | ~2180 |
+| flush.rs | 480 | ~70 | ~550 |
+| mod.rs | 5459 | -5200 | ~260 |
+
+disk_cache, encoding, rotation exceed 1000 lines but only because of test code. Production code in each stays well under 1000.
+
+#### Execution order
+
+Do the move in batches, keeping the project compilable between each:
+
+1. **encoding.rs**: Page Group Encoding + Page Type Detection + Seekable + is_valid_btree_page
+2. **disk_cache.rs**: PageBitmap + GroupState + DiskCache + concurrent + encode-cache roundtrip + DiskCache+SubChunk integration + Prefetch GroupState+claim
+3. **cache_tracking.rs**: SubChunkTracker + regression eviction + encryption persistence
+4. **manifest.rs**: Manifest + GroupingStrategy dispatch + Range-GET budget
+5. **rotation.rs**: Key rotation
+6. **Small files**: config.rs, s3_client.rs, prefetch.rs, handle.rs, flush.rs
+7. **mod.rs cleanup**: Remove the entire `#[cfg(test)] mod tests {}` block except Coordinate Math tests
+
+After each step: `cargo test --lib --features zstd,tiered,encryption` to verify zero tests lost.
+
+#### Import pattern
+
+Each target file's test module needs:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;  // where needed
+    // ... other imports as needed per section
+}
+```
+
+For files that already have `#[cfg(test)] mod tests {}` (cache_tracking.rs), append to the existing block.
+
+#### Verification
+
+After all moves: `cargo test --features zstd,tiered,encryption --lib`. All 280 tests must pass. No test lost or duplicated.
+
 ---
 
 ## Marne: Query-Plan-Aware Prefetch
 > After: Verdun · Before: (future)
 
-SQLite extension that intercepts the query plan BEFORE execution and tells the VFS exactly which B-trees will be accessed. Eliminates the hop schedule tradeoff entirely: the VFS knows the access pattern before the first page request.
+The VFS knows which B-trees a query will access BEFORE the first page read. Eliminates the hop schedule warmup entirely for cold queries: scans, joins, and index lookups on uncached indexes all get parallel prefetch from the moment execution begins.
 
 Verdun learns patterns from past transactions (reactive). Marne knows the plan for the current query (proactive). Together they cover 100% of cases: Marne handles known queries, Verdun handles dynamic/ad-hoc patterns.
 
 ### Design
 
-**Query plan interception.** Two options:
-1. `sqlite3_set_authorizer` callback: fires for every table/index access in query compilation. Lightweight, synchronous, available before first page read.
-2. `EXPLAIN QUERY PLAN` wrapper: run EQP on the SQL string, parse output for SCAN/SEARCH + table/index names, pass to VFS via shared channel.
+**Architecture: trace callback + EQP + global queue.**
 
-Option 1 is preferred: zero overhead, no extra query, fires during `sqlite3_prepare_v2`.
+The loadable extension (`ext_entry.c`) and the VFS share a global queue of planned accesses. Two components, one `.so`, shared memory:
 
-**VFS communication channel.** Shared `Arc<Mutex<PendingPlan>>` between the authorizer callback and the VFS handle. Authorizer populates the plan (which tables, which indices, SCAN vs SEARCH). VFS `read_exact_at` checks the plan on first page request.
+1. **Trace callback** (installed via `sqlite3_trace_v2(SQLITE_TRACE_STMT)`): fires at the start of `sqlite3_step()`, before the VDBE executes, with the SQL string. Runs `EXPLAIN QUERY PLAN` on the SQL, parses SCAN/SEARCH + table/index names, pushes `PlannedAccess` entries to the global queue.
+
+2. **VFS `read_exact_at`**: on first cache miss, drains the queue and submits all planned groups to the prefetch pool in one batch. If the queue is empty, falls back to the hop schedule (backward compatible).
+
+**Why trace + EQP (not authorizer):**
+- `sqlite3_set_authorizer` fires during `prepare()` with table/column names but cannot distinguish SCAN from SEARCH. Both are `SQLITE_READ`.
+- `EXPLAIN QUERY PLAN` gives us the exact access type per table/index. Cost is ~10-50us (pure CPU, no I/O), invisible next to S3 latency.
+- `sqlite3_trace_v2(SQLITE_TRACE_STMT)` fires at start of `step()`, before any data page reads. The trace callback is synchronous: it completes before the VDBE touches data pages.
+- Running EQP inside the trace callback is safe: SQLite is reentrant, EQP does no I/O.
+
+**Why a global queue (not per-connection or per-VFS):**
+- The VFS just needs to know that trees are about to be needed. It doesn't need to know when or from which connection.
+- If two connections prepare back-to-back, the queue accumulates both plans. The VFS drains all of them. Both connections benefit.
+- If a tree's groups are already cached/fetching, the prefetch pool checks `group_state` and skips. No wasted S3 requests.
 
 **Prefetch strategy per access type:**
-- SEARCH (index lookup): prefetch index groups only (point query, 1-2 groups)
-- SCAN (full table scan): prefetch ALL groups for the table (bulk, aggressive first-miss)
-- JOIN: prefetch all participating tables/indices in parallel
+- SEARCH (index lookup): prefetch all index groups for the referenced index (not data groups, let the index point to the exact data page)
+- SCAN (full table scan): prefetch ALL groups for the table (index + data, aggressive)
+- JOIN: prefetch all participating tables/indices in parallel per their access type
 
-**Integration with hop schedule:** When a query plan is available, the hop schedule is bypassed entirely. The VFS issues parallel group fetches for all planned B-trees on first page request. No hops, no budget, no waiting.
+**Integration with hop schedule:** When planned groups exist, the VFS submits them all on first cache miss and does not advance the hop counter. If the queue is empty (extension not loaded, or DDL/PRAGMA statements), the hop schedule operates normally.
+
+**Prepared statement reuse:** `sqlite3_trace_v2(SQLITE_TRACE_STMT)` fires only on the first `step()` of a prepared statement. Subsequent executions with different binds benefit from cache warmed by the first execution. This is fine: anyone reusing prepared statements is optimizing for warm paths.
 
 ### Implementation
 
-- [ ] SQLite loadable extension with `sqlite3_set_authorizer` hook
-- [ ] `PendingPlan` struct: `Vec<PlannedAccess>` where `PlannedAccess { btree_name, access_type: Scan|Search }`
-- [ ] Shared channel: `Arc<Mutex<Option<PendingPlan>>>` on TieredHandle
-- [ ] VFS checks plan on first cache miss: if plan exists, submit all planned groups to prefetch pool
-- [ ] Authorizer resets plan on each new `prepare` call
-- [ ] Test: SEARCH query prefetches only index groups
-- [ ] Test: SCAN query prefetches all table groups
-- [ ] Test: JOIN prefetches all participating B-trees in parallel
-- [ ] Test: without extension loaded, VFS falls back to hop schedule (backward compatible)
-- [ ] Benchmark: compare plan-aware vs hop-schedule on 1M posts, all query types
+- [x] `PlannedAccess` struct: `{ tree_name: String, access_type: Scan|Search }`
+- [x] `PlanQueue`: global `Mutex<Vec<PlannedAccess>>`, exposed as a static in `src/tiered/query_plan.rs`
+- [x] EQP parser: run `EXPLAIN QUERY PLAN` on SQL string, parse output rows for `SCAN`/`SEARCH` + table/index names
+- [x] C trace callback in `ext_entry.c`: installed via `sqlite3_trace_v2`, calls Rust EQP parser, pushes to global queue
+- [x] VFS `read_exact_at`: on every read, drain queue, resolve tree names to group IDs via `tree_name_to_groups`, submit all to prefetch pool
+- [x] Config: `query_plan_prefetch: bool` on `TieredConfig` (default true)
+- [x] 15 unit tests: parser (SCAN, SEARCH, COVERING INDEX, rowid, joins, dedup, indented output), queue semantics, non-SELECT filtering
+- [ ] Benchmark: `--plan-aware` flag in tiered-bench. Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate the trace callback. Compare plan-aware vs hop-schedule on all query types, cache levels none/interior/index.
 
 ---
 

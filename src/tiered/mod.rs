@@ -66,6 +66,7 @@ mod import;
 mod manifest;
 mod prediction;
 mod prefetch;
+mod query_plan;
 mod rotation;
 mod s3_client;
 mod vfs;
@@ -77,6 +78,7 @@ pub use handle::TieredHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
 pub use vfs::TieredVfs;
+pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses};
 #[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;
 
@@ -85,6 +87,7 @@ pub(crate) use cache_tracking::*;
 pub(crate) use disk_cache::*;
 pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
+pub(crate) use query_plan::*;
 pub(crate) use s3_client::*;
 
 
@@ -123,6 +126,24 @@ pub fn set_local_checkpoint_only(val: bool) {
 /// Returns the current value of the local-checkpoint-only flag.
 pub fn is_local_checkpoint_only() -> bool {
     LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire)
+}
+
+/// Check if a manifest exists at the given S3 prefix. Returns the manifest if found.
+/// Useful for checking whether data has already been imported before re-importing.
+pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let handle = runtime.handle().clone();
+    let s3_cfg = TieredConfig {
+        bucket: config.bucket.clone(),
+        prefix: config.prefix.clone(),
+        endpoint_url: config.endpoint_url.clone(),
+        region: config.region.clone(),
+        runtime_handle: Some(handle.clone()),
+        ..Default::default()
+    };
+    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
+    s3.get_manifest()
 }
 
 // ===== Page group coordinate math =====
@@ -1372,6 +1393,7 @@ mod tests {
         assert_eq!(c.cache_ttl_secs, 3600);
         assert_eq!(c.prefetch_hops, vec![0.33, 0.33]);
         assert_eq!(c.btree_prefetch_hops, vec![0.0, 0.5, 0.5]);
+        assert_eq!(c.max_range_gets_per_tree, 2);
         let expected_threads = std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(2) + 1;
@@ -5287,6 +5309,160 @@ mod tests {
             assert_eq!(m.page_size, 65536);
             assert_eq!(m.version, 5);
         }
+    }
+
+    // =========================================================================
+    // Range-GET budget per tree (Phase Midway-i)
+    // =========================================================================
+
+    #[test]
+    fn test_group_to_tree_name_built_on_index() {
+        // group_to_tree_name reverse index should be populated by build_page_index
+        let mut m = Manifest {
+            page_count: 20,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3],   // group 0: posts
+                vec![4, 5, 6, 7],   // group 1: posts
+                vec![8, 9, 10, 11], // group 2: idx_posts_user
+            ],
+            btrees: {
+                let mut bt = HashMap::new();
+                bt.insert(0, BTreeManifestEntry {
+                    name: "posts".to_string(),
+                    obj_type: "table".to_string(),
+                    group_ids: vec![0, 1],
+                });
+                bt.insert(8, BTreeManifestEntry {
+                    name: "idx_posts_user".to_string(),
+                    obj_type: "index".to_string(),
+                    group_ids: vec![2],
+                });
+                bt
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // group 0 and 1 belong to "posts"
+        assert_eq!(m.group_to_tree_name.get(&0), Some(&"posts".to_string()));
+        assert_eq!(m.group_to_tree_name.get(&1), Some(&"posts".to_string()));
+        // group 2 belongs to "idx_posts_user"
+        assert_eq!(m.group_to_tree_name.get(&2), Some(&"idx_posts_user".to_string()));
+        // group 3 doesn't exist
+        assert_eq!(m.group_to_tree_name.get(&3), None);
+    }
+
+    #[test]
+    fn test_group_to_tree_name_empty_for_positional() {
+        // Positional strategy has no btrees, so group_to_tree_name should be empty
+        let mut m = Manifest {
+            page_count: 10,
+            pages_per_group: 4,
+            strategy: GroupingStrategy::Positional,
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+        assert!(m.group_to_tree_name.is_empty());
+    }
+
+    #[test]
+    fn test_group_to_tree_name_cleared_on_rebuild() {
+        // Rebuilding the index should clear stale entries
+        let mut m = Manifest {
+            page_count: 10,
+            pages_per_group: 4,
+            group_pages: vec![vec![0, 1, 2, 3]],
+            btrees: {
+                let mut bt = HashMap::new();
+                bt.insert(0, BTreeManifestEntry {
+                    name: "posts".to_string(),
+                    obj_type: "table".to_string(),
+                    group_ids: vec![0],
+                });
+                bt
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+        assert_eq!(m.group_to_tree_name.len(), 1);
+
+        // Now rebuild with empty btrees
+        m.btrees.clear();
+        m.group_pages.clear();
+        m.strategy = GroupingStrategy::Positional;
+        m.build_page_index();
+        assert!(m.group_to_tree_name.is_empty());
+    }
+
+    #[test]
+    fn test_max_range_gets_per_tree_config_default() {
+        let c = TieredConfig::default();
+        assert_eq!(c.max_range_gets_per_tree, 2);
+    }
+
+    #[test]
+    fn test_max_range_gets_per_tree_config_zero() {
+        let c = TieredConfig {
+            max_range_gets_per_tree: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.max_range_gets_per_tree, 0);
+    }
+
+    #[test]
+    fn test_group_to_tree_name_multi_tree() {
+        // Verify per-tree independence: multiple trees map correctly
+        let mut m = Manifest {
+            page_count: 30,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3],     // group 0: posts
+                vec![4, 5, 6, 7],     // group 1: posts
+                vec![8, 9, 10, 11],   // group 2: idx_posts_user
+                vec![12, 13, 14, 15], // group 3: users
+                vec![16, 17, 18, 19], // group 4: users
+            ],
+            btrees: {
+                let mut bt = HashMap::new();
+                bt.insert(0, BTreeManifestEntry {
+                    name: "posts".to_string(),
+                    obj_type: "table".to_string(),
+                    group_ids: vec![0, 1],
+                });
+                bt.insert(8, BTreeManifestEntry {
+                    name: "idx_posts_user".to_string(),
+                    obj_type: "index".to_string(),
+                    group_ids: vec![2],
+                });
+                bt.insert(12, BTreeManifestEntry {
+                    name: "users".to_string(),
+                    obj_type: "table".to_string(),
+                    group_ids: vec![3, 4],
+                });
+                bt
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // Each group maps to its tree
+        assert_eq!(m.group_to_tree_name.get(&0).unwrap(), "posts");
+        assert_eq!(m.group_to_tree_name.get(&1).unwrap(), "posts");
+        assert_eq!(m.group_to_tree_name.get(&2).unwrap(), "idx_posts_user");
+        assert_eq!(m.group_to_tree_name.get(&3).unwrap(), "users");
+        assert_eq!(m.group_to_tree_name.get(&4).unwrap(), "users");
+        // Total entries = number of groups with tree assignments
+        assert_eq!(m.group_to_tree_name.len(), 5);
+    }
+
+    #[test]
+    fn test_max_range_gets_per_tree_config_max() {
+        let c = TieredConfig {
+            max_range_gets_per_tree: u8::MAX,
+            ..Default::default()
+        };
+        assert_eq!(c.max_range_gets_per_tree, 255);
     }
 
     #[test]
