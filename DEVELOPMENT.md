@@ -2,20 +2,14 @@
 
 ## Secrets
 
-Managed via [Soup](https://getsoup.dev) (`~/.soup/bin/soup`).
+Set these environment variables for S3/Tigris integration tests:
 
-- Project: `turbolite`, environment: `development`
-- `soup run -p turbolite -e development -- <cmd>` injects secrets as env vars
-- `soup secrets list -p turbolite -e development` to view keys
-- `soup secrets set -p turbolite -e development KEY VALUE` to add/update
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — S3-compatible credentials
+- `AWS_ENDPOINT_URL` — S3 endpoint (Tigris: `https://fly.storage.tigris.dev`)
+- `AWS_REGION` — region (e.g. `auto` for Tigris, `us-east-2` for AWS)
+- `TIERED_TEST_BUCKET` — S3 bucket for integration tests
 
-Secrets stored:
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — Tigris S3-compatible credentials
-- `AWS_ENDPOINT_URL` — Tigris endpoint (`https://t3.storage.dev`)
-- `AWS_REGION` — `auto`
-- `TIERED_TEST_BUCKET` — S3 bucket for integration tests (`turbolite-test`)
-
-You can use these as environment variables as well.
+Use a `.env` file, your shell profile, or any secrets manager to inject them.
 
 ## Running Tests
 
@@ -23,8 +17,8 @@ You can use these as environment variables as well.
 # Unit tests (no credentials needed)
 cargo test --features tiered,zstd --lib
 
-# Integration tests (require Tigris credentials via soup)
-soup run -p turbolite -e development -- cargo test --features tiered,zstd --test tiered_test -- --ignored
+# Integration tests (require S3/Tigris credentials in environment)
+cargo test --features tiered,zstd --test tiered_test -- --ignored
 ```
 
 ## Code Style
