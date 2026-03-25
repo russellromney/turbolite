@@ -972,7 +972,23 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     if cli.skip_verify {
         eprintln!("[bench] connection opened, skipping COUNT(*) verification");
     } else {
-        eprintln!("[bench] connection opened, running COUNT(*)...");
+        // Run integrity_check first to get detailed corruption info
+        eprintln!("[bench] connection opened, running integrity_check...");
+        let mut stmt = warm_conn.prepare("PRAGMA integrity_check(100)").expect("prepare integrity_check");
+        let results: Vec<String> = stmt.query_map([], |row| row.get(0))
+            .expect("integrity_check query")
+            .filter_map(|r| r.ok())
+            .collect();
+        if results.len() == 1 && results[0] == "ok" {
+            eprintln!("[bench] integrity_check: ok");
+        } else {
+            for msg in &results {
+                eprintln!("[bench] INTEGRITY ERROR: {}", msg);
+            }
+            panic!("[bench] integrity_check found {} errors", results.len());
+        }
+
+        eprintln!("[bench] running COUNT(*)...");
         let row_count: i64 = warm_conn
             .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
             .expect("count query failed");

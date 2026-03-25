@@ -1,14 +1,18 @@
 # turbolite
 
-turbolite is a SQLite VFS that serves point lookups and joins directly from S3 with millisecond cold latency. 
+turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-100ms cold latency. 
 
-turbolite also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest.
+It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest.
 
 > turbolite is **experimental**. It is new and may corrupt your data. Please be careful.
 
-The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot).
+Object storage is getting fast. [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) delivers single-digit millisecond GETs and [Tigris is extremely fast](https://www.tigrisdata.com/blog/benchmark-small-objects/). The gap between local disk and cloud storage is shrinking, and turbolite exploits that.
 
-turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Works with any S3-compatible storage (AWS S3, Tigris, R2, MinIO, etc.). It's a standard VFS operating at the page level, so most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
+If you have one database per server, use a volume. turbolite is for when you have hundreds or thousands of databases (one per tenant, one per workspace, one per device), don't want a volume for each one, and you're okay with a single write source. 
+
+The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of ruthlessly architecting around cloud storage constraints. The project's initial goal was to beat [Neon's 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot).
+
+turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Any S3-compatible storage works (AWS S3, Tigris, R2, MinIO, etc.). It's a standard SQLite VFS operating at the page level, so most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
 
 If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
@@ -34,18 +38,7 @@ Benchmarks are organized by **cache level** (what's already on local disk when t
 | **index** | interior + index pages | data pages only | Normal turbolite operation |
 | **data** | everything | nothing | Equivalent to local SQLite |
 
-**interior** is the most realistic cold benchmark: interior pages load eagerly on connection open, so by the time you run your first query, they're cached. Index pages prefetch lazily in the background and may not be ready yet.
-
-> Why not just use a volume? If you have one database per server, you should. turbolite is interesting when you have hundreds or thousands of databases and don't want a volume for each one. It's also a fun experiment in what happens when you design a SQLite storage layer around S3's constraints instead of fighting them.
-
-### Cloud storage is getting faster
-
-S3 Express One Zone delivers single-digit millisecond GET latency from the same availability zone. This changes the economics of serving databases from object storage, with PUTs and GETs 10x cheaper than normal S3. A 5-join profile query completes in 134ms with only interior B-tree pages cached (the realistic first-query state). With index pages cached, point lookups take 11ms.
-
-turbolite's seekable zstd encoding and byte-range GETs mean you only download the pages you need, not entire objects. A cache miss fetches one compressed sub-chunk (~256KB), not a 16MB page group.
-
-The trend is clear: object storage is getting faster (S3 Express, Tigris, R2), and the gap between "local disk" and "cloud storage" is shrinking. turbolite is designed to ride this wave. The faster GETs get, the less caching matters, and the more databases you can serve from a single bucket.
-
+**interior** is the most realistic cold benchmark: interior pages load eagerly on connection open, so by the time you run your first query, they're cached. Index pages aggressively prefetch on first access in the background and may not be ready yet.
 
 ## Quick Start
 
@@ -105,7 +98,7 @@ Manifest: "page 4,271 is in group 16, sub-chunk 3, bytes 81,920-106,496"
 turbolite: check local storage -> cache miss
     |
     v
-S3: GET for ~256KB compressed sub-chunk → decompress → return page
+S3: GET for ~256KB compressed sub-chunk -> decompress -> return page
 ```
 
 **Writes** go through SQLite's normal WAL, then flush to S3 at checkpoint:
@@ -117,13 +110,13 @@ SQLite: "commit + checkpoint"
 turbolite: collect dirty pages, group by page group and page type
     |
     v
-Encode: zstd compress each frame → (optional) GCM encrypt
+Encode: zstd compress each frame -> (optional) GCM encrypt
     |
     v
-S3: PUT new page group versions → PUT new manifest (atomic commit)
+S3: PUT new page group versions -> PUT new manifest (atomic commit)
 ```
 
-The MsgPack **manifest** is the source of truth for where every page lives. It replaces SQLite's implicit `offset = page * size` with explicit pointers. Old page group versions are never overwritten; the manifest PUT is the atomic commit point. Old versions become garbage, cleaned up by `gc()`.
+The **manifest** is the source of truth for where every page lives. It replaces SQLite's implicit `offset = page * size` with explicit pointers. Old page group versions are never overwritten; the manifest PUT is the atomic commit point. Old versions become garbage, cleaned up by `gc()`.
 
 SQLite defaults to 4KB pages to match filesystem disk page size. On S3, disk page size is irrelevant. What matters is minimizing request count and maximizing B-tree fan-out. The answer is **large pages**: turbolite defaults to 64KB pages. Fewer pages = fewer S3 round trips to reach a leaf.
 
@@ -143,7 +136,9 @@ To make scans not-slow (they'll never be fast), turbolite uses **speculative pre
 
 Consecutive misses escalate aggressively: by default, first miss fetches 33% of all groups, the second miss another 33%, and the third miss the rest. A hit resets the miss counter (so technically you might see more than 3 hops). This is byte-inefficient (it might overfetch data) but request-count-efficient. 
 
-> Note: prefetch aggression is configurable.
+turbolite calls this speculative prefetching (because we're guessing) or adaptive prefetching (because we can adapt aggression level after cache hits)
+
+Prefetch aggression is configurable, .33/.33/.34 is just the default tuned for mixed workloads. 
 
 ### Encryption & Compression
 
@@ -374,7 +369,7 @@ These replicate local writes to S3 for backup or restore.
 ### Custom storage engines
 
 - [**mvsqlite**](https://github.com/losfair/mvsqlite): Pages stored in FoundationDB as content-addressed KV pairs. Full MVCC with time-travel to any snapshot, XOR+zstd delta encoding between page versions. The most sophisticated storage engine in this space, but requires FoundationDB, not S3.
-- [**sqlite-s3vfs**](https://github.com/simonw/sqlite-s3vfs): Each SQLite page stored as a separate S3 object. Enables writes but at one PUT per page - $0.02 per 4096 pages vs turbolite's $0.000005 for the same batch.
+- [**sqlite-s3vfs**](https://github.com/simonw/sqlite-s3vfs): Each SQLite page stored as a separate S3 object. Enables writes but at one PUT per page, costing \$0.02 per 4096 pages vs turbolite's $0.000005 for the same batch (at 64KB page default).
 
 ### Compression
 

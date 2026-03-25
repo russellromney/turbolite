@@ -1,25 +1,42 @@
 # turbolite Roadmap
 
-(Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
+## Tannenberg: File Size Cleanup
+> After: Ypres · Before: Marne
 
-## Current Status
+`tiered.rs` is 8,758 lines and `lib.rs` is 2,595 lines. Both far exceed the 1,000-line limit. Split by domain into focused modules. Pure refactor, no behavior changes.
 
-Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 64KB pages, 256 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~256KB) without downloading entire groups.
+### a. Split `tiered.rs` (8,758 lines) into `src/tiered/`
+- [ ] `mod.rs` -- module declarations, public re-exports, constants, coordinate math helpers
+- [ ] `config.rs` -- `TieredConfig`, `GroupState`, defaults
+- [ ] `manifest.rs` -- `Manifest`, `PageLocation`, `BTreeManifestEntry`, `FrameEntry`, index building
+- [ ] `s3_client.rs` -- `S3Client`, all AWS SDK integration (GET/PUT/DELETE, manifest ops, key generation)
+- [ ] `cache_tracking.rs` -- `PageBitmap`, `SubChunkTracker`, `SubChunkId`, `SubChunkTier`, tiered LRU eviction
+- [ ] `disk_cache.rs` -- `DiskCache`, page I/O, group state management, eviction
+- [ ] `encoding.rs` -- `encode_page_group()`, `encode_page_group_seekable()`, `decode_*`, `encode_interior_bundle()`, `decode_interior_bundle()`
+- [ ] `prefetch.rs` -- `PrefetchPool`, `PrefetchJob`, background worker threads
+- [ ] `handle.rs` -- `TieredHandle` struct, initialization, checkpoint, `DatabaseHandle` trait impl
+- [ ] `vfs.rs` -- `TieredVfs` struct, `Vfs` trait impl, `register()`
+- [ ] `import.rs` -- `import_sqlite_file()` with B-tree walking and page packing
+- [ ] `rotation.rs` -- `rotate_encryption_key()` with verification and GC
+- [ ] `bench.rs` -- `TieredBenchHandle`
 
-Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything. `rotate_encryption_key()` supports key rotation, adding encryption, and removing encryption (decrypt/re-encrypt without decompression, atomic manifest swap, post-upload verification).
+### b. Split `lib.rs` (2,595 lines) into focused modules
+- [ ] `lib.rs` -- module declarations, public re-exports only
+- [ ] `locks.rs` -- `InProcessLocks`, `SlotState`, `SHARED_FILE_CACHE`, lock/unlock functions, debug tracing
+- [ ] `file_format.rs` -- `FileHeader`, `PageIndex`, magic bytes, constants
+- [ ] `compressed_handle.rs` -- `CompressedHandle` struct, page ops, `DatabaseHandle` trait impl, `FileWalIndex`
+- [ ] `compressed_vfs.rs` -- `CompressedVfs`, `Vfs` trait impl
+- [ ] `maintenance.rs` -- `inspect_database()`, `compact()`, `compact_with_recompression()`, `CompactionConfig`
 
-1M-row social media dataset (1.46GB, 91 page groups, 64KB pages, EC2 c5.2xlarge, S3 Express One Zone, same AZ):
-- Cache: none — point lookup: 75ms, 5-join profile: 202ms
-- Cache: interior — point lookup: 11ms, 5-join profile: 134ms
-- Cache: index — point lookup: 11ms, 5-join profile: 113ms
-- Cache: data — point lookup: 157us, 5-join profile: 301us
-
-Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 43 S3 integration tests + 180 unit tests passing.
+### c. Verify
+- [ ] `cargo test` passes with no changes to public API
+- [ ] `make ext` builds successfully
+- [ ] All `use turbolite::` paths in bin/, tests/, examples/ still compile
 
 ---
 
 ## Marne: Dirty Page Memory Optimization
-> After: Ypres · Before: Thermopylae
+> After: Tannenberg · Before: Thermopylae
 
 `write_all_at()` stores a full page copy in `dirty_pages: HashMap<u64, Vec<u8>>` AND writes it to the cache file. The HashMap copy is only needed at checkpoint to know which groups to re-encode — but the data is already in the cache. Holding it twice wastes memory: 1000 dirty 64KB pages = 64MB in the HashMap alone.
 
@@ -72,7 +89,7 @@ Note: this is a minor optimization. S3 is the source of truth, local disk is eph
 ---
 
 ## Midway: B-Tree-Aware Page Groups
-> After: Marathon · Before: Normandy
+> After: Marathon · Before: Gallipoli
 
 Replaces the old Midway (two-layer index deltas) and Stalingrad (write amplification) phases. B-tree-aware packing solves both problems as one feature: the manifest becomes a structural map of the database, page groups are packed by B-tree, prefetch becomes demand-driven instead of speculative, and write amplification drops dramatically.
 
@@ -113,53 +130,112 @@ The gap between "interior" and "index" cache levels nearly disappears. With targ
 ### Implementation
 
 #### a. B-tree map construction
-- [ ] Read `sqlite_master` to get root pages, names, types (table vs index)
-- [ ] Walk each B-tree from root to enumerate all pages (interior + leaf + overflow)
-- [ ] Handle freelist pages (pack separately, or skip upload since they hold no useful data)
-- [ ] Handle page 1 (sqlite_master) and other system pages
+- [x] `src/btree_walker.rs`: `walk_all_btrees()` entry point parses sqlite_master, walks each B-tree via BFS
+- [x] Collects interior + leaf + overflow pages per B-tree, follows overflow chains
+- [x] Handles page 0 (sqlite_master root with 100-byte header offset), freelist pages go to `unowned_pages`
+- [x] Returns `BTreeWalkResult { btrees: HashMap<u64, BTreeEntry>, unowned_pages: Vec<u64> }`
+- [x] 5 tests passing (simple DB, multi-level B-tree, overflow pages, varint parsing, serial type sizes)
+- Known limitations (non-critical, cause slightly wasteful packing but no corruption):
+  - Freelist pages (trunk/leaf) land in `unowned_pages` instead of being tracked separately
+  - Lock-byte page (1GB boundary) not excluded from `unowned_pages`
+  - Assumes `usable_size == page_size` (no reserved bytes); affects overflow threshold for PRAGMA page_reserved > 0
+  - Pointer map pages (auto-vacuum DBs) not detected
 
 #### b. Manifest format change
-- [ ] Replace positional page-to-group mapping with explicit mapping
-- [ ] Add `btrees` section: root_page -> { name, type, groups }
-- [ ] Add `pages` list per group (ordered, defines position within group)
-- [ ] Build reverse index on manifest load: page_num -> (group_id, position)
-- [ ] Automigrate: detect old positional manifest, convert to explicit on first checkpoint
+- [x] `PageLocation { group_id: u64, index: u32 }` for reverse index entries
+- [x] `BTreeManifestEntry { name, obj_type, group_ids }` for B-tree metadata
+- [x] New Manifest fields: `group_pages: Vec<Vec<u64>>`, `btrees: HashMap<u64, BTreeManifestEntry>`, `page_index: HashMap<u64, PageLocation>` (skip serialize)
+- [x] `build_page_index()`: builds reverse index from `group_pages`
+- [x] `page_location(page_num)` helper
+- [x] `build_page_index()` called after deserialization in `get_manifest_async`
+- [x] All Manifest construction sites updated (checkpoint, import, tests)
 
 #### c. B-tree-aware packing (import)
-- [ ] Pack pages by B-tree into groups during import
-- [ ] Large B-trees (> pages_per_group pages) span multiple groups
-- [ ] Small B-trees (< ~50 pages) share a group
-- [ ] Leave slack per group for future growth (~200 of 256 slots)
-- [ ] Existing seekable zstd sub-chunk encoding works unchanged (position is per-group, not per-page-number)
+- [x] Import calls `walk_all_btrees()` to discover page ownership
+- [x] Large B-trees (>= ppg/4 pages) get their own groups, chunked to ppg
+- [x] Small B-trees + unowned pages bin-packed into shared groups
+- [x] Builds `group_pages` and `btrees` manifest entries
+- [x] Seekable zstd encoding works unchanged (position is per-group, not per-page-number)
+- [x] `DiskCache::write_pages_scattered()` added for non-consecutive page writes
 
-#### d. Demand-driven prefetch
+#### d. Read path with explicit mapping
+- [x] `read_exact_at` uses `manifest.page_location(page_num).expect()` for gid and index
+- [x] Seekable path: `group_pages[gid]` for scattered cache writes after sub-chunk decode
+- [x] Full group download path: `write_pages_scattered` with `group_pages[gid]`
+- [x] All legacy positional fallbacks removed (no backward compat with old manifests)
+- [x] `decode_and_cache_group_static` takes `group_page_nums: &[u64]` instead of positional params
+
+#### e. Checkpoint with B-tree awareness
+- [x] Dirty pages grouped by `page_location().expect().group_id`
+- [x] Group re-encoding uses `group_pages[gid]` for page iteration and S3 merge
+- [x] Interior page marking gracefully handles pages not yet in manifest
+- [x] Carry forward `group_pages` and `btrees` to new manifest
+- [x] New pages assigned to groups via `assign_new_pages_to_groups()` before dirty grouping
+- [x] `read_exact_at` checks dirty pages + bounds BEFORE `page_location()` (prevents panic on new pages)
+- [x] `detect_interior_page` graceful when page not in manifest
+- [x] 6 regression tests for new-page assignment (basic, fill-last-group, overflow, empty, no-dupes, roundtrip)
+- [ ] Re-walk B-trees at checkpoint to update mapping for new/moved pages
+
+#### e2. Prefetch worker (Phase Midway)
+- [x] Prefetch worker uses `job.group_page_nums` for scattered writes (no legacy path)
+- [x] Seekable decode passes `group_page_nums.len()` as group size
+- [x] Page type scanning uses explicit page numbers from `group_page_nums`
+- [x] `gp_for()` and all submit callers `.expect()` group existence
+
+#### e3. Corruption fix (SubChunkTracker positional mismatch)
+- [x] Root cause: `SubChunkTracker::sub_chunk_for_page()` uses positional division, not B-tree mapping
+  - Writing page X marks positional sub-chunk as present; unwritten page Y in same sub-chunk returns false cache hit (zeros)
+- [x] Fix: `write_pages_scattered` no longer marks SubChunkTracker (bitmap-only, per-page accurate)
+- [x] Fix: `write_pages_scattered` only marks bitmap for pages with sufficient data (no early-break desync)
+- [x] Fix: `DiskCache::ensure_group_capacity()` called at VFS open when B-tree groups exceed positional formula
+- [x] 10 regression tests: tracker pollution, bitmap-only accuracy, partial data, empty data, data integrity, group capacity
+
+#### e4. Eliminate all positional mapping from DiskCache + SubChunkTracker
+Phase e3 fixed `write_pages_scattered` but left deeper positional mapping bugs:
+
+- [x] `evict_group(gid)` clears bitmap at `[gid * ppg, gid * ppg + ppg)` (positional), not the actual pages in the group. Fixed: uses `group_pages[gid]` to clear correct pages.
+- [x] `clear_cache` family marks group 0 pages as `0..ppg` (positional), not `group_pages[0]`. Fixed: all 3 variants use `group_pages[0]`.
+- [x] `DiskCache::is_present` checks SubChunkTracker first (positional `page_num / ppg`), falls back to bitmap. Fixed: bitmap-only.
+- [x] `mark_interior_group` / `mark_index_page` use `sub_chunk_for_page(page_num)` (positional). Fixed: accept `(gid, index_in_group)`, use `sub_chunk_id_for()`.
+- [x] `detect_interior_page` passes manifest-aware `loc.group_id` and `loc.index` to marking functions.
+- [x] `touch_group` uses actual page count from `group_pages` (not positional ppg max).
+- [x] Group state initialization in `DiskCache::new()` uses `group_pages[gid]` instead of positional range.
+- [x] Added `group_pages: RwLock<Vec<Vec<u64>>>` to DiskCache, updated on sync and open.
+- [x] Added `SubChunkTracker::sub_chunk_id_for(gid, index_in_group)` for manifest-aware SubChunkId.
+- [x] Updated all callers: read path, inline range GET, prefetch worker, interior chunk loading, sync.
+- [x] Updated all 170 tests (3 new B-tree-aware regression tests).
+
+#### e5. Restore SubChunkTracker population for tiered eviction
+Phase e3 stopped marking the tracker to prevent positional pollution. With manifest-aware `sub_chunk_id_for()` from e4, the tracker can be correctly populated again, restoring tiered eviction (Pinned > Index > Data).
+
+- [x] `write_pages_scattered` now accepts `gid` and `start_index_in_group`, marks tracker sub-chunks as `Data` tier after writing
+- [x] `decode_and_cache_group_static` now accepts `gid`, marks tracker sub-chunks as `Data` tier after writing
+- [x] All callers updated: prefetch worker, seekable sub-chunk path, full group download, eager group 0 load
+- [x] 2 new regression tests: tracker population across frames, sub-frame offset marking
+- [x] Updated existing no_tracker_pollution test to verify tracker IS marked correctly
+- [x] 172 lib tests pass
+
+#### f. Demand-driven prefetch
 - [ ] On root page read, look up B-tree's groups in manifest
 - [ ] Prefetch those groups (whole-group GETs, not scattered sub-chunk range GETs)
 - [ ] Remove current "prefetch all index chunks" behavior
 - [ ] Optional: access history (track which B-trees were accessed, prefetch those eagerly on next open)
 
-#### e. Checkpoint with B-tree awareness
-- [ ] Re-walk B-trees at checkpoint to rebuild page-to-btree map
-- [ ] New pages: append to B-tree's last group if slack available, else create new group
-- [ ] Freed pages: mark as dead space in group
-- [ ] Only re-encode and upload groups containing dirty pages
-- [ ] Write amplification metrics: track dirty pages, dirty groups, bytes uploaded per checkpoint
-
-#### f. Compaction
+#### g. Compaction
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
 - [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
 - [ ] GC old groups after manifest swap
 - [ ] VACUUM triggers full repack (all page numbers change)
 
-#### g. Tests
-- [ ] Import: verify pages packed by B-tree, manifest mapping correct
-- [ ] Read: page lookup via explicit mapping matches page content
+#### h. Tests
+- [x] Import: manifest mapping verified via IMPORT_VERIFY env (encode/decode roundtrip per group)
+- [x] Read: page lookup via explicit mapping matches page content (integrity_check passes on 100k bench)
+- [x] Cache: scattered write bitmap/tracker correctness (10 unit tests)
 - [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
 - [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
 - [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
 - [ ] Compaction: dead space reclaimed, B-tree groups repacked optimally
 - [ ] VACUUM: full repack produces correct mapping
-- [ ] Automigration: old positional manifest upgraded to explicit on first checkpoint
 
 ---
 

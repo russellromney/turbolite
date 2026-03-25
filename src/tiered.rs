@@ -248,6 +248,24 @@ impl Default for TieredConfig {
 
 // ===== Manifest =====
 
+/// Location of a page within the explicit group mapping (Phase Midway).
+#[derive(Debug, Clone, Copy)]
+pub struct PageLocation {
+    pub group_id: u64,
+    /// Position within the group's page list (index into group_pages[group_id])
+    pub index: u32,
+}
+
+/// B-tree metadata stored in the manifest (Phase Midway).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BTreeManifestEntry {
+    pub name: String,
+    /// "table" or "index"
+    pub obj_type: String,
+    /// Group IDs containing this B-tree's pages
+    pub group_ids: Vec<u64>,
+}
+
 /// S3 manifest — updated atomically after all page group uploads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -279,6 +297,21 @@ pub struct Manifest {
     /// Pages per sub-chunk frame (for seekable page groups). Default 0 = legacy format.
     #[serde(default)]
     pub sub_pages_per_frame: u32,
+
+    // --- Phase Midway: B-tree-aware page groups ---
+
+    /// Explicit page-to-group mapping. group_pages[gid] = ordered list of page numbers
+    /// in that group. Empty = legacy positional mapping (gid = page_num / ppg).
+    #[serde(default)]
+    pub group_pages: Vec<Vec<u64>>,
+
+    /// B-tree map: root_page (0-based) -> B-tree info + group IDs.
+    #[serde(default)]
+    pub btrees: HashMap<u64, BTreeManifestEntry>,
+
+    /// Reverse index: page_num -> (group_id, position). Built on load, not serialized.
+    #[serde(skip)]
+    pub page_index: HashMap<u64, PageLocation>,
 }
 
 /// A single frame entry in a seekable page group. Points to a byte range within the S3 object
@@ -307,14 +340,38 @@ impl Manifest {
             index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
+            group_pages: Vec::new(),
+            btrees: HashMap::new(),
+            page_index: HashMap::new(),
         }
     }
 
     fn total_groups(&self) -> u64 {
+        if !self.group_pages.is_empty() {
+            return self.group_pages.len() as u64;
+        }
         if self.pages_per_group == 0 || self.page_count == 0 {
             return 0;
         }
         (self.page_count + self.pages_per_group as u64 - 1) / self.pages_per_group as u64
+    }
+
+    /// Build the reverse index (page_num -> PageLocation) from group_pages.
+    pub fn build_page_index(&mut self) {
+        self.page_index.clear();
+        for (gid, pages) in self.group_pages.iter().enumerate() {
+            for (idx, &page_num) in pages.iter().enumerate() {
+                self.page_index.insert(page_num, PageLocation {
+                    group_id: gid as u64,
+                    index: idx as u32,
+                });
+            }
+        }
+    }
+
+    /// Look up where a page lives. Returns None only if page_num is beyond manifest.
+    pub fn page_location(&self, page_num: u64) -> Option<PageLocation> {
+        self.page_index.get(&page_num).copied()
     }
 }
 
@@ -687,12 +744,13 @@ impl S3Client {
         let key = self.manifest_key();
         match self.get_object_async(&key).await? {
             Some(bytes) => {
-                let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Invalid manifest JSON: {}", e),
                     )
                 })?;
+                manifest.build_page_index();
                 Ok(Some(manifest))
             }
             None => Ok(None),
@@ -842,6 +900,14 @@ impl PageBitmap {
         }
     }
 
+    fn clear(&mut self, page: u64) {
+        let byte_idx = page as usize / 8;
+        let bit_idx = page as usize % 8;
+        if byte_idx < self.bits.len() {
+            self.bits[byte_idx] &= !(1 << bit_idx);
+        }
+    }
+
     fn clear_range(&mut self, start: u64, count: u64) {
         for p in start..start + count {
             let byte_idx = p as usize / 8;
@@ -951,7 +1017,8 @@ impl SubChunkTracker {
         }
     }
 
-    /// Compute which sub-chunk a page belongs to.
+    /// Compute which sub-chunk a page belongs to (LEGACY: positional mapping).
+    /// Only valid for positional groups. For B-tree-aware groups, use sub_chunk_id_for().
     fn sub_chunk_for_page(&self, page_num: u64) -> SubChunkId {
         let ppg = self.pages_per_group;
         let spf = self.sub_pages_per_frame;
@@ -962,6 +1029,14 @@ impl SubChunkTracker {
         let page_in_group = (page_num % ppg as u64) as u32;
         let frame_idx = page_in_group / spf;
         SubChunkId { group_id: gid, frame_index: frame_idx as u16 }
+    }
+
+    /// Compute SubChunkId from manifest-aware group ID and index within group.
+    /// Correct for B-tree-aware groups where pages are non-positional.
+    fn sub_chunk_id_for(&self, gid: u64, index_in_group: u32) -> SubChunkId {
+        let spf = self.sub_pages_per_frame;
+        let frame_idx = if spf > 0 { index_in_group / spf } else { 0 };
+        SubChunkId { group_id: gid as u32, frame_index: frame_idx as u16 }
     }
 
     /// Check if the sub-chunk containing this page is cached.
@@ -1275,13 +1350,17 @@ struct DiskCache {
     page_size: std::sync::atomic::AtomicU32,
     /// Encryption key for cache-at-rest. Uses CTR mode (no size overhead).
     encryption_key: Option<[u8; 32]>,
+    /// B-tree-aware page-to-group mapping: group_pages[gid] = list of page numbers.
+    /// Used by evict_group and clear_cache to clear the correct bitmap bits.
+    /// Updated when the manifest changes (via set_group_pages).
+    group_pages: parking_lot::RwLock<Vec<Vec<u64>>>,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
 static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DiskCache {
-    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>) -> io::Result<Self> {
+    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
         let cache_file_path = cache_dir.join("data.cache");
@@ -1325,25 +1404,21 @@ impl DiskCache {
             0
         };
 
-        // Initialize group states — mark as Present for groups where tracker shows coverage
+        // Initialize group states — mark as Present for groups where bitmap shows all pages cached.
+        // Uses B-tree-aware group_pages mapping (not positional).
         let group_states: Vec<std::sync::atomic::AtomicU8> = (0..total_groups)
             .map(|gid| {
-                // Check if all sub-chunks in this group are present in tracker
-                let frames_per_group = if spf > 0 { (pages_per_group + spf - 1) / spf } else { 1 };
-                let all_sub_chunks = (0..frames_per_group).all(|fi| {
-                    let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
-                    tracker.is_sub_chunk_present(&id)
-                });
-                // Fallback: check legacy bitmap (all pages in group present)
-                let all_bitmap = if !all_sub_chunks {
-                    let group_start = gid as u64 * pages_per_group as u64;
-                    let group_end = std::cmp::min(group_start + pages_per_group as u64, page_count);
-                    group_end > group_start && (group_start..group_end).all(|p| bitmap.is_present(p))
-                } else {
-                    false
-                };
-                let state = if (all_sub_chunks || all_bitmap) && page_count > 0 {
-                    GroupState::Present as u8
+                let state = if page_count > 0 {
+                    if let Some(gp) = group_pages.get(gid) {
+                        // B-tree-aware: check if all pages in this group are in the bitmap
+                        if !gp.is_empty() && gp.iter().all(|&p| bitmap.is_present(p)) {
+                            GroupState::Present as u8
+                        } else {
+                            GroupState::None as u8
+                        }
+                    } else {
+                        GroupState::None as u8
+                    }
                 } else {
                     GroupState::None as u8
                 };
@@ -1368,6 +1443,7 @@ impl DiskCache {
             sub_pages_per_frame: spf,
             page_size: std::sync::atomic::AtomicU32::new(page_size),
             encryption_key,
+            group_pages: parking_lot::RwLock::new(group_pages),
         })
     }
 
@@ -1486,20 +1562,97 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Write pages to the cache at non-consecutive positions (Phase Midway: B-tree-packed groups).
+    /// `page_nums` maps position in `data` to actual page number.
+    fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let page_sz = self.page_size.load(Ordering::Acquire) as usize;
+        if page_nums.is_empty() || page_sz == 0 {
+            return Ok(());
+        }
+
+        // Track how many pages we actually write (data may be shorter than page_nums)
+        let writable_count = page_nums.iter().enumerate()
+            .take_while(|(i, _)| (i + 1) * page_sz <= data.len())
+            .count();
+        let written_pages = &page_nums[..writable_count];
+        if written_pages.is_empty() {
+            return Ok(());
+        }
+
+        // Find max page to size the cache file
+        let max_page = written_pages.iter().copied().max().unwrap_or(0);
+        let needed = (max_page + 1) * page_sz as u64;
+
+        // Ensure file is large enough
+        {
+            let file = self.cache_file.read();
+            if file.metadata()?.len() < needed {
+                drop(file);
+                let file = self.cache_file.write();
+                if file.metadata()?.len() < needed {
+                    file.set_len(needed)?;
+                }
+                for (i, &pnum) in written_pages.iter().enumerate() {
+                    let src_start = i * page_sz;
+                    let page_data = &data[src_start..src_start + page_sz];
+                    #[cfg(feature = "encryption")]
+                    let page_data = if let Some(ref key) = self.encryption_key {
+                        &compress::encrypt_ctr(page_data, pnum, key)?
+                    } else {
+                        page_data
+                    };
+                    #[cfg(not(feature = "encryption"))]
+                    let page_data = page_data;
+                    let offset = pnum * page_sz as u64;
+                    file.write_all_at(page_data, offset)?;
+                }
+            } else {
+                for (i, &pnum) in written_pages.iter().enumerate() {
+                    let src_start = i * page_sz;
+                    let page_data = &data[src_start..src_start + page_sz];
+                    #[cfg(feature = "encryption")]
+                    let page_data = if let Some(ref key) = self.encryption_key {
+                        &compress::encrypt_ctr(page_data, pnum, key)?
+                    } else {
+                        page_data
+                    };
+                    #[cfg(not(feature = "encryption"))]
+                    let page_data = page_data;
+                    let offset = pnum * page_sz as u64;
+                    file.write_all_at(page_data, offset)?;
+                }
+            }
+        }
+
+        // Mark bitmap for per-page presence
+        let mut bitmap = self.bitmap.lock();
+        for &pnum in written_pages {
+            bitmap.mark_present(pnum);
+        }
+        drop(bitmap);
+
+        // Mark tracker sub-chunks as Data tier (manifest-aware, not positional)
+        let mut tracker = self.tracker.lock();
+        for (i, _) in written_pages.iter().enumerate() {
+            let idx = start_index_in_group + i as u32;
+            let id = tracker.sub_chunk_id_for(gid, idx);
+            tracker.mark_present(id, SubChunkTier::Data);
+        }
+        drop(tracker);
+
+        Ok(())
+    }
+
     /// Update the page size (needed when writer VFS learns page size from first write).
     fn set_page_size(&self, new_page_size: u32) {
         self.page_size.store(new_page_size, Ordering::Release);
     }
 
     /// Check if a page is present in the local cache.
-    /// Uses sub-chunk tracker as primary, falls back to legacy bitmap.
+    /// Uses bitmap (per-page accurate). SubChunkTracker is not consulted here
+    /// because it uses positional mapping which is wrong for B-tree-aware groups.
     fn is_present(&self, page_num: u64) -> bool {
-        let tracker = self.tracker.lock();
-        if tracker.is_present(page_num) {
-            return true;
-        }
-        drop(tracker);
-        // Fallback to legacy bitmap (for pages cached before tracker was introduced)
         self.bitmap.lock().is_present(page_num)
     }
 
@@ -1570,6 +1723,11 @@ impl DiskCache {
         }
     }
 
+    /// Update the B-tree-aware group_pages mapping (called when manifest changes).
+    fn set_group_pages(&self, gp: Vec<Vec<u64>>) {
+        *self.group_pages.write() = gp;
+    }
+
     /// Wait for a group to leave Fetching state (condvar, no spin).
     /// Wait until the group is no longer in a "pending" state.
     /// Returns when state is Present, or Fetching (worker claimed it),
@@ -1577,33 +1735,32 @@ impl DiskCache {
     /// Caller must re-check state and loop as needed.
     fn wait_for_group(&self, gid: u64) {
         let mut guard = self.group_condvar_mutex.lock();
-        // Wait while state is Fetching (worker in progress).
-        // If state is None (worker hasn't claimed yet, or failed), also wait
-        // but with a timeout to avoid spinning.
         loop {
             let state = self.group_state(gid);
             if state == GroupState::Present {
                 return;
             }
             if state == GroupState::Fetching {
-                // Worker is actively fetching. Wait for completion notification.
                 self.group_condvar.wait(&mut guard);
                 continue;
             }
             // state == None. Worker may not have picked up job yet.
-            // Wait with a short timeout, then re-check.
             self.group_condvar.wait_for(&mut guard, Duration::from_millis(5));
-            return; // Let caller loop and re-check.
+            return;
         }
     }
 
     /// Touch a group's access time for TTL tracking.
     fn touch_group(&self, gid: u64) {
         self.group_access.lock().insert(gid, Instant::now());
-        // Also touch all sub-chunks in this group
+        // Also touch all sub-chunks in this group.
+        // Use actual page count from group_pages (not positional ppg).
+        let gp = self.group_pages.read();
+        let num_pages = gp.get(gid as usize).map(|v| v.len() as u32).unwrap_or(self.pages_per_group);
+        drop(gp);
         let mut tracker = self.tracker.lock();
         let frames = if self.sub_pages_per_frame > 0 {
-            (self.pages_per_group + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
+            (num_pages + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
         } else { 1 };
         for fi in 0..frames {
             let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
@@ -1612,16 +1769,16 @@ impl DiskCache {
     }
 
     /// Mark a page group as containing B-tree interior pages (permanently pinned).
-    fn mark_interior_group(&self, gid: u64, page_num: u64) {
+    /// Uses manifest-aware (gid, index_in_group) for correct SubChunkId computation.
+    fn mark_interior_group(&self, gid: u64, page_num: u64, index_in_group: u32) {
         self.interior_groups.lock().insert(gid);
         self.interior_pages.lock().insert(page_num);
-        // Only promote to Pinned if the sub-chunk is already fully cached
-        // (present in the tracker via write_pages_bulk). If the page was loaded
-        // individually via write_page() (e.g. eager interior load), marking
-        // pinned would add the sub-chunk to the tracker's present set, causing
+        // Only promote to Pinned if the sub-chunk is already fully cached.
+        // If the page was loaded individually via write_page() (e.g. eager interior load),
+        // marking pinned would add the sub-chunk to the tracker's present set, causing
         // adjacent pages to be falsely reported as cached (they contain zeros).
         let mut tracker = self.tracker.lock();
-        let id = tracker.sub_chunk_for_page(page_num);
+        let id = tracker.sub_chunk_id_for(gid, index_in_group);
         if tracker.is_sub_chunk_present(&id) {
             tracker.mark_pinned(id);
         }
@@ -1629,12 +1786,11 @@ impl DiskCache {
 
     /// Mark a page's sub-chunk as Index tier (evicted after Data, before Pinned).
     /// Called when we detect an index leaf page (0x0A) during page scanning.
-    /// Only upgrades tier if the sub-chunk is already present in the tracker
-    /// (i.e., all pages in the sub-chunk were written via write_pages_bulk).
-    fn mark_index_page(&self, page_num: u64) {
+    /// Uses manifest-aware (gid, index_in_group) for correct SubChunkId computation.
+    fn mark_index_page(&self, page_num: u64, gid: u64, index_in_group: u32) {
         self.index_pages.lock().insert(page_num);
         let mut tracker = self.tracker.lock();
-        let id = tracker.sub_chunk_for_page(page_num);
+        let id = tracker.sub_chunk_id_for(gid, index_in_group);
         if tracker.is_sub_chunk_present(&id) {
             tracker.mark_index(id);
         }
@@ -1670,30 +1826,39 @@ impl DiskCache {
     }
 
     /// Evict a single page group from the local cache.
+    /// Uses B-tree-aware group_pages mapping to clear the correct bitmap bits.
     fn evict_group(&self, gid: u64) {
-        let start = gid * self.pages_per_group as u64;
-        let count = self.pages_per_group as u64;
-        self.bitmap.lock().clear_range(start, count);
-        // Also remove all sub-chunks for this group from tracker
-        self.tracker.lock().remove_group(gid as u32);
+        let gp = self.group_pages.read();
+        if let Some(page_nums) = gp.get(gid as usize) {
+            // Clear bitmap for actual pages in this group (not positional)
+            let mut bitmap = self.bitmap.lock();
+            for &pnum in page_nums {
+                bitmap.clear(pnum);
+            }
+            drop(bitmap);
 
-        // On Linux: hole punch to reclaim NVMe blocks
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let file = self.cache_file.write();
-            let ps = self.page_size.load(Ordering::Acquire) as u64;
-            let offset = (start * ps) as libc::off_t;
-            let len = (count * ps) as libc::off_t;
-            unsafe {
-                libc::fallocate(
-                    file.as_raw_fd(),
-                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                    offset,
-                    len,
-                );
+            // On Linux: hole punch each page to reclaim NVMe blocks
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                let file = self.cache_file.write();
+                let ps = self.page_size.load(Ordering::Acquire) as u64;
+                for &pnum in page_nums {
+                    let offset = (pnum * ps) as libc::off_t;
+                    let len = ps as libc::off_t;
+                    unsafe {
+                        libc::fallocate(
+                            file.as_raw_fd(),
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            offset,
+                            len,
+                        );
+                    }
+                }
             }
         }
+        // Also remove all sub-chunks for this group from tracker
+        self.tracker.lock().remove_group(gid as u32);
 
         // Reset group state to None
         let states = self.group_states.lock();
@@ -1911,7 +2076,11 @@ fn decode_page_group_seekable_full(
         output.extend_from_slice(&decompressed);
     }
 
-    // Truncate to actual page count (last frame may have been padded)
+    // Truncate to actual page count (last frame may have been padded).
+    // Use the smaller of the theoretical max and actual decoded bytes,
+    // since the encoder strips trailing empty pages from the last group.
+    let decoded_pages = (output.len() / page_size as usize) as u32;
+    let actual_pages = std::cmp::min(actual_pages, decoded_pages);
     let expected_len = actual_pages as usize * page_size as usize;
     output.truncate(expected_len);
 
@@ -2129,6 +2298,8 @@ struct PrefetchJob {
     page_size: u32,
     /// Sub-chunk size (needed for seekable decode).
     sub_pages_per_frame: u32,
+    /// Page numbers in this group (Phase Midway: B-tree groups). Empty = legacy positional.
+    group_page_nums: Vec<u64>,
 }
 
 /// Fixed thread pool for background page group prefetching.
@@ -2182,10 +2353,18 @@ impl PrefetchPool {
                         }
                     };
 
-                    // CAS: claim the group before fetching
-                    if !cache.try_claim_group(job.gid) {
+                    // Group may have been pre-claimed by the read path (Fetching)
+                    // or submitted by trigger_prefetch (still None). Try to claim
+                    // if not already Fetching; skip if already Done/Ready.
+                    let current = cache.group_state(job.gid);
+                    if current == GroupState::None {
+                        if !cache.try_claim_group(job.gid) {
+                            in_flight.fetch_sub(1, Ordering::Release);
+                            continue;
+                        }
+                    } else if current != GroupState::Fetching {
                         if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!("  [prefetch-skip] gid={} already claimed", job.gid);
+                            eprintln!("  [prefetch-skip] gid={} state={:?}", job.gid, current);
                         }
                         in_flight.fetch_sub(1, Ordering::Release);
                         continue;
@@ -2229,15 +2408,14 @@ impl PrefetchPool {
 
                     let decompress_start = Instant::now();
                     let decode_result = if !job.frame_table.is_empty() {
-                        let start_page = group_start_page(job.gid, ppg);
                         let pc = page_count.load(Ordering::Relaxed);
                         decode_page_group_seekable_full(
                             &pg_data,
                             &job.frame_table,
                             job.page_size,
-                            ppg,
+                            job.group_page_nums.len() as u32,
                             pc,
-                            start_page,
+                            0, // B-tree groups: group size from group_page_nums, not positional
                             #[cfg(feature = "zstd")]
                             decoder_dict.as_ref(),
                             encryption_key.as_ref().as_ref(),
@@ -2265,48 +2443,46 @@ impl PrefetchPool {
                     };
                     let decompress_ms = decompress_start.elapsed().as_millis();
 
-                    // Bulk write all pages
+                    // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
                     let write_start = Instant::now();
-                    let start_page = group_start_page(job.gid, ppg);
-                    let pc = page_count.load(Ordering::Relaxed);
-                    let actual_pages = std::cmp::min(
-                        pg_count as u64,
-                        pc.saturating_sub(start_page),
-                    );
-                    if actual_pages > 0 {
-                        let data_len = actual_pages as usize * _pg_size as usize;
-                        if let Err(e) = cache.write_pages_bulk(
-                            start_page,
+                    let actual_pages = std::cmp::min(pg_count as usize, job.group_page_nums.len());
+                    let write_result = if actual_pages > 0 {
+                        let data_len = actual_pages * _pg_size as usize;
+                        cache.write_pages_scattered(
+                            &job.group_page_nums[..actual_pages],
                             &page_data[..data_len],
-                            actual_pages,
-                        ) {
-                            eprintln!("[prefetch] gid={} write error: {}", job.gid, e);
-                            let states = cache.group_states.lock();
-                            if let Some(s) = states.get(job.gid as usize) {
-                                s.store(GroupState::None as u8, Ordering::Release);
-                            }
-                            cache.group_condvar.notify_all();
-                            in_flight.fetch_sub(1, Ordering::Release);
-                            continue;
+                            job.gid,
+                            0,
+                        )
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(e) = write_result {
+                        eprintln!("[prefetch] gid={} write error: {}", job.gid, e);
+                        let states = cache.group_states.lock();
+                        if let Some(s) = states.get(job.gid as usize) {
+                            s.store(GroupState::None as u8, Ordering::Release);
                         }
+                        cache.group_condvar.notify_all();
+                        in_flight.fetch_sub(1, Ordering::Release);
+                        continue;
                     }
                     let write_ms = write_start.elapsed().as_millis();
 
                     // Scan pages for page types and set sub-chunk tier
                     {
                         let ps = _pg_size as usize;
-                        for i in 0..actual_pages as usize {
-                            let pnum = start_page + i as u64;
+                        for (i, &pnum) in job.group_page_nums.iter().take(actual_pages).enumerate() {
                             let hdr_off = if pnum == 0 { 100 } else { 0 };
                             let page_start = i * ps;
                             let type_byte = page_data.get(page_start + hdr_off).copied();
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
-                                    cache.mark_interior_group(job.gid, pnum);
+                                    cache.mark_interior_group(job.gid, pnum, i as u32);
                                 } else if b == 0x0A {
                                     if let Some(page_slice) = page_data.get(page_start..page_start + ps) {
                                         if is_valid_btree_page(page_slice, hdr_off) {
-                                            cache.mark_index_page(pnum);
+                                            cache.mark_index_page(pnum, job.gid, i as u32);
                                         }
                                     }
                                 }
@@ -2338,7 +2514,7 @@ impl PrefetchPool {
     }
 
     /// Submit a prefetch job (non-blocking). Returns false if channel is closed.
-    fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32) -> bool {
+    fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
         match self.sender.send(PrefetchJob {
             gid,
@@ -2346,6 +2522,7 @@ impl PrefetchPool {
             frame_table,
             page_size,
             sub_pages_per_frame: sub_ppf,
+            group_page_nums,
         }) {
             Ok(()) => true,
             Err(_) => {
@@ -2457,11 +2634,13 @@ impl TieredHandle {
                     if cache.try_claim_group(0) {
                         if let Ok(Some(pg_data)) = s3.get_page_group(key) {
                             let ft = manifest.frame_tables.first().map(|v| v.as_slice());
+                            let gp0 = manifest.group_pages.get(0)
+                                .expect("group 0 must exist in group_pages");
                             let _ = Self::decode_and_cache_group_static(
                                 &cache,
                                 &pg_data,
-                                0,
-                                pages_per_group,
+                                gp0,
+                                0, // gid
                                 manifest.page_size,
                                 manifest.page_count,
                                 ft,
@@ -2508,8 +2687,9 @@ impl TieredHandle {
                                 total_pages += pages.len();
                                 for (pnum, pdata) in &pages {
                                     let _ = cache.write_page(*pnum, pdata);
-                                    let gid = group_id(*pnum, pages_per_group);
-                                    cache.mark_interior_group(gid, *pnum);
+                                    let loc = manifest.page_location(*pnum)
+                                        .expect("interior page must have group assignment");
+                                    cache.mark_interior_group(loc.group_id, *pnum, loc.index);
                                 }
                             }
                             Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
@@ -2681,8 +2861,8 @@ impl TieredHandle {
     fn decode_and_cache_group_static(
         cache: &DiskCache,
         pg_data: &[u8],
+        group_page_nums: &[u64],
         gid: u64,
-        pages_per_group: u32,
         page_size: u32,
         page_count: u64,
         frame_table: Option<&[FrameEntry]>,
@@ -2692,18 +2872,16 @@ impl TieredHandle {
         #[cfg(feature = "zstd")]
         let decoder_dict = dictionary.map(zstd::dict::DecoderDictionary::copy);
 
-        let start_page = group_start_page(gid, pages_per_group);
-
         // Dispatch: seekable (frame_table present and non-empty) vs legacy bulk
-        let (pg_count, page_data) = match frame_table.filter(|ft| !ft.is_empty()) {
+        let (_pg_count, page_data) = match frame_table.filter(|ft| !ft.is_empty()) {
             Some(ft) => {
                 let (c, _s, d) = decode_page_group_seekable_full(
                     pg_data,
                     ft,
                     page_size,
-                    pages_per_group,
+                    group_page_nums.len() as u32,
                     page_count,
-                    start_page,
+                    0, // B-tree groups: size from group_page_nums
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
                     encryption_key,
@@ -2722,18 +2900,38 @@ impl TieredHandle {
         };
 
         let ps = page_size as usize;
-        for i in 0..pg_count as usize {
-            let pnum = start_page + i as u64;
+        let mut written = 0usize;
+        for (i, &pnum) in group_page_nums.iter().enumerate() {
             if pnum >= page_count {
-                break;
+                continue;
             }
             let offset = i * ps;
             let end = offset + ps;
             if end > page_data.len() {
+                eprintln!(
+                    "[decode_and_cache_group_static] short data: group has {} page_nums, decoded {} bytes ({} pages), breaking at i={}",
+                    group_page_nums.len(), page_data.len(), page_data.len() / ps, i,
+                );
                 break;
             }
             cache.write_page(pnum, &page_data[offset..end])?;
+            written += 1;
         }
+        if written < group_page_nums.len() {
+            eprintln!(
+                "[decode_and_cache_group_static] WARNING: wrote {}/{} pages (data has {} bytes for {} byte pages)",
+                written, group_page_nums.len(), page_data.len(), ps,
+            );
+        }
+
+        // Mark tracker sub-chunks as Data tier (manifest-aware)
+        let mut tracker = cache.tracker.lock();
+        for i in 0..written {
+            let id = tracker.sub_chunk_id_for(gid, i as u32);
+            tracker.mark_present(id, SubChunkTier::Data);
+        }
+        drop(tracker);
+
         Ok(())
     }
 
@@ -2745,7 +2943,13 @@ impl TieredHandle {
         pg_data: &[u8],
         gid: u64,
     ) -> io::Result<()> {
-        let page_count = self.manifest.read().page_count;
+        let manifest = self.manifest.read();
+        let page_count = manifest.page_count;
+        let group_page_nums = manifest.group_pages.get(gid as usize)
+            .expect("group must exist in group_pages");
+        let group_page_nums = group_page_nums.clone();
+        drop(manifest);
+
         let (_pg_count, _pg_size, pages) = decode_page_group(
             pg_data,
             #[cfg(feature = "zstd")]
@@ -2753,11 +2957,11 @@ impl TieredHandle {
             self.encryption_key.as_ref(),
         )?;
 
-        let start_page = group_start_page(gid, self.pages_per_group);
         for (i, page_data) in pages.iter().enumerate() {
-            let pnum = start_page + i as u64;
+            if i >= group_page_nums.len() { break; }
+            let pnum = group_page_nums[i];
             if pnum >= page_count {
-                break;
+                continue;
             }
             cache.write_page(pnum, page_data)?;
         }
@@ -2773,12 +2977,67 @@ impl TieredHandle {
         let type_byte = buf.get(hdr_offset).copied();
         if let Some(b) = type_byte {
             if b == 0x05 || b == 0x02 {
-                let gid = group_id(page_num, self.pages_per_group);
-                cache.mark_interior_group(gid, page_num);
+                // New pages (not yet synced) may not have a group assignment yet
+                if let Some(loc) = self.manifest.read().page_location(page_num) {
+                    cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                }
             } else if b == 0x0A && is_valid_btree_page(buf, hdr_offset) {
-                cache.mark_index_page(page_num);
+                if let Some(loc) = self.manifest.read().page_location(page_num) {
+                    cache.mark_index_page(page_num, loc.group_id, loc.index);
+                }
             }
         }
+    }
+
+    /// Assign new pages (not in page_index) to new groups during sync.
+    /// Bin-packs unassigned pages into groups of ppg, extends group_pages,
+    /// and updates page_index. Called before dirty page grouping in sync().
+    fn assign_new_pages_to_groups(manifest: &mut Manifest, unassigned: &[u64], ppg: u32) {
+        if unassigned.is_empty() {
+            return;
+        }
+        let mut sorted = unassigned.to_vec();
+        sorted.sort_unstable();
+
+        // Check if last existing group has room for some pages
+        let last_gid = manifest.group_pages.len().saturating_sub(1);
+        let last_group_room = if !manifest.group_pages.is_empty() {
+            ppg as usize - manifest.group_pages[last_gid].len()
+        } else {
+            0
+        };
+
+        let mut idx = 0;
+        // Fill remaining space in last group
+        if last_group_room > 0 && !manifest.group_pages.is_empty() {
+            let fill = std::cmp::min(last_group_room, sorted.len());
+            for &pnum in &sorted[..fill] {
+                manifest.group_pages[last_gid].push(pnum);
+                manifest.page_index.insert(pnum, PageLocation {
+                    group_id: last_gid as u64,
+                    index: (manifest.group_pages[last_gid].len() - 1) as u32,
+                });
+            }
+            idx = fill;
+        }
+
+        // Create new groups for remaining pages
+        for chunk in sorted[idx..].chunks(ppg as usize) {
+            let new_gid = manifest.group_pages.len() as u64;
+            for (i, &pnum) in chunk.iter().enumerate() {
+                manifest.page_index.insert(pnum, PageLocation {
+                    group_id: new_gid,
+                    index: i as u32,
+                });
+            }
+            manifest.group_pages.push(chunk.to_vec());
+        }
+
+        eprintln!(
+            "[sync] assigned {} new pages to groups (total groups: {})",
+            unassigned.len(),
+            manifest.group_pages.len(),
+        );
     }
 
     /// Trigger fraction-based prefetch after a cache miss.
@@ -2819,6 +3078,11 @@ impl TieredHandle {
         let ft_for = |g: u64| -> Vec<FrameEntry> {
             manifest.frame_tables.get(g as usize).cloned().unwrap_or_default()
         };
+        let gp_for = |g: u64| -> Vec<u64> {
+            manifest.group_pages.get(g as usize)
+                .expect("group must exist in group_pages")
+                .clone()
+        };
         let ps = manifest.page_size;
         let sub_ppf = manifest.sub_pages_per_frame;
 
@@ -2833,7 +3097,7 @@ impl TieredHandle {
                 if cache.group_state(fwd) == GroupState::None {
                     if let Some(key) = manifest.page_group_keys.get(fwd as usize) {
                         if !key.is_empty() {
-                            pool.submit(fwd, key.clone(), ft_for(fwd), ps, sub_ppf);
+                            pool.submit(fwd, key.clone(), ft_for(fwd), ps, sub_ppf, gp_for(fwd));
                             submitted += 1;
                         }
                     }
@@ -2845,7 +3109,7 @@ impl TieredHandle {
                 if cache.group_state(bwd) == GroupState::None {
                     if let Some(key) = manifest.page_group_keys.get(bwd as usize) {
                         if !key.is_empty() {
-                            pool.submit(bwd, key.clone(), ft_for(bwd), ps, sub_ppf);
+                            pool.submit(bwd, key.clone(), ft_for(bwd), ps, sub_ppf, gp_for(bwd));
                             submitted += 1;
                         }
                     }
@@ -2913,9 +3177,8 @@ impl DatabaseHandle for TieredHandle {
             if ps > 0 { ps as u64 } else { buf.len() as u64 }
         };
         let page_num = offset / page_size;
-        let gid = group_id(page_num, self.pages_per_group);
 
-        // 1. Check dirty pages (in-memory, raw/uncompressed)
+        // 1. Check dirty pages first (new pages may not be in manifest yet)
         {
             let dirty = self.dirty_pages.read();
             if let Some(raw) = dirty.get(&page_num) {
@@ -2925,14 +3188,25 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // 2. Bounds check
+        // 2. Bounds check - page beyond manifest is zero-filled
         let manifest_page_count = self.manifest.read().page_count;
         if page_num >= manifest_page_count {
             buf.fill(0);
             return Ok(());
         }
 
-        // 3. Check page bitmap (cache hit = direct pread, no decompression)
+        // 3. Look up page location (Phase Midway). Safe to .expect() here because:
+        //    - New pages (not in manifest) are always in dirty_pages (returned above)
+        //    - Pages beyond page_count are zero-filled (returned above)
+        //    - sync() assigns new pages to groups before clearing dirty_pages
+        let manifest_ref = self.manifest.read();
+        let loc = manifest_ref.page_location(page_num)
+            .expect("page within manifest bounds must have group assignment");
+        drop(manifest_ref);
+        let gid = loc.group_id;
+        let page_in_group_idx = loc.index as usize;
+
+        // 4. Check page bitmap (cache hit = direct pread, no decompression)
         let cache_arc = Arc::clone(self.cache.as_ref().expect("disk cache required"));
         let cache = cache_arc.as_ref();
         if cache.is_present(page_num) {
@@ -2943,43 +3217,81 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // 4. Cache miss — fetch from S3.
+        // 5. Cache miss - fetch from S3.
         let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
-        let start_page = group_start_page(gid, self.pages_per_group);
-
         // Check if seekable format is available for sub-chunk range GETs.
         let frame_table = manifest.frame_tables.get(gid as usize);
         let has_frames = manifest.sub_pages_per_frame > 0
             && frame_table.map(|ft| !ft.is_empty()).unwrap_or(false);
         if has_frames {
-            // ── SEEKABLE PATH: range GET just the sub-chunk containing the needed page ──
-            // Downloads ~100KB instead of ~2-10MB. Prefetch still gets the full group.
             let sub_ppg = manifest.sub_pages_per_frame;
-            let page_in_group = (page_num - start_page) as usize;
+            let page_in_group = page_in_group_idx;
             let frame_idx = page_in_group / sub_ppg as usize;
             let ft = frame_table.unwrap();
 
             if frame_idx < ft.len() {
-                let entry = &ft[frame_idx];
-                let key = &manifest.page_group_keys[gid as usize];
+                let key = manifest.page_group_keys.get(gid as usize)
+                    .expect("gid must be valid index into page_group_keys");
 
-                // Submit the CURRENT group to prefetch pool (full group fetch in background).
-                // This ensures subsequent pages from the same group are cache hits.
+                // Submit prefetch for the full group if not already in flight.
+                // Claim the group (None -> Fetching) HERE so the inline path
+                // below immediately sees Fetching and waits, closing the timing
+                // gap between submit() and the worker's dequeue.
                 self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-                if let Some(pool) = &self.prefetch_pool {
-                    if cache.group_state(gid) == GroupState::None {
-                        if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                            if !key.is_empty() {
-                                pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg);
+                let group_state = cache.group_state(gid);
+                if group_state == GroupState::None {
+                    if cache.try_claim_group(gid) {
+                        let mut submitted = false;
+                        if let Some(pool) = &self.prefetch_pool {
+                            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                                if !key.is_empty() {
+                                    let gp = manifest.group_pages.get(gid as usize)
+                                        .expect("group must exist in group_pages")
+                                        .clone();
+                                    submitted = pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp);
+                                }
                             }
                         }
+                        if !submitted {
+                            // Reset state: no pool or no key, don't leave stuck in Fetching
+                            let states = cache.group_states.lock();
+                            if let Some(s) = states.get(gid as usize) {
+                                s.store(GroupState::None as u8, Ordering::Release);
+                            }
+                            cache.group_condvar.notify_all();
+                        }
                     }
+                    // Trigger neighbor prefetch on first miss only
+                    self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
                 }
-                // Also trigger neighbor prefetch
-                self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
 
+                // If prefetch is already fetching this group, wait for it instead
+                // of issuing a redundant inline range GET. One full-group GET is
+                // cheaper than N per-frame range GETs, especially on low-latency
+                // links (Fly <-> Tigris ~5ms).
+                if cache.group_state(gid) == GroupState::Fetching {
+                    let wait_start = Instant::now();
+                    cache.wait_for_group(gid);
+                    if std::env::var("BENCH_VERBOSE").is_ok() {
+                        eprintln!(
+                            "  [wait-prefetch] page={} gid={} waited {}ms",
+                            page_num, gid, wait_start.elapsed().as_millis(),
+                        );
+                    }
+                    // Prefetch landed, page should now be in cache
+                    if cache.is_present(page_num) {
+                        cache.read_page(page_num, buf)?;
+                        self.detect_interior_page(buf, page_num, cache);
+                        cache.touch_group(gid);
+                        self.consecutive_misses = 0;
+                        return Ok(());
+                    }
+                    // Prefetch failed or page still missing, fall through to inline fetch
+                }
+
+                let entry = &ft[frame_idx];
                 let s3_start = Instant::now();
                 match s3_arc.range_get(key, entry.offset, entry.len) {
                     Ok(Some(compressed_frame)) => {
@@ -3005,36 +3317,39 @@ impl DatabaseHandle for TieredHandle {
                             buf.fill(0);
                         }
 
-                        // Write sub-chunk pages to cache for future hits
-                        let frame_start_page = start_page + (frame_idx * sub_ppg as usize) as u64;
-                        let pages_in_frame = std::cmp::min(
-                            sub_ppg as u64,
-                            manifest.page_count.saturating_sub(frame_start_page),
-                        );
-                        if pages_in_frame > 0 {
-                            let data_len = pages_in_frame as usize * ps;
-                            if data_len <= decompressed.len() {
-                                cache.write_pages_bulk(
-                                    frame_start_page,
-                                    &decompressed[..data_len],
-                                    pages_in_frame,
-                                )?;
+                        // Write sub-chunk pages to cache (Phase Midway: B-tree-aware groups)
+                        let frame_start_idx = frame_idx * sub_ppg as usize;
+                        let gp = manifest.group_pages.get(gid as usize)
+                            .expect("group must exist in group_pages");
+                        {
+                            let frame_end_idx = std::cmp::min(frame_start_idx + sub_ppg as usize, gp.len());
+                            let frame_page_nums = &gp[frame_start_idx..frame_end_idx];
+                            let pages_in_frame = frame_page_nums.len() as u64;
+                            if pages_in_frame > 0 {
+                                let data_len = pages_in_frame as usize * ps;
+                                if data_len <= decompressed.len() {
+                                    cache.write_pages_scattered(
+                                        frame_page_nums,
+                                        &decompressed[..data_len],
+                                        gid,
+                                        frame_start_idx as u32,
+                                    )?;
+                                }
                             }
-                        }
-
-                        // Scan for page types in the sub-chunk and set tier
-                        for i in 0..pages_in_frame as usize {
-                            let pnum = frame_start_page + i as u64;
-                            let hdr_off = if pnum == 0 { 100 } else { 0 };
-                            let page_start = i * ps;
-                            let type_byte = decompressed.get(page_start + hdr_off).copied();
-                            if let Some(b) = type_byte {
-                                if b == 0x05 || b == 0x02 {
-                                    cache.mark_interior_group(gid, pnum);
-                                } else if b == 0x0A {
-                                    if let Some(page_slice) = decompressed.get(page_start..page_start + ps) {
-                                        if is_valid_btree_page(page_slice, hdr_off) {
-                                            cache.mark_index_page(pnum);
+                            // Scan for page types in the sub-chunk
+                            for (i, &pnum) in frame_page_nums.iter().enumerate() {
+                                let hdr_off = if pnum == 0 { 100 } else { 0 };
+                                let page_start = i * ps;
+                                let idx_in_group = (frame_start_idx + i) as u32;
+                                let type_byte = decompressed.get(page_start + hdr_off).copied();
+                                if let Some(b) = type_byte {
+                                    if b == 0x05 || b == 0x02 {
+                                        cache.mark_interior_group(gid, pnum, idx_in_group);
+                                    } else if b == 0x0A {
+                                        if let Some(page_slice) = decompressed.get(page_start..page_start + ps) {
+                                            if is_valid_btree_page(page_slice, hdr_off) {
+                                                cache.mark_index_page(pnum, gid, idx_in_group);
+                                            }
                                         }
                                     }
                                 }
@@ -3092,16 +3407,18 @@ impl DatabaseHandle for TieredHandle {
                             Ok(Some(pg_data)) => {
                                 let s3_ms = s3_start.elapsed().as_millis();
                                 let decode_start = Instant::now();
-                                // Use seekable full decode if frame table available, else legacy
+                                // Decode: seekable (multi-frame) or bulk (single frame)
                                 let decode_result = if has_frames {
                                     let ft = frame_table.unwrap();
+                                    let gp = manifest.group_pages.get(gid as usize)
+                                        .expect("group must exist in group_pages");
                                     decode_page_group_seekable_full(
                                         &pg_data,
                                         ft,
                                         manifest.page_size,
-                                        self.pages_per_group,
+                                        gp.len() as u32,
                                         manifest.page_count,
-                                        start_page,
+                                        0, // not used for truncation; group size from group_pages
                                         #[cfg(feature = "zstd")]
                                         self.decoder_dict.as_ref(),
                                         self.encryption_key.as_ref(),
@@ -3116,24 +3433,25 @@ impl DatabaseHandle for TieredHandle {
                                 };
                                 let (pg_count, pg_size, page_data) = decode_result?;
                                 let decode_ms = decode_start.elapsed().as_millis();
-                                let pc = manifest.page_count;
-                                let actual_pages = std::cmp::min(
-                                    pg_count as u64,
-                                    pc.saturating_sub(start_page),
-                                );
-                                let write_start = Instant::now();
-                                if actual_pages > 0 {
-                                    let data_len = actual_pages as usize * pg_size as usize;
-                                    cache.write_pages_bulk(
-                                        start_page,
-                                        &page_data[..data_len],
-                                        actual_pages,
-                                    )?;
-                                }
-                                let write_ms = write_start.elapsed().as_millis();
                                 let ps = pg_size as usize;
-                                for i in 0..actual_pages as usize {
-                                    let pnum = start_page + i as u64;
+
+                                // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
+                                let write_start = Instant::now();
+                                let gp = manifest.group_pages.get(gid as usize)
+                                    .expect("group must exist in group_pages");
+                                let actual_pages = std::cmp::min(pg_count as usize, gp.len());
+                                if actual_pages > 0 {
+                                    let data_len = actual_pages * ps;
+                                    if data_len <= page_data.len() {
+                                        cache.write_pages_scattered(
+                                            &gp[..actual_pages],
+                                            &page_data[..data_len],
+                                            gid,
+                                            0,
+                                        )?;
+                                    }
+                                }
+                                for (i, &pnum) in gp.iter().take(actual_pages).enumerate() {
                                     let type_byte = if pnum == 0 {
                                         page_data.get(i * ps + 100).copied()
                                     } else {
@@ -3141,10 +3459,11 @@ impl DatabaseHandle for TieredHandle {
                                     };
                                     if let Some(b) = type_byte {
                                         if b == 0x05 || b == 0x02 {
-                                            cache.mark_interior_group(gid, pnum);
+                                            cache.mark_interior_group(gid, pnum, i as u32);
                                         }
                                     }
                                 }
+                                let write_ms = write_start.elapsed().as_millis();
                                 cache.mark_group_present(gid);
                                 cache.touch_group(gid);
                                 if std::env::var("BENCH_VERBOSE").is_ok() {
@@ -3301,19 +3620,31 @@ impl DatabaseHandle for TieredHandle {
         // Pages are already in disk cache from write_all_at().
         if LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
             let cache = self.disk_cache();
+            let mut manifest = self.manifest.write();
             let mut pending = self.s3_dirty_groups.lock().unwrap();
             let mut interior_found = 0usize;
+            // Assign new pages (not in page_index) to new groups before recording dirty groups
+            let unassigned: Vec<u64> = dirty_snapshot.keys()
+                .filter(|&&pn| manifest.page_location(pn).is_none())
+                .copied()
+                .collect();
+            if !unassigned.is_empty() {
+                Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+            }
             for (&page_num, data) in &dirty_snapshot {
-                pending.insert(group_id(page_num, ppg));
+                let loc = manifest.page_location(page_num)
+                    .expect("page must have group assignment after new-page assignment");
+                pending.insert(loc.group_id);
                 // Track interior pages so final sync builds correct interior chunks
                 let type_byte = if page_num == 0 { data.get(100) } else { data.get(0) };
                 if let Some(&b) = type_byte {
                     if b == 0x05 || b == 0x02 {
-                        cache.mark_interior_group(group_id(page_num, ppg), page_num);
+                        cache.mark_interior_group(loc.group_id, page_num, loc.index);
                         interior_found += 1;
                     }
                 }
             }
+            drop(manifest);
             let n = dirty_snapshot.len();
             let total_interior = cache.interior_pages.lock().len();
             // Free in-memory dirty pages — they're already on local disk
@@ -3324,12 +3655,28 @@ impl DatabaseHandle for TieredHandle {
 
         let s3 = self.s3();
         let cache = self.disk_cache();
-        let page_count = self.manifest.read().page_count;
+
+        // Assign new pages (not in page_index) to new groups before grouping
+        {
+            let mut manifest = self.manifest.write();
+            let unassigned: Vec<u64> = dirty_snapshot.keys()
+                .filter(|&&pn| manifest.page_location(pn).is_none())
+                .copied()
+                .collect();
+            if !unassigned.is_empty() {
+                Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+            }
+        }
+
+        let manifest_snap = self.manifest.read().clone();
+        let page_count = manifest_snap.page_count;
 
         // Group dirty pages by page group
         let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
         for &page_num in dirty_snapshot.keys() {
-            let gid = group_id(page_num, ppg);
+            let gid = manifest_snap.page_location(page_num)
+                .expect("page must have group assignment after new-page assignment")
+                .group_id;
             groups_dirty.entry(gid).or_default().push(page_num);
         }
 
@@ -3389,20 +3736,25 @@ impl DatabaseHandle for TieredHandle {
 
         // For each dirty page group that needs uploading: read all raw pages, encode as whole-group compressed
         for &gid in &groups_needing_upload {
-            let mut pages: Vec<Option<Vec<u8>>> = vec![None; ppg as usize];
-            let start = group_start_page(gid, ppg);
             let mut need_s3_merge = false;
 
+            // Get explicit page list from B-tree-aware manifest (Phase Midway)
+            let pages_in_group = manifest_snap.group_pages.get(gid as usize)
+                .expect("group must exist in group_pages")
+                .clone();
+            let group_size = pages_in_group.len();
+
+            let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+
             // First, try to read all pages from local cache (raw, uncompressed)
-            for i in 0..ppg {
-                let pnum = start + i as u64;
+            for (i, &pnum) in pages_in_group.iter().enumerate() {
                 if pnum >= page_count {
                     break;
                 }
                 if cache.is_present(pnum) {
                     let mut page_buf = vec![0u8; page_size as usize];
                     if cache.read_page(pnum, &mut page_buf).is_ok() {
-                        pages[i as usize] = Some(page_buf);
+                        pages[i] = Some(page_buf);
                     }
                 } else {
                     need_s3_merge = true;
@@ -3414,7 +3766,6 @@ impl DatabaseHandle for TieredHandle {
                 if let Some(existing_key) = new_keys.get(gid as usize) {
                     if !existing_key.is_empty() {
                         if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
-                            // Decode the existing group to get raw pages
                             if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
@@ -3422,10 +3773,8 @@ impl DatabaseHandle for TieredHandle {
                                 self.encryption_key.as_ref(),
                             ) {
                                 for (j, existing_page) in existing_pages.into_iter().enumerate() {
-                                    let jpnum = start + j as u64;
-                                    if jpnum >= page_count {
-                                        break;
-                                    }
+                                    if j >= pages_in_group.len() { break; }
+                                    if pages_in_group[j] >= page_count { break; }
                                     if pages[j].is_none() {
                                         pages[j] = Some(existing_page);
                                     }
@@ -3478,7 +3827,9 @@ impl DatabaseHandle for TieredHandle {
                 if let Some(&b) = type_byte {
                     if b == 0x05 || b == 0x02 {
                         all_interior.insert(pnum, data.clone());
-                        cache.mark_interior_group(group_id(pnum, ppg), pnum);
+                        if let Some(loc) = manifest_snap.page_location(pnum) {
+                            cache.mark_interior_group(loc.group_id, pnum, loc.index);
+                        }
                         dirty_interior_count += 1;
                     }
                 }
@@ -3699,10 +4050,11 @@ impl DatabaseHandle for TieredHandle {
         }
 
         // Update manifest atomically
-        let new_manifest = Manifest {
+        let old_manifest = self.manifest.read().clone();
+        let mut new_manifest = Manifest {
             version: next_version,
-            page_count: self.manifest.read().page_count,
-            page_size: self.manifest.read().page_size,
+            page_count: old_manifest.page_count,
+            page_size: old_manifest.page_size,
             pages_per_group: ppg,
             page_group_keys: new_keys,
             interior_chunk_keys: new_chunk_keys,
@@ -3710,12 +4062,19 @@ impl DatabaseHandle for TieredHandle {
             // VFS sync path uses legacy single-frame encoding for now
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
+            // Carry forward B-tree-aware fields (Phase Midway)
+            group_pages: old_manifest.group_pages.clone(),
+            btrees: old_manifest.btrees.clone(),
+            page_index: HashMap::new(),
         };
+        new_manifest.build_page_index();
         s3.put_manifest(&new_manifest)?;
 
         // Commit local state
         {
             let mut m = self.manifest.write();
+            // Update cache's group_pages to match new manifest
+            cache.set_group_pages(new_manifest.group_pages.clone());
             *m = new_manifest;
         }
         {
@@ -4024,7 +4383,13 @@ impl TieredVfs {
             page_size,
             manifest.page_count,
             config.encryption_key,
+            manifest.group_pages.clone(),
         )?;
+
+        // B-tree-aware groups may exceed the positional group count formula.
+        // Ensure group_states can track all manifest groups.
+        let manifest_groups = manifest.total_groups() as usize;
+        cache.ensure_group_capacity(manifest_groups);
 
         let s3 = Arc::new(s3);
         let cache = Arc::new(cache);
@@ -4068,7 +4433,6 @@ impl TieredVfs {
         self.prefetch_pool.wait_idle();
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
-        let ppg = self.cache.pages_per_group as u64;
 
         // Reset group states to None, except group 0 stays Present
         let states = self.cache.group_states.lock();
@@ -4084,10 +4448,11 @@ impl TieredVfs {
         self.cache.group_access.lock().clear();
 
         // Clear bitmap except for interior pages, index pages, and group 0
+        // Uses B-tree-aware group_pages[0] for group 0 (not positional 0..ppg)
         {
             let index_pages = self.cache.index_pages.lock().clone();
+            let gp = self.cache.group_pages.read();
             let mut bitmap = self.cache.bitmap.lock();
-            let total_pages = bitmap.bits.len() as u64 * 8;
             bitmap.bits.fill(0);
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
@@ -4095,9 +4460,10 @@ impl TieredVfs {
             for &page in &index_pages {
                 bitmap.mark_present(page);
             }
-            let g0_end = ppg.min(total_pages);
-            for p in 0..g0_end {
-                bitmap.mark_present(p);
+            if let Some(g0_pages) = gp.first() {
+                for &p in g0_pages {
+                    bitmap.mark_present(p);
+                }
             }
             let _ = bitmap.persist();
         }
@@ -4107,10 +4473,6 @@ impl TieredVfs {
             let mut tracker = self.cache.tracker.lock();
             tracker.clear_data_only();
         }
-
-        // Don't truncate cache file — bitmap/tracker control what's "present".
-        // Pinned page data stays in the file at correct offsets.
-        // Non-pinned pages are absent so reads will re-fetch from S3.
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
@@ -4255,6 +4617,12 @@ impl Vfs for TieredVfs {
                 self.config.pages_per_group
             };
 
+            // Update cache's group_pages from latest manifest
+            if !manifest.group_pages.is_empty() {
+                self.cache.set_group_pages(manifest.group_pages.clone());
+                self.cache.ensure_group_capacity(manifest.group_pages.len());
+            }
+
             let lock_dir = self.config.cache_dir.join("locks");
             fs::create_dir_all(&lock_dir)?;
             let lock_path = lock_dir.join(db);
@@ -4352,7 +4720,6 @@ impl TieredBenchHandle {
         self.prefetch_pool.wait_idle();
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
-        let ppg = self.cache.pages_per_group as u64;
 
         // Reset group states to None, except group 0 stays Present
         let states = self.cache.group_states.lock();
@@ -4368,10 +4735,11 @@ impl TieredBenchHandle {
         self.cache.group_access.lock().clear();
 
         // Clear bitmap except for interior pages, index pages, and group 0
+        // Uses B-tree-aware group_pages[0] (not positional 0..ppg)
         {
             let index_pages = self.cache.index_pages.lock().clone();
+            let gp = self.cache.group_pages.read();
             let mut bitmap = self.cache.bitmap.lock();
-            let total_pages = bitmap.bits.len() as u64 * 8;
             bitmap.bits.fill(0);
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
@@ -4379,9 +4747,10 @@ impl TieredBenchHandle {
             for &page in &index_pages {
                 bitmap.mark_present(page);
             }
-            let g0_end = ppg.min(total_pages);
-            for p in 0..g0_end {
-                bitmap.mark_present(p);
+            if let Some(g0_pages) = gp.first() {
+                for &p in g0_pages {
+                    bitmap.mark_present(p);
+                }
             }
             let _ = bitmap.persist();
         }
@@ -4400,7 +4769,6 @@ impl TieredBenchHandle {
         self.prefetch_pool.wait_idle();
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
-        let ppg = self.cache.pages_per_group as u64;
 
         // Reset group states to None, except group 0 stays Present
         let states = self.cache.group_states.lock();
@@ -4417,16 +4785,18 @@ impl TieredBenchHandle {
         self.cache.index_pages.lock().clear();
 
         // Clear bitmap except for interior pages and group 0
+        // Uses B-tree-aware group_pages[0] (not positional 0..ppg)
         {
+            let gp = self.cache.group_pages.read();
             let mut bitmap = self.cache.bitmap.lock();
-            let total_pages = bitmap.bits.len() as u64 * 8;
             bitmap.bits.fill(0);
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
             }
-            let g0_end = ppg.min(total_pages);
-            for p in 0..g0_end {
-                bitmap.mark_present(p);
+            if let Some(g0_pages) = gp.first() {
+                for &p in g0_pages {
+                    bitmap.mark_present(p);
+                }
             }
             let _ = bitmap.persist();
         }
@@ -4850,15 +5220,10 @@ pub fn import_sqlite_file(
         total_groups,
     );
 
-    // Read all pages, group them, detect interior pages
+    // Phase Midway: walk B-trees to build page-to-btree map, then pack by B-tree
     let compression_level = config.compression_level;
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
-    let mut page_group_keys: Vec<String> = Vec::with_capacity(total_groups as usize);
-    let mut frame_tables: Vec<Vec<FrameEntry>> = Vec::with_capacity(total_groups as usize);
-    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut interior_pages: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut index_leaf_pages: Vec<(u64, Vec<u8>)> = Vec::new();
     let version = 1u64;
 
     eprintln!(
@@ -4867,17 +5232,94 @@ pub fn import_sqlite_file(
         sub_ppf,
     );
 
-    for gid in 0..total_groups {
-        let start_page = gid * ppg as u64;
-        let end_page = std::cmp::min(start_page + ppg as u64, page_count);
-        let mut pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(ppg as usize);
+    // Walk B-trees to discover page ownership
+    eprintln!("[import] walking B-trees...");
+    let walk_result = crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
+        let mut buf = vec![0u8; page_size as usize];
+        file.read_exact_at(&mut buf, page_num * page_size as u64).ok()?;
+        Some(buf)
+    });
+    eprintln!(
+        "[import] found {} B-trees, {} unowned pages",
+        walk_result.btrees.len(),
+        walk_result.unowned_pages.len(),
+    );
 
-        for i in 0..ppg as usize {
-            let pnum = start_page + i as u64;
-            if pnum >= page_count {
-                pages.push(None);
-                continue;
+    // Pack pages by B-tree into groups.
+    // Large B-trees (>= ppg/4 pages) get their own groups.
+    // Small B-trees + unowned pages are bin-packed into shared groups.
+    let mut group_pages_list: Vec<Vec<u64>> = Vec::new();
+
+    // Sort B-trees by size descending (large first)
+    let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
+        walk_result.btrees.iter().collect();
+    btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+
+    let threshold = std::cmp::max(ppg as usize / 4, 1);
+    let mut small_pages: Vec<u64> = Vec::new();
+
+    for (_root, entry) in &btree_list {
+        if entry.pages.len() >= threshold {
+            // Large B-tree: own groups, chunked to ppg
+            for chunk in entry.pages.chunks(ppg as usize) {
+                group_pages_list.push(chunk.to_vec());
             }
+        } else {
+            // Small B-tree: collect for bin-packing
+            small_pages.extend_from_slice(&entry.pages);
+        }
+    }
+
+    // Add unowned pages to the small-pages bin
+    small_pages.extend_from_slice(&walk_result.unowned_pages);
+
+    // Bin-pack small pages into groups
+    for chunk in small_pages.chunks(ppg as usize) {
+        group_pages_list.push(chunk.to_vec());
+    }
+
+    let actual_groups = group_pages_list.len();
+    eprintln!(
+        "[import] packed into {} groups (was {} positional)",
+        actual_groups, total_groups,
+    );
+
+    // Build btrees manifest map by scanning which groups contain which B-tree's pages
+    let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
+    for (gid, pages) in group_pages_list.iter().enumerate() {
+        for &p in pages {
+            page_to_gid.insert(p, gid as u64);
+        }
+    }
+
+    let mut btrees_manifest: HashMap<u64, BTreeManifestEntry> = HashMap::new();
+    for (&root_page, entry) in &walk_result.btrees {
+        let mut gid_set: HashSet<u64> = HashSet::new();
+        for &p in &entry.pages {
+            if let Some(&gid) = page_to_gid.get(&p) {
+                gid_set.insert(gid);
+            }
+        }
+        let mut gids: Vec<u64> = gid_set.into_iter().collect();
+        gids.sort_unstable();
+        btrees_manifest.insert(root_page, BTreeManifestEntry {
+            name: entry.name.clone(),
+            obj_type: entry.obj_type.clone(),
+            group_ids: gids,
+        });
+    }
+
+    // Encode and collect uploads for each group
+    let mut page_group_keys: Vec<String> = Vec::with_capacity(actual_groups);
+    let mut frame_tables: Vec<Vec<FrameEntry>> = Vec::with_capacity(actual_groups);
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut interior_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut index_leaf_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    for (gid, page_nums) in group_pages_list.iter().enumerate() {
+        let mut pages: Vec<Option<Vec<u8>>> = vec![None; ppg as usize];
+
+        for (idx, &pnum) in page_nums.iter().enumerate() {
             let mut buf = vec![0u8; page_size as usize];
             file.read_exact_at(&mut buf, pnum * page_size as u64)?;
 
@@ -4890,10 +5332,10 @@ pub fn import_sqlite_file(
                 index_leaf_pages.push((pnum, buf.clone()));
             }
 
-            pages.push(Some(buf));
+            pages[idx] = Some(buf);
         }
 
-        let key = s3.page_group_key(gid, version);
+        let key = s3.page_group_key(gid as u64, version);
         if use_seekable {
             let (encoded, ft) = encode_page_group_seekable(
                 &pages,
@@ -4920,10 +5362,44 @@ pub fn import_sqlite_file(
         }
         page_group_keys.push(key);
 
-        if (gid + 1) % 50 == 0 || gid + 1 == total_groups {
+        // DEBUG: verify encode/decode roundtrip for every group
+        if std::env::var("IMPORT_VERIFY").is_ok() {
+            let encoded_data = &uploads.last().unwrap().1;
+            let ft = frame_tables.last().unwrap();
+            if use_seekable && !ft.is_empty() {
+                let (dec_count, _dec_size, decoded) = decode_page_group_seekable_full(
+                    encoded_data,
+                    ft,
+                    page_size,
+                    page_nums.len() as u32,
+                    page_count,
+                    0,
+                    #[cfg(feature = "zstd")]
+                    None,
+                    config.encryption_key.as_ref(),
+                ).expect("decode roundtrip failed");
+                assert_eq!(dec_count as usize, page_nums.len(), "gid={} page count mismatch", gid);
+                for (idx, &pnum) in page_nums.iter().enumerate() {
+                    let start = idx * page_size as usize;
+                    let end = start + page_size as usize;
+                    let decoded_page = &decoded[start..end];
+                    let original = pages[idx].as_ref().unwrap();
+                    assert_eq!(decoded_page, original.as_slice(),
+                        "gid={} page {} (idx={}) roundtrip mismatch: first differing byte at {}",
+                        gid, pnum, idx,
+                        decoded_page.iter().zip(original.iter()).position(|(a, b)| a != b).unwrap_or(0),
+                    );
+                }
+            }
+            if gid == 0 {
+                eprintln!("[import] IMPORT_VERIFY: roundtrip checks enabled");
+            }
+        }
+
+        if (gid + 1) % 50 == 0 || gid + 1 == actual_groups {
             eprintln!(
                 "[import] encoded {}/{} groups ({} interior pages so far)",
-                gid + 1, total_groups, interior_pages.len(),
+                gid + 1, actual_groups, interior_pages.len(),
             );
         }
     }
@@ -5009,8 +5485,8 @@ pub fn import_sqlite_file(
         eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
     }
 
-    // Build and upload manifest
-    let manifest = Manifest {
+    // Build and upload manifest (Phase Midway: explicit B-tree-aware groups)
+    let mut manifest = Manifest {
         version,
         page_count,
         page_size,
@@ -5020,7 +5496,11 @@ pub fn import_sqlite_file(
         index_chunk_keys,
         frame_tables,
         sub_pages_per_frame: if use_seekable { sub_ppf } else { 0 },
+        group_pages: group_pages_list,
+        btrees: btrees_manifest,
+        page_index: HashMap::new(),
     };
+    manifest.build_page_index();
     s3.put_manifest(&manifest)?;
     eprintln!(
         "[import] manifest uploaded: version={} pages={} groups={} interior_chunks={} seekable={}",
@@ -5041,6 +5521,22 @@ pub fn register(name: &str, vfs: TieredVfs) -> Result<(), io::Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Build a positional group_pages vec for tests: group g contains pages [g*ppg .. (g+1)*ppg).
+    fn positional_group_pages(pages_per_group: u32, page_count: u64) -> Vec<Vec<u64>> {
+        let ppg = pages_per_group as u64;
+        if ppg == 0 || page_count == 0 {
+            return Vec::new();
+        }
+        let num_groups = (page_count + ppg - 1) / ppg;
+        (0..num_groups)
+            .map(|g| {
+                let start = g * ppg;
+                let end = ((g + 1) * ppg).min(page_count);
+                (start..end).collect()
+            })
+            .collect()
+    }
 
     // =========================================================================
     // PageBitmap
@@ -5513,7 +6009,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_and_read_page() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
         let data = vec![42u8; 64];
         cache.write_page(5, &data).unwrap();
         assert!(cache.is_present(5));
@@ -5526,7 +6022,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_multiple_pages() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
         for i in 0..16u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
         }
@@ -5541,7 +6037,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_page_overwrite() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         cache.write_page(3, &vec![0xAA; 64]).unwrap();
         cache.write_page(3, &vec![0xBB; 64]).unwrap(); // overwrite
         let mut buf = vec![0u8; 64];
@@ -5552,7 +6048,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_extends_file() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None).unwrap(); // page_count=0
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None, Vec::new()).unwrap(); // page_count=0
         // Writing page 10 should extend the file
         cache.write_page(10, &vec![42u8; 64]).unwrap();
         assert!(cache.is_present(10));
@@ -5564,7 +6060,7 @@ mod tests {
     #[test]
     fn test_disk_cache_read_uncached_page_returns_zeros() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
         // Page exists in sparse file but not marked in bitmap
         let mut buf = vec![0xFFu8; 64];
         cache.read_page(0, &mut buf).unwrap();
@@ -5574,7 +6070,7 @@ mod tests {
     #[test]
     fn test_disk_cache_creates_cache_file() {
         let dir = TempDir::new().unwrap();
-        let _cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 100, None).unwrap();
+        let _cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 100, None, Vec::new()).unwrap();
         assert!(dir.path().join("data.cache").exists());
         let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
         assert_eq!(meta.len(), 100 * 64); // page_count * page_size
@@ -5584,14 +6080,14 @@ mod tests {
     fn test_disk_cache_creates_dir_if_missing() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
-        let _cache = DiskCache::new(&nested, 3600, 4, 2, 64, 8, None).unwrap();
+        let _cache = DiskCache::new(&nested, 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         assert!(nested.join("data.cache").exists());
     }
 
     #[test]
     fn test_disk_cache_group_states() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         assert_eq!(cache.group_state(0), GroupState::None);
         assert_eq!(cache.group_state(1), GroupState::None);
         assert!(cache.try_claim_group(0));
@@ -5604,7 +6100,7 @@ mod tests {
     #[test]
     fn test_disk_cache_try_claim_present_fails() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         assert!(!cache.try_claim_group(0)); // Already Present
@@ -5613,7 +6109,7 @@ mod tests {
     #[test]
     fn test_disk_cache_group_state_out_of_bounds() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap(); // 2 groups
         // Out of bounds should return None
         assert_eq!(cache.group_state(100), GroupState::None);
         assert_eq!(cache.group_state(u64::MAX), GroupState::None);
@@ -5622,7 +6118,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_present() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         // Should return immediately
@@ -5632,7 +6128,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_none() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         // State is None — should return immediately
         cache.wait_for_group(0);
     }
@@ -5640,7 +6136,7 @@ mod tests {
     #[test]
     fn test_disk_cache_touch_group_updates_access() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         assert!(!cache.group_access.lock().contains_key(&0));
         cache.touch_group(0);
         assert!(cache.group_access.lock().contains_key(&0));
@@ -5651,20 +6147,20 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_interior_group() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         assert!(!cache.interior_groups.lock().contains(&0));
-        cache.mark_interior_group(0, 0);
+        cache.mark_interior_group(0, 0, 0);
         assert!(cache.interior_groups.lock().contains(&0));
         // Marking again is idempotent
-        cache.mark_interior_group(0, 0);
+        cache.mark_interior_group(0, 0, 0);
         assert_eq!(cache.interior_groups.lock().len(), 1);
     }
 
     #[test]
     fn test_disk_cache_eviction_skips_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 0, 4, 2, 64, 8, None).unwrap(); // TTL=0 = disabled
-        cache.mark_interior_group(0, 0);
+        let cache = DiskCache::new(dir.path(), 0, 4, 2, 64, 8, None, Vec::new()).unwrap(); // TTL=0 = disabled
+        cache.mark_interior_group(0, 0, 0);
         cache.touch_group(0);
         cache.touch_group(1);
         cache.evict_expired();
@@ -5675,7 +6171,8 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_clears_bitmap_and_state() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let gp = positional_group_pages(4, 16);
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp).unwrap();
         // Write pages in group 0 (pages 0-3)
         for i in 0..4u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5698,7 +6195,8 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_preserves_other_groups() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let gp = positional_group_pages(4, 16);
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp).unwrap();
         // Write pages in groups 0 and 1
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5713,7 +6211,8 @@ mod tests {
     fn test_disk_cache_evict_expired_with_real_ttl() {
         let dir = TempDir::new().unwrap();
         // TTL = 1 second
-        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None).unwrap();
+        let gp = positional_group_pages(4, 16);
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None, gp).unwrap();
 
         // Write and touch group 0
         for i in 0..4u64 {
@@ -5736,7 +6235,8 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_expired_protects_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None).unwrap(); // TTL = 1s
+        let gp = positional_group_pages(4, 16);
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None, gp).unwrap(); // TTL = 1s
 
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5747,7 +6247,7 @@ mod tests {
         cache.mark_group_present(1);
         cache.touch_group(0);
         cache.touch_group(1);
-        cache.mark_interior_group(0, 0); // Group 0 is interior = pinned
+        cache.mark_interior_group(0, 0, 0); // Group 0 is interior = pinned
 
         std::thread::sleep(Duration::from_millis(1100));
         cache.evict_expired();
@@ -5757,10 +6257,107 @@ mod tests {
         assert!(!cache.is_present(4)); // Evicted
     }
 
+    /// Regression test: evict_group with B-tree-aware (non-positional) group_pages
+    /// clears the correct bitmap bits, not positional ones.
+    #[test]
+    fn test_evict_group_btree_aware_pages() {
+        let dir = TempDir::new().unwrap();
+        // B-tree groups: group 0 has pages [10, 20, 30], group 1 has pages [5, 15, 25]
+        let gp = vec![vec![10, 20, 30], vec![5, 15, 25]];
+        let cache = DiskCache::new(dir.path(), 1, 3, 1, 64, 31, None, gp).unwrap();
+
+        // Write pages for both groups
+        for &p in &[10u64, 20, 30, 5, 15, 25] {
+            cache.write_page(p, &[0xAA; 64]).unwrap();
+        }
+        assert!(cache.is_present(10));
+        assert!(cache.is_present(20));
+        assert!(cache.is_present(30));
+        assert!(cache.is_present(5));
+        assert!(cache.is_present(15));
+        assert!(cache.is_present(25));
+
+        // Evict group 0 (pages 10, 20, 30)
+        cache.evict_group(0);
+
+        // Group 0 pages should be cleared
+        assert!(!cache.is_present(10));
+        assert!(!cache.is_present(20));
+        assert!(!cache.is_present(30));
+
+        // Group 1 pages should NOT be affected
+        assert!(cache.is_present(5));
+        assert!(cache.is_present(15));
+        assert!(cache.is_present(25));
+
+        // Positional pages 0-2 should NOT have been touched (they weren't in any group)
+        // This verifies we didn't fall back to positional clearing
+    }
+
+    /// Regression test: group state initialization uses B-tree-aware group_pages.
+    #[test]
+    fn test_group_state_init_btree_aware() {
+        let dir = TempDir::new().unwrap();
+        // B-tree group 0 has pages [5, 10, 15]
+        let gp = vec![vec![5, 10, 15]];
+
+        // Write pages 5, 10, 15 to bitmap manually via a first cache
+        {
+            let cache = DiskCache::new(dir.path(), 3600, 3, 1, 64, 16, None, gp.clone()).unwrap();
+            for &p in &[5u64, 10, 15] {
+                cache.write_page(p, &[0xBB; 64]).unwrap();
+            }
+            let _ = cache.persist_bitmap();
+        }
+
+        // Reopen with same group_pages — group 0 should be Present
+        let cache2 = DiskCache::new(dir.path(), 3600, 3, 1, 64, 16, None, gp).unwrap();
+        assert_eq!(cache2.group_state(0), GroupState::Present);
+    }
+
+    /// Regression test: clear_cache uses B-tree-aware group_pages[0] for group 0.
+    #[test]
+    fn test_clear_cache_btree_aware_group0() {
+        let dir = TempDir::new().unwrap();
+        // B-tree group 0 has pages [7, 14, 21], group 1 has pages [3, 6, 9]
+        let gp = vec![vec![7, 14, 21], vec![3, 6, 9]];
+        let cache = DiskCache::new(dir.path(), 3600, 3, 1, 64, 22, None, gp).unwrap();
+
+        // Write all pages
+        for &p in &[7u64, 14, 21, 3, 6, 9] {
+            cache.write_page(p, &[0xCC; 64]).unwrap();
+        }
+
+        // Simulate clear_cache: clear bitmap, re-mark group 0 pages
+        {
+            let gp = cache.group_pages.read();
+            let mut bitmap = cache.bitmap.lock();
+            bitmap.bits.fill(0);
+            if let Some(g0_pages) = gp.first() {
+                for &p in g0_pages {
+                    bitmap.mark_present(p);
+                }
+            }
+        }
+
+        // Group 0 pages should be present
+        assert!(cache.is_present(7));
+        assert!(cache.is_present(14));
+        assert!(cache.is_present(21));
+
+        // Group 1 pages should be cleared
+        assert!(!cache.is_present(3));
+        assert!(!cache.is_present(6));
+        assert!(!cache.is_present(9));
+
+        // Positional page 0 should NOT have been marked (it's not in group 0)
+        assert!(!cache.is_present(0));
+    }
+
     #[test]
     fn test_disk_cache_evict_expired_skips_recent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 10, 4, 2, 64, 8, None).unwrap(); // TTL = 10s
+        let cache = DiskCache::new(dir.path(), 10, 4, 2, 64, 8, None, Vec::new()).unwrap(); // TTL = 10s
         cache.touch_group(0);
         cache.evict_expired();
         // Group should NOT be evicted (only 0ms elapsed, TTL = 10s)
@@ -5770,7 +6367,7 @@ mod tests {
     #[test]
     fn test_disk_cache_ensure_group_capacity() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap(); // 2 groups
         assert_eq!(cache.group_states.lock().len(), 2);
         cache.ensure_group_capacity(10);
         assert_eq!(cache.group_states.lock().len(), 10);
@@ -5782,11 +6379,11 @@ mod tests {
     fn test_disk_cache_bitmap_persistence() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
             cache.write_page(3, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         assert!(cache2.is_present(3));
         assert!(!cache2.is_present(4));
     }
@@ -5794,8 +6391,9 @@ mod tests {
     #[test]
     fn test_disk_cache_reopen_initializes_group_states_from_bitmap() {
         let dir = TempDir::new().unwrap();
+        let gp = positional_group_pages(4, 16);
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp.clone()).unwrap();
             // Write ALL pages in group 0 (pages 0-3)
             for i in 0..4u64 {
                 cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -5803,7 +6401,7 @@ mod tests {
             cache.persist_bitmap().unwrap();
         }
         // Reopen — group 0 should be Present (all 4 pages marked)
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp).unwrap();
         assert_eq!(cache2.group_state(0), GroupState::Present);
         // Group 1 should be None (no pages)
         assert_eq!(cache2.group_state(1), GroupState::None);
@@ -5813,13 +6411,13 @@ mod tests {
     fn test_disk_cache_reopen_partial_group_is_none() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
             // Write only 2 of 4 pages in group 0
             cache.write_page(0, &vec![0u8; 64]).unwrap();
             cache.write_page(1, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
         // Partial group should be None (not all pages present)
         assert_eq!(cache2.group_state(0), GroupState::None);
         // But individual pages should still be present
@@ -5831,7 +6429,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_page_count() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None, Vec::new()).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
         assert_eq!(cache.group_state(0), GroupState::None);
     }
@@ -5839,7 +6437,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_ppg() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 0, 0, 64, 100, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 0, 0, 64, 100, None, Vec::new()).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
     }
 
@@ -5854,11 +6452,7 @@ mod tests {
             page_count: 10000,
             page_size: 4096,
             pages_per_group: 2048,
-            page_group_keys: vec![],
-            interior_chunk_keys: HashMap::new(),
-            index_chunk_keys: HashMap::new(),
-            frame_tables: Vec::new(),
-            sub_pages_per_frame: 0,
+            ..Manifest::empty()
         };
         assert_eq!(m.total_groups(), 5); // ceil(10000/2048)
 
@@ -5917,10 +6511,7 @@ mod tests {
                 "pg/1_v1".to_string(),
                 "pg/2_v1".to_string(),
             ],
-            interior_chunk_keys: HashMap::new(),
-            index_chunk_keys: HashMap::new(),
-            frame_tables: Vec::new(),
-            sub_pages_per_frame: 0,
+            ..Manifest::empty()
         };
         let json = serde_json::to_string(&m).unwrap();
         let m2: Manifest = serde_json::from_str(&json).unwrap();
@@ -6066,8 +6657,6 @@ mod tests {
             page_size: 4096,
             pages_per_group: 64,
             page_group_keys: vec!["pg/0_v1".to_string(), "pg/1_v1".to_string()],
-            interior_chunk_keys: HashMap::new(),
-            index_chunk_keys: HashMap::new(),
             frame_tables: vec![
                 vec![
                     FrameEntry { offset: 0, len: 500 },
@@ -6079,6 +6668,7 @@ mod tests {
                 ],
             ],
             sub_pages_per_frame: 32,
+            ..Manifest::empty()
         };
         let json = serde_json::to_string(&m).unwrap();
         let m2: Manifest = serde_json::from_str(&json).unwrap();
@@ -6195,7 +6785,7 @@ mod tests {
     #[test]
     fn test_disk_cache_concurrent_claim() {
         let dir = TempDir::new().unwrap();
-        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None).unwrap());
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap());
 
         // Simulate two threads trying to claim the same group
         let claimed1 = cache.try_claim_group(0);
@@ -6207,7 +6797,7 @@ mod tests {
     #[test]
     fn test_disk_cache_multiple_groups_independent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32, None).unwrap(); // 8 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32, None, Vec::new()).unwrap(); // 8 groups
 
         // Claim different groups — all should succeed
         for gid in 0..8u64 {
@@ -6228,7 +6818,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ppg = 4u32;
         let page_size = 64u32;
-        let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64, None, Vec::new()).unwrap();
 
         // Create page group with known data
         let pages: Vec<Option<Vec<u8>>> = (0..ppg)
@@ -6701,7 +7291,7 @@ mod tests {
     fn test_disk_cache_write_pages_bulk_marks_sub_chunks() {
         let dir = TempDir::new().unwrap();
         // ppg=8, spf=2, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
         // Write 2 pages (a complete sub-chunk frame)
         let data = vec![42u8; 128]; // 2 pages * 64 bytes
         cache.write_pages_bulk(0, &data, 2).unwrap();
@@ -6717,7 +7307,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_page_does_not_mark_sub_chunk() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
         let data = vec![42u8; 64];
         cache.write_page(0, &data).unwrap();
 
@@ -6730,7 +7320,7 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_interior_promotes_to_pinned() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
         // Write a complete sub-chunk
         let data = vec![42u8; 128];
         cache.write_pages_bulk(0, &data, 2).unwrap();
@@ -6743,7 +7333,7 @@ mod tests {
         }
 
         // Mark as interior
-        cache.mark_interior_group(0, 0);
+        cache.mark_interior_group(0, 0, 0);
 
         // Now Pinned
         {
@@ -6756,7 +7346,8 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_index_promotes_to_index_tier() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let gp = positional_group_pages(8, 16);
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, gp).unwrap();
         let data = vec![42u8; 128];
         cache.write_pages_bulk(2, &data, 2).unwrap();
 
@@ -6767,7 +7358,8 @@ mod tests {
             assert_eq!(tracker.tiers.get(&id), Some(&SubChunkTier::Data));
         }
 
-        cache.mark_index_page(2);
+        // page 2 is at index 2 in group 0 => sub_chunk_id_for(0, 2) gives frame_index=1
+        cache.mark_index_page(2, 0, 2);
 
         // Now Index tier
         {
@@ -6780,7 +7372,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_clears_tracker() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
         // Write all sub-chunks in group 0 (4 frames * 2 pages = 8 pages)
         let data = vec![42u8; 512]; // 8 pages * 64 bytes
         cache.write_pages_bulk(0, &data, 8).unwrap();
@@ -6804,7 +7396,7 @@ mod tests {
         // Test that pages at sub-chunk boundaries are correctly assigned
         let dir = TempDir::new().unwrap();
         // ppg=4, spf=2: 2 frames per group
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
 
         // Write frame 0 of group 0 (pages 0,1)
         cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();
@@ -6941,7 +7533,8 @@ mod tests {
         // Should call clear_data_only() to keep Index + Pinned.
         let dir = TempDir::new().unwrap();
         // ppg=8, spf=2, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None).unwrap();
+        let gp = positional_group_pages(8, 16);
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, gp).unwrap();
 
         // Write some frames via bulk (marks tracker)
         cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();  // frame (0,0) - pages 0,1
@@ -6949,7 +7542,8 @@ mod tests {
         cache.write_pages_bulk(4, &vec![3u8; 128], 2).unwrap();  // frame (0,2) - pages 4,5
 
         // Promote one to Index, one to Pinned
-        cache.mark_index_page(2); // frame (0,1) → Index
+        // page 2 is at index 2 in group 0 => sub_chunk_id_for(0, 2) gives frame_index=1
+        cache.mark_index_page(2, 0, 2); // frame (0,1) → Index
         {
             let mut tracker = cache.tracker.lock();
             let id = tracker.sub_chunk_for_page(0);
@@ -7093,7 +7687,7 @@ mod tests {
         // written without their sub-chunk neighbors.
         let dir = tempfile::tempdir().unwrap();
         // ppg=4, sub_ppf=2, page_size=64, page_count=8 → 2 groups, 2 sub-chunks/group
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
         let data = vec![0xAA; 64];
 
         // Write page 0 individually (simulates eager index load)
@@ -7125,7 +7719,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ppg=8, sub_ppf=4, page_size=64, page_count=16
         // Sub-chunk 0 = pages 0-3, Sub-chunk 1 = pages 4-7
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Simulate eager load: write pages 0, 5 (scattered across sub-chunks)
         let index_data = vec![0xBB; 64];
@@ -7154,7 +7748,7 @@ mod tests {
         // present in the tracker. If called after write_page (bitmap only),
         // it does NOT poison the tracker.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Write only page 0 (simulates eager index load)
         let data = vec![0xCC; 64];
@@ -7164,7 +7758,7 @@ mod tests {
         assert!(!cache.is_present(1));
 
         // mark_index_page should be a no-op (sub-chunk not in tracker)
-        cache.mark_index_page(0);
+        cache.mark_index_page(0, 0, 0);
 
         // Page 1 must still NOT be present (no poisoning)
         assert!(!cache.is_present(1),
@@ -7179,7 +7773,7 @@ mod tests {
         // Same fix as mark_index_page: mark_interior_group only calls
         // mark_pinned if the sub-chunk is already in the tracker.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Write only page 0 (simulates eager interior load)
         let data = vec![0xDD; 64];
@@ -7190,7 +7784,7 @@ mod tests {
 
         // mark_interior_group should add to interior_pages/groups
         // but NOT poison the tracker
-        cache.mark_interior_group(0, 0);
+        cache.mark_interior_group(0, 0, 0);
 
         // interior_pages set updated
         assert!(cache.interior_pages.lock().contains(&0));
@@ -7216,7 +7810,7 @@ mod tests {
         // This is the correct path used by on-demand S3 fetch.
         let dir = tempfile::tempdir().unwrap();
         // ppg=8, sub_ppf=4, page_size=64, page_count=16
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Write a complete sub-chunk (pages 0-3) via bulk
         let bulk_data = vec![0xDD; 64 * 4];
@@ -7242,7 +7836,7 @@ mod tests {
         // Raw bitmap clear (without index_pages re-marking) loses index pages.
         // This tests the low-level bitmap behavior.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Simulate eager load: write individual page via write_page (bitmap only)
         let data = vec![0xEE; 64];
@@ -7260,7 +7854,7 @@ mod tests {
         // Index pages tracked in index_pages set must survive clear_cache.
         // clear_cache re-marks them in the bitmap after clearing.
         let dir = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap();
 
         // Simulate eager index load: write pages and register in index_pages
         let data = vec![0xEE; 64];
@@ -7317,7 +7911,7 @@ mod tests {
     fn test_encrypted_cache_write_read_roundtrip() {
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
 
         let page_data = vec![0xABu8; 64];
         cache.write_page(3, &page_data).unwrap();
@@ -7333,7 +7927,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
 
         let page_data = vec![0xABu8; 64];
         cache.write_page(3, &page_data).unwrap();
@@ -7350,14 +7944,14 @@ mod tests {
     fn test_encrypted_cache_wrong_key_returns_garbage() {
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
 
         let page_data = vec![0xCDu8; 64];
         cache.write_page(5, &page_data).unwrap();
         drop(cache);
 
         // Reopen with wrong key — CTR decrypts to garbage (no auth tag to reject)
-        let bad_cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(wrong_key())).unwrap();
+        let bad_cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(wrong_key()), Vec::new()).unwrap();
         let mut buf = vec![0u8; 64];
         bad_cache.read_page(5, &mut buf).unwrap();
         assert_ne!(buf, page_data, "wrong key must not produce correct plaintext");
@@ -7368,7 +7962,7 @@ mod tests {
     fn test_encrypted_cache_bulk_write_read_roundtrip() {
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
 
         // Write 4 pages at once (one full group)
         let mut bulk_data = Vec::with_capacity(4 * 64);
@@ -7391,7 +7985,7 @@ mod tests {
         use std::os::unix::fs::FileExt;
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
 
         // Write identical data to two different pages — ciphertext must differ (different nonces)
         let page_data = vec![0xFFu8; 64];
@@ -7413,7 +8007,7 @@ mod tests {
         // Cache file size = page_count * page_size (no overhead from encryption)
         let dir = TempDir::new().unwrap();
         let key = test_key();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, Some(key)).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, Some(key), Vec::new()).unwrap();
         let _ = cache;
         let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
         assert_eq!(meta.len(), 8 * 64); // page_count * page_size, no overhead
@@ -7997,10 +8591,8 @@ mod tests {
             page_size: 4096,
             pages_per_group: 8,
             page_group_keys: vec!["pg/0_v5".to_string()],
-            interior_chunk_keys: HashMap::new(),
-            index_chunk_keys: HashMap::new(),
             frame_tables: vec![vec![]],
-            sub_pages_per_frame: 0,
+            ..Manifest::empty()
         };
 
         let mut new_manifest = manifest.clone();
@@ -8475,5 +9067,650 @@ mod tests {
         let old_key: Option<[u8; 32]> = None;
         let new_key: Option<[u8; 32]> = None;
         assert!(old_key.is_none() && new_key.is_none());
+    }
+
+    // ── Phase Midway regression tests ──
+
+    #[test]
+    fn test_assign_new_pages_to_groups_basic() {
+        let mut manifest = Manifest {
+            page_count: 10,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        // Pages 8 and 9 are new (not in page_index)
+        let unassigned = vec![8, 9];
+        TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+
+        // Should be added to a group and in page_index
+        assert!(manifest.page_location(8).is_some());
+        assert!(manifest.page_location(9).is_some());
+        // All original pages still mapped correctly
+        for p in 0..8 {
+            assert!(manifest.page_location(p).is_some());
+        }
+    }
+
+    #[test]
+    fn test_assign_new_pages_fills_last_group_first() {
+        let mut manifest = Manifest {
+            page_count: 5,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3], // full
+                vec![4],          // room for 3 more
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        let unassigned = vec![5, 6];
+        TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+
+        // Pages 5,6 should fill group 1 (had room)
+        let loc5 = manifest.page_location(5).unwrap();
+        let loc6 = manifest.page_location(6).unwrap();
+        assert_eq!(loc5.group_id, 1);
+        assert_eq!(loc6.group_id, 1);
+        assert_eq!(manifest.group_pages.len(), 2); // no new groups needed
+    }
+
+    #[test]
+    fn test_assign_new_pages_overflow_to_new_group() {
+        let mut manifest = Manifest {
+            page_count: 8,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3], // full
+                vec![4, 5, 6, 7], // full
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        let unassigned = vec![8, 9, 10, 11, 12];
+        TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+
+        // 5 new pages, both groups full -> need new group(s)
+        assert_eq!(manifest.group_pages.len(), 4); // 2 original + 2 new (4 + 1)
+        for p in 8..=12 {
+            assert!(manifest.page_location(p).is_some());
+        }
+        // First 4 go to group 2, last 1 to group 3
+        assert_eq!(manifest.page_location(8).unwrap().group_id, 2);
+        assert_eq!(manifest.page_location(12).unwrap().group_id, 3);
+    }
+
+    #[test]
+    fn test_assign_new_pages_empty_input() {
+        let mut manifest = Manifest {
+            page_count: 4,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![vec![0, 1, 2, 3]],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+        let original_groups = manifest.group_pages.len();
+
+        TieredHandle::assign_new_pages_to_groups(&mut manifest, &[], 4);
+
+        assert_eq!(manifest.group_pages.len(), original_groups);
+    }
+
+    #[test]
+    fn test_assign_new_pages_no_duplicate_assignments() {
+        let mut manifest = Manifest {
+            page_count: 4,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![vec![0, 1, 2, 3]],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        let unassigned = vec![4, 5, 6, 7, 8, 9];
+        TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+
+        // Each page should appear exactly once across all groups
+        let mut all_pages: Vec<u64> = manifest.group_pages.iter().flatten().copied().collect();
+        all_pages.sort_unstable();
+        all_pages.dedup();
+        let total: usize = manifest.group_pages.iter().map(|g| g.len()).sum();
+        assert_eq!(all_pages.len(), total, "duplicate page in group_pages");
+    }
+
+    #[test]
+    fn test_build_page_index_roundtrip() {
+        let mut manifest = Manifest {
+            page_count: 10,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![5, 0, 3, 8],  // non-sequential
+                vec![1, 7, 2],
+                vec![9, 4, 6],
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        // Every page 0-9 should have a location
+        for p in 0..10 {
+            let loc = manifest.page_location(p).unwrap_or_else(|| panic!("missing page {}", p));
+            // Verify the reverse: group_pages[gid][index] == p
+            assert_eq!(manifest.group_pages[loc.group_id as usize][loc.index as usize], p);
+        }
+    }
+
+    // ── Phase Midway: B-tree-aware page groups tests ──
+
+    #[test]
+    fn test_total_groups_btree_vs_positional() {
+        // Positional: ceil(100/32) = 4
+        let m = Manifest {
+            page_count: 100,
+            pages_per_group: 32,
+            ..Manifest::empty()
+        };
+        assert_eq!(m.total_groups(), 4);
+
+        // B-tree groups: explicit mapping with more groups than positional formula
+        let m2 = Manifest {
+            page_count: 100,
+            pages_per_group: 32,
+            group_pages: vec![
+                vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9, 10, 11],
+                vec![12, 13, 14, 15, 16, 17, 18, 19],  // extra group from B-tree packing
+            ],
+            ..Manifest::empty()
+        };
+        // B-tree mapping takes priority: 5 groups, not positional 4
+        assert_eq!(m2.total_groups(), 5);
+    }
+
+    #[test]
+    fn test_write_pages_scattered_only_marks_written_pages() {
+        // Regression: bitmap must not mark pages beyond data length
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+        // Provide data for 2 pages but page_nums has 4
+        let page_nums = vec![0u64, 1, 5, 10];
+        let data = vec![0xAA; 128]; // only 2 pages worth (2 * 64)
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // Pages 0 and 1 should be present (data written)
+        assert!(cache.is_present(0), "page 0 should be present");
+        assert!(cache.is_present(1), "page 1 should be present");
+        // Pages 5 and 10 should NOT be present (data was too short)
+        assert!(!cache.bitmap.lock().is_present(5), "page 5 should NOT be present (no data)");
+        assert!(!cache.bitmap.lock().is_present(10), "page 10 should NOT be present (no data)");
+    }
+
+    #[test]
+    fn test_write_pages_scattered_exact_data_marks_all() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+        // Data exactly matches page_nums length
+        let page_nums = vec![3u64, 7, 12];
+        let data = vec![0xBB; 192]; // 3 * 64
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        for &p in &page_nums {
+            assert!(cache.is_present(p), "page {} should be present", p);
+        }
+    }
+
+    #[test]
+    fn test_write_pages_scattered_no_tracker_pollution() {
+        // Regression: scattered writes mark the tracker with manifest-aware sub-chunk IDs.
+        // Bitmap is per-page (accurate), so unwritten pages in the same sub-chunk stay absent.
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=4, page_size=64, page_count=32
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 32, None, Vec::new()).unwrap();
+
+        // Write page 5 via scattered (simulates B-tree group write)
+        let page_nums = vec![5u64];
+        let data = vec![0xCC; 64];
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // Page 5 should be present (bitmap)
+        assert!(cache.bitmap.lock().is_present(5));
+
+        // Unwritten pages must not be present (bitmap is per-page accurate)
+        assert!(!cache.is_present(4), "page 4 must not be present");
+        assert!(!cache.is_present(6), "page 6 must not be present");
+        assert!(!cache.is_present(7), "page 7 must not be present");
+
+        // But tracker sub-chunk (0, 0) IS marked (gid=0, index_in_group=0 -> frame 0)
+        let tracker = cache.tracker.lock();
+        let id = tracker.sub_chunk_id_for(0, 0);
+        assert!(tracker.is_sub_chunk_present(&id), "sub-chunk must be marked after write");
+    }
+
+    #[test]
+    fn test_write_pages_scattered_data_integrity() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+        // Write non-sequential pages with distinct data
+        let page_nums = vec![3u64, 0, 7, 15];
+        let mut data = Vec::with_capacity(4 * 64);
+        for (i, &pnum) in page_nums.iter().enumerate() {
+            data.extend(std::iter::repeat(((pnum + 1) as u8) * 10 + i as u8).take(64));
+        }
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // Read back each page and verify data
+        for (i, &pnum) in page_nums.iter().enumerate() {
+            let mut buf = vec![0u8; 64];
+            cache.read_page(pnum, &mut buf).unwrap();
+            let expected_byte = ((pnum + 1) as u8) * 10 + i as u8;
+            assert_eq!(buf[0], expected_byte, "page {} data mismatch", pnum);
+            assert!(buf.iter().all(|&b| b == expected_byte), "page {} not uniform", pnum);
+        }
+    }
+
+    #[test]
+    fn test_manifest_btree_page_location_non_sequential() {
+        // B-tree groups have non-sequential page numbers
+        let mut manifest = Manifest {
+            page_count: 20,
+            page_size: 4096,
+            pages_per_group: 8,
+            group_pages: vec![
+                vec![0, 5, 10, 15],     // gid=0: scattered pages from B-tree A
+                vec![1, 2, 3, 4],       // gid=1: sequential pages from B-tree B
+                vec![6, 7, 8, 9],       // gid=2: sequential from B-tree C
+                vec![11, 12, 13, 14, 16, 17, 18, 19], // gid=3: remaining pages
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        // Verify page 10 is in gid=0 at index=2
+        let loc = manifest.page_location(10).unwrap();
+        assert_eq!(loc.group_id, 0);
+        assert_eq!(loc.index, 2);
+
+        // Page 3 is in gid=1 at index=2
+        let loc = manifest.page_location(3).unwrap();
+        assert_eq!(loc.group_id, 1);
+        assert_eq!(loc.index, 2);
+
+        // Page 18 is in gid=3 at index=6
+        let loc = manifest.page_location(18).unwrap();
+        assert_eq!(loc.group_id, 3);
+        assert_eq!(loc.index, 6);
+    }
+
+    #[test]
+    fn test_manifest_total_groups_with_btree_exceeds_positional() {
+        // 10 pages with ppg=4 gives positional total_groups=3.
+        // But B-tree packing produces 5 groups (small B-trees get own groups).
+        let m = Manifest {
+            page_count: 10,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1],      // B-tree A (2 pages)
+                vec![2, 3],      // B-tree B (2 pages)
+                vec![4, 5],      // B-tree C (2 pages)
+                vec![6, 7],      // B-tree D (2 pages)
+                vec![8, 9],      // unowned (2 pages)
+            ],
+            ..Manifest::empty()
+        };
+        // Positional would be ceil(10/4) = 3, but B-tree mapping says 5
+        assert_eq!(m.total_groups(), 5);
+    }
+
+    #[test]
+    fn test_ensure_group_capacity_for_btree_groups() {
+        // DiskCache starts with positional group count but B-tree groups may need more
+        let dir = TempDir::new().unwrap();
+        // page_count=10, ppg=4 -> positional total_groups = 3
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 10, None, Vec::new()).unwrap();
+        assert_eq!(cache.group_states.lock().len(), 3);
+
+        // B-tree manifest has 5 groups (more than positional)
+        cache.ensure_group_capacity(5);
+        assert_eq!(cache.group_states.lock().len(), 5);
+
+        // Can claim and mark all 5 groups
+        for gid in 0..5u64 {
+            assert!(cache.try_claim_group(gid));
+            cache.mark_group_present(gid);
+            assert_eq!(cache.group_state(gid), GroupState::Present);
+        }
+    }
+
+    #[test]
+    fn test_write_pages_scattered_empty_data() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+        // Empty data but non-empty page_nums: should be a no-op
+        let page_nums = vec![0u64, 1, 2];
+        let data: Vec<u8> = vec![];
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // No pages should be marked
+        assert!(!cache.is_present(0));
+        assert!(!cache.is_present(1));
+        assert!(!cache.is_present(2));
+    }
+
+    #[test]
+    fn test_write_pages_scattered_partial_page_data() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+        // Data for 1.5 pages (not enough for second page)
+        let page_nums = vec![0u64, 1];
+        let data = vec![0xDD; 96]; // 64 + 32 (not enough for page 1)
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // Only page 0 should be marked (page 1 had partial data)
+        assert!(cache.is_present(0), "page 0 with full data should be present");
+        assert!(!cache.bitmap.lock().is_present(1), "page 1 with partial data should not be present");
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_btree_groups() {
+        // group_pages and btrees must survive JSON serialization.
+        // page_index is #[serde(skip)] and rebuilt from group_pages.
+        let mut m = Manifest {
+            version: 5,
+            page_count: 20,
+            page_size: 4096,
+            pages_per_group: 8,
+            page_group_keys: vec![
+                "pg/0_v5".into(), "pg/1_v5".into(), "pg/2_v5".into(),
+            ],
+            group_pages: vec![
+                vec![0, 5, 10, 15],     // B-tree A (scattered)
+                vec![1, 2, 3, 4],       // B-tree B (sequential)
+                vec![6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19],
+            ],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                });
+                h.insert(5, BTreeManifestEntry {
+                    name: "idx_users_name".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![1],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        let json = serde_json::to_string(&m).unwrap();
+        let mut m2: Manifest = serde_json::from_str(&json).unwrap();
+
+        // group_pages survives
+        assert_eq!(m.group_pages, m2.group_pages);
+        // btrees survives
+        assert_eq!(m.btrees.len(), m2.btrees.len());
+        assert_eq!(m.btrees[&0].name, m2.btrees[&0].name);
+        assert_eq!(m.btrees[&5].group_ids, m2.btrees[&5].group_ids);
+        // page_index is NOT serialized (skip)
+        assert!(m2.page_index.is_empty(), "page_index should be empty after deserialize");
+        // Rebuild and verify
+        m2.build_page_index();
+        assert_eq!(m2.page_location(10).unwrap().group_id, 0);
+        assert_eq!(m2.page_location(10).unwrap().index, 2);
+        assert_eq!(m2.page_location(3).unwrap().group_id, 1);
+        assert_eq!(m2.page_location(3).unwrap().index, 2);
+        // total_groups uses group_pages, not positional
+        assert_eq!(m2.total_groups(), 3);
+    }
+
+    #[test]
+    fn test_page_location_missing_page_returns_none() {
+        let mut manifest = Manifest {
+            page_count: 10,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        // Pages 0-7 are assigned, 8-9 are NOT (unassigned gap)
+        assert!(manifest.page_location(0).is_some());
+        assert!(manifest.page_location(7).is_some());
+        assert!(manifest.page_location(8).is_none(), "unassigned page should return None");
+        assert!(manifest.page_location(9).is_none());
+        assert!(manifest.page_location(100).is_none(), "way out of bounds should return None");
+    }
+
+    #[test]
+    fn test_concurrent_scattered_writes_no_tracker_pollution() {
+        // Reproduces the EXACT corruption scenario: two B-tree groups with pages
+        // that share positional sub-chunks. Writing group A must not make group B's
+        // unwritten pages appear as cache hits.
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=4: pages 0-3 = sub-chunk (0,0), pages 4-7 = sub-chunk (0,1)
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 8, 4, 64, 16, None, Vec::new()).unwrap());
+
+        // B-tree group A: pages [0, 4] (spans two positional sub-chunks)
+        // B-tree group B: pages [1, 5] (same two positional sub-chunks!)
+        let cache_a = Arc::clone(&cache);
+        let cache_b = Arc::clone(&cache);
+
+        // Thread A writes B-tree group A
+        let handle_a = std::thread::spawn(move || {
+            let data_a = vec![0xAA; 128]; // 2 pages * 64
+            cache_a.write_pages_scattered(&[0, 4], &data_a, 0, 0).unwrap();
+        });
+
+        // Thread B writes B-tree group B
+        let handle_b = std::thread::spawn(move || {
+            let data_b = vec![0xBB; 128]; // 2 pages * 64
+            cache_b.write_pages_scattered(&[1, 5], &data_b, 0, 0).unwrap();
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // Pages 0, 4 should have 0xAA data
+        let mut buf = vec![0u8; 64];
+        cache.read_page(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xAA), "page 0 should be 0xAA");
+        cache.read_page(4, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xAA), "page 4 should be 0xAA");
+
+        // Pages 1, 5 should have 0xBB data
+        cache.read_page(1, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xBB), "page 1 should be 0xBB");
+        cache.read_page(5, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xBB), "page 5 should be 0xBB");
+
+        // CRITICAL: pages 2, 3, 6, 7 were NEVER written. They must NOT be present.
+        // Before the fix, tracker pollution would report them as present.
+        assert!(!cache.is_present(2), "page 2 never written, must not be present");
+        assert!(!cache.is_present(3), "page 3 never written, must not be present");
+        assert!(!cache.is_present(6), "page 6 never written, must not be present");
+        assert!(!cache.is_present(7), "page 7 never written, must not be present");
+
+        // And reading unwritten pages must return zeros, not stale data
+        cache.read_page(2, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "unwritten page 2 must be zeros");
+        cache.read_page(6, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "unwritten page 6 must be zeros");
+    }
+
+    #[test]
+    fn test_write_pages_scattered_sparse_page_distribution() {
+        // Pages from a B-tree group can span a very wide range of page numbers.
+        // Verify writes at large offsets work correctly.
+        let dir = TempDir::new().unwrap();
+        // Large page_count to ensure file is pre-allocated
+        let cache = DiskCache::new(dir.path(), 3600, 128, 4, 64, 4000, None, Vec::new()).unwrap();
+
+        // Sparse pages from one B-tree group
+        let page_nums = vec![10u64, 500, 1000, 3999];
+        let mut data = Vec::with_capacity(4 * 64);
+        for &pnum in &page_nums {
+            data.extend(std::iter::repeat((pnum % 256) as u8).take(64));
+        }
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        // Verify each page has correct data
+        for &pnum in &page_nums {
+            assert!(cache.is_present(pnum), "page {} should be present", pnum);
+            let mut buf = vec![0u8; 64];
+            cache.read_page(pnum, &mut buf).unwrap();
+            let expected = (pnum % 256) as u8;
+            assert!(buf.iter().all(|&b| b == expected),
+                "page {} data mismatch: expected 0x{:02x}, got 0x{:02x}", pnum, expected, buf[0]);
+        }
+
+        // Pages between sparse entries must NOT be present
+        assert!(!cache.is_present(11));
+        assert!(!cache.is_present(499));
+        assert!(!cache.is_present(501));
+        assert!(!cache.is_present(999));
+    }
+
+    #[test]
+    fn test_btree_group_single_page() {
+        // A B-tree with exactly 1 page (e.g., a small table).
+        // write_pages_scattered must handle single-entry page_nums.
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 128, 4, 64, 100, None, Vec::new()).unwrap();
+
+        let page_nums = vec![42u64];
+        let data = vec![0xFF; 64];
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        assert!(cache.is_present(42));
+        let mut buf = vec![0u8; 64];
+        cache.read_page(42, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xFF));
+
+        // Neighbors must not be present
+        assert!(!cache.is_present(41));
+        assert!(!cache.is_present(43));
+    }
+
+    #[test]
+    fn test_write_pages_scattered_populates_tracker_subchunks() {
+        // Regression: write_pages_scattered must mark SubChunkTracker with correct
+        // manifest-aware sub_chunk_id_for() so tiered eviction works.
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=4 -> 2 frames per group. page_size=64, page_count=32
+        let group_pages = vec![vec![10, 20, 30, 5, 15, 25, 35, 45]]; // group 0
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 50, None, group_pages).unwrap();
+
+        // Write all 8 pages (2 frames worth)
+        let page_nums = vec![10u64, 20, 30, 5, 15, 25, 35, 45];
+        let data = vec![0xAA; 8 * 64];
+        cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+        let tracker = cache.tracker.lock();
+        // Frame 0: indices 0-3 -> SubChunkId { group_id: 0, frame_index: 0 }
+        let f0 = tracker.sub_chunk_id_for(0, 0);
+        assert!(tracker.is_sub_chunk_present(&f0), "frame 0 must be marked present");
+        // Frame 1: indices 4-7 -> SubChunkId { group_id: 0, frame_index: 1 }
+        let f1 = tracker.sub_chunk_id_for(0, 4);
+        assert!(tracker.is_sub_chunk_present(&f1), "frame 1 must be marked present");
+        // Non-existent frame 2 should not be present
+        let f2 = SubChunkId { group_id: 0, frame_index: 2 };
+        assert!(!tracker.is_sub_chunk_present(&f2), "frame 2 must not be present");
+        drop(tracker);
+
+        // Bitmap should have all 8 pages
+        for &p in &page_nums {
+            assert!(cache.is_present(p), "page {} must be present in bitmap", p);
+        }
+        // Unwritten pages must not be present
+        assert!(!cache.is_present(11));
+        assert!(!cache.is_present(0));
+    }
+
+    #[test]
+    fn test_write_pages_scattered_subframe_offset() {
+        // write_pages_scattered with start_index_in_group > 0 (sub-chunk frame offset)
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=4 -> 2 frames per group
+        let cache = DiskCache::new(dir.path(), 3600, 8, 4, 64, 50, None, Vec::new()).unwrap();
+
+        // Write 4 pages starting at index 4 in group 0 (frame 1)
+        let page_nums = vec![100u64, 200, 300, 400];
+        let data = vec![0xBB; 4 * 64];
+        cache.write_pages_scattered(&page_nums, &data, 0, 4).unwrap();
+
+        let tracker = cache.tracker.lock();
+        // These pages are at indices 4,5,6,7 -> frame 1
+        let f1 = tracker.sub_chunk_id_for(0, 4);
+        assert!(tracker.is_sub_chunk_present(&f1), "frame 1 must be marked");
+        // Frame 0 should NOT be marked (we only wrote frame 1)
+        let f0 = tracker.sub_chunk_id_for(0, 0);
+        assert!(!tracker.is_sub_chunk_present(&f0), "frame 0 must not be marked");
+    }
+
+    #[test]
+    fn test_manifest_btree_group_partial_last_group() {
+        // Last B-tree group may have fewer pages than ppg.
+        // total_groups, page_location, frame calculations all must respect actual size.
+        let mut manifest = Manifest {
+            page_count: 10,
+            page_size: 4096,
+            pages_per_group: 4,
+            group_pages: vec![
+                vec![0, 1, 2, 3],   // full group
+                vec![4, 5, 6, 7],   // full group
+                vec![8, 9],         // partial group (2 of 4)
+            ],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        assert_eq!(manifest.total_groups(), 3);
+
+        // Page 9 is in the partial group at index 1
+        let loc = manifest.page_location(9).unwrap();
+        assert_eq!(loc.group_id, 2);
+        assert_eq!(loc.index, 1);
+
+        // Group 2 has 2 pages, not 4
+        assert_eq!(manifest.group_pages[2].len(), 2);
+    }
+
+    #[test]
+    fn test_manifest_deserialize_btree_fields_default_when_missing() {
+        // Old manifests without group_pages/btrees should deserialize cleanly
+        let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["pg/0_v1","pg/1_v1","pg/2_v1","pg/3_v1"]}"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+
+        // B-tree fields default to empty
+        assert!(m.group_pages.is_empty());
+        assert!(m.btrees.is_empty());
+        assert!(m.page_index.is_empty());
+
+        // Falls back to positional total_groups
+        assert_eq!(m.total_groups(), 4); // ceil(100/32)
     }
 }
