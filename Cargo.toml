@@ -96,6 +96,11 @@ path = "benchmark/tiered-bench-lambda.rs"
 required-features = ["lambda"]
 
 [[bin]]
+name = "write-bench"
+path = "benchmark/write-bench.rs"
+required-features = ["tiered", "zstd"]
+
+[[bin]]
 name = "bench-validate"
 path = "benchmark/bench-validate.rs"
 required-features = ["tiered", "zstd"]
