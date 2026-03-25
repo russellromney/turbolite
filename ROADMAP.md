@@ -216,10 +216,36 @@ Phase e3 stopped marking the tracker to prevent positional pollution. With manif
 - [x] 172 lib tests pass
 
 #### f. Demand-driven prefetch
-- [ ] On root page read, look up B-tree's groups in manifest
-- [ ] Prefetch those groups (whole-group GETs, not scattered sub-chunk range GETs)
-- [ ] Remove current "prefetch all index chunks" behavior
-- [ ] Optional: access history (track which B-trees were accessed, prefetch those eagerly on next open)
+- [x] Read path restructured: range GET first (serves page), then background prefetch
+- [x] Legacy inline full-group download path removed (all reads use seekable sub-chunk range GETs)
+- [x] `trigger_prefetch`: fraction-based escalation via `prefetch_hops` (33%/33%/all)
+- [x] `trigger_prefetch`: claims groups (CAS) before pool submit (deduplication)
+- [x] `btree_groups` reverse index in manifest: group -> sibling group_ids from same B-tree
+- [x] Built in `build_page_index()`, survives serde roundtrip (skip + rebuild)
+- [x] S3 range GET failures return proper errors (no silent zero-fill)
+- [x] 236 tests passing (tiered+zstd+encryption)
+
+#### f2. Performance investigation (B-tree groups slower than positional)
+
+B-tree-aware groups are theoretically optimal but benchmarks show 3-10x slower than positional groups at 100K. Need to find whether the gap is an implementation bug, encoding issue, or fundamental problem.
+
+**Observed**: 100K INDEX post+user
+- Main (positional): 126ms / 2 GETs / 36KB
+- B-tree (restructured): 448ms / 7 GETs / 11.9MB
+
+**Hypotheses to test**:
+- [ ] **H1: Sub-chunk size mismatch.** Are B-tree group sub-chunks bigger than positional? Compare `frame_table[i].len` across both. If B-tree groups compress worse (heterogeneous page types in same group), sub-chunks are larger.
+- [ ] **H2: More groups touched per query.** Does a point query actually touch fewer groups with B-tree packing? Log `gid` per read in BENCH_VERBOSE, compare unique groups touched per query between main and B-tree branch.
+- [ ] **H3: Background prefetch bandwidth contention.** The 11.9MB total is dominated by background full-group downloads, not range GETs. Disable trigger_prefetch entirely and benchmark: if latency drops but bytes drop to ~256KB, the prefetch is the bottleneck.
+- [ ] **H4: B-tree walk produces wrong group assignment.** Verify import: for each group, are the pages actually from the same B-tree? Dump `group_pages` and cross-reference with `sqlite_master` root pages.
+- [ ] **H5: Sub-chunk range GET fetches correct data but from wrong offset.** Verify: after range GET, does the decoded page match a direct `pread` from the original SQLite file? Content mismatch = encoding/offset bug.
+- [ ] **H6: Disable prefetch entirely.** Pure range-GET-only (no background downloads at all). This is the lower bound. If still slower than main, the issue is group layout, not prefetch.
+
+**Experiment plan**:
+1. H6 first (disable prefetch): establishes baseline for range-GET-only performance
+2. H2 (log groups per query): understand the access pattern difference
+3. H1 (compare sub-chunk sizes): check if compression is the issue
+4. H3 (prefetch bandwidth): if H6 shows range-GET-only is fast, prefetch is the bottleneck
 
 #### g. Compaction
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
@@ -252,7 +278,7 @@ Small items remaining from Phase Normandy (loadable extension + language package
 ---
 
 ## Somme: Built-in WAL Shipping
-> After: Gallipoli · Before: (future)
+> After: Gallipoli · Before: Verdun
 
 Close the durability gap between checkpoints. The VFS already intercepts every WAL write via `write_all_at()` and has an S3 client + tokio runtime. Ship WAL frames to S3 in the background so writes are durable before checkpoint.
 
@@ -274,6 +300,120 @@ Close the durability gap between checkpoints. The VFS already intercepts every W
 ### d. WAL write callback (future)
 - [ ] `TieredConfig::on_wal_write(fn(&[u8]))` — optional hook for external tools (walrust, custom replication)
 - [ ] turbolite doesn't care what the callback does — just observes and forwards
+
+---
+
+## Verdun: Predictive Cross-Tree Prefetch + Access History
+> After: Somme · Before: (future)
+
+Depends on Phase Midway (B-tree-aware page groups + demand-driven prefetch). Midway solves "fetch one tree fast" (~5ms on Express). But multi-join queries touch 3-4 trees sequentially. Without prediction, each tree is fetched on-demand as SQLite traverses into it: posts index (5ms), then users data (5ms), then likes index (5ms). Serial chain = 15ms of waiting.
+
+Predictive prefetch eliminates the serial chain. When SQLite reads the second B-tree in a lock session and the pair matches a known pattern, all remaining trees prefetch in parallel. 15ms serial collapses to 5ms parallel.
+
+Two complementary features:
+1. **Access history** (prefetch on open): track which B-trees are used, eagerly fetch the hot ones when a new connection opens
+2. **Predictive cross-tree prefetch** (prefetch within a session): learn which B-trees appear together in transactions, prefetch the full set when a partial match is detected
+
+### Design
+
+**Pattern boundary = lock lifecycle.** The VFS sees `lock()` and `unlock()` calls on `DatabaseHandle`. A lock session is NONE -> SHARED (or EXCLUSIVE) -> NONE. Read queries acquire SHARED for the duration; transactions hold the lock across all queries until commit. The lock lifecycle is the natural repeating unit: a web app hitting the same endpoint runs the same transaction pattern thousands of times.
+
+Each `TieredHandle` is per-connection, so concurrent readers track patterns independently. The prediction table is shared (`Arc<RwLock<PredictionTable>>`) so patterns learned by one connection benefit all others.
+
+**Pattern = unordered set.** `BTreeSet<u64>` of B-tree root pages touched during a lock session. Unordered because `SELECT FROM posts JOIN users` and `SELECT FROM users JOIN posts` touch the same trees (query planner picks traversal order). The prediction value is "these trees appear together," not "in this order."
+
+**B-tree touch detection.** On every `read_exact_at`, translate `page_num` to B-tree root via `manifest.page_index` -> `btree owner`. If this root hasn't been seen in the current lock session, add it to the session's `BTreeSet`. This is an O(1) HashMap lookup + HashSet insert per page read.
+
+**Fingerprint and prediction (K=2).** After 2 distinct B-tree roots are touched in a lock session, hash the pair as a fingerprint and look up the prediction table. If a known pattern contains this pair and confidence > threshold, submit all remaining predicted groups to the prefetch pool in parallel. K=2 is the right width: 1-tree queries never fire predictions (no false positives), and for 3+ tree queries we get 1+ trees of lookahead.
+
+**Confidence scoring.**
+- Initial confidence: 0.3 (one observation is not enough to fire; threshold is 0.5)
+- Reinforcement: +0.25 per correct prediction (predicted groups ARE subsequently read in the same lock session)
+- Time decay: *0.95 per lock session flush (slow fade for patterns that stop appearing)
+- Write decay: *0.7 per dirty page in a predicted B-tree (bulk writes fade predictions to zero)
+- Threshold to fire: 0.5
+- A pattern needs 2 observations to fire (0.3 + 0.25 = 0.55 > 0.5). Three writes to a predicted tree drops confidence below threshold (0.8 * 0.7^3 = 0.27). Patterns that fire correctly every session stabilize around 0.85-0.95.
+
+**Access history (eager prefetch on open).** Track B-tree access frequency across sessions. On checkpoint, merge the current session's touched B-trees into a manifest-persisted frequency map (`HashMap<u64, f32>`). Apply exponential decay (*0.9) per session so B-trees that stop being accessed fade out. On connection open, sort B-trees by frequency and prefetch the top N groups eagerly (parallel, background). A database where 90% of queries hit `users` + `posts` + `idx_posts_user` will have those trees fully cached within milliseconds of opening.
+
+**Persistence.** Both the prediction table and access history are stored as manifest fields. Typical app has <100 unique patterns * avg 4 trees * 8 bytes + stats = ~5KB. Access history is even smaller (~600 bytes for 50 B-trees). Both fit comfortably in the manifest. Rebuilt after VACUUM or schema change (root pages move).
+
+**Graceful degradation.** Wrong or stale predictions fall back to demand-driven prefetch from Midway (still fast, ~5ms per tree). Predictions are purely additive: they submit extra prefetch jobs but never block the read path. The workloads where predictions matter most (repeated transaction patterns, read-heavy CRUD) are the workloads where they're most stable.
+
+### a. Lock session tracking infrastructure
+
+Add per-connection state to track B-tree touches within a lock session.
+
+- [ ] Add to `TieredHandle`: `session_btrees: HashSet<u64>` (B-tree roots touched in current lock session)
+- [ ] Add to `TieredHandle`: `session_active: bool` (true between lock acquire and release)
+- [ ] In `read_exact_at`: after resolving `page_num` to B-tree root via manifest, insert into `session_btrees`
+- [ ] Need reverse index: `page_num -> btree_root`. Build from `manifest.btrees` (root -> pages) into `HashMap<u64, u64>` (page -> root). Build alongside `page_index` in `build_page_index()`
+- [ ] In `lock()`: when transitioning from NONE to SHARED/RESERVED, set `session_active = true`, clear `session_btrees`
+- [ ] In `unlock()` / lock downgrade to NONE: set `session_active = false`, flush session pattern
+
+### b. Access history (eager prefetch on open)
+
+Track B-tree usage frequency across sessions. Prefetch hot trees on connection open.
+
+- [ ] Add to `Manifest`: `btree_access_freq: HashMap<u64, f32>` (root page -> frequency score)
+- [ ] On lock session flush: for each root in `session_btrees`, increment `btree_access_freq[root] += 1.0`
+- [ ] On checkpoint (`sync()`): apply decay `*= 0.9` to all entries, prune entries below 0.1, serialize into manifest
+- [ ] In `new_tiered()`: after manifest download, sort B-trees by frequency, prefetch top N groups eagerly via prefetch pool
+- [ ] Config: `eager_btree_count: u32` (default 5) controls how many hot B-trees to prefetch on open
+- [ ] Test: open DB, run queries touching 3 B-trees, checkpoint, reopen, verify those 3 B-trees' groups are prefetched before any query
+- [ ] Test: B-tree that stops being accessed decays below threshold after ~20 sessions
+
+### c. Prediction table
+
+Learn which B-trees appear together in transactions. Fire parallel prefetch on partial match.
+
+- [ ] `PredictionEntry { predicted_roots: BTreeSet<u64>, confidence: f32, hit_count: u32 }`
+- [ ] `PredictionTable { patterns: HashMap<BTreeSet<u64>, PredictionEntry> }` shared via `Arc<RwLock<>>`
+- [ ] On lock session flush: if `session_btrees.len() >= 2`, upsert pattern. New pattern gets confidence 0.3. Existing pattern: apply time decay (*0.95) then reinforcement (+0.25 if prediction fired and was correct)
+- [ ] Store prediction table in `TieredVfs` (shared across all connections for this VFS instance)
+- [ ] Manifest field: `prediction_patterns: Vec<(BTreeSet<u64>, f32)>` for persistence across restarts
+- [ ] On checkpoint: serialize prediction table to manifest. Prune patterns below confidence 0.1
+- [ ] On VFS open: deserialize prediction table from manifest into shared `Arc<RwLock<>>`
+
+### d. Prediction firing
+
+Trigger parallel prefetch when a partial match is detected during a lock session.
+
+- [ ] Add to `TieredHandle`: `prediction_fired: bool` (prevent re-firing within same session)
+- [ ] In `read_exact_at`, after adding a new B-tree root to `session_btrees`: if `session_btrees.len() >= 2` and `!prediction_fired`, scan prediction table for any pattern where `session_btrees` is a subset and confidence >= 0.5
+- [ ] On match: submit all groups for predicted roots NOT already in `session_btrees` to prefetch pool
+- [ ] Set `prediction_fired = true` for this session
+- [ ] Prediction scan optimization: index patterns by pairs. `HashMap<(u64, u64), Vec<usize>>` mapping each pair of roots to pattern indices. On 2nd B-tree touch, look up the pair directly instead of scanning all patterns
+
+### e. Write decay
+
+Dirty pages reduce confidence for predictions involving that B-tree.
+
+- [ ] In `write_all_at`: resolve dirty page to B-tree root (same reverse index as read path)
+- [ ] For each prediction containing that root: `confidence *= 0.7`
+- [ ] Bulk writes (100 dirty pages in same B-tree) apply decay once per B-tree per lock session, not per page
+- [ ] Test: write-heavy workload fades predictions below threshold; read-only workload keeps them stable
+
+### f. Reinforcement
+
+Correct predictions get stronger. Wrong predictions decay naturally.
+
+- [ ] On lock session flush: if `prediction_fired`, check whether predicted roots were actually touched in `session_btrees`
+- [ ] If all predicted roots were touched: `confidence += 0.25` (capped at 1.0)
+- [ ] If some predicted roots were NOT touched: no reinforcement (time decay handles the fade)
+- [ ] Track `hit_count` for observability
+
+### g. Tests
+
+- [ ] Unit: lock session tracking accumulates correct B-tree roots
+- [ ] Unit: prediction table upsert/decay/reinforcement math
+- [ ] Unit: pair index correctly maps to patterns
+- [ ] Integration: 3-table join pattern learned after 2 observations, fires on 3rd
+- [ ] Integration: pattern decays below threshold after ~10 sessions without reinforcement
+- [ ] Integration: write decay drops prediction after bulk writes
+- [ ] Integration: access history prefetches hot B-trees on reopen
+- [ ] Integration: concurrent readers learn independent patterns without interference
+- [ ] Benchmark: measure serial vs parallel tree fetch latency for multi-join queries (standard S3 + Express)
 
 ---
 
@@ -308,28 +448,3 @@ The local cache currently uses `pread`/`pwrite`. Memory-mapping the cache file w
 
 ### Multi-writer coordination
 - [ ] Distributed locks for concurrent writers (if needed)
-
-### Predictive cross-tree prefetch
-Depends on Phase Midway (B-tree-aware page groups). B-tree packing solves "fetch one tree fast" (~5ms). But multi-join queries touch 3-4 trees sequentially. Without prediction, each tree is fetched on-demand as SQLite traverses into it: posts index (5ms), then users data (5ms), then likes index (5ms). Serial chain = 15ms of waiting.
-
-Predictive prefetch eliminates the serial chain. When SQLite reads the posts root page, the prediction table fires "this pattern always needs users data + likes index too" and all three trees prefetch in parallel. 15ms serial collapses to 5ms parallel. The difference between "fast" and "feels local."
-
-**Observation layer.** The VFS sees every `read_exact_at` call. Record page access bursts (clustered reads separated by idle gaps) in a ring buffer: `[(page_num, timestamp), ...]`. With the B-tree map from Midway, translate page numbers into B-tree identities (root page numbers). Each burst becomes a B-tree access sequence.
-
-**Prediction table.** Derived from the ring buffer with time-weighted aggregation. Key = first K page reads of a burst (the access fingerprint). Value = full set of B-tree groups needed. When a new burst starts and the first 2-3 page reads match a known fingerprint, speculatively prefetch all predicted groups in parallel.
-
-**Confidence scoring with decay.**
-- Time decay: older observations lose weight naturally
-- Write decay: when a page in B-tree X is dirtied, multiply X's prediction confidence by a factor (e.g., 0.7). A single delete barely hurts. Bulk deletes fade predictions to zero.
-- Reinforcement: when a prediction fires and the pages ARE subsequently requested, bump confidence. Correct predictions get stronger.
-- At checkpoint: rebuild the ring buffer baseline. Predictions that survived write decay carry forward; stale ones are dropped.
-
-**Graceful degradation.** If predictions are wrong or stale, the fallback is demand-driven prefetch from Midway (still fast, ~5ms per tree). Predictions are purely additive. The workloads where predictions matter most (repeated query patterns, read-heavy) are the workloads where they're most stable.
-
-- [ ] Ring buffer for page access bursts with timestamps
-- [ ] B-tree access sequence derivation from page reads + Midway B-tree map
-- [ ] Prediction table: access fingerprint -> predicted B-tree groups
-- [ ] Confidence scoring: time decay + write decay + reinforcement
-- [ ] Speculative parallel prefetch when fingerprint matches
-- [ ] Persistence: store prediction table in manifest sidecar, rebuilt after VACUUM/schema change
-- [ ] Benchmark: measure serial vs parallel tree fetch latency for multi-join queries

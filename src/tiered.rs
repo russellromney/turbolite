@@ -312,6 +312,11 @@ pub struct Manifest {
     /// Reverse index: page_num -> (group_id, position). Built on load, not serialized.
     #[serde(skip)]
     pub page_index: HashMap<u64, PageLocation>,
+
+    /// Demand-driven prefetch: group_id -> sibling group_ids from the same B-tree.
+    /// Built on load from `btrees`, not serialized.
+    #[serde(skip)]
+    pub btree_groups: HashMap<u64, Vec<u64>>,
 }
 
 /// A single frame entry in a seekable page group. Points to a byte range within the S3 object
@@ -343,6 +348,7 @@ impl Manifest {
             group_pages: Vec::new(),
             btrees: HashMap::new(),
             page_index: HashMap::new(),
+            btree_groups: HashMap::new(),
         }
     }
 
@@ -365,6 +371,13 @@ impl Manifest {
                     group_id: gid as u64,
                     index: idx as u32,
                 });
+            }
+        }
+        // Build btree_groups: for each group, store all sibling groups from the same B-tree
+        self.btree_groups.clear();
+        for (_root, entry) in &self.btrees {
+            for &gid in &entry.group_ids {
+                self.btree_groups.insert(gid, entry.group_ids.clone());
             }
         }
     }
@@ -3040,8 +3053,16 @@ impl TieredHandle {
         );
     }
 
-    /// Trigger fraction-based prefetch after a cache miss.
-    /// Non-blocking: spawns background tasks on the tokio runtime.
+    /// Demand-driven, fraction-based prefetch of B-tree sibling groups.
+    ///
+    /// When we miss on group G, prefetch a FRACTION of sibling groups from
+    /// the same B-tree. The fraction escalates with consecutive misses:
+    ///   miss 1 -> hops[0] (33%) of siblings
+    ///   miss 2 -> hops[1] (33%) more
+    ///   miss 3+ -> all remaining
+    ///
+    /// Each sibling is claimed (CAS None->Fetching) before submission to
+    /// guarantee at most one download per group.
     fn trigger_prefetch(
         &self,
         current_gid: u64,
@@ -3049,77 +3070,85 @@ impl TieredHandle {
         cache: &Arc<DiskCache>,
         _s3: &Arc<S3Client>,
     ) {
-        let total_groups = manifest.total_groups();
-        if total_groups <= 1 {
-            return;
-        }
-
         let pool = match &self.prefetch_pool {
             Some(pool) => pool,
             None => return,
         };
 
-        // Determine prefetch count based on hop schedule
-        let hop_idx = (self.consecutive_misses as usize).saturating_sub(1);
-        let fraction = if hop_idx < self.prefetch_hops.len() {
-            self.prefetch_hops[hop_idx]
-        } else {
-            1.0 // Final hop: fetch everything remaining
+        let siblings = match manifest.btree_groups.get(&current_gid) {
+            Some(s) => s,
+            None => return,
         };
-        let prefetch_count = ((total_groups as f32) * fraction).ceil() as u64;
-        if prefetch_count == 0 {
+
+        // Compute how many siblings to prefetch (excluding self and already-fetching)
+        let eligible: Vec<u64> = siblings.iter()
+            .copied()
+            .filter(|&gid| gid != current_gid && cache.group_state(gid) == GroupState::None)
+            .collect();
+
+        if eligible.is_empty() {
             return;
         }
 
-        // Fan out from current group (nearest neighbors first).
-        // Use lightweight state check (no CAS). Workers do try_claim_group
-        // before fetching — avoids locking groups in FETCHING state before
-        // a worker is ready, which would block the sync read path.
-        let ft_for = |g: u64| -> Vec<FrameEntry> {
-            manifest.frame_tables.get(g as usize).cloned().unwrap_or_default()
+        // Fraction-based escalation: consecutive_misses indexes into prefetch_hops
+        let hop_idx = self.consecutive_misses.saturating_sub(1) as usize;
+        let fraction = if hop_idx < self.prefetch_hops.len() {
+            self.prefetch_hops[hop_idx]
+        } else {
+            1.0 // beyond all hops: fetch everything
         };
-        let gp_for = |g: u64| -> Vec<u64> {
-            manifest.group_pages.get(g as usize)
-                .expect("group must exist in group_pages")
-                .clone()
-        };
+        let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
+
         let ps = manifest.page_size;
         let sub_ppf = manifest.sub_pages_per_frame;
+        let mut submitted = 0usize;
 
-        let mut submitted = 0u64;
-        for delta in 1..=total_groups {
-            if submitted >= prefetch_count {
+        for &gid in &eligible {
+            if submitted >= max_submit {
                 break;
             }
-            // Forward
-            let fwd = current_gid + delta;
-            if fwd < total_groups {
-                if cache.group_state(fwd) == GroupState::None {
-                    if let Some(key) = manifest.page_group_keys.get(fwd as usize) {
-                        if !key.is_empty() {
-                            pool.submit(fwd, key.clone(), ft_for(fwd), ps, sub_ppf, gp_for(fwd));
+            // Claim before submit: guarantees at most one download per group
+            if cache.try_claim_group(gid) {
+                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                    if !key.is_empty() {
+                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
+                        let gp = manifest.group_pages.get(gid as usize)
+                            .expect("group must exist in group_pages")
+                            .clone();
+                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
                             submitted += 1;
+                        } else {
+                            // Submit failed (channel closed), reset state
+                            let states = cache.group_states.lock();
+                            if let Some(s) = states.get(gid as usize) {
+                                s.store(GroupState::None as u8, Ordering::Release);
+                            }
+                            cache.group_condvar.notify_all();
                         }
-                    }
-                }
-            }
-            // Backward
-            if delta <= current_gid && submitted < prefetch_count {
-                let bwd = current_gid - delta;
-                if cache.group_state(bwd) == GroupState::None {
-                    if let Some(key) = manifest.page_group_keys.get(bwd as usize) {
-                        if !key.is_empty() {
-                            pool.submit(bwd, key.clone(), ft_for(bwd), ps, sub_ppf, gp_for(bwd));
-                            submitted += 1;
+                    } else {
+                        // Empty key, reset state
+                        let states = cache.group_states.lock();
+                        if let Some(s) = states.get(gid as usize) {
+                            s.store(GroupState::None as u8, Ordering::Release);
                         }
+                        cache.group_condvar.notify_all();
                     }
+                } else {
+                    // No key for gid, reset state
+                    let states = cache.group_states.lock();
+                    if let Some(s) = states.get(gid as usize) {
+                        s.store(GroupState::None as u8, Ordering::Release);
+                    }
+                    cache.group_condvar.notify_all();
                 }
             }
         }
+
         if std::env::var("BENCH_VERBOSE").is_ok() {
             eprintln!(
-                "  [prefetch] from gid={} miss={} hop_frac={:.2} submitted={}/{}",
-                current_gid, self.consecutive_misses, fraction, submitted, prefetch_count,
+                "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={}",
+                current_gid, self.consecutive_misses, fraction * 100.0,
+                eligible.len(), submitted,
             );
         }
     }
@@ -3221,305 +3250,164 @@ impl DatabaseHandle for TieredHandle {
         let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
-        // Check if seekable format is available for sub-chunk range GETs.
-        let frame_table = manifest.frame_tables.get(gid as usize);
-        let has_frames = manifest.sub_pages_per_frame > 0
-            && frame_table.map(|ft| !ft.is_empty()).unwrap_or(false);
-        if has_frames {
-            let sub_ppg = manifest.sub_pages_per_frame;
-            let page_in_group = page_in_group_idx;
-            let frame_idx = page_in_group / sub_ppg as usize;
-            let ft = frame_table.unwrap();
 
-            if frame_idx < ft.len() {
-                let key = manifest.page_group_keys.get(gid as usize)
-                    .expect("gid must be valid index into page_group_keys");
-
-                // Submit prefetch for the full group if not already in flight.
-                // Claim the group (None -> Fetching) HERE so the inline path
-                // below immediately sees Fetching and waits, closing the timing
-                // gap between submit() and the worker's dequeue.
-                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-                let group_state = cache.group_state(gid);
-                if group_state == GroupState::None {
-                    if cache.try_claim_group(gid) {
-                        let mut submitted = false;
-                        if let Some(pool) = &self.prefetch_pool {
-                            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                                if !key.is_empty() {
-                                    let gp = manifest.group_pages.get(gid as usize)
-                                        .expect("group must exist in group_pages")
-                                        .clone();
-                                    submitted = pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp);
-                                }
-                            }
-                        }
-                        if !submitted {
-                            // Reset state: no pool or no key, don't leave stuck in Fetching
-                            let states = cache.group_states.lock();
-                            if let Some(s) = states.get(gid as usize) {
-                                s.store(GroupState::None as u8, Ordering::Release);
-                            }
-                            cache.group_condvar.notify_all();
-                        }
-                    }
-                    // Trigger neighbor prefetch on first miss only
-                    self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
-                }
-
-                // If prefetch is already fetching this group, wait for it instead
-                // of issuing a redundant inline range GET. One full-group GET is
-                // cheaper than N per-frame range GETs, especially on low-latency
-                // links (Fly <-> Tigris ~5ms).
-                if cache.group_state(gid) == GroupState::Fetching {
-                    let wait_start = Instant::now();
-                    cache.wait_for_group(gid);
-                    if std::env::var("BENCH_VERBOSE").is_ok() {
-                        eprintln!(
-                            "  [wait-prefetch] page={} gid={} waited {}ms",
-                            page_num, gid, wait_start.elapsed().as_millis(),
-                        );
-                    }
-                    // Prefetch landed, page should now be in cache
-                    if cache.is_present(page_num) {
-                        cache.read_page(page_num, buf)?;
-                        self.detect_interior_page(buf, page_num, cache);
-                        cache.touch_group(gid);
-                        self.consecutive_misses = 0;
-                        return Ok(());
-                    }
-                    // Prefetch failed or page still missing, fall through to inline fetch
-                }
-
-                let entry = &ft[frame_idx];
-                let s3_start = Instant::now();
-                match s3_arc.range_get(key, entry.offset, entry.len) {
-                    Ok(Some(compressed_frame)) => {
-                        let s3_ms = s3_start.elapsed().as_millis();
-                        let decode_start = Instant::now();
-                        let decompressed = decode_seekable_subchunk(
-                            &compressed_frame,
-                            #[cfg(feature = "zstd")]
-                            self.decoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-                        let decode_ms = decode_start.elapsed().as_millis();
-
-                        let ps = manifest.page_size as usize;
-
-                        // Extract needed page directly into buf (no cache round-trip)
-                        let page_offset_in_frame = page_in_group % sub_ppg as usize;
-                        let src_start = page_offset_in_frame * ps;
-                        let src_end = src_start + buf.len();
-                        if src_end <= decompressed.len() {
-                            buf.copy_from_slice(&decompressed[src_start..src_end]);
-                        } else {
-                            buf.fill(0);
-                        }
-
-                        // Write sub-chunk pages to cache (Phase Midway: B-tree-aware groups)
-                        let frame_start_idx = frame_idx * sub_ppg as usize;
-                        let gp = manifest.group_pages.get(gid as usize)
-                            .expect("group must exist in group_pages");
-                        {
-                            let frame_end_idx = std::cmp::min(frame_start_idx + sub_ppg as usize, gp.len());
-                            let frame_page_nums = &gp[frame_start_idx..frame_end_idx];
-                            let pages_in_frame = frame_page_nums.len() as u64;
-                            if pages_in_frame > 0 {
-                                let data_len = pages_in_frame as usize * ps;
-                                if data_len <= decompressed.len() {
-                                    cache.write_pages_scattered(
-                                        frame_page_nums,
-                                        &decompressed[..data_len],
-                                        gid,
-                                        frame_start_idx as u32,
-                                    )?;
-                                }
-                            }
-                            // Scan for page types in the sub-chunk
-                            for (i, &pnum) in frame_page_nums.iter().enumerate() {
-                                let hdr_off = if pnum == 0 { 100 } else { 0 };
-                                let page_start = i * ps;
-                                let idx_in_group = (frame_start_idx + i) as u32;
-                                let type_byte = decompressed.get(page_start + hdr_off).copied();
-                                if let Some(b) = type_byte {
-                                    if b == 0x05 || b == 0x02 {
-                                        cache.mark_interior_group(gid, pnum, idx_in_group);
-                                    } else if b == 0x0A {
-                                        if let Some(page_slice) = decompressed.get(page_start..page_start + ps) {
-                                            if is_valid_btree_page(page_slice, hdr_off) {
-                                                cache.mark_index_page(pnum, gid, idx_in_group);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        self.detect_interior_page(buf, page_num, cache);
-                        cache.touch_group(gid);
-                        self.consecutive_misses = 0;
-
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!(
-                                "  [inline-subchunk] page={} gid={} frame={}/{} s3={}ms decode={}ms total={}ms ({:.1}KB)",
-                                page_num, gid, frame_idx, ft.len(), s3_ms, decode_ms,
-                                miss_start.elapsed().as_millis(),
-                                compressed_frame.len() as f64 / 1024.0,
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Ok(None) => {
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!("  [inline-subchunk] page={} gid={} NOT FOUND {}ms", page_num, gid, miss_start.elapsed().as_millis());
-                        }
-                    }
-                    Err(e) => {
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!("[inline-subchunk] page={} gid={} frame={} error: {} {}ms", page_num, gid, frame_idx, e, miss_start.elapsed().as_millis());
-                        }
-                    }
-                }
-            }
-            // Fall through to legacy path if sub-chunk fetch failed
-        }
-
-        // ── LEGACY PATH: full group download ──
-        let state = cache.group_state(gid);
-        if state == GroupState::Fetching {
+        // 5a. If another thread is already fetching this group, wait for it
+        let group_state = cache.group_state(gid);
+        if group_state == GroupState::Fetching {
             let wait_start = Instant::now();
             cache.wait_for_group(gid);
             if std::env::var("BENCH_VERBOSE").is_ok() {
                 eprintln!(
-                    "  [inline] page={} gid={} WAITED for prefetch worker {}ms",
+                    "  [wait-prefetch] page={} gid={} waited {}ms",
                     page_num, gid, wait_start.elapsed().as_millis(),
                 );
             }
-        } else if state != GroupState::Present {
-            if cache.try_claim_group(gid) {
-                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-                self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
-                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                    if !key.is_empty() {
-                        let s3_start = Instant::now();
-                        match s3_arc.get_page_group(key) {
-                            Ok(Some(pg_data)) => {
-                                let s3_ms = s3_start.elapsed().as_millis();
-                                let decode_start = Instant::now();
-                                // Decode: seekable (multi-frame) or bulk (single frame)
-                                let decode_result = if has_frames {
-                                    let ft = frame_table.unwrap();
-                                    let gp = manifest.group_pages.get(gid as usize)
-                                        .expect("group must exist in group_pages");
-                                    decode_page_group_seekable_full(
-                                        &pg_data,
-                                        ft,
-                                        manifest.page_size,
-                                        gp.len() as u32,
-                                        manifest.page_count,
-                                        0, // not used for truncation; group size from group_pages
-                                        #[cfg(feature = "zstd")]
-                                        self.decoder_dict.as_ref(),
-                                        self.encryption_key.as_ref(),
-                                    )
-                                } else {
-                                    decode_page_group_bulk(
-                                        &pg_data,
-                                        #[cfg(feature = "zstd")]
-                                        self.decoder_dict.as_ref(),
-                                        self.encryption_key.as_ref(),
-                                    )
-                                };
-                                let (pg_count, pg_size, page_data) = decode_result?;
-                                let decode_ms = decode_start.elapsed().as_millis();
-                                let ps = pg_size as usize;
+            if cache.is_present(page_num) {
+                cache.read_page(page_num, buf)?;
+                self.detect_interior_page(buf, page_num, cache);
+                cache.touch_group(gid);
+                self.consecutive_misses = 0;
+                return Ok(());
+            }
+            // Prefetch failed or page still missing, fall through to range GET
+        }
 
-                                // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
-                                let write_start = Instant::now();
-                                let gp = manifest.group_pages.get(gid as usize)
-                                    .expect("group must exist in group_pages");
-                                let actual_pages = std::cmp::min(pg_count as usize, gp.len());
-                                if actual_pages > 0 {
-                                    let data_len = actual_pages * ps;
-                                    if data_len <= page_data.len() {
-                                        cache.write_pages_scattered(
-                                            &gp[..actual_pages],
-                                            &page_data[..data_len],
-                                            gid,
-                                            0,
-                                        )?;
+        // 5b. Inline range GET: fastest path, serves the page immediately
+        let ft = manifest.frame_tables.get(gid as usize)
+            .expect("group must have seekable frame table");
+        assert!(!ft.is_empty(), "frame table must not be empty for gid={}", gid);
+        let sub_ppg = manifest.sub_pages_per_frame;
+        assert!(sub_ppg > 0, "sub_pages_per_frame must be > 0");
+        let page_in_group = page_in_group_idx;
+        let frame_idx = page_in_group / sub_ppg as usize;
+        assert!(frame_idx < ft.len(),
+            "frame_idx {} must be < frame_table.len() {} for gid={} page={}",
+            frame_idx, ft.len(), gid, page_num);
+
+        let key = manifest.page_group_keys.get(gid as usize)
+            .expect("gid must be valid index into page_group_keys");
+
+        let entry = &ft[frame_idx];
+        let s3_start = Instant::now();
+        match s3_arc.range_get(key, entry.offset, entry.len) {
+            Ok(Some(compressed_frame)) => {
+                let s3_ms = s3_start.elapsed().as_millis();
+                let decode_start = Instant::now();
+                let decompressed = decode_seekable_subchunk(
+                    &compressed_frame,
+                    #[cfg(feature = "zstd")]
+                    self.decoder_dict.as_ref(),
+                    self.encryption_key.as_ref(),
+                )?;
+                let decode_ms = decode_start.elapsed().as_millis();
+
+                let ps = manifest.page_size as usize;
+
+                // Extract needed page directly into buf (no cache round-trip)
+                let page_offset_in_frame = page_in_group % sub_ppg as usize;
+                let src_start = page_offset_in_frame * ps;
+                let src_end = src_start + buf.len();
+                if src_end <= decompressed.len() {
+                    buf.copy_from_slice(&decompressed[src_start..src_end]);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("sub-chunk too small: need {}..{} but got {} bytes (page={} gid={})",
+                            src_start, src_end, decompressed.len(), page_num, gid),
+                    ));
+                }
+
+                // Write sub-chunk pages to cache
+                let frame_start_idx = frame_idx * sub_ppg as usize;
+                let gp = manifest.group_pages.get(gid as usize)
+                    .expect("group must exist in group_pages");
+                {
+                    let frame_end_idx = std::cmp::min(frame_start_idx + sub_ppg as usize, gp.len());
+                    let frame_page_nums = &gp[frame_start_idx..frame_end_idx];
+                    let pages_in_frame = frame_page_nums.len() as u64;
+                    if pages_in_frame > 0 {
+                        let data_len = pages_in_frame as usize * ps;
+                        if data_len <= decompressed.len() {
+                            cache.write_pages_scattered(
+                                frame_page_nums,
+                                &decompressed[..data_len],
+                                gid,
+                                frame_start_idx as u32,
+                            )?;
+                        }
+                    }
+                    // Scan for page types in the sub-chunk
+                    for (i, &pnum) in frame_page_nums.iter().enumerate() {
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let page_start = i * ps;
+                        let idx_in_group = (frame_start_idx + i) as u32;
+                        let type_byte = decompressed.get(page_start + hdr_off).copied();
+                        if let Some(b) = type_byte {
+                            if b == 0x05 || b == 0x02 {
+                                cache.mark_interior_group(gid, pnum, idx_in_group);
+                            } else if b == 0x0A {
+                                if let Some(page_slice) = decompressed.get(page_start..page_start + ps) {
+                                    if is_valid_btree_page(page_slice, hdr_off) {
+                                        cache.mark_index_page(pnum, gid, idx_in_group);
                                     }
                                 }
-                                for (i, &pnum) in gp.iter().take(actual_pages).enumerate() {
-                                    let type_byte = if pnum == 0 {
-                                        page_data.get(i * ps + 100).copied()
-                                    } else {
-                                        page_data.get(i * ps).copied()
-                                    };
-                                    if let Some(b) = type_byte {
-                                        if b == 0x05 || b == 0x02 {
-                                            cache.mark_interior_group(gid, pnum, i as u32);
-                                        }
-                                    }
-                                }
-                                let write_ms = write_start.elapsed().as_millis();
-                                cache.mark_group_present(gid);
-                                cache.touch_group(gid);
-                                if std::env::var("BENCH_VERBOSE").is_ok() {
-                                    eprintln!(
-                                        "  [inline] page={} gid={} s3={}ms decode={}ms write={}ms total={}ms ({:.1}KB)",
-                                        page_num, gid, s3_ms, decode_ms, write_ms,
-                                        miss_start.elapsed().as_millis(),
-                                        pg_data.len() as f64 / 1024.0,
-                                    );
-                                }
-                            }
-                            Ok(None) => {
-                                let states = cache.group_states.lock();
-                                if let Some(s) = states.get(gid as usize) {
-                                    s.store(GroupState::None as u8, Ordering::Release);
-                                }
-                                cache.group_condvar.notify_all();
-                                if std::env::var("BENCH_VERBOSE").is_ok() {
-                                    eprintln!("  [inline] page={} gid={} NOT FOUND {}ms", page_num, gid, miss_start.elapsed().as_millis());
-                                }
-                            }
-                            Err(e) => {
-                                if std::env::var("BENCH_VERBOSE").is_ok() {
-                                    eprintln!("[inline] page={} gid={} error: {} {}ms", page_num, gid, e, miss_start.elapsed().as_millis());
-                                }
-                                let states = cache.group_states.lock();
-                                if let Some(s) = states.get(gid as usize) {
-                                    s.store(GroupState::None as u8, Ordering::Release);
-                                }
-                                cache.group_condvar.notify_all();
                             }
                         }
                     }
                 }
-            } else {
-                let wait_start = Instant::now();
-                cache.wait_for_group(gid);
+
+                self.detect_interior_page(buf, page_num, cache);
+                cache.touch_group(gid);
+
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     eprintln!(
-                        "  [inline] page={} gid={} WAITED (race) {}ms",
-                        page_num, gid, wait_start.elapsed().as_millis(),
+                        "  [range-get] page={} gid={} frame={}/{} s3={}ms decode={}ms total={}ms ({:.1}KB)",
+                        page_num, gid, frame_idx, ft.len(), s3_ms, decode_ms,
+                        miss_start.elapsed().as_millis(),
+                        compressed_frame.len() as f64 / 1024.0,
                     );
                 }
+
+                // 5c. AFTER serving the page: submit background cache warming.
+                // Range GET already returned the data we need. These are non-blocking
+                // channel sends that warm the cache for future reads.
+                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+                if cache.try_claim_group(gid) {
+                    let mut submitted = false;
+                    if let Some(pool) = &self.prefetch_pool {
+                        if !key.is_empty() {
+                            let gp_clone = gp.clone();
+                            submitted = pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_clone);
+                        }
+                    }
+                    if !submitted {
+                        // Reset state: no pool or empty key, don't leave stuck in Fetching
+                        let states = cache.group_states.lock();
+                        if let Some(s) = states.get(gid as usize) {
+                            s.store(GroupState::None as u8, Ordering::Release);
+                        }
+                        cache.group_condvar.notify_all();
+                    }
+                    // Demand-driven prefetch: fraction of B-tree siblings
+                    self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
+                }
+                self.consecutive_misses = 0;
+
+                return Ok(());
+            }
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("S3 object not found for page group gid={} key={}", gid, key),
+                ));
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("S3 range GET failed for gid={} frame={}: {}", gid, frame_idx, e),
+                ));
             }
         }
-
-        // Read the page from cache (should be present now for legacy path).
-        if cache.is_present(page_num) {
-            self.consecutive_misses = 0;
-            cache.read_page(page_num, buf)?;
-            self.detect_interior_page(buf, page_num, cache);
-            cache.touch_group(gid);
-            return Ok(());
-        }
-        buf.fill(0);
-        Ok(())
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error> {
@@ -4066,6 +3954,7 @@ impl DatabaseHandle for TieredHandle {
             group_pages: old_manifest.group_pages.clone(),
             btrees: old_manifest.btrees.clone(),
             page_index: HashMap::new(),
+            btree_groups: HashMap::new(),
         };
         new_manifest.build_page_index();
         s3.put_manifest(&new_manifest)?;
@@ -5499,6 +5388,7 @@ pub fn import_sqlite_file(
         group_pages: group_pages_list,
         btrees: btrees_manifest,
         page_index: HashMap::new(),
+        btree_groups: HashMap::new(),
     };
     manifest.build_page_index();
     s3.put_manifest(&manifest)?;
@@ -6716,53 +6606,6 @@ mod tests {
     fn test_tiered_config_default_pages_per_group() {
         assert_eq!(DEFAULT_PAGES_PER_GROUP, 256);
         assert_eq!(TieredConfig::default().pages_per_group, 256);
-    }
-
-    // =========================================================================
-    // Fraction-Based Prefetch Math
-    // =========================================================================
-
-    #[test]
-    fn test_fraction_prefetch_schedule() {
-        let hops = vec![0.33f32, 0.33];
-        let total_groups = 10u64;
-        let count1 = ((total_groups as f32) * hops[0]).ceil() as u64;
-        assert_eq!(count1, 4); // 33% of 10 = 3.3 → ceil = 4
-        let count2 = ((total_groups as f32) * hops[1]).ceil() as u64;
-        assert_eq!(count2, 4);
-        let count3 = ((total_groups as f32) * 1.0).ceil() as u64;
-        assert_eq!(count3, 10); // 100%
-    }
-
-    #[test]
-    fn test_fraction_prefetch_single_group() {
-        let hops = vec![0.33f32, 0.33];
-        let total_groups = 1u64;
-        let count = ((total_groups as f32) * hops[0]).ceil() as u64;
-        assert_eq!(count, 1); // 33% of 1 = 0.33 → ceil = 1
-    }
-
-    #[test]
-    fn test_fraction_prefetch_large_db() {
-        let hops = vec![0.33f32, 0.33];
-        let total_groups = 1000u64;
-        let hop1 = ((total_groups as f32) * hops[0]).ceil() as u64;
-        assert_eq!(hop1, 330);
-        let hop2 = ((total_groups as f32) * hops[1]).ceil() as u64;
-        assert_eq!(hop2, 330);
-        // Remaining after 2 hops
-        let remaining = total_groups - hop1 - hop2;
-        assert_eq!(remaining, 340); // hop3 fetches all remaining
-    }
-
-    #[test]
-    fn test_fraction_prefetch_empty_hops() {
-        let hops: Vec<f32> = vec![];
-        // With empty hops, hop_idx 0 is beyond len, so fraction = 1.0
-        let total_groups = 10u64;
-        let fraction = if 0 < hops.len() { hops[0] } else { 1.0 };
-        let count = ((total_groups as f32) * fraction).ceil() as u64;
-        assert_eq!(count, 10); // Fetch all immediately
     }
 
     // =========================================================================
@@ -9480,6 +9323,11 @@ mod tests {
         assert_eq!(m2.page_location(3).unwrap().index, 2);
         // total_groups uses group_pages, not positional
         assert_eq!(m2.total_groups(), 3);
+        // btree_groups rebuilt correctly (group -> sibling group_ids)
+        assert_eq!(m2.btree_groups.get(&0).unwrap(), &vec![0u64]);
+        assert_eq!(m2.btree_groups.get(&1).unwrap(), &vec![1u64]);
+        // group 2 has no btree entry, so no btree_groups mapping
+        assert!(m2.btree_groups.get(&2).is_none());
     }
 
     #[test]
@@ -9712,5 +9560,641 @@ mod tests {
 
         // Falls back to positional total_groups
         assert_eq!(m.total_groups(), 4); // ceil(100/32)
+    }
+
+    // =========================================================================
+    // Demand-Driven Prefetch: btree_groups data structure tests
+    // =========================================================================
+
+    #[test]
+    fn test_btree_groups_single_btree_multiple_groups() {
+        // A B-tree spanning 3 groups: each group should map to all siblings
+        let mut m = Manifest {
+            page_count: 12,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into(), "c".into()],
+            group_pages: vec![
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+                vec![8, 9, 10, 11],
+            ],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1, 2],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // All three groups should map to the same sibling list [0, 1, 2]
+        assert_eq!(m.btree_groups.get(&0).unwrap(), &vec![0u64, 1, 2]);
+        assert_eq!(m.btree_groups.get(&1).unwrap(), &vec![0u64, 1, 2]);
+        assert_eq!(m.btree_groups.get(&2).unwrap(), &vec![0u64, 1, 2]);
+    }
+
+    #[test]
+    fn test_btree_groups_multiple_btrees_disjoint() {
+        // Two B-trees, each with their own groups, no overlap
+        let mut m = Manifest {
+            page_count: 20,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            group_pages: vec![
+                vec![0, 1, 2, 3],     // B-tree A
+                vec![4, 5, 6, 7],     // B-tree A
+                vec![8, 9, 10, 11],   // B-tree B
+                vec![12, 13, 14, 15], // B-tree B
+            ],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "table_a".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1],
+                });
+                h.insert(8, BTreeManifestEntry {
+                    name: "table_b".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![2, 3],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // B-tree A groups map to [0, 1]
+        assert_eq!(m.btree_groups.get(&0).unwrap(), &vec![0u64, 1]);
+        assert_eq!(m.btree_groups.get(&1).unwrap(), &vec![0u64, 1]);
+        // B-tree B groups map to [2, 3]
+        assert_eq!(m.btree_groups.get(&2).unwrap(), &vec![2u64, 3]);
+        assert_eq!(m.btree_groups.get(&3).unwrap(), &vec![2u64, 3]);
+        // No cross-contamination
+        assert!(!m.btree_groups[&0].contains(&2));
+        assert!(!m.btree_groups[&2].contains(&0));
+    }
+
+    #[test]
+    fn test_btree_groups_single_group_btree_has_self_only() {
+        // A B-tree that fits in a single group: btree_groups maps it to [self]
+        let mut m = Manifest {
+            page_count: 4,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into()],
+            group_pages: vec![vec![0, 1, 2, 3]],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "small_table".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // Single group: sibling list is [0] (only self)
+        assert_eq!(m.btree_groups.get(&0).unwrap(), &vec![0u64]);
+        // trigger_prefetch skips self, so no siblings to prefetch (correct)
+    }
+
+    #[test]
+    fn test_btree_groups_empty_when_no_btrees() {
+        // Manifest with group_pages but no btrees: btree_groups is empty
+        let mut m = Manifest {
+            page_count: 8,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into()],
+            group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            btrees: HashMap::new(),
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        assert!(m.btree_groups.is_empty());
+    }
+
+    #[test]
+    fn test_btree_groups_group_not_in_any_btree() {
+        // Group 2 exists in group_pages but isn't claimed by any btree
+        let mut m = Manifest {
+            page_count: 12,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into(), "c".into()],
+            group_pages: vec![
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+                vec![8, 9, 10, 11], // orphan group
+            ],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1], // only groups 0 and 1
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        assert!(m.btree_groups.get(&0).is_some());
+        assert!(m.btree_groups.get(&1).is_some());
+        assert!(m.btree_groups.get(&2).is_none(), "orphan group should not be in btree_groups");
+    }
+
+    #[test]
+    fn test_btree_groups_rebuild_clears_stale() {
+        // Calling build_page_index twice with different btrees replaces stale mappings
+        let mut m = Manifest {
+            page_count: 8,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into()],
+            group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "v1".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+        assert_eq!(m.btree_groups.len(), 2);
+        assert_eq!(m.btree_groups[&0], vec![0u64, 1]);
+
+        // Change btrees: group 1 is now a separate B-tree
+        m.btrees.clear();
+        m.btrees.insert(0, BTreeManifestEntry {
+            name: "v2_a".into(),
+            obj_type: "table".into(),
+            group_ids: vec![0],
+        });
+        m.btrees.insert(4, BTreeManifestEntry {
+            name: "v2_b".into(),
+            obj_type: "table".into(),
+            group_ids: vec![1],
+        });
+        m.build_page_index();
+
+        // Now group 0 and group 1 are in separate B-trees
+        assert_eq!(m.btree_groups[&0], vec![0u64]);
+        assert_eq!(m.btree_groups[&1], vec![1u64]);
+    }
+
+    #[test]
+    fn test_btree_groups_overwrite_when_group_in_multiple_btrees() {
+        // Edge case: a group appears in multiple B-tree entries.
+        // Last-writer-wins due to HashMap iteration order.
+        // This shouldn't happen in practice (B-tree-aware grouping assigns
+        // each group to exactly one B-tree), but verify no panic.
+        let mut m = Manifest {
+            page_count: 8,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into()],
+            group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            btrees: {
+                let mut h = HashMap::new();
+                // Both B-trees claim group 0
+                h.insert(0, BTreeManifestEntry {
+                    name: "tree_a".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                });
+                h.insert(4, BTreeManifestEntry {
+                    name: "tree_b".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![0, 1], // group 0 also here
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        // Group 0 ends up in btree_groups (no panic, last write wins)
+        assert!(m.btree_groups.contains_key(&0));
+        // Group 1 should be present too
+        assert!(m.btree_groups.contains_key(&1));
+    }
+
+    // =========================================================================
+    // Demand-Driven Prefetch: GroupState + just_claimed logic tests
+    // =========================================================================
+
+    #[test]
+    fn test_group_state_claim_prevents_double_claim() {
+        // Two threads trying to claim the same group: only one succeeds
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+
+        // First claim succeeds
+        assert!(cache.try_claim_group(0));
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
+
+        // Second claim fails (already Fetching)
+        assert!(!cache.try_claim_group(0));
+    }
+
+    #[test]
+    fn test_group_state_claim_then_present() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        assert_eq!(cache.group_state(0), GroupState::None);
+        assert!(cache.try_claim_group(0));
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
+        cache.mark_group_present(0);
+        assert_eq!(cache.group_state(0), GroupState::Present);
+
+        // Can't claim a Present group
+        assert!(!cache.try_claim_group(0));
+    }
+
+    #[test]
+    fn test_concurrent_group_claim_exactly_one_wins() {
+        // Multiple threads race to claim the same group. Exactly one succeeds.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+        let winners = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&cache);
+            let w = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                if c.try_claim_group(0) {
+                    w.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(winners.load(Ordering::Relaxed), 1, "exactly one thread should win the claim");
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
+    }
+
+    #[test]
+    fn test_group_state_reset_on_failed_fetch() {
+        // If a fetch fails, state should be reset to None so another thread can retry
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        assert!(cache.try_claim_group(0));
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
+
+        // Simulate fetch failure: reset to None
+        let states = cache.group_states.lock();
+        if let Some(s) = states.get(0) {
+            s.store(GroupState::None as u8, Ordering::Release);
+        }
+        drop(states);
+
+        assert_eq!(cache.group_state(0), GroupState::None);
+        // Can be claimed again
+        assert!(cache.try_claim_group(0));
+    }
+
+    #[test]
+    fn test_wait_for_group_returns_when_present() {
+        // wait_for_group should unblock when another thread marks group Present
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+
+        assert!(cache.try_claim_group(0));
+
+        let c = Arc::clone(&cache);
+        let waiter = std::thread::spawn(move || {
+            c.wait_for_group(0);
+            c.group_state(0)
+        });
+
+        // Brief delay, then mark present
+        std::thread::sleep(Duration::from_millis(10));
+        cache.mark_group_present(0);
+        cache.group_condvar.notify_all();
+
+        let final_state = waiter.join().unwrap();
+        assert_eq!(final_state, GroupState::Present);
+    }
+
+    #[test]
+    fn test_wait_for_group_returns_on_reset_to_none() {
+        // wait_for_group should unblock when state is reset to None (fetch failed)
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+
+        assert!(cache.try_claim_group(0));
+
+        let c = Arc::clone(&cache);
+        let waiter = std::thread::spawn(move || {
+            c.wait_for_group(0);
+            c.group_state(0)
+        });
+
+        // Simulate fetch failure: reset to None
+        std::thread::sleep(Duration::from_millis(10));
+        {
+            let states = cache.group_states.lock();
+            if let Some(s) = states.get(0) {
+                s.store(GroupState::None as u8, Ordering::Release);
+            }
+        }
+        cache.group_condvar.notify_all();
+
+        let final_state = waiter.join().unwrap();
+        assert_eq!(final_state, GroupState::None);
+    }
+
+    #[test]
+    fn test_prefetch_worker_skips_already_present_group() {
+        // Simulates what happens when a group is already Present by the time
+        // the prefetch worker picks it up: worker should skip it.
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        // Mark group as Present (as if another path already fetched it)
+        assert!(cache.try_claim_group(0));
+        cache.mark_group_present(0);
+
+        // Worker logic: if state is not None and not Fetching, skip
+        let current = cache.group_state(0);
+        assert_eq!(current, GroupState::Present);
+        assert!(current != GroupState::None && current != GroupState::Fetching,
+            "worker should skip this group");
+    }
+
+    #[test]
+    fn test_prefetch_worker_claims_unclaimed_group() {
+        // Simulates what happens when trigger_prefetch submits a group
+        // that hasn't been claimed yet (state = None)
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        // Group starts as None (submitted by trigger_prefetch, not yet claimed)
+        assert_eq!(cache.group_state(0), GroupState::None);
+
+        // Worker claims it
+        assert!(cache.try_claim_group(0));
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
+    }
+
+    #[test]
+    fn test_btree_groups_many_btrees_large_manifest() {
+        // Stress test: 50 B-trees, each with 10 groups = 500 groups total
+        let mut group_pages = Vec::new();
+        let mut btrees = HashMap::new();
+        let ppg = 4u32;
+        let mut page_num = 0u64;
+
+        for btree_idx in 0u64..50 {
+            let mut group_ids = Vec::new();
+            for g in 0..10 {
+                let gid = btree_idx * 10 + g;
+                let pages: Vec<u64> = (0..ppg as u64).map(|p| page_num + p).collect();
+                page_num += ppg as u64;
+                group_pages.push(pages);
+                group_ids.push(gid);
+            }
+            btrees.insert(btree_idx * ppg as u64, BTreeManifestEntry {
+                name: format!("btree_{}", btree_idx),
+                obj_type: "table".into(),
+                group_ids,
+            });
+        }
+
+        let mut m = Manifest {
+            page_count: page_num,
+            page_size: 4096,
+            pages_per_group: ppg,
+            page_group_keys: (0..500).map(|i| format!("pg/{}_v1", i)).collect(),
+            group_pages,
+            btrees,
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+
+        assert_eq!(m.btree_groups.len(), 500);
+
+        // Each group should map to exactly 10 siblings (its B-tree's groups)
+        for gid in 0u64..500 {
+            let siblings = m.btree_groups.get(&gid).unwrap();
+            assert_eq!(siblings.len(), 10, "gid {} should have 10 siblings", gid);
+            // All siblings should be from the same B-tree (same 10-group block)
+            let btree_block = gid / 10;
+            for &s in siblings {
+                assert_eq!(s / 10, btree_block, "sibling {} should be in same B-tree block as gid {}", s, gid);
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_groups_survives_serde_roundtrip() {
+        // btree_groups is #[serde(skip)], so it must be rebuilt after deserialization
+        let mut m = Manifest {
+            page_count: 12,
+            page_size: 4096,
+            pages_per_group: 4,
+            page_group_keys: vec!["a".into(), "b".into(), "c".into()],
+            group_pages: vec![
+                vec![0, 1, 2, 3],
+                vec![4, 5, 6, 7],
+                vec![8, 9, 10, 11],
+            ],
+            btrees: {
+                let mut h = HashMap::new();
+                h.insert(0, BTreeManifestEntry {
+                    name: "table_x".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1],
+                });
+                h.insert(8, BTreeManifestEntry {
+                    name: "idx_x".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![2],
+                });
+                h
+            },
+            ..Manifest::empty()
+        };
+        m.build_page_index();
+        assert_eq!(m.btree_groups.len(), 3);
+
+        // Serialize
+        let json = serde_json::to_string(&m).unwrap();
+
+        // Deserialize: btree_groups should be empty (skipped)
+        let mut m2: Manifest = serde_json::from_str(&json).unwrap();
+        assert!(m2.btree_groups.is_empty(), "btree_groups should not survive serialization");
+
+        // Rebuild
+        m2.build_page_index();
+        assert_eq!(m2.btree_groups.len(), 3);
+        assert_eq!(m2.btree_groups[&0], vec![0u64, 1]);
+        assert_eq!(m2.btree_groups[&1], vec![0u64, 1]);
+        assert_eq!(m2.btree_groups[&2], vec![2u64]);
+    }
+
+    // =========================================================================
+    // Fraction-based prefetch escalation
+    // =========================================================================
+
+    #[test]
+    fn test_fraction_prefetch_first_miss_33_percent() {
+        // With hops=[0.33, 0.33] and consecutive_misses=1, prefetch 33% of siblings
+        let hops = vec![0.33f32, 0.33];
+        let hop_idx = 0usize; // consecutive_misses=1, so hop_idx=0
+        let fraction = hops[hop_idx];
+        // 10 eligible siblings -> ceil(10 * 0.33) = 4
+        let eligible = 10;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 4);
+    }
+
+    #[test]
+    fn test_fraction_prefetch_second_miss_66_percent() {
+        let hops = vec![0.33f32, 0.33];
+        let hop_idx = 1usize; // consecutive_misses=2
+        let fraction = hops[hop_idx];
+        let eligible = 10;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 4);
+        // Total after 2 misses: 4 + 4 = 8 out of 10
+    }
+
+    #[test]
+    fn test_fraction_prefetch_third_miss_all() {
+        let hops = vec![0.33f32, 0.33];
+        let hop_idx = 2usize; // consecutive_misses=3, beyond hops.len()
+        let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+        assert_eq!(fraction, 1.0);
+        let eligible = 10;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 10); // all remaining
+    }
+
+    #[test]
+    fn test_fraction_prefetch_single_sibling() {
+        // With only 1 eligible sibling, even 33% rounds up to 1
+        let hops = vec![0.33f32, 0.33];
+        let fraction = hops[0];
+        let eligible = 1;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 1);
+    }
+
+    #[test]
+    fn test_fraction_prefetch_zero_eligible() {
+        // All siblings already fetching/present -> 0 eligible -> 0 to submit
+        let hops = vec![0.33f32, 0.33];
+        let fraction = hops[0];
+        let eligible = 0;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 0);
+    }
+
+    #[test]
+    fn test_fraction_prefetch_empty_hops_fetches_all() {
+        // Empty hops vec -> fraction = 1.0 -> fetch all on first miss
+        let hops: Vec<f32> = vec![];
+        let hop_idx = 0usize;
+        let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+        assert_eq!(fraction, 1.0);
+        let eligible = 10;
+        let max_submit = ((eligible as f32) * fraction).ceil() as usize;
+        assert_eq!(max_submit, 10);
+    }
+
+    #[test]
+    fn test_prefetch_dedup_claim_prevents_double_download() {
+        // Simulates trigger_prefetch deduplication: claiming before submitting
+        // ensures at most one download per group
+        let dir = TempDir::new().unwrap();
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+
+        // First call claims group 1
+        assert!(cache.try_claim_group(1));
+        assert_eq!(cache.group_state(1), GroupState::Fetching);
+
+        // Second call (from another trigger_prefetch) fails to claim
+        assert!(!cache.try_claim_group(1));
+
+        // After first finishes, marks Present
+        cache.mark_group_present(1);
+
+        // Third call (from yet another trigger_prefetch) also can't claim
+        assert!(!cache.try_claim_group(1));
+    }
+
+    #[test]
+    fn test_prefetch_claim_reset_on_failure() {
+        // If pool.submit fails, state must be reset to None so the group
+        // can be retried by another miss
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        assert!(cache.try_claim_group(1));
+        assert_eq!(cache.group_state(1), GroupState::Fetching);
+
+        // Simulate submit failure: reset to None
+        {
+            let states = cache.group_states.lock();
+            if let Some(s) = states.get(1) {
+                s.store(GroupState::None as u8, Ordering::Release);
+            }
+        }
+        cache.group_condvar.notify_all();
+
+        // Now another path can claim it
+        assert!(cache.try_claim_group(1));
+        assert_eq!(cache.group_state(1), GroupState::Fetching);
+    }
+
+    #[test]
+    fn test_read_path_range_get_before_prefetch() {
+        // Verify the logical ordering: range GET should complete before
+        // background prefetch is submitted. We test this by checking that
+        // after a cache miss, the page is served immediately while the
+        // group state transitions happen after.
+        //
+        // This is a structural test of the invariant, not an integration test.
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+        // Before range GET: group state should be None
+        assert_eq!(cache.group_state(0), GroupState::None);
+
+        // After range GET writes sub-chunk to cache, page is present
+        // but group state is still None (prefetch not yet submitted)
+        let page_data = vec![42u8; 64];
+        cache.write_pages_scattered(&[0], &page_data, 0, 0).unwrap();
+        assert!(cache.is_present(0));
+        assert_eq!(cache.group_state(0), GroupState::None,
+            "group state should remain None until prefetch is submitted");
+
+        // Now the read path would claim and submit to pool
+        assert!(cache.try_claim_group(0));
+        assert_eq!(cache.group_state(0), GroupState::Fetching);
     }
 }
