@@ -21,9 +21,9 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 | Query | Cache: none | Cache: interior | Cache: index | Cache: data |
 |-------|-------------|-----------------|--------------|-------------|
 | Point lookup | 75ms | 11ms | 11ms | 157us |
-| Profile (5 joins) | 202ms | 134ms | 113ms | 301us |
-| Who-liked | 118ms | 51ms | 5ms | 259us |
-| Mutual friends | 82ms | 25ms | 5ms | 116us |
+| Profile (5 JOINs) | 202ms | 134ms | 113ms | 301us |
+| Who-liked (one to many JOIN) | 118ms | 51ms | 5ms | 259us |
+| Mutual friends (many to many JOIN)| 82ms | 25ms | 5ms | 116us |
 | Indexed filter | 76ms | 12ms | 5ms | 106us |
 | Full scan + filter | 691ms | 685ms | 562ms | 280ms |
 
@@ -82,7 +82,7 @@ turbolite is designed for S3's constraints over filesystem constraints. Every de
 
 ### Architecture
 
-turbolite adds introspection and indirection layers between SQLite and S3 that efficiently groups, compresses, and tracks pages. 
+turbolite adds introspection and indirection layers between SQLite and S3 that efficiently groups, compresses, tracks, and fetches pages. 
 
 SQLite uses a B-tree index and requests for one page at a time. It knows page N is at byte offset `N * page_size`. And those pages are distributed randomly throughout the pagemap for efficient random access. But on S3, fetching one page per request would mean thousands of potentially random GETs per query. 
 
@@ -102,21 +102,21 @@ SQLite defaults to 4KB pages to match filesystem disk page size. On S3, disk pag
 
 To make point queries fast, turbolite uses **seekable compression**: each page group is encoded as multiple **zstd frames** (~4 pages per frame). The manifest stores byte offsets per frame, so a cache miss fetches just the ~256KB sub-chunk with the needed page via S3 range GET, not the entire group.
 
-To make scans not-slow (they'll never be fast), turbolite uses **adaptive prefetching**, inspired by exponential backoff. On a cache miss, two things happen concurrently:
+To make scans not-slow (they'll never be fast), turbolite uses **adaptive prefetching** with **per-tree miss tracking**. On a cache miss, two things happen concurrently:
 1. **Inline range GET**: fetch the specific page group frame containing the needed page, return to SQLite immediately.
-2. **Background prefetch**: submit the full group *for that tree (index or table)* to a thread pool for fetch according to the hop schedule.
+2. **Background prefetch**: submit sibling groups *for that tree (index or table)* to a thread pool according to the prefetch schedule.
 
-Consecutive misses escalate: each miss advances through a **"prefetch aggression" schedule** that controls what fraction of groups to prefetch.
+Miss counters are tracked **per B-tree, not globally**. A profile query that hits `users` (miss 1) then `posts` (miss 1) correctly tracks each tree at 1, not 2. This prevents a multi-table join from accidentally escalating prefetch aggression on every tree just because it touches several.
 
-The default aggression schedule is `[0.0, 0.5, 0.5]` which skips the first miss entirely (so point queries pay zero overhead), then fetches 50% of *same-tree page groups* on the second miss and the remaining 50% on the third.
+Each consecutive miss advances through a **prefetch schedule** that controls what fraction of same-tree groups to prefetch. turbolite uses two schedules, selected automatically based on the query plan:
+- **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
+- **Lookup schedule** `[0.0, 0.1, 0.2]`: for point queries and index lookups that hit 1-2 pages per tree. Conservative because these rarely need prefetch at all.
 
-This schedule takes advantage of B-tree introspection, but it does make a key tradeoff: a slower latency floor (extra GET on cache miss) for extremely efficient scans: every prefetched group in a scan is guaranteed to contain pages from the right tree. In the 1.5GB benchmark, this brings down a full table scan from ~650ms to ~250ms, while adding ~50ms to point fetches.
-
-An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and immediately fetches the rest of the `users` table in the background - *and nothing else*. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
+Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the tables' page groups live next to each other.
 
 ### Experimental^2 Features
 
-Adapting prefetching is reactive: it discovers tables through misses. But SQLite already knows what it's going to read. turbolite exploits this with **frontrun prefetch**: it intercepts the SQLite query plan before a query executes, extracts the exact tables/indexes the query will touch, and submits the relevant page groups to the prefetch pool in the order that they will be requested by SQlite - before the first page is even read. 
+Adaptive prefetching is reactive: it discovers tables through misses. But SQLite already knows what it's going to read. turbolite exploits this with **prefetch frontrunning** (made up name): it intercepts the SQLite query plan before a query executes, extracts the exact tables/indexes the query will touch, and submits the relevant page groups to the prefetch pool in the order that they will be requested by SQlite - before the first page is even read. 
 
 This is pretty neat: a five-table join that would trigger five sequential miss-then-fetch cycles instead fires all five fetches in parallel at query start. Benchmarking shows this speeds up cold multi-table queries by 1.5x and scans by up to 5x (depending on prefetch agression). The hop schedule remains as fallback. 
 
@@ -144,7 +144,7 @@ If encryption is enabled, turbolite encrypts everything: S3 objects, local cache
 
 **Point lookups are the sweet spot.** At cache level `index`, a point lookup fetches 1-2 sub-chunks via S3 range GET (~100KB each). Interior and index pages are already cached. At cache level `none`, add ~120ms for interior re-fetch + first data page. This works on any machine size.
 
-**Scans with enough cores.** The prefetch pool saturates S3 bandwidth with flexible hop scheduling (default: 33%/33%/remaining of all groups per consecutive miss). Sufficient threads can sync multi-GB databases in seconds with 2-3 prefetch batches.
+**Scans with enough cores.** The prefetch pool saturates S3 bandwidth with per-tree adaptive scheduling. Search queries ramp prefetch aggressively from the first miss; plan-aware SCAN queries bulk-prefetch the entire table upfront. Sufficient threads can sync multi-GB databases in seconds with 2-3 prefetch batches.
 
 ### Where turbolite is slow
 
@@ -163,25 +163,54 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 
 ## Tuning
 
+### General parameters
+
 | Parameter | What it controls | Default |
 |-----------|-----------------|---------|
 | `prefetch_threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
-| `btree_prefetch_hops` | Sibling prefetch schedule (BTreeAware strategy) | `0.0, 0.5, 0.5` (skip first miss) |
 | `pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
 | `grouping_strategy` | How pages are packed into groups at import | BTreeAware |
 | `gc_enabled` | Delete old page group versions after checkpoint | false |
 | `sync_mode` | Checkpoint durability: `Durable` (S3 upload in checkpoint) or `LocalThenFlush` (defer upload) | Durable |
 
-**Recommended configs:**
+### Prefetch schedules
+
+The VFS automatically selects a prefetch strategy per query using EXPLAIN QUERY PLAN:
+
+| Strategy | When | Default schedule | What happens |
+|----------|------|-----------------|--------------|
+| **SCAN** (plan-aware) | EQP says `SCAN table` | All groups upfront | Bulk prefetch of entire table before first read. No hop schedule. |
+| **SEARCH** | EQP says `SEARCH ... USING INDEX` | `[0, 0, 0.2, 0.3, 0.5]` | 2 free inline range GETs, then background prefetch ramps. |
+| **Default** | No EQP info, point queries | `[0.3, 0.3, 0.4]` | Moderate prefetch from first miss. |
+
+Each element is the fraction of sibling groups to prefetch on the Nth consecutive cache miss. When misses exceed the array length, fraction=1.0 (all remaining).
+
+**Why two schedules?** SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately. SCAN queries need everything upfront and bypass schedules entirely (plan-aware bulk prefetch).
+
+### Runtime tuning
+
+Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+
+```sql
+SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
+SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
+SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
+SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
+SELECT turbolite_config_set('plan_aware', 'false');
+```
+
+Changes take effect on the next query. Zero overhead when not used.
+
+### Recommended configs
 
 | Workload | Config | Why |
 |----------|--------|-----|
-| Point lookups, small machine | `btree_prefetch_hops=0.0,0.0,0.5,0.5` | Zero overhead on first two misses. Only prefetch on sustained access. |
-| Mixed OLTP | `btree_prefetch_hops=0.0,0.5,0.5` | Skip point queries, aggressive on scans. Default. |
-| Scan-heavy analytics | `prefetch_threads=8+, prefetch_hops=0.5,0.5` | Aggressive hops. Saturate S3 bandwidth. |
-| Bursty serverless | `btree_prefetch_hops=0.0,0.0,0.5,0.5` | Conservative. Two misses before any prefetch. |
+| Mixed OLTP | Defaults | Plan-aware handles scans, search schedule warms indexes, lookup schedule stays conservative. |
+| Point-heavy (agent DBs) | `prefetch_lookup=0,0,0` | Lookups almost never need prefetch. |
+| Scan-heavy analytics | `prefetch_search=0.5,0.5`, `plan_aware=true` | Aggressive search warmup plus plan-aware bulk prefetch. |
+| Conservative (bursty serverless) | `prefetch_search=0.1,0.2,0.3`, `prefetch_lookup=0,0,0.1` | Minimal prefetch noise. |
 
-**Limitation**: prefetch is per-connection. Each new connection starts with a cold hop counter. The cache is shared, so a second connection benefits from pages cached by the first.
+**Note**: prefetch is per-connection. Each new connection starts with cold per-tree miss counters. The cache is shared, so a second connection benefits from pages cached by the first.
 
 ## Durability
 
@@ -434,7 +463,7 @@ cargo run --features zstd,tiered --bin tiered-bench --release -- \
 cargo run --example quick-bench --features encryption --release
 ```
 
-Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--btree-hops` (B-tree prefetch schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch).
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-search` (SEARCH schedule), `--prefetch-lookup` (lookup schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch).
 
 ## Testing
 

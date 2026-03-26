@@ -362,6 +362,7 @@ pub fn import_sqlite_file(
         btree_groups: HashMap::new(),
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
+        group_to_tree_name: HashMap::new(),
         btree_access_freq: HashMap::new(),
         prediction_patterns: Vec::new(),
     };

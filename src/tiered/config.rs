@@ -97,12 +97,17 @@ pub struct TieredConfig {
     /// total page groups to prefetch on consecutive cache misses.
     /// Default [0.33, 0.33] = 3-hop: miss 1 fetches 33%, miss 2 fetches 33%, miss 3+ fetches all.
     pub prefetch_hops: Vec<f32>,
-    /// B-tree sibling prefetch schedule (BTreeAware strategy). Each element is the fraction of
-    /// eligible sibling groups to prefetch on consecutive cache misses.
-    /// Default [0.0, 0.5, 0.5] = skip first miss (point queries get zero overhead),
-    /// then 50% on miss 2, remaining 50% on miss 3, everything on miss 4+.
-    /// Higher floor, lower volatility: scans pay one extra miss but point queries are clean.
-    pub btree_prefetch_hops: Vec<f32>,
+    /// Prefetch schedule for SEARCH queries (BTreeAware strategy).
+    /// SEARCH queries scan unknown portions of indexes/tables, need aggressive warmup.
+    /// Default [0.3, 0.3, 0.4] = prefetch 30% of siblings on first miss, ramp up.
+    /// SCAN queries bypass this entirely (plan-aware bulk prefetch).
+    /// Tunable at runtime via `turbolite_config_set('prefetch_search', '0.3,0.3,0.4')`.
+    pub prefetch_search: Vec<f32>,
+    /// Prefetch schedule for index lookups / point queries (BTreeAware strategy).
+    /// Lookups hit 1-2 pages per tree, so prefetch should be conservative.
+    /// Default [0, 0.1, 0.2] = first miss free, then gentle ramp.
+    /// Tunable at runtime via `turbolite_config_set('prefetch_lookup', '0,0.1,0.2')`.
+    pub prefetch_lookup: Vec<f32>,
     /// Number of prefetch worker threads (default: num_cpus + 1).
     /// N+1 keeps the pipeline full: when a thread blocks on S3 I/O,
     /// the extra thread uses that core for decompression/cache writes.
@@ -157,7 +162,7 @@ impl Default for TieredConfig {
             bucket: String::new(),
             prefix: String::new(),
             cache_dir: PathBuf::from("/tmp/sqlces-cache"),
-            compression_level: 3,
+            compression_level: 1,
             endpoint_url: None,
             read_only: false,
             runtime_handle: None,
@@ -165,7 +170,8 @@ impl Default for TieredConfig {
             region: None,
             cache_ttl_secs: 3600,
             prefetch_hops: vec![0.33, 0.33],
-            btree_prefetch_hops: vec![0.1, 0.3, 0.6],
+            prefetch_search: vec![0.3, 0.3, 0.4],
+            prefetch_lookup: vec![0.0, 0.1, 0.2],
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())

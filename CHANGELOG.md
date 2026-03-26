@@ -59,7 +59,7 @@ Replaces positional page grouping (pages 0-255 in group 0) with B-tree-aware pac
 ### Demand-driven prefetch
 - Range GET first (serves page), then background prefetch of full group + siblings
 - `btree_groups` reverse index: group -> sibling group_ids from same B-tree
-- Fraction-based escalation via `prefetch_hops` and `btree_prefetch_hops`
+- Fraction-based escalation via `prefetch_hops`, `prefetch_search`, and `prefetch_lookup`
 - Range-GET budget per tree: caps inline range GETs, then waits for prefetch
 - 236 tests passing (tiered+zstd+encryption)
 

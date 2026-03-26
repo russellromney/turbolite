@@ -55,23 +55,64 @@ CREATE INDEX idx_users_school ON users(school);
 | **idx-filter** | `SELECT COUNT(*) FROM posts WHERE user_id = ?` | Indexed count. Covered by idx_posts_user, only index pages needed. |
 | **scan-filter** | `SELECT COUNT(*) FROM posts WHERE like_count > ?` | Full table scan. No index on like_count, must read every data page. |
 
+## Prefetch Tuning
+
+The VFS uses three prefetch strategies, selected automatically per query via EXPLAIN QUERY PLAN:
+
+| Strategy | When | Default schedule | What happens |
+|----------|------|-----------------|--------------|
+| **SCAN** (plan-aware) | EQP says `SCAN table` | All groups submitted upfront | Bulk prefetch of entire table before first read. No hop schedule involved. |
+| **SEARCH** | EQP says `SEARCH table USING INDEX` | `[0.3, 0.3, 0.4]` | Aggressive warmup from first miss. SEARCH queries scan unknown portions of indexes/tables. |
+| **Lookup** | No EQP info, point queries, DDL | `[0, 0.1, 0.2]` | First miss free, gentle ramp. Lookups hit 1-2 pages per tree. |
+
+Each element in a schedule is the fraction of eligible sibling groups to prefetch on the Nth consecutive cache miss (per-tree). When misses exceed the array length, fraction=1.0 (all remaining siblings).
+
+### Runtime tuning
+
+Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+
+```sql
+-- Tune before a batch of queries
+SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
+SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
+SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
+SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
+SELECT turbolite_config_set('plan_aware', 'false');
+
+-- Changes take effect on the next query (zero overhead when not used)
+```
+
+| Key | Values | Description |
+|-----|--------|-------------|
+| `prefetch` | Comma-separated floats | Convenience: sets both search and lookup schedules |
+| `prefetch_search` | Comma-separated floats | SEARCH query prefetch schedule (aggressive) |
+| `prefetch_lookup` | Comma-separated floats | Lookup/point query prefetch schedule (conservative) |
+| `prefetch_reset` | Any (ignored) | Reset both schedules to defaults |
+| `plan_aware` | `true`/`false` | Enable/disable SCAN bulk prefetch |
+
+### Why two schedules?
+
+SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking across trees in a query: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately. SCAN queries need everything upfront and bypass schedules entirely (plan-aware bulk prefetch).
+
 ## CLI flags
 
 ```
---sizes          Row counts, comma-separated (default: 10000)
---iterations     Measured iterations per query per cache level (default: 10)
---warmup         Warmup iterations before measuring (default: 2)
---modes          Cache levels to run, comma-separated (default: all)
-                 Options: none, interior, index, data
---queries        Queries to run, comma-separated (default: all)
-                 Options: post, profile, who-liked, mutual, idx-filter, scan-filter
---prefetch-threads  Worker threads for parallel S3 fetches (default: 8)
---prefetch-hops    Fraction schedule, comma-separated (default: 0.33,0.33)
---ppg            Pages per page group (default: 256)
---page-size      Page size in bytes (default: 65536)
---import         Import mode: "auto" generates locally then uploads, or path to existing .db
---skip-verify    Skip COUNT(*) verification
---cleanup        Delete S3 data after benchmark
+--sizes            Row counts, comma-separated (default: 10000)
+--iterations       Measured iterations per query per cache level (default: 10)
+--warmup           Warmup iterations before measuring (default: 2)
+--modes            Cache levels to run, comma-separated (default: all)
+                   Options: none, interior, index, data
+--queries          Queries to run, comma-separated (default: all)
+                   Options: post, profile, who-liked, mutual, idx-filter, scan-filter
+--prefetch-threads Worker threads for parallel S3 fetches (default: 8)
+--prefetch-search  SEARCH prefetch schedule (default: 0.3,0.3,0.4)
+--prefetch-lookup  Lookup prefetch schedule (default: 0,0.1,0.2)
+--prefetch-hops    Radial prefetch schedule for Positional strategy (default: 0.33,0.33)
+--ppg              Pages per page group (default: 256)
+--page-size        Page size in bytes (default: 65536)
+--import           Import mode: "auto" generates locally then uploads, or path to existing .db
+--skip-verify      Skip COUNT(*) verification
+--cleanup          Delete S3 data after benchmark
 ```
 
 ## Environment Variables

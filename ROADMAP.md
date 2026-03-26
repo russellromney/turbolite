@@ -243,7 +243,7 @@ Extend tree-level prediction with frame granularity. Instead of "fetch all of tr
 ---
 
 ## Jena: Interior Page Introspection for Precise Prefetch
-> After: Marne (Query Plan remaining) · Before: (future)
+> After: Marne (Query Plan remaining) · Before: Rosetta
 
 The B-tree structure is fully known from interior pages (cached/pinned). By extracting child pointers at checkpoint and persisting them in the manifest, we can predict exact leaf pages for any query without guessing. Replaces the hop schedule heuristic with direct structural knowledge.
 
@@ -310,6 +310,83 @@ When a leaf page arrives from S3, parse its cells to extract rowids/foreign keys
 - [ ] Start with integer rowids only (covers profile query: idx_posts_user leaf -> post rowids -> posts data groups)
 - [ ] Tests: parse leaf cells for integer PK, composite index, overflow pages (payload > page), string keys
 - [ ] Benchmark: profile query with leaf chasing vs without (expect 53 GETs / 67MB -> ~6 GETs / 5MB)
+
+---
+
+## Rosetta: Value-Partitioned Index Access
+> After: Jena · Before: (future)
+
+Double-store index leaf pages in S3, organized by key value range instead of page number. SEARCH queries skip B-tree traversal entirely: the VFS maps the search key to the right partition and does one range GET. Storage cost is negligible (Tigris $0.02/GB). Normal B-tree groups remain for SCANs and general access.
+
+**How it works:** At import, for each index with enough leaf pages, walk the B-tree in key order, group leaf pages into equal-depth partitions (~256 pages each), store as one seekable S3 object per index. Convert partition boundary keys to a normalized byte format (sort-order-preserving). At query time, the engine passes the normalized search key; the VFS binary-searches boundaries and range-GETs exactly one frame.
+
+**Depends on:** Jena's SQLite record format parser (Jena d) for extracting key values from leaf cells. Jena's interior introspection is complementary, not replaced.
+
+### a. Normalized key bytes
+
+Sort-order-preserving byte encoding so partition boundaries are memcmp-comparable. Handles all SQLite column types.
+
+- [ ] `normalize_key(cell_payload, col_types) -> Vec<u8>`: parse SQLite record format, emit normalized bytes
+- [ ] Encoding: NULL `0x00`, INTEGER `0x01` + 8-byte BE with sign bit flipped, REAL `0x02` + 8-byte IEEE 754 with sign manipulation, TEXT `0x03` + raw bytes + `0x00`, BLOB `0x04` + raw bytes
+- [ ] Composite indexes: concatenate normalized bytes per column (memcmp on result gives correct multi-column sort)
+- [ ] `compare_normalized(a, b) -> Ordering`: simple memcmp wrapper
+- [ ] Tests: single-column INTEGER (positive, negative, zero, i64 extremes), TEXT (ASCII, UTF-8, empty), REAL, NULL ordering, composite key (INT, TEXT), round-trip encode/compare matches SQLite's own ordering
+
+### b. Partition builder (import path)
+
+At import time, build value-partitioned copies for qualifying indexes.
+
+- [ ] Threshold: only partition indexes with > 1 page group worth of leaf pages (small indexes don't benefit)
+- [ ] Walk each qualifying index B-tree in key order (leaf pages left-to-right via sibling pointers or interior page traversal)
+- [ ] Group leaf pages into equal-depth partitions of N pages each (N = pages_per_group)
+- [ ] For each partition: extract + normalize the first key from the first leaf page (the min boundary)
+- [ ] Encode all partitions as one seekable S3 object per index: `{prefix}/vp/{index_root_page}_v{version}`
+- [ ] Seekable frame table: one frame per partition (reuse existing seekable encode infrastructure)
+- [ ] Manifest fields: `value_partitions: HashMap<u64, ValuePartition>` where key is index root page
+- [ ] `ValuePartition { s3_key: String, boundaries: Vec<Vec<u8>>, frame_table: Vec<FrameEntry>, leaf_page_nums: Vec<Vec<u64>> }`
+- [ ] `boundaries[i]` = normalized min key of partition i; binary search finds the right frame
+- [ ] Wire into `import_sqlite_file()` after normal page group upload
+- [ ] Tests: 1000-page index partitioned into 4 partitions, boundary keys correct, seekable object decodable, small index skipped, composite index boundaries correct
+
+### c. Partition lookup (read path)
+
+VFS uses value partitions for SEARCH queries when available.
+
+- [ ] Extend `PlannedAccess` with optional `search_key: Option<Vec<u8>>` (normalized key bytes from engine)
+- [ ] `push_planned_accesses`: if access is SEARCH and value partition exists for the index, binary-search `boundaries` to find target frame index
+- [ ] Issue range GET for that single frame of the partition's seekable S3 object
+- [ ] Decode frame, write pages to cache (scattered writes, same as normal prefetch)
+- [ ] Pages land in cache by their real page numbers; SQLite reads them normally
+- [ ] Fallback: if no value partition exists, or search_key is None, use normal B-tree access (Jena or hop schedule)
+- [ ] Tests: SEARCH hits correct partition, value at partition boundary, value before first partition, value after last partition, fallback when no partition exists, fallback when key is None
+
+### d. Engine integration
+
+Engine normalizes bound values and passes them to the VFS.
+
+- [ ] Engine extracts bound parameter values from prepared statement (sqlite3_bind_* values)
+- [ ] `normalize_query_key(value, col_affinity) -> Vec<u8>`: normalize a Rust value to the same format as partition boundaries
+- [ ] For composite indexes: normalize each column, concatenate
+- [ ] Pass normalized key via `PlannedAccess.search_key` alongside EQP info
+- [ ] Tests: integer lookup, string lookup, composite key lookup, NULL handling, type mismatch (string in integer column)
+
+### e. Staleness and rebuild
+
+Value partitions are read-only, built at import. Handle staleness gracefully.
+
+- [ ] After writes modify an index's pages, mark that index's value partition as stale (don't use it for lookups)
+- [ ] Staleness detection: compare manifest version at partition build time vs current manifest version, or track dirty index root pages
+- [ ] `rebuild_value_partitions(config) -> io::Result<()>`: CLI/API to rebuild partitions from current S3 data (download page groups, re-sort, re-upload partitioned copies)
+- [ ] Wire into compaction (Phase Midway g): when groups are repacked, rebuild value partitions too
+- [ ] Tests: stale partition falls back to B-tree, rebuild produces correct partitions, rebuild after INSERT/DELETE
+
+### f. Benchmark
+
+- [ ] Add `--value-partitions` flag to tiered-bench
+- [ ] Compare at `interior` and `none` cache levels with/without value partitions
+- [ ] Key metrics: S3 GETs per query, bytes fetched, p50/p99 latency
+- [ ] Expected wins: Q4 (mutual) and Q5 (idx-filter) see 2-4 fewer GETs; Q6 (scan) unchanged
+- [ ] Report partition build time and S3 storage overhead
 
 ---
 

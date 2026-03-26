@@ -69,6 +69,7 @@ mod prefetch;
 mod query_plan;
 mod rotation;
 mod s3_client;
+mod settings;
 mod vfs;
 
 // Public API (visible outside the crate)
@@ -79,6 +80,7 @@ pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
 pub use vfs::TieredVfs;
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses};
+pub use settings::{turbolite_config_set, push_setting};
 #[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;
 

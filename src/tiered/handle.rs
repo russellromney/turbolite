@@ -24,12 +24,19 @@ pub struct TieredHandle {
     read_only: bool,
     /// Per-VFS sync mode (Durable = S3 upload in sync, LocalThenFlush = defer to flush_to_s3)
     sync_mode: SyncMode,
-    /// Consecutive cache misses (for fraction-based prefetch).
-    consecutive_misses: u8,
+    /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
+    /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
+    tree_miss_counts: HashMap<String, u8>,
+    /// Miss counter for pages not belonging to any known tree (Positional strategy).
+    default_miss_count: u8,
     /// Radial prefetch schedule (Positional strategy).
     prefetch_hops: Vec<f32>,
-    /// B-tree sibling prefetch schedule (BTreeAware strategy).
-    btree_prefetch_hops: Vec<f32>,
+    /// Prefetch schedule for SEARCH queries (aggressive warmup).
+    prefetch_search: Vec<f32>,
+    /// Prefetch schedule for index lookups / point queries (conservative).
+    prefetch_lookup: Vec<f32>,
+    /// Tree names from current query plan that are SEARCH (not SCAN).
+    search_trees: HashSet<String>,
     /// Fixed thread pool for background prefetch.
     prefetch_pool: Option<Arc<PrefetchPool>>,
 
@@ -90,7 +97,8 @@ impl TieredHandle {
         read_only: bool,
         sync_mode: SyncMode,
         prefetch_hops: Vec<f32>,
-        btree_prefetch_hops: Vec<f32>,
+        prefetch_search: Vec<f32>,
+        prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
         gc_enabled: bool,
         eager_index_load: bool,
@@ -258,9 +266,12 @@ impl TieredHandle {
             compression_level,
             read_only,
             sync_mode,
-            consecutive_misses: 0,
+            tree_miss_counts: HashMap::new(),
+            default_miss_count: 0,
             prefetch_hops,
-            btree_prefetch_hops,
+            prefetch_search,
+            prefetch_lookup,
+            search_trees: HashSet::new(),
             prefetch_pool,
             gc_enabled,
             encryption_key,
@@ -294,9 +305,12 @@ impl TieredHandle {
             compression_level: 0,
             read_only: false,
             sync_mode: SyncMode::Durable,
-            consecutive_misses: 0,
+            tree_miss_counts: HashMap::new(),
+            default_miss_count: 0,
             prefetch_hops: vec![0.33, 0.33],
-            btree_prefetch_hops: vec![0.0, 0.5, 0.5],
+            prefetch_search: vec![0.3, 0.3, 0.4],
+            prefetch_lookup: vec![0.0, 0.1, 0.2],
+            search_trees: HashSet::new(),
             prefetch_pool: None,
             gc_enabled: false,
             encryption_key,
@@ -319,6 +333,33 @@ impl TieredHandle {
 
     pub(crate) fn is_passthrough(&self) -> bool {
         self.passthrough_file.is_some()
+    }
+
+    /// Get miss count for a tree (or default if no tree name).
+    fn miss_count(&self, tree_name: Option<&String>) -> u8 {
+        match tree_name {
+            Some(name) => *self.tree_miss_counts.get(name).unwrap_or(&0),
+            None => self.default_miss_count,
+        }
+    }
+
+    /// Increment miss count for a tree (or default).
+    fn increment_misses(&mut self, tree_name: Option<&String>) {
+        match tree_name {
+            Some(name) => {
+                let count = self.tree_miss_counts.entry(name.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+            None => self.default_miss_count = self.default_miss_count.saturating_add(1),
+        }
+    }
+
+    /// Reset miss count for a tree (or default) on cache hit.
+    fn reset_misses(&mut self, tree_name: Option<&String>) {
+        match tree_name {
+            Some(name) => { self.tree_miss_counts.remove(name); }
+            None => self.default_miss_count = 0,
+        }
     }
 
     pub(crate) fn s3(&self) -> &S3Client {
@@ -593,19 +634,25 @@ impl TieredHandle {
                     return;
                 }
 
-                // Use btree-specific hop schedule: [0.0, 0.5, 0.3, 0.2] by default.
-                // Skip first miss (point queries get zero overhead), then front-load.
-                let hop_idx = self.consecutive_misses.saturating_sub(1) as usize;
-                let fraction = if hop_idx < self.btree_prefetch_hops.len() {
-                    self.btree_prefetch_hops[hop_idx]
+                // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
+                // Per-tree miss counts ensure independent tracking across trees in a query.
+                let tree_name = manifest.group_to_tree_name.get(&current_gid);
+                let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
+                let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
+
+                let miss_count = self.miss_count(tree_name);
+                let hop_idx = miss_count.saturating_sub(1) as usize;
+                let fraction = if hop_idx < hops.len() {
+                    hops[hop_idx]
                 } else {
                     1.0
                 };
                 if fraction <= 0.0 {
                     if std::env::var("BENCH_VERBOSE").is_ok() {
                         eprintln!(
-                            "  [prefetch] gid={} misses={} SKIP (btree hop fraction=0)",
-                            current_gid, self.consecutive_misses,
+                            "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
+                            current_gid, miss_count,
+                            if is_search { "search " } else { "" },
                         );
                     }
                     return;
@@ -620,9 +667,10 @@ impl TieredHandle {
 
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     eprintln!(
-                        "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={}",
-                        current_gid, self.consecutive_misses, fraction * 100.0,
+                        "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
+                        current_gid, miss_count, fraction * 100.0,
                         eligible.len(), submitted,
+                        if is_search { "search" } else { "default" },
                     );
                 }
             }
@@ -632,7 +680,7 @@ impl TieredHandle {
                     return;
                 }
 
-                let hop_idx = (self.consecutive_misses as usize).saturating_sub(1);
+                let hop_idx = (self.default_miss_count as usize).saturating_sub(1);
                 let fraction = if hop_idx < self.prefetch_hops.len() {
                     self.prefetch_hops[hop_idx]
                 } else {
@@ -661,7 +709,7 @@ impl TieredHandle {
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     eprintln!(
                         "  [prefetch] from gid={} miss={} hop_frac={:.2} submitted={}/{}",
-                        current_gid, self.consecutive_misses, fraction, submitted, prefetch_count,
+                        current_gid, self.default_miss_count, fraction, submitted, prefetch_count,
                     );
                 }
             }
@@ -770,7 +818,8 @@ impl DatabaseHandle for TieredHandle {
         {
             let dirty = self.dirty_pages.read();
             if let Some(raw) = dirty.get(&page_num) {
-                self.consecutive_misses = 0;
+                // No miss reset here: dirty pages are local writes, tree context
+                // isn't resolved yet. Per-tree reset happens at cache hit paths below.
                 Self::copy_raw_into_buf(raw, buf, offset, page_size);
                 return Ok(());
             }
@@ -821,8 +870,9 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        drop(manifest_ref);
         let gid = loc.group_id;
+        let current_tree_name = manifest_ref.group_to_tree_name.get(&gid).cloned();
+        drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
         // 3c. Phase Verdun (d): submit predicted groups to prefetch pool
@@ -856,7 +906,49 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // 3d. Phase Marne: query-plan-aware prefetch.
+        // 3d. Drain per-connection settings (turbolite_config_set SQL function).
+        // Same global-queue pattern as plan drain. Users can tune prefetch schedules
+        // before each query without reopening the connection.
+        //
+        // Keys:
+        //   prefetch        - convenience, sets both search and lookup
+        //   prefetch_search - SEARCH queries (aggressive warmup)
+        //   prefetch_lookup - index lookups / point queries (conservative)
+        //   prefetch_reset  - reset both to defaults
+        //   plan_aware      - enable/disable plan-aware prefetch
+        {
+            let updates = settings::drain_settings();
+            for update in updates {
+                match update.key.as_str() {
+                    "prefetch" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops.clone();
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_search" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops;
+                        }
+                    }
+                    "prefetch_lookup" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_reset" => {
+                        self.prefetch_search = vec![0.3, 0.3, 0.4];
+                        self.prefetch_lookup = vec![0.0, 0.1, 0.2];
+                    }
+                    "plan_aware" => {
+                        self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3e. Phase Marne: query-plan-aware prefetch.
         //
         // Drain the global plan queue and submit ALL planned groups to the
         // prefetch pool in EQP order: all groups for tree 1, then all groups
@@ -873,13 +965,22 @@ impl DatabaseHandle for TieredHandle {
         if self.query_plan_prefetch {
             let planned = query_plan::drain_planned_accesses();
             if !planned.is_empty() {
+                // Collect SEARCH tree names for per-query hop schedule selection.
+                // Clear previous query's search trees and populate from new plan.
+                self.search_trees.clear();
+                for access in &planned {
+                    if access.access_type == query_plan::AccessType::Search {
+                        self.search_trees.insert(access.tree_name.clone());
+                    }
+                }
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     let manifest_snap = self.manifest.read();
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> = planned.iter().map(|a| a.tree_name.as_str()).collect();
+                    let search_names: Vec<&String> = self.search_trees.iter().collect();
                     eprintln!(
-                        "  [plan-drain] planned={:?} manifest_trees={:?}",
-                        planned_names, tree_names,
+                        "  [plan-drain] planned={:?} search_trees={:?} manifest_trees={:?}",
+                        planned_names, search_names, tree_names,
                     );
                     drop(manifest_snap);
                 }
@@ -888,8 +989,8 @@ impl DatabaseHandle for TieredHandle {
                     let sub_ppf = manifest_snap.sub_pages_per_frame;
                     let cache_ref = self.cache.as_ref().expect("disk cache required");
                     for access in &planned {
-                        // Only prefetch for SCAN (full table/index scan). SEARCH is a
-                        // selective index lookup (1-3 pages); the hop schedule handles it.
+                        // Only bulk prefetch for SCAN. SEARCH uses prefetch_search
+                        // via trigger_prefetch (per-tree miss counters).
                         if access.access_type != query_plan::AccessType::Scan {
                             continue;
                         }
@@ -923,7 +1024,7 @@ impl DatabaseHandle for TieredHandle {
         let cache_arc = Arc::clone(self.cache.as_ref().expect("disk cache required"));
         let cache = cache_arc.as_ref();
         if cache.is_present(page_num) {
-            self.consecutive_misses = 0;
+            self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
@@ -940,7 +1041,7 @@ impl DatabaseHandle for TieredHandle {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
-            self.consecutive_misses = 0;
+            self.reset_misses(current_tree_name.as_ref());
             return Ok(());
         }
 
@@ -962,7 +1063,7 @@ impl DatabaseHandle for TieredHandle {
                 let entry = &ft[frame_idx];
 
                 // Submit the CURRENT group to prefetch pool (full group fetch in background).
-                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+                self.increment_misses(current_tree_name.as_ref());
                 if let Some(pool) = &self.prefetch_pool {
                     if cache.group_state(gid) == GroupState::None
                         && cache.try_claim_group(gid)
@@ -1048,7 +1149,7 @@ impl DatabaseHandle for TieredHandle {
 
                         self.detect_interior_page(buf, page_num, cache);
                         cache.touch_group(gid);
-                        self.consecutive_misses = 0;
+                        self.reset_misses(current_tree_name.as_ref());
 
                         if std::env::var("BENCH_VERBOSE").is_ok() {
                             eprintln!(
@@ -1087,7 +1188,7 @@ impl DatabaseHandle for TieredHandle {
             }
         } else if state != GroupState::Present {
             if cache.try_claim_group(gid) {
-                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+                self.increment_misses(current_tree_name.as_ref());
                 self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
@@ -1192,7 +1293,7 @@ impl DatabaseHandle for TieredHandle {
 
         // Read the page from cache (should be present now after legacy download).
         if cache.is_present(page_num) {
-            self.consecutive_misses = 0;
+            self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
@@ -1779,6 +1880,7 @@ impl DatabaseHandle for TieredHandle {
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            group_to_tree_name: HashMap::new(),
             // Phase Verdun (c): serialize access history + prediction patterns
             btree_access_freq: self.access_history.as_ref().map(|ah| {
                 let mut h = ah.write();

@@ -430,6 +430,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            group_to_tree_name: HashMap::new(),
             btree_access_freq: access_history
                 .map(|ah| {
                     let mut h = ah.write();

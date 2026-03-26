@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses};
+use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -133,11 +133,16 @@ struct Cli {
     #[arg(long, default_value = "0.33,0.33", env = "BENCH_PREFETCH_HOPS")]
     prefetch_hops: String,
 
-    /// B-tree sibling prefetch hop schedule (BTreeAware). Comma-separated fractions.
-    /// Default "0.0,0.5,0.5" = skip 1st miss (zero overhead for point queries),
-    /// then 50% on miss 2, remaining 50% on miss 3, all on miss 4+.
-    #[arg(long, default_value = "0.0,0.5,0.5", env = "BENCH_BTREE_HOPS")]
-    btree_hops: String,
+    /// Prefetch schedule for SEARCH queries (aggressive warmup).
+    /// Comma-separated fractions. Default "0.3,0.3,0.4".
+    /// SCAN queries use plan-aware bulk prefetch (bypasses schedule entirely).
+    #[arg(long, default_value = "0.3,0.3,0.4", env = "BENCH_PREFETCH_SEARCH")]
+    prefetch_search: String,
+
+    /// Prefetch schedule for index lookups / point queries (conservative).
+    /// Comma-separated fractions. Default "0,0.1,0.2".
+    #[arg(long, default_value = "0,0.1,0.2", env = "BENCH_PREFETCH_LOOKUP")]
+    prefetch_lookup: String,
 
     /// Which queries to run (comma-separated). Default: all.
     /// Options: post, profile, who-liked, mutual
@@ -169,6 +174,43 @@ struct Cli {
     /// planned groups immediately instead of waiting for the hop schedule.
     #[arg(long, env = "BENCH_PLAN_AWARE")]
     plan_aware: bool,
+
+    /// Naive mode: disable ALL prefetch (no sibling prefetch, no plan-aware).
+    /// Simulates dumb "fetch page from S3 on demand" like other S3-backed SQLite.
+    /// Useful as a baseline to measure turbolite's prefetch advantage.
+    #[arg(long, env = "BENCH_NAIVE")]
+    naive: bool,
+
+    /// Per-query prefetch schedule for "post+user" (point lookup).
+    /// Default: "off" (point lookup, 1-2 pages per tree, prefetch is wasted).
+    /// Use "off" to disable, or comma-separated fractions.
+    #[arg(long, default_value = "off", env = "BENCH_POST_PREFETCH")]
+    post_prefetch: String,
+
+    /// Per-query prefetch schedule for "profile" (multi-tree join).
+    /// Default: "0.1,0.2,0.3" (moderate, hits a few pages across trees).
+    #[arg(long, default_value = "0.1,0.2,0.3", env = "BENCH_PROFILE_PREFETCH")]
+    profile_prefetch: String,
+
+    /// Per-query prefetch schedule for "who-liked" (SEARCH on likes index).
+    /// Default: "0.3,0.3,0.4" (aggressive, scans unknown portion of index).
+    #[arg(long, default_value = "0.3,0.3,0.4", env = "BENCH_WHO_LIKED_PREFETCH")]
+    who_liked_prefetch: String,
+
+    /// Per-query prefetch schedule for "mutual" (multiple SEARCH scans).
+    /// Default: "0.4,0.3,0.3" (very aggressive, many index pages).
+    #[arg(long, default_value = "0.4,0.3,0.3", env = "BENCH_MUTUAL_PREFETCH")]
+    mutual_prefetch: String,
+
+    /// Per-query prefetch schedule for "idx-filter" (index range scan).
+    /// Default: "0.2,0.3,0.5" (moderate-aggressive, range of index pages).
+    #[arg(long, default_value = "0.2,0.3,0.5", env = "BENCH_IDX_FILTER_PREFETCH")]
+    idx_filter_prefetch: String,
+
+    /// Per-query prefetch schedule for "scan-filter" (full table scan).
+    /// Default: "off" (plan-aware bulk prefetch handles this, schedule irrelevant).
+    #[arg(long, default_value = "off", env = "BENCH_SCAN_FILTER_PREFETCH")]
+    scan_filter_prefetch: String,
 }
 
 // =========================================================================
@@ -245,6 +287,14 @@ fn format_number(n: usize) -> String {
     result.chars().rev().collect()
 }
 
+/// Parse a per-query prefetch schedule. "off" = None (disabled), otherwise comma-separated floats.
+fn parse_query_prefetch(s: &str) -> Option<Vec<f32>> {
+    match s.trim().to_lowercase().as_str() {
+        "off" | "none" | "disabled" | "" => None,
+        _ => Some(parse_prefetch_hops(s)),
+    }
+}
+
 fn format_ms(us: f64) -> String {
     if us >= 1_000_000.0 {
         format!("{:.1}s", us / 1_000_000.0)
@@ -283,7 +333,8 @@ fn make_config(
     ppg: u32,
     prefetch_threads: u32,
     prefetch_hops: Vec<f32>,
-    btree_prefetch_hops: Vec<f32>,
+    prefetch_search: Vec<f32>,
+    prefetch_lookup: Vec<f32>,
     grouping: GroupingStrategy,
 ) -> TieredConfig {
     TieredConfig {
@@ -296,7 +347,8 @@ fn make_config(
         pages_per_group: ppg,
         prefetch_threads,
         prefetch_hops,
-        btree_prefetch_hops,
+        prefetch_search,
+        prefetch_lookup,
         grouping_strategy: grouping,
         ..Default::default()
     }
@@ -308,7 +360,8 @@ fn make_reader_config(
     ppg: u32,
     prefetch_threads: u32,
     prefetch_hops: Vec<f32>,
-    btree_prefetch_hops: Vec<f32>,
+    prefetch_search: Vec<f32>,
+    prefetch_lookup: Vec<f32>,
     grouping: GroupingStrategy,
 ) -> TieredConfig {
     TieredConfig {
@@ -322,7 +375,8 @@ fn make_reader_config(
         pages_per_group: ppg,
         prefetch_threads,
         prefetch_hops,
-        btree_prefetch_hops,
+        prefetch_search,
+        prefetch_lookup,
         grouping_strategy: grouping,
         ..Default::default()
     }
@@ -667,7 +721,19 @@ fn run_query(
     sql: &str,
     params: &[rusqlite::types::Value],
     plan_aware: bool,
+    per_query_schedule: Option<&Vec<f32>>,
 ) -> Result<usize, rusqlite::Error> {
+    // Push per-query prefetch schedule (drained by VFS on first read).
+    // None = "off" = push zeros to disable sibling prefetch for this query.
+    match per_query_schedule {
+        Some(schedule) => {
+            let schedule_str = schedule.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
+            push_setting("prefetch".to_string(), schedule_str);
+        }
+        None => {
+            push_setting("prefetch".to_string(), "0,0,0,0,0,0,0,0,0,0".to_string());
+        }
+    }
     if plan_aware {
         push_query_plan(conn, sql, params);
     } else if std::env::var("BENCH_VERBOSE").is_ok() {
@@ -698,11 +764,12 @@ fn bench_data(
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
     iterations: usize,
     plan_aware: bool,
+    per_query_schedule: Option<&Vec<f32>>,
 ) -> BenchResult {
     // Prime: run query once to populate cache, then reuse same params
     // to measure true cache-hit latency (no S3 fetches)
     let params = param_fn(0);
-    let _ = run_query(conn, sql, &params, false);
+    let _ = run_query(conn, sql, &params, false, per_query_schedule);
     handle.reset_s3_counters();
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -712,7 +779,7 @@ fn bench_data(
     for i in 0..iterations {
         handle.reset_s3_counters();
         let start = Instant::now();
-        match run_query(conn, sql, &params, plan_aware) {
+        match run_query(conn, sql, &params, plan_aware, per_query_schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -737,6 +804,7 @@ fn bench_index(
     warmup: usize,
     iterations: usize,
     plan_aware: bool,
+    per_query_schedule: Option<&Vec<f32>>,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_data_only();
@@ -745,7 +813,7 @@ fn bench_index(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("index-level connection");
-        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             eprintln!("    [index] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -764,7 +832,7 @@ fn bench_index(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("index-level connection");
-        match run_query(&conn, sql, &params, plan_aware) {
+        match run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -791,6 +859,7 @@ fn bench_interior(
     warmup: usize,
     iterations: usize,
     plan_aware: bool,
+    per_query_schedule: Option<&Vec<f32>>,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_interior_only();
@@ -799,7 +868,7 @@ fn bench_interior(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("interior-level connection");
-        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             eprintln!("    [interior] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -818,7 +887,7 @@ fn bench_interior(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("interior-level connection");
-        match run_query(&conn, sql, &params, plan_aware) {
+        match run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -845,6 +914,7 @@ fn bench_none(
     warmup: usize,
     iterations: usize,
     plan_aware: bool,
+    per_query_schedule: Option<&Vec<f32>>,
 ) -> BenchResult {
     for i in 0..warmup {
         handle.clear_cache_all();
@@ -853,7 +923,7 @@ fn bench_none(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("none-level connection");
-        if let Err(e) = run_query(&conn, sql, &params, plan_aware) {
+        if let Err(e) = run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             eprintln!("    [none] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
@@ -872,7 +942,7 @@ fn bench_none(
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
         ).expect("none-level connection");
-        match run_query(&conn, sql, &params, plan_aware) {
+        match run_query(&conn, sql, &params, plan_aware, per_query_schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -933,13 +1003,15 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
     let grouping = parse_grouping(&cli.grouping);
     println!();
-    let btree_hops = parse_prefetch_hops(&cli.btree_hops);
+    let prefetch_search = parse_prefetch_hops(&cli.prefetch_search);
+    let prefetch_lookup = parse_prefetch_hops(&cli.prefetch_lookup);
     println!(
         "--- {} posts, {} users (~{:.1} MB, ~{} pages, ~{} page groups, {:?}) ---",
         format_number(n_posts), format_number(n_users), db_size_mb, est_pages, est_page_groups, grouping,
     );
     if grouping == GroupingStrategy::BTreeAware {
-        println!("    btree hops: {:?}", btree_hops);
+        println!("    prefetch_search: {:?}", prefetch_search);
+        println!("    prefetch_lookup: {:?}", prefetch_lookup);
     }
     println!("    radial hops: {:?}", parse_prefetch_hops(&cli.prefetch_hops));
 
@@ -1017,7 +1089,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         }
     } else if cli.force {
         // Legacy VFS generation path
-        let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), parse_prefetch_hops(&cli.btree_hops), parse_grouping(&cli.grouping));
+        let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), prefetch_search.clone(), prefetch_lookup.clone(), parse_grouping(&cli.grouping));
         let vfs_name = unique_vfs_name("write");
         let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -1068,7 +1140,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // Create reader VFS + bench handle
     eprintln!("[bench] creating reader VFS...");
     let reader_cache = TempDir::new().expect("reader temp dir");
-    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), parse_prefetch_hops(&cli.btree_hops), parse_grouping(&cli.grouping));
+    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), prefetch_search.clone(), prefetch_lookup.clone(), parse_grouping(&cli.grouping));
     if std::env::var("BENCH_NO_EAGER_INDEX").is_ok() {
         reader_config.eager_index_load = false;
         eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
@@ -1121,6 +1193,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         label: &'static str,
         sql: &'static str,
         param_fn: Box<dyn Fn(usize) -> Vec<rusqlite::types::Value>>,
+        /// Per-query prefetch schedule. None = "off" (no sibling prefetch for this query).
+        prefetch_schedule: Option<Vec<f32>>,
     }
 
     let query_filter: Option<Vec<String>> = cli.queries.as_ref().map(|q| {
@@ -1136,6 +1210,18 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         mode_filter.as_ref().map_or(true, |f| f.contains(&mode.to_string()))
     };
 
+    // --naive overrides: disable all prefetch and plan-aware
+    let plan_aware = if cli.naive { false } else { cli.plan_aware };
+    let naive = cli.naive;
+
+    // Per-query prefetch schedules (--naive forces all to None)
+    let post_sched = if naive { None } else { parse_query_prefetch(&cli.post_prefetch) };
+    let profile_sched = if naive { None } else { parse_query_prefetch(&cli.profile_prefetch) };
+    let who_liked_sched = if naive { None } else { parse_query_prefetch(&cli.who_liked_prefetch) };
+    let mutual_sched = if naive { None } else { parse_query_prefetch(&cli.mutual_prefetch) };
+    let idx_filter_sched = if naive { None } else { parse_query_prefetch(&cli.idx_filter_prefetch) };
+    let scan_filter_sched = if naive { None } else { parse_query_prefetch(&cli.scan_filter_prefetch) };
+
     let all_queries = vec![
         QueryDef {
             label: "post+user",
@@ -1144,6 +1230,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let pid = phash(i as u64 + 500) % n_posts as u64;
                 vec![rusqlite::types::Value::Integer(pid as i64)]
             }),
+            prefetch_schedule: post_sched,
         },
         QueryDef {
             label: "profile",
@@ -1152,6 +1239,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let uid = phash(i as u64 + 100) % n_users as u64;
                 vec![rusqlite::types::Value::Integer(uid as i64)]
             }),
+            prefetch_schedule: profile_sched,
         },
         QueryDef {
             label: "who-liked",
@@ -1160,6 +1248,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let pid = phash(i as u64 + 200) % n_posts as u64;
                 vec![rusqlite::types::Value::Integer(pid as i64)]
             }),
+            prefetch_schedule: who_liked_sched,
         },
         QueryDef {
             label: "mutual",
@@ -1172,6 +1261,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                     rusqlite::types::Value::Integer(b as i64),
                 ]
             }),
+            prefetch_schedule: mutual_sched,
         },
         QueryDef {
             label: "idx-filter",
@@ -1180,6 +1270,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let uid = phash(i as u64 + 600) % n_users as u64;
                 vec![rusqlite::types::Value::Integer(uid as i64)]
             }),
+            prefetch_schedule: idx_filter_sched,
         },
         QueryDef {
             label: "scan-filter",
@@ -1189,13 +1280,22 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let threshold = (phash(i as u64 + 700) % 50) as i64;
                 vec![rusqlite::types::Value::Integer(threshold)]
             }),
+            prefetch_schedule: scan_filter_sched,
         },
     ];
     let queries: Vec<QueryDef> = all_queries.into_iter().filter(|q| should_run_query(q.label)).collect();
 
-    let plan_aware = cli.plan_aware;
-    if plan_aware {
+    if naive {
+        println!("  Mode:        NAIVE (no prefetch, no plan-aware, fetch-on-demand only)");
+    } else if plan_aware {
         println!("  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)");
+    }
+    // Print per-query schedules
+    for q in &queries {
+        match &q.prefetch_schedule {
+            Some(sched) => println!("  {:12} prefetch: {:?}", q.label, sched),
+            None => println!("  {:12} prefetch: off", q.label),
+        }
     }
 
     if should_run_mode("data") {
@@ -1203,7 +1303,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware));
+            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, q.prefetch_schedule.as_ref()));
         }
     }
 
@@ -1214,7 +1314,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, q.prefetch_schedule.as_ref()));
         }
     }
 
@@ -1223,7 +1323,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, q.prefetch_schedule.as_ref()));
         }
     }
 
@@ -1232,7 +1332,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware));
+            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, q.prefetch_schedule.as_ref()));
         }
     }
 
