@@ -41,6 +41,7 @@ pub mod ffi;
 pub mod ext;
 #[cfg(feature = "tiered")]
 pub mod tiered;
+pub mod btree_walker;
 
 use parking_lot::{Mutex, RwLock};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};

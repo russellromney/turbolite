@@ -1,4 +1,4 @@
-app = "cinch-tiered-bench"
+app = "turbolite-tiered-bench"
 primary_region = "iad"
 
 [build]
@@ -6,13 +6,14 @@ primary_region = "iad"
 
 [env]
   RUST_LOG = "warn"
+  BENCH_VERBOSE = "1"
 
 [mounts]
   source = "bench_data"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --iterations 10 --skip-verify --modes none,interior,index,data"
+  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --grouping btree --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0.1,0.2 --plan-aware"
 
 [[vm]]
   size = "performance-8x"

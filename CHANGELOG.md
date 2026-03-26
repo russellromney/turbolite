@@ -2,6 +2,133 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Marne: Query-Plan-Aware Prefetch
+
+The VFS knows which B-trees a query will access BEFORE the first page read. A trace callback runs EXPLAIN QUERY PLAN at the start of sqlite3_step(), parses SCAN/SEARCH + table/index names, and pushes them to a global queue. The VFS drains the queue on first cache miss and submits all planned groups to the prefetch pool in one batch. Falls back to hop schedule when queue is empty.
+
+- `PlannedAccess` struct + global `Mutex<Vec<PlannedAccess>>` queue in `src/tiered/query_plan.rs`
+- EQP parser: handles SCAN, SEARCH, COVERING INDEX, rowid lookups, joins, deduplication
+- C trace callback in `ext_entry.c` via `sqlite3_trace_v2(SQLITE_TRACE_STMT)`
+- VFS `read_exact_at` drains queue, resolves tree names to group IDs, submits to prefetch pool
+- Config: `query_plan_prefetch: bool` (default true, no-op without extension)
+- 15 unit tests
+
+---
+
+## Verdun (Prediction): Predictive Cross-Tree Prefetch
+
+Learn which B-trees appear together in transactions and prefetch the full set when a partial match is detected. Pattern boundary = lock lifecycle (NONE -> SHARED/EXCLUSIVE -> NONE). K=2 trigger: after 2 distinct trees are touched, predict the rest.
+
+### Lock session tracking (a-f)
+- `LockSession` tracks B-tree touches per connection, `PredictionTable` with pair index and confidence math
+- Confidence: initial 0.3, reinforce +0.25, time decay *0.95, write decay *0.7, threshold 0.5
+- `AccessHistory` tracks B-tree frequency across sessions with exponential decay
+- Prediction firing: on 2nd tree touch, predict remaining trees, submit groups to prefetch pool
+- Write decay applied per dirty B-tree on lock release; reinforcement on correct prediction
+- 25 unit tests
+
+### Name-based prediction keys (i1-i2)
+- Refactored from u64 root page IDs to String table/index names (survives VACUUM)
+- `page_to_tree_name` and `tree_name_to_groups` reverse indexes in manifest
+- All prediction types (LockSession, PredictionTable, AccessHistory) use String keys
+- 28 tests including VACUUM resilience, table rename, drop/create same name
+
+---
+
+## Midway: B-Tree-Aware Page Groups
+
+Replaces positional page grouping (pages 0-255 in group 0) with B-tree-aware packing. Pages from the same B-tree go into the same groups. Solves both prefetch efficiency (fetch 2 groups instead of 46) and write amplification (4-5 dirty groups instead of 15-20).
+
+### B-tree map + manifest format
+- `walk_all_btrees()` in `src/btree_walker.rs`: BFS from root pages, collects interior + leaf + overflow pages per B-tree
+- Manifest: `group_pages: Vec<Vec<u64>>`, `btrees: HashMap<u64, BTreeManifestEntry>`, `page_index` reverse index
+- `build_page_index()` builds reverse index from `group_pages`, called after deserialization
+
+### B-tree-aware packing + read/write paths
+- Import: large B-trees get own groups, small ones bin-packed
+- `DiskCache::write_pages_scattered()` for non-consecutive page writes
+- Read path uses `manifest.page_location(page_num).expect()` for gid and index
+- Checkpoint groups dirty pages by manifest mapping, carries forward `group_pages` and `btrees`
+
+### Correctness hardening (e2-e5)
+- Prefetch worker uses `job.group_page_nums` for scattered writes
+- SubChunkTracker positional mismatch fix: `write_pages_scattered` bitmap-only, per-page accurate
+- Eliminated all positional mapping from DiskCache + SubChunkTracker (8 fixes, 170 tests updated)
+- Restored SubChunkTracker population with manifest-aware `sub_chunk_id_for()` for tiered eviction
+
+### Demand-driven prefetch
+- Range GET first (serves page), then background prefetch of full group + siblings
+- `btree_groups` reverse index: group -> sibling group_ids from same B-tree
+- Fraction-based escalation via `prefetch_hops`, `prefetch_search`, and `prefetch_lookup`
+- Range-GET budget per tree: caps inline range GETs, then waits for prefetch
+- 236 tests passing (tiered+zstd+encryption)
+
+---
+
+## Tannenberg: File Size Cleanup
+
+Split `tiered.rs` (8,758 lines) into `src/tiered/` with 13 focused modules. Split mod.rs tests (~5,270 lines) into 13 separate `test_*.rs` files using Rust's `#[path]` attribute. The `test_` prefix convention lets LLMs skip test files immediately when reading production code.
+
+### Tiered module split
+- mod.rs (208 lines), config.rs, manifest.rs, s3_client.rs, cache_tracking.rs, disk_cache.rs, encoding.rs, prefetch.rs, handle.rs, vfs.rs, import.rs, rotation.rs, bench.rs
+- Public API re-exports in mod.rs, crate-internal `pub(crate) use` for submodule access
+
+### Test file extraction
+- 13 `test_*.rs` files (6,396 lines total) extracted from inline `#[cfg(test)] mod tests {}`
+- Source files end with `#[cfg(test)] #[path = "test_*.rs"] mod tests;`
+- 312 tests pass unchanged
+
+---
+
+## Kursk: Write & Checkpoint Benchmarks
+
+Standalone `benchmark/write-bench.rs` with 7 scenarios, all passing against Tigris.
+
+### Bug fixes
+- sync page-group skip corruption: sync skipped uploading groups where all dirty pages were interior/index, causing cold readers to get zeros. Fixed by uploading every dirty group regardless of page type.
+- S3 PUT counters: added `put_count`/`put_bytes` to S3Client for write benchmarking.
+
+### Scenarios
+- sustained, checkpoint-latency, incremental, update, delete, realistic (randomized bursty mix), cold-write
+- Default page_size=4096, ppg=8 to force multi-group behavior at modest row counts
+
+---
+
+## Stalingrad: Non-Blocking Checkpoint + SyncMode
+
+Two-phase checkpoint: fast local WAL compaction (~1ms lock) + async S3 upload (no lock). Reads and writes continue during S3 upload. Configurable per-VFS via `SyncMode`.
+
+### Two-phase checkpoint (flush_to_s3)
+- Shared `Arc<RwLock<Manifest>>` and `Arc<Mutex<HashSet<u64>>>` between handle and VFS for lock-free flush
+- `flush_to_s3()` on both `TieredVfs` and `TieredBenchHandle`
+- Uploads page groups, interior chunks, and index leaf bundles outside any SQLite lock
+- `flush_lock` mutex prevents concurrent flush races on version numbers and S3 keys
+- Cache eviction protects pending-upload groups from eviction (all `clear_cache*` methods)
+- Benchmark: **1,133x lock reduction** (650ms blocking -> 0.6ms local + 601ms flush with no lock)
+
+### SyncMode config
+- `SyncMode::Durable` (default): `sync()` uploads to S3 during checkpoint (blocking, full durability)
+- `SyncMode::LocalThenFlush`: `sync()` writes local disk cache only; user calls `flush_to_s3()` for S3 durability
+- Per-VFS config field on `TieredConfig`, immutable after connection open
+- Global `LOCAL_CHECKPOINT_ONLY` flag retained for benchmark use
+
+### Durability model
+- Between checkpoint and flush, data exists only in local disk cache
+- Process crash: data survives (on local disk)
+- Machine loss: data lost (not yet on S3)
+- After `flush_to_s3()` completes, data is durable on S3
+
+### Bug fixes
+- WAL stub file creation on VFS open (SQLite silently fell back to DELETE journal mode without it)
+- Index leaf pages now collected in flush path (scan dirty group pages for type 0x0A)
+- Flush uses manifest snapshot consistently (no re-acquiring shared lock mid-flush)
+
+### New files
+- `src/tiered/flush.rs`: non-blocking S3 upload logic (~480 lines)
+- `benchmark/write-bench.rs`: `two-phase` scenario added
+
+---
+
 ## Inchon: Rename to turbolite
 
 Full project rename from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.

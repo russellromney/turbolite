@@ -382,6 +382,97 @@ def _():
             pass  # Expected — not a compressed file
 
 
+# ── Phase Marne: trace callback + bench SQL functions ─────────────
+
+
+@test("turbolite_clear_cache SQL function exists and accepts modes")
+def _():
+    conn = sqlite3.connect(":memory:")
+    load_ext(conn)
+    # Without tiered VFS (no TURBOLITE_BUCKET), returns 1 (no handle)
+    rc = conn.execute("SELECT turbolite_clear_cache('all')").fetchone()[0]
+    assert rc == 1, f"expected 1 (no tiered VFS), got {rc}"
+    rc = conn.execute("SELECT turbolite_clear_cache('data')").fetchone()[0]
+    assert rc == 1
+    rc = conn.execute("SELECT turbolite_clear_cache('interior')").fetchone()[0]
+    assert rc == 1
+    conn.close()
+
+
+@test("turbolite_clear_cache rejects invalid mode")
+def _():
+    conn = sqlite3.connect(":memory:")
+    load_ext(conn)
+    try:
+        conn.execute("SELECT turbolite_clear_cache('bogus')")
+        assert False, "should have raised error"
+    except Exception as e:
+        assert "must be" in str(e)
+    conn.close()
+
+
+@test("turbolite_s3_gets and turbolite_s3_bytes return integers")
+def _():
+    conn = sqlite3.connect(":memory:")
+    load_ext(conn)
+    gets = conn.execute("SELECT turbolite_s3_gets()").fetchone()[0]
+    assert isinstance(gets, int), f"expected int, got {type(gets)}"
+    bytes_ = conn.execute("SELECT turbolite_s3_bytes()").fetchone()[0]
+    assert isinstance(bytes_, int)
+    conn.close()
+
+
+@test("turbolite_reset_s3_counters returns integer")
+def _():
+    conn = sqlite3.connect(":memory:")
+    load_ext(conn)
+    rc = conn.execute("SELECT turbolite_reset_s3_counters()").fetchone()[0]
+    assert isinstance(rc, int)
+    conn.close()
+
+
+@test("trace callback fires on SELECT (EQP + plan queue)")
+def _():
+    """Verify the trace callback doesn't crash when SELECT queries run.
+    The trace callback runs EQP internally and pushes to the plan queue.
+    We can't inspect the queue from Python, but we can verify no crashes."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "test.db")
+        conn = sqlite3.connect(":memory:")
+        load_ext(conn)
+        conn.close()
+
+        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+        conn.execute("CREATE INDEX idx_email ON users(email)")
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, content TEXT)")
+        conn.execute("CREATE INDEX idx_posts_user ON posts(user_id)")
+        for i in range(100):
+            conn.execute("INSERT INTO users VALUES (?, ?, ?)", (i, f"user_{i}", f"user_{i}@test.com"))
+            conn.execute("INSERT INTO posts VALUES (?, ?, ?)", (i, i % 10, f"post {i}"))
+        conn.commit()
+
+        # These queries trigger the trace callback + EQP:
+        # SEARCH with index
+        row = conn.execute("SELECT * FROM users WHERE email = 'user_42@test.com'").fetchone()
+        assert row is not None
+
+        # SCAN
+        count = conn.execute("SELECT COUNT(*) FROM posts WHERE content LIKE '%post%'").fetchone()[0]
+        assert count == 100
+
+        # JOIN with indexes
+        rows = conn.execute("""
+            SELECT u.name, p.content
+            FROM users u
+            JOIN posts p ON p.user_id = u.id
+            WHERE u.email = 'user_5@test.com'
+        """).fetchall()
+        assert len(rows) == 10  # 100 posts / 10 users
+
+        conn.close()
+
+
 # ── Summary ───────────────────────────────────────────────────────
 
 

@@ -4768,4 +4768,150 @@ mod tiered_tests {
             cleanup_vfs.destroy_s3().unwrap();
         }
     }
+
+    /// Regression test: small pages_per_group (ppg=8) caused index corruption
+    /// because sync skipped page groups where all dirty pages were interior/index,
+    /// assuming bundles would serve them. But cold readers could read those pages
+    /// before background bundle loading completed, getting zeros instead of data.
+    ///
+    /// Fixed by removing the skip optimization: every dirty page group is uploaded
+    /// regardless of page types.
+    #[test]
+    fn test_small_ppg_index_integrity() {
+        let cache_dir = TempDir::new().unwrap();
+        let unique_prefix = format!(
+            "test/small_ppg_integrity/{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let bucket = test_bucket();
+        let endpoint = Some(endpoint_url());
+        let region = Some("auto".to_string());
+
+        // Use ppg=8 to force many small page groups
+        let config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: unique_prefix.clone(),
+            cache_dir: cache_dir.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint.clone(),
+            region: region.clone(),
+            pages_per_group: 8,
+            ..Default::default()
+        };
+
+        let vfs_name = unique_vfs_name("small_ppg_write");
+        let vfs = TieredVfs::new(config).expect("failed to create VFS");
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "small_ppg_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA page_size=4096;
+             PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL, counter INTEGER NOT NULL);
+             CREATE INDEX idx_items_counter ON items(counter);
+             CREATE INDEX idx_items_value ON items(value);",
+        )
+        .unwrap();
+
+        // Insert enough rows to span multiple page groups (ppg=8 = 32KB per group)
+        let mut tx = conn.unchecked_transaction().unwrap();
+        for i in 0..2000 {
+            tx.execute(
+                "INSERT INTO items (id, value, counter) VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, format!("item_{:08}", i), i % 100],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Checkpoint to S3
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+
+        // Cold reader: fresh cache, read from S3
+        let read_cache = TempDir::new().unwrap();
+        let reader_config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: unique_prefix.clone(),
+            cache_dir: read_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint.clone(),
+            read_only: true,
+            region: region.clone(),
+            pages_per_group: 8,
+            ..Default::default()
+        };
+
+        let reader_vfs_name = unique_vfs_name("small_ppg_reader");
+        let reader_vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
+        turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
+
+        let reader_conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "small_ppg_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &reader_vfs_name,
+        )
+        .unwrap();
+
+        // integrity_check must pass (this was the regression: index pages returned as zeros)
+        let results: Vec<String> = reader_conn
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            results,
+            vec!["ok".to_string()],
+            "integrity_check failed with ppg=8: {:?}",
+            &results[..std::cmp::min(results.len(), 5)]
+        );
+
+        // Verify row count
+        let count: i64 = reader_conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2000, "expected 2000 rows, got {}", count);
+
+        // Verify index is usable (query that requires the index)
+        let sum: i64 = reader_conn
+            .query_row(
+                "SELECT SUM(counter) FROM items WHERE counter BETWEEN 10 AND 20",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sum > 0, "index query returned 0, index may be corrupt");
+
+        drop(reader_conn);
+
+        // Cleanup S3
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix: unique_prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                pages_per_group: 8,
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
 }

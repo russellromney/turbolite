@@ -31,6 +31,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static LOCAL_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// Global bench handle for the tiered VFS (set during extension load).
+/// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
+#[cfg(feature = "tiered")]
+static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredBenchHandle> = std::sync::OnceLock::new();
+
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
 ///
@@ -117,7 +122,53 @@ fn register_tiered() -> Result<(), std::io::Error> {
     }
 
     let vfs = TieredVfs::new(config)?;
+    let _ = BENCH_HANDLE.set(vfs.bench_handle());
     crate::tiered::register("turbolite-s3", vfs)
+}
+
+// ── Bench SQL functions (FFI, called from ext_entry.c) ──────────────────
+
+/// Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
+/// Returns 0 on success, 1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            match mode {
+                0 => h.clear_cache_all(),
+                1 => h.clear_cache_data_only(),
+                2 => h.clear_cache_interior_only(),
+                _ => return 1,
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Reset S3 counters. Returns 0 on success.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
+    match BENCH_HANDLE.get() {
+        Some(h) => { h.reset_s3_counters(); 0 }
+        None => 1,
+    }
+}
+
+/// Get S3 GET count since last reset.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
+    BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().0 as i64)
+}
+
+/// Get S3 GET bytes since last reset.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
+    BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().1 as i64)
 }
 
 #[cfg(not(feature = "tiered"))]

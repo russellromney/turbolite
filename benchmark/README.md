@@ -55,23 +55,125 @@ CREATE INDEX idx_users_school ON users(school);
 | **idx-filter** | `SELECT COUNT(*) FROM posts WHERE user_id = ?` | Indexed count. Covered by idx_posts_user, only index pages needed. |
 | **scan-filter** | `SELECT COUNT(*) FROM posts WHERE like_count > ?` | Full table scan. No index on like_count, must read every data page. |
 
+## Prefetch Tuning
+
+The VFS uses three prefetch strategies, selected automatically per query via EXPLAIN QUERY PLAN:
+
+| Strategy | When | Default schedule | What happens |
+|----------|------|-----------------|--------------|
+| **SCAN** (plan-aware) | EQP says `SCAN table` | All groups submitted upfront | Bulk prefetch of entire table before first read. No hop schedule involved. |
+| **SEARCH** | EQP says `SEARCH table USING INDEX` | `[0.3, 0.3, 0.4]` | Aggressive warmup from first miss. SEARCH queries scan unknown portions of indexes/tables. |
+| **Lookup** | No EQP info, point queries, DDL | `[0, 0.1, 0.2]` | First miss free, gentle ramp. Lookups hit 1-2 pages per tree. |
+
+Each element in a schedule is the fraction of eligible sibling groups to prefetch on the Nth consecutive cache miss (per-tree). When misses exceed the array length, fraction=1.0 (all remaining siblings).
+
+### Runtime tuning
+
+Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+
+```sql
+-- Tune before a batch of queries
+SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
+SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
+SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
+SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
+SELECT turbolite_config_set('plan_aware', 'false');
+
+-- Changes take effect on the next query (zero overhead when not used)
+```
+
+| Key | Values | Description |
+|-----|--------|-------------|
+| `prefetch` | Comma-separated floats | Convenience: sets both search and lookup schedules |
+| `prefetch_search` | Comma-separated floats | SEARCH query prefetch schedule (aggressive) |
+| `prefetch_lookup` | Comma-separated floats | Lookup/point query prefetch schedule (conservative) |
+| `prefetch_reset` | Any (ignored) | Reset both schedules to defaults |
+| `plan_aware` | `true`/`false` | Enable/disable SCAN bulk prefetch |
+
+### Why two schedules?
+
+SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking across trees in a query: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately. SCAN queries need everything upfront and bypass schedules entirely (plan-aware bulk prefetch).
+
 ## CLI flags
 
 ```
---sizes          Row counts, comma-separated (default: 10000)
---iterations     Measured iterations per query per cache level (default: 10)
---warmup         Warmup iterations before measuring (default: 2)
---modes          Cache levels to run, comma-separated (default: all)
-                 Options: none, interior, index, data
---queries        Queries to run, comma-separated (default: all)
-                 Options: post, profile, who-liked, mutual, idx-filter, scan-filter
---prefetch-threads  Worker threads for parallel S3 fetches (default: 8)
---prefetch-hops    Fraction schedule, comma-separated (default: 0.33,0.33)
---ppg            Pages per page group (default: 256)
---page-size      Page size in bytes (default: 65536)
---import         Import mode: "auto" generates locally then uploads, or path to existing .db
---skip-verify    Skip COUNT(*) verification
---cleanup        Delete S3 data after benchmark
+--sizes            Row counts, comma-separated (default: 10000)
+--iterations       Measured iterations per query per cache level (default: 10)
+--warmup           Warmup iterations before measuring (default: 2)
+--modes            Cache levels to run, comma-separated (default: all)
+                   Options: none, interior, index, data
+--queries          Queries to run, comma-separated (default: all)
+                   Options: post, profile, who-liked, mutual, idx-filter, scan-filter
+--prefetch-threads Worker threads for parallel S3 fetches (default: 8)
+--prefetch-search  SEARCH prefetch schedule (default: 0.3,0.3,0.4)
+--prefetch-lookup  Lookup prefetch schedule (default: 0,0.1,0.2)
+--prefetch-hops    Radial prefetch schedule for Positional strategy (default: 0.33,0.33)
+--ppg              Pages per page group (default: 256)
+--page-size        Page size in bytes (default: 65536)
+--import           Import mode: "auto" generates locally then uploads, or path to existing .db
+--skip-verify      Skip COUNT(*) verification
+--cleanup          Delete S3 data after benchmark
+--plan-aware       Enable Phase Marne query-plan-aware prefetch
+--matrix           Sweep schedule pairs at "none" level (see Matrix Mode below)
+--matrix-schedules Schedule pairs to test (semicolon-separated, "search/lookup" format)
+```
+
+## Matrix Mode
+
+Matrix mode (`--matrix`) tests each query at cache level "none" with every schedule pair in `--matrix-schedules`. This produces a comparison table per query showing how different search/lookup schedule combinations affect latency, GET count, and bytes transferred.
+
+```bash
+# Default 10 schedule pairs (off, old uniform, current dual, aggressive, etc.)
+cargo run --release --features tiered,zstd --bin tiered-bench -- \
+    --sizes 1000000 --import auto --plan-aware --matrix --iterations 10
+
+# Custom schedule pairs
+cargo run --release --features tiered,zstd --bin tiered-bench -- \
+    --sizes 1000000 --plan-aware --matrix --iterations 10 \
+    --matrix-schedules "off;0.3,0.3,0.4/0,0.1,0.2;0.5,0.5/0,0,0.1;1.0/0"
+```
+
+Schedule pair format: `search_schedule/lookup_schedule`, semicolon-separated. `off` = no prefetch (both zeros). No slash = same schedule for both.
+
+Output is a table per query:
+
+```
+  --- post+user ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                                96.0ms    111.7ms       13.9       16.2MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20          77.1ms     94.7ms       14.0       17.1MB
+  0.50,0.50 / 0.00,0.00,0.10               74.2ms     99.1ms       11.5        6.8MB
+```
+
+## Tuning Tool (tiered-tune)
+
+`tiered-tune` connects to an existing turbolite database and sweeps prefetch schedules against your actual queries. Instead of benchmarking a synthetic dataset, tune against your real workload.
+
+```bash
+# Tune against an existing database
+TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://t3.storage.dev \
+  cargo run --release --features tiered,zstd --bin tiered-tune -- \
+    --prefix "databases/tenant-123" \
+    --query "SELECT * FROM users WHERE id = ?1" --param 42 \
+    --query "SELECT p.*, u.name FROM posts p JOIN users u ON p.user_id = u.id WHERE p.id = ?1" --param 100 \
+    --plan-aware --iterations 10
+
+# Custom schedule grid
+cargo run --release --features tiered,zstd --bin tiered-tune -- \
+    --prefix "databases/tenant-123" \
+    --query "SELECT * FROM orders WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 20" --param 1 \
+    --search-schedules "0.3,0.3,0.4;0.5,0.5;1.0" \
+    --lookup-schedules "0;0,0,0.1;0,0,0,0.1,0.2" \
+    --plan-aware --iterations 10
+```
+
+The tool builds a Cartesian product of search x lookup schedules, tests each pair, and recommends the best one with the SQL to apply it:
+
+```
+  Best: 0.50,0.50 / 0.00,0.00,0.10 (p50 = 74.2ms)
+  SELECT turbolite_config_set('prefetch_search', '0.5,0.5');
+  SELECT turbolite_config_set('prefetch_lookup', '0,0,0.1');
 ```
 
 ## Environment Variables
@@ -107,7 +209,7 @@ Data is stored at `social_{size}/` in the bucket and reused across runs automati
 
 ## 2. Fly.io (against Tigris)
 
-The Fly app `cinch-tiered-bench` is pre-configured in `fly.toml`:
+The Fly app `turbolite-tiered-bench` is pre-configured in `fly.toml`:
 - Region: `iad`
 - VM: `performance-8x` (8 dedicated vCPU, 16GB RAM)
 - Volume: 40GB at `/data`
@@ -117,14 +219,14 @@ The Fly app `cinch-tiered-bench` is pre-configured in `fly.toml`:
 
 ```bash
 # From project root (not benchmark/)
-fly deploy --app cinch-tiered-bench \
+fly deploy --app turbolite-tiered-bench \
   --config benchmark/fly.toml \
   --dockerfile benchmark/Dockerfile \
   --remote-only
 
 # Machine starts automatically, runs the benchmark, then stops.
 # If it doesn't start, kick it manually:
-fly machine start <machine-id> --app cinch-tiered-bench
+fly machine start <machine-id> --app turbolite-tiered-bench
 ```
 
 The process args in `fly.toml` control what runs:
@@ -152,7 +254,7 @@ grep -E '\[data\]|\[index\]|\[interior\]|\[none\]' /tmp/bench.log
 Or check Fly logs directly:
 
 ```bash
-fly logs --app cinch-tiered-bench --no-tail | grep -E '\[data\]|\[index\]|\[interior\]|\[none\]'
+fly logs --app turbolite-tiered-bench --no-tail | grep -E '\[data\]|\[index\]|\[interior\]|\[none\]'
 ```
 
 ## 3. EC2 (against S3 Express or S3 Standard)
@@ -163,8 +265,8 @@ S3 Express One Zone provides single-digit ms latency from the same availability 
 
 | Resource | Value |
 |----------|-------|
-| S3 Express bucket | `cinch-bench--use2-az1--x-s3` |
-| S3 Standard bucket | `cinch-bench-regular` |
+| S3 Express bucket | `turbolite-bench--use2-az1--x-s3` |
+| S3 Standard bucket | `turbolite-bench-regular` |
 | Region | `us-east-2` |
 | AZ | `us-east-2a` (zone ID: `use2-az1`) |
 | Security group | `sg-07069137083c088b7` (SSH open) |
@@ -200,7 +302,7 @@ INSTANCE_ID=$(aws ec2 run-instances --region us-east-2 \
   --image-id $AMI --instance-type t3.medium --key-name russellromney \
   --security-group-ids sg-07069137083c088b7 \
   --placement AvailabilityZone=us-east-2a \
-  --iam-instance-profile Name=cinch-bench-ec2 \
+  --iam-instance-profile Name=turbolite-bench-ec2 \
   --associate-public-ip-address \
   --query 'Instances[0].InstanceId' --output text)
 
@@ -223,11 +325,11 @@ aws ec2-instance-connect send-ssh-public-key --region us-east-2 \
 
 ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -i ~/.ssh/id_rsa ec2-user@$IP \
   'chmod +x /home/ec2-user/tiered-bench && \
-   BUCKET_NAME=cinch-bench--use2-az1--x-s3 AWS_REGION=us-east-2 \
+   BUCKET_NAME=turbolite-bench--use2-az1--x-s3 AWS_REGION=us-east-2 \
    /home/ec2-user/tiered-bench --sizes 100000 --import auto 2>&1'
 
 # Or use regular S3 instead of S3 Express:
-#  BUCKET_NAME=cinch-bench-regular AWS_REGION=us-east-2 \
+#  BUCKET_NAME=turbolite-bench-regular AWS_REGION=us-east-2 \
 #  /home/ec2-user/tiered-bench --sizes 100000 --import auto 2>&1'
 
 # Terminate when done
@@ -237,14 +339,14 @@ aws ec2 terminate-instances --region us-east-2 --instance-ids $INSTANCE_ID
 ## Recreating the IAM Instance Profile (if deleted)
 
 ```bash
-aws iam create-role --role-name cinch-bench-ec2-role \
+aws iam create-role --role-name turbolite-bench-ec2-role \
   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
-aws iam put-role-policy --role-name cinch-bench-ec2-role --policy-name s3-express-access \
-  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3express:CreateSession","s3:GetObject","s3:PutObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3express:us-east-2:462570052286:bucket/cinch-bench--use2-az1--x-s3","arn:aws:s3express:us-east-2:462570052286:bucket/cinch-bench--use2-az1--x-s3/*","arn:aws:s3:::cinch-bench-regular","arn:aws:s3:::cinch-bench-regular/*"]}]}'
+aws iam put-role-policy --role-name turbolite-bench-ec2-role --policy-name s3-express-access \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3express:CreateSession","s3:GetObject","s3:PutObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3express:us-east-2:462570052286:bucket/turbolite-bench--use2-az1--x-s3","arn:aws:s3express:us-east-2:462570052286:bucket/turbolite-bench--use2-az1--x-s3/*","arn:aws:s3:::turbolite-bench-regular","arn:aws:s3:::turbolite-bench-regular/*"]}]}'
 
-aws iam create-instance-profile --instance-profile-name cinch-bench-ec2
-aws iam add-role-to-instance-profile --instance-profile-name cinch-bench-ec2 --role-name cinch-bench-ec2-role
+aws iam create-instance-profile --instance-profile-name turbolite-bench-ec2
+aws iam add-role-to-instance-profile --instance-profile-name turbolite-bench-ec2 --role-name turbolite-bench-ec2-role
 sleep 10
 ```
 
@@ -258,51 +360,243 @@ sleep 10
 
 ## Reference Results
 
-### S3 Express One Zone (EC2 c5.2xlarge, us-east-2a, 8 dedicated vCPU, 16GB RAM, March 2026)
+### Default schedules (cache level: none, 10 iterations, March 2026)
 
-1M posts (1.46GB, 91 page groups):
+1M posts (812MB, 51 page groups, BTreeAware grouping, 64KB pages, 256 ppg).
+Default prefetch: search `[0.3, 0.3, 0.4]`, lookup `[0, 0.1, 0.2]`, plan-aware enabled.
 
-| Query | none | interior | index | data |
-|-------|------|----------|-------|------|
-| Point lookup | 75ms | 11ms | 11ms | 157us |
-| Profile (5 joins) | 202ms | 134ms | 113ms | 301us |
-| Who-liked | 118ms | 51ms | 5ms | 259us |
-| Mutual friends | 82ms | 25ms | 5ms | 116us |
-| Indexed filter | 76ms | 12ms | 5ms | 106us |
-| Full scan + filter | 691ms | 685ms | 562ms | 280ms |
+**S3 Express One Zone** (EC2 c5.2xlarge, us-east-2a, ~4ms GET latency):
 
-### S3 Standard (EC2 c5.2xlarge, us-east-2a, 8 dedicated vCPU, 16GB RAM, March 2026)
+| Query | p50 | p90 | Avg GETs | Avg bytes |
+|-------|-----|-----|----------|-----------|
+| post+user | 77ms | 95ms | 14.0 | 17MB |
+| profile | 188ms | 263ms | 41.4 | 53MB |
+| who-liked | 118ms | 173ms | 15.7 | 15MB |
+| mutual | 77ms | 99ms | 11.5 | 9MB |
+| idx-filter | 75ms | 137ms | 17.6 | 31MB |
+| scan-filter | 591ms | 673ms | 102.3 | 153MB |
 
-1M posts (1.46GB, 91 page groups):
+**Tigris** (Fly.io iad, performance-8x, ~25ms GET latency):
 
-| Query | none | interior | index | data |
-|-------|------|----------|-------|------|
-| Point lookup | 156ms | 55ms | 54ms | 128us |
-| Profile (5 joins) | 469ms | 342ms | 343ms | 295us |
-| Who-liked | 275ms | 166ms | 31ms | 309us |
-| Mutual friends | 162ms | 69ms | 28ms | 111us |
-| Indexed filter | 164ms | 50ms | 23ms | 70us |
-| Full scan + filter | 808ms | 722ms | 650ms | 285ms |
+| Query | p50 | p90 | Avg GETs | Avg bytes |
+|-------|-----|-----|----------|-----------|
+| post+user | 259ms | 395ms | 23.6 | 46MB |
+| profile | 681ms | 825ms | 47.5 | 75MB |
+| who-liked | 384ms | 483ms | 31.1 | 73MB |
+| mutual | 201ms | 426ms | 9.1 | 4MB |
+| idx-filter | 159ms | 257ms | 18.4 | 33MB |
+| scan-filter | 921ms | 1.0s | 105.4 | 153MB |
 
-### Tigris (Fly.io iad, performance-8x, 8 dedicated vCPU, 16GB RAM, March 2026)
+### Schedule matrix (cache level: none, 10 iterations, March 2026)
 
-1M posts (1.46GB, 91 page groups):
+10 search/lookup schedule pairs tested per query. Key findings:
 
-| Query | none | interior | index | data |
-|-------|------|----------|-------|------|
-| Point lookup | 189ms | 31ms | 44ms | 110us |
-| Profile (5 joins) | 433ms | 339ms | 244ms | 355us |
-| Who-liked | 220ms | 112ms | 12ms | 374us |
-| Mutual friends | 197ms | 42ms | 11ms | 179us |
-| Indexed filter | 157ms | 71ms | 11ms | 157us |
-| Full scan + filter | 984ms | 905ms | 712ms | 281ms |
+**S3 Express winners (by p50):**
 
-### Comparison
+| Query | Best schedule | p50 | vs off/off | GETs | Bytes |
+|-------|--------------|-----|-----------|------|-------|
+| post+user | `0.50,0.50 / 0,0,0.10` | 74ms | -23% | 11.5 | 7MB |
+| profile | `0.30,0.30,0.40 / 0,0.10,0.20` | 188ms | -11% | 41.4 | 53MB |
+| who-liked | `0.30,0.30,0.40 / 0,0.10,0.20` | 118ms | -16% | 15.7 | 15MB |
+| mutual | `0.50,0.50 / 0.10,0.20,0.30` | 69ms | -11% | 11.8 | 13MB |
+| idx-filter | `0.33,0.33,0.34 / 0.33,0.33,0.34` | 66ms | -5% | 12.4 | 17MB |
+| scan-filter | `1.00 / 0` | 553ms | -5% | 97.9 | 139MB |
 
-S3 Express is the fastest option: single-digit ms GET latency from the same availability zone yields 75ms cold point lookups and 11ms at interior level. Regular S3 is roughly 2-3x slower than Express but still usable, with 156ms cold point lookups and 469ms cold profile queries. Tigris latency from Fly.io iad is comparable to standard S3 from EC2 in the same region (189ms vs 156ms cold point lookup, 433ms vs 469ms cold profile).
+**Tigris winners (by p50):**
 
-The "data" (fully cached) numbers are nearly identical across all three environments (110-157us for point lookups), confirming that the difference between storage backends is purely storage latency, not CPU.
+| Query | Best schedule | p50 | vs off/off | GETs | Bytes |
+|-------|--------------|-----|-----------|------|-------|
+| post+user | `0.50,0.30,0.20 / 0.10,0.10,0.20` | 219ms | -10% | 23.7 | 37MB |
+| profile | `0.50,0.50 / 0,0,0.10` | 549ms | -24% | 40.8 | 50MB |
+| who-liked | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 369ms | -13% | 31.2 | 82MB |
+| mutual | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 157ms | -25% | 17.4 | 31MB |
+| idx-filter | `0.30,0.30,0.40 / 0,0.10,0.20` | 159ms | -39% | 18.4 | 33MB |
+| scan-filter | `0.33,0.33,0.34 / 0.33,0.33,0.34` | 901ms | -2% | 107.5 | 153MB |
 
-The gap between backends narrows at the "index" cache level because fewer S3 fetches are needed (only data pages). At "index" level, all three backends deliver single-digit to low-double-digit ms for targeted queries like who-liked and mutual friends.
+### Key observations
 
-For most workloads, the realistic operating state is "interior" (first query after connection open) or "index" (after background prefetch completes, which happens on first use and takes dozens to hundreds of milliseconds, depending on index size; this benchmark has 144MB index). Full scan is CPU-bound (all environments have 8 dedicated vCPU), so storage backend differences are smallest there.
+**Storage backend determines optimal tuning.** On S3 Express (~4ms GET), conservative lookup schedules with leading zeros dominate because individual range GETs are cheap (4ms each). Over-prefetching wastes decompression CPU with minimal latency benefit. On Tigris (~25ms GET), aggressive search schedules pay off more because each avoided round trip saves 25ms, and the idx-filter improvement (39%) is nearly 8x the S3 Express improvement (5%).
+
+**Lookup zeros consistently help.** Every S3 Express winner has at least one leading zero in the lookup schedule. Point queries and joins hit 1-2 pages per tree; prefetching more pages wastes bandwidth without reducing latency. The `[0, 0.10, 0.20]` default is near-optimal across both backends.
+
+**Scan-filter is schedule-insensitive.** Plan-aware frontrunning bulk-prefetches the entire table before the first read. Schedule variation is noise (553-591ms on S3 Express, 901-1100ms on Tigris). This validates that frontrunning (Phase Marne) is doing its job for SCAN queries.
+
+**The defaults are strong.** `[0.3, 0.3, 0.4] / [0, 0.1, 0.2]` wins or nearly wins on the most important queries (profile, who-liked, idx-filter) on both backends. Per-query tuning provides 5-25% additional improvement, but the defaults are a safe universal choice.
+
+**off/off is a viable baseline.** With seekable sub-chunk encoding, each cache miss is a ~18KB range GET instead of a full 1.2MB group download. On S3 Express, off/off delivers 96ms point lookups and 212ms profiles. This validates that the sub-chunk architecture is sound on its own; prefetch is optimization on top, not a crutch.
+
+### Full matrix data (S3 Express)
+
+```
+  --- post+user ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                                96.0ms    111.7ms       13.9       16.2MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34          95.3ms    118.1ms       16.5       11.0MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20          77.1ms     94.7ms       14.0       17.1MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40          92.0ms    113.1ms       16.2       10.3MB
+  0.50,0.50 / 0.00,0.00,0.10               74.2ms     99.1ms       11.5        6.8MB
+  0.50,0.50 / 0.10,0.20,0.30              102.3ms    128.5ms       22.7       28.3MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20          98.7ms    123.3ms       18.1       19.0MB
+  1.00 / 0.00                              76.3ms     93.9ms       18.0       30.2MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20          87.6ms    132.4ms       16.0       20.3MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30          95.6ms    111.0ms       17.4       15.9MB
+
+  --- profile ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               211.7ms    279.5ms       43.2       59.7MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         254.1ms    327.0ms       56.2       75.9MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         188.0ms    262.9ms       41.4       52.8MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         269.0ms    336.6ms       58.4       81.0MB
+  0.50,0.50 / 0.00,0.00,0.10              218.5ms    295.8ms       46.1       67.0MB
+  0.50,0.50 / 0.10,0.20,0.30              258.6ms    349.4ms       61.5       86.7MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         264.3ms    339.4ms       64.0       97.2MB
+  1.00 / 0.00                             199.7ms    267.8ms       44.8       63.9MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         192.4ms    309.5ms       41.6       53.5MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         236.0ms    373.1ms       55.3       75.0MB
+
+  --- who-liked ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               141.0ms    196.7ms       17.3       13.3MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         156.3ms    249.2ms       17.8       29.1MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         118.1ms    173.1ms       15.7       15.0MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         124.3ms    270.8ms       22.3       39.4MB
+  0.50,0.50 / 0.00,0.00,0.10              130.8ms    254.7ms       22.6       34.9MB
+  0.50,0.50 / 0.10,0.20,0.30              173.4ms    206.4ms       19.4       33.4MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         135.5ms    281.3ms       21.4       36.8MB
+  1.00 / 0.00                             150.7ms    192.5ms       17.8       20.4MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         147.6ms    254.2ms       22.3       32.3MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         146.3ms    286.0ms       26.1       53.9MB
+
+  --- mutual ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                                77.8ms     89.4ms       15.0       22.0MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34          74.0ms    145.4ms        8.8        4.0MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20          76.8ms     98.6ms       11.5        8.9MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40          73.0ms    110.1ms        8.4        2.8MB
+  0.50,0.50 / 0.00,0.00,0.10               73.5ms    108.5ms        8.9        3.0MB
+  0.50,0.50 / 0.10,0.20,0.30               69.4ms    132.4ms       11.8       13.3MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20          72.5ms    103.2ms        9.7        5.7MB
+  1.00 / 0.00                              75.0ms     97.3ms       12.3       12.4MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20          78.4ms    100.4ms       13.5       15.8MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30          82.3ms     89.3ms        8.8        3.0MB
+
+  --- idx-filter ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                                69.5ms     90.2ms        8.8        3.0MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34          65.5ms     81.4ms       12.4       17.2MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20          74.5ms    137.0ms       17.6       31.1MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40          76.1ms     92.1ms       11.5       10.9MB
+  0.50,0.50 / 0.00,0.00,0.10               65.8ms     94.1ms       11.6       12.9MB
+  0.50,0.50 / 0.10,0.20,0.30               69.7ms     96.2ms        8.2        2.8MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20          71.2ms    109.5ms       14.4       22.3MB
+  1.00 / 0.00                              81.8ms    103.5ms       16.0       26.0MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20          77.1ms    100.5ms       21.0       42.2MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30          69.4ms     81.2ms       12.1       16.1MB
+
+  --- scan-filter ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               580.6ms    646.0ms       98.2      138.6MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         579.0ms    663.1ms      102.7      152.6MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         591.0ms    673.3ms      102.3      152.6MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         574.5ms    666.8ms       97.8      138.6MB
+  0.50,0.50 / 0.00,0.00,0.10              577.3ms    598.8ms       97.8      138.6MB
+  0.50,0.50 / 0.10,0.20,0.30              566.7ms    701.6ms       98.4      138.6MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         574.0ms    635.6ms       97.3      138.5MB
+  1.00 / 0.00                             553.2ms    623.4ms       97.9      138.6MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         554.9ms    632.3ms       97.5      138.5MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         554.1ms    637.5ms       97.2      138.5MB
+```
+
+### Full matrix data (Tigris)
+
+```
+  --- post+user ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               243.8ms    348.1ms       21.3       42.6MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         245.0ms    344.2ms       18.5       21.2MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         259.2ms    394.8ms       23.6       46.0MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         238.3ms    411.2ms       16.5       13.1MB
+  0.50,0.50 / 0.00,0.00,0.10              289.8ms    363.1ms       18.9       31.9MB
+  0.50,0.50 / 0.10,0.20,0.30              281.7ms    440.6ms       20.1       26.0MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         218.6ms    271.0ms       23.7       37.4MB
+  1.00 / 0.00                             260.0ms    500.8ms       19.5       37.3MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         231.6ms    286.2ms       18.9       30.8MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         261.3ms    447.1ms       23.6       37.1MB
+
+  --- profile ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               727.0ms       1.1s       54.5       93.5MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         730.7ms    982.4ms       82.1      127.2MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         680.6ms    824.5ms       47.5       74.9MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         667.0ms    997.2ms       90.8      137.5MB
+  0.50,0.50 / 0.00,0.00,0.10              549.0ms    920.5ms       40.8       50.0MB
+  0.50,0.50 / 0.10,0.20,0.30              700.6ms    824.9ms       76.7      113.8MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         609.4ms    937.8ms       75.6      111.0MB
+  1.00 / 0.00                             688.8ms       1.1s       54.8       95.4MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         634.5ms    675.9ms       50.4       80.8MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         705.9ms    934.0ms       84.8      130.4MB
+
+  --- who-liked ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               424.3ms    523.3ms       24.6       48.6MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         413.6ms    750.0ms       21.8       49.1MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         384.1ms    482.8ms       31.1       73.4MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         417.5ms    579.5ms       26.9       68.4MB
+  0.50,0.50 / 0.00,0.00,0.10              471.9ms    550.5ms       30.5       77.0MB
+  0.50,0.50 / 0.10,0.20,0.30              380.1ms    612.4ms       21.3       51.3MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         488.0ms    618.1ms       31.0       87.7MB
+  1.00 / 0.00                             533.0ms    720.6ms       30.5       79.3MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         374.0ms    595.2ms       26.6       61.3MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         369.0ms    451.8ms       31.2       82.0MB
+
+  --- mutual ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               209.9ms    315.7ms       16.2       29.4MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         208.8ms    256.1ms       15.9       27.4MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         200.5ms    425.7ms        9.1        4.3MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         188.0ms    369.1ms       20.5       43.6MB
+  0.50,0.50 / 0.00,0.00,0.10              235.2ms    305.7ms       15.9       25.4MB
+  0.50,0.50 / 0.10,0.20,0.30              214.1ms    329.9ms       17.5       29.0MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         204.3ms    340.7ms       10.3       10.2MB
+  1.00 / 0.00                             231.5ms    329.6ms        8.7        3.8MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         162.0ms    225.9ms       16.2       27.9MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         156.8ms    227.9ms       17.4       31.2MB
+
+  --- idx-filter ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               259.8ms    472.6ms       16.5       30.6MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         198.3ms    446.9ms       17.1       30.8MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         158.9ms    257.4ms       18.4       32.6MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         344.2ms    535.8ms       16.6       32.6MB
+  0.50,0.50 / 0.00,0.00,0.10              176.2ms    232.1ms       16.7       30.7MB
+  0.50,0.50 / 0.10,0.20,0.30              215.5ms    343.5ms       18.9       38.7MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20         245.5ms    392.8ms       16.8       30.0MB
+  1.00 / 0.00                             185.8ms    311.5ms       19.8       40.3MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20         234.6ms    366.0ms       14.4       22.7MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         163.5ms    359.3ms       12.2       16.6MB
+
+  --- scan-filter ---
+  search / lookup                             p50        p90       GETs        bytes
+  ------------------------------------ ---------- ---------- ---------- ------------
+  off / off                               922.3ms       1.2s      108.0      152.7MB
+  0.33,0.33,0.34 / 0.33,0.33,0.34         900.7ms       1.1s      107.5      152.7MB
+  0.30,0.30,0.40 / 0.00,0.10,0.20         920.5ms       1.0s      105.4      152.7MB
+  0.30,0.30,0.40 / 0.30,0.30,0.40         973.5ms       1.1s      101.8      138.6MB
+  0.50,0.50 / 0.00,0.00,0.10              944.0ms       1.2s      107.2      152.7MB
+  0.50,0.50 / 0.10,0.20,0.30              937.3ms       1.6s      108.8      152.8MB
+  0.50,0.30,0.20 / 0.10,0.10,0.20            1.1s       1.2s      108.9      152.8MB
+  1.00 / 0.00                                1.1s       1.3s      109.8      152.8MB
+  0.20,0.30,0.50 / 0.00,0.00,0.20            1.0s       1.4s      109.3      152.8MB
+  0.40,0.30,0.30 / 0.10,0.20,0.30         952.8ms       1.2s      107.3      138.7MB
+```

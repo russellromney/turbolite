@@ -15,7 +15,7 @@ if [ -n "$TIERED_TEST_BUCKET" ]; then
   # Background loop to upload progress every 30 seconds
   if command -v aws >/dev/null 2>&1; then
     (
-      while sleep 30; do
+      while sleep 10; do
         [ -f "$LOG_FILE" ] && aws s3 cp "$LOG_FILE" "$S3_LOG_PATH" ${AWS_ENDPOINT_URL:+--endpoint-url=$AWS_ENDPOINT_URL} 2>/dev/null || true
       done
     ) &
