@@ -2,11 +2,11 @@
 
 turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency. 
 
-It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest.
+It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rests, which can be used separately from S3.
 
 > turbolite is **experimental**. It is new and contains bugs. It may corrupt your data. Please be careful.
 
-Object storage is getting fast. [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) delivers single-digit millisecond GETs and [Tigris is extremely fast](https://www.tigrisdata.com/blog/benchmark-small-objects/). The gap between local disk and cloud storage is shrinking, and turbolite exploits that.
+Object storage is getting fast. [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) delivers single-digit millisecond GETs and [Tigris is also extremely fast](https://www.tigrisdata.com/blog/benchmark-small-objects/). The gap between local disk and cloud storage is shrinking, and turbolite exploits that.
 
 The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of ruthlessly architecting around cloud storage constraints. The project's initial goal was to beat [Neon's 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). Goal achieved.
 
@@ -18,16 +18,16 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 
 ## Performance
 
-| Query | Cache: none | Cache: interior | Cache: index | Cache: data |
-|-------|-------------|-----------------|--------------|-------------|
-| Point lookup | 75ms | 11ms | 11ms | 157us |
-| Profile (5 JOINs) | 202ms | 134ms | 113ms | 301us |
-| Who-liked (one to many JOIN) | 118ms | 51ms | 5ms | 259us |
-| Mutual friends (many to many JOIN)| 82ms | 25ms | 5ms | 116us |
-| Indexed filter | 76ms | 12ms | 5ms | 106us |
-| Full scan + filter | 691ms | 685ms | 562ms | 280ms |
+| Query | Type | Cold (S3 Express) | Cold (Tigris) |
+|-------|------|-------------------|---------------|
+| Post + user | point lookup + join | 77ms | 259ms |
+| Profile | multi-table join (5 JOINs) | 188ms | 681ms |
+| Who-liked | index search + join | 118ms | 384ms |
+| Mutual friends | multi-search join | 77ms | 201ms |
+| Indexed filter | covered index scan | 75ms | 159ms |
+| Full scan + filter | full table scan | 591ms | 921ms |
 
-1M rows (1.46GB uncompressed) on EC2 c5.2xlarge, S3 Express One Zone, same AZ. 8 dedicated vCPU, 16GB RAM, 8 prefetch threads, 64KB pages. See [Benchmarking](#benchmarking). Fly/Tigris or EC2+S3 (not Express) is 20-50% slower. 
+1M rows, 1.5GB at with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 8 prefetch threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
 
 Benchmarks are organized by **cache level** (what's already on local disk when the query runs):
 
@@ -102,27 +102,29 @@ SQLite defaults to 4KB pages to match filesystem disk page size. On S3, disk pag
 
 To make point queries fast, turbolite uses **seekable compression**: each page group is encoded as multiple **zstd frames** (~4 pages per frame). The manifest stores byte offsets per frame, so a cache miss fetches just the ~256KB sub-chunk with the needed page via S3 range GET, not the entire group.
 
-To make scans not-slow (they'll never be fast), turbolite uses **adaptive prefetching** with **per-tree miss tracking**. On a cache miss, two things happen concurrently:
-1. **Inline range GET**: fetch the specific page group frame containing the needed page, return to SQLite immediately.
-2. **Background prefetch**: submit sibling groups *for that tree (index or table)* to a thread pool according to the prefetch schedule.
+Prefetching has two layers: **proactive** (query-plan frontrunning) and **reactive** (adaptive miss-based).
 
-Miss counters are tracked **per B-tree, not globally**. A profile query that hits `users` (miss 1) then `posts` (miss 1) correctly tracks each tree at 1, not 2. This prevents a multi-table join from accidentally escalating prefetch aggression on every tree just because it touches several.
+**Query-plan frontrunning** runs first. Before a query executes, turbolite intercepts the SQLite query plan via `EXPLAIN QUERY PLAN`, extracts the exact tables and indexes the query will touch, and submits all their page groups to the prefetch pool before the first page is even read. A five-table join that would otherwise trigger five sequential miss-then-fetch cycles instead fires all five fetches in parallel at query start. For `SCAN` queries, this means the entire table is prefetched upfront.
 
-Each consecutive miss advances through a **prefetch schedule** that controls what fraction of same-tree groups to prefetch. turbolite uses two schedules, selected automatically based on the query plan:
+> Caveat: SQLite supports one trace callback per connection. If another extension claims the slot first, frontrunning silently falls back to reactive prefetch.
+
+**Reactive prefetching** handles what frontrunning misses and acts as fallback. On a cache miss, two things happen concurrently:
+1. **Inline range GET**: fetch the specific sub-chunk containing the needed page, return to SQLite immediately.
+2. **Background prefetch**: submit sibling groups *for that tree* to the prefetch pool according to a schedule.
+
+Miss counters are tracked **per B-tree, not globally**. A profile query that hits `users` (miss 1) then `posts` (miss 1) correctly tracks each tree at 1, not 2. This prevents a multi-table join from accidentally escalating prefetch on every tree just because it touches several.
+
+Each consecutive miss advances through a **prefetch schedule** that controls what fraction of same-tree groups to prefetch. turbolite selects a schedule automatically based on the query plan:
 - **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
 - **Lookup schedule** `[0.0, 0.1, 0.2]`: for point queries and index lookups that hit 1-2 pages per tree. Conservative because these rarely need prefetch at all.
 
-Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the tables' page groups live next to each other.
+You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
 
-### Experimental^2 Features
+Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
-Adaptive prefetching is reactive: it discovers tables through misses. But SQLite already knows what it's going to read. turbolite exploits this with **prefetch frontrunning** (made up name): it intercepts the SQLite query plan before a query executes, extracts the exact tables/indexes the query will touch, and submits the relevant page groups to the prefetch pool in the order that they will be requested by SQlite - before the first page is even read. 
+### Experimental Features
 
-This is pretty neat: a five-table join that would trigger five sequential miss-then-fetch cycles instead fires all five fetches in parallel at query start. Benchmarking shows this speeds up cold multi-table queries by 1.5x and scans by up to 5x (depending on prefetch agression). The hop schedule remains as fallback. 
-
-> One caveat: SQLite supports one trace callback per connection. If another extension claims the slot first, frontrun prefetch silently fails.
-
-turbolite also has an experimental **semantic predictive prefetching** feature that tracks **cross-table access patterns** using a lightweight prediction engine held as a [trie](https://ds.cs.rutgers.edu/assignment-trie/) in the manifest. When queries consistently touch the same set of tables together (e.g. `users` then `posts` then `likes`), future queries that touch any subset trigger background prefetch of the rest. See [Predictive Prefetching](#predictive-prefetching-experimental) for details.
+turbolite has an experimental **semantic predictive prefetching** feature that tracks **cross-table access patterns** using a lightweight prediction engine held as a [trie](https://ds.cs.rutgers.edu/assignment-trie/) in the manifest. When queries consistently touch the same set of tables together (e.g. `users` then `posts` then `likes`), future queries that touch any subset trigger background prefetch of the rest. See [Predictive Prefetching](#predictive-prefetching-experimental) for details.
 
 ### Encryption & Compression
 
@@ -175,17 +177,17 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 
 ### Prefetch schedules
 
-The VFS automatically selects a prefetch strategy per query using EXPLAIN QUERY PLAN:
+Query-plan frontrunning (see Architecture) is the primary prefetch mechanism. The reactive schedules below act as fallback when frontrunning isn't available or when queries access pages that weren't in the plan.
 
 | Strategy | When | Default schedule | What happens |
 |----------|------|-----------------|--------------|
-| **SCAN** (plan-aware) | EQP says `SCAN table` | All groups upfront | Bulk prefetch of entire table before first read. No hop schedule. |
-| **SEARCH** | EQP says `SEARCH ... USING INDEX` | `[0, 0, 0.2, 0.3, 0.5]` | 2 free inline range GETs, then background prefetch ramps. |
-| **Default** | No EQP info, point queries | `[0.3, 0.3, 0.4]` | Moderate prefetch from first miss. |
+| **SCAN** (frontrun) | EQP says `SCAN table` | All groups upfront | Bulk prefetch of entire table before first read. No hop schedule needed. |
+| **SEARCH** (reactive) | EQP says `SEARCH ... USING INDEX` | `[0.3, 0.3, 0.4]` | Aggressive prefetch from first miss; scans unknown index portions. |
+| **Lookup** (reactive) | Point queries, no EQP info | `[0.0, 0.1, 0.2]` | Conservative; point queries rarely need prefetch. |
 
-Each element is the fraction of sibling groups to prefetch on the Nth consecutive cache miss. When misses exceed the array length, fraction=1.0 (all remaining).
+Each element is the fraction of sibling groups to prefetch on the Nth consecutive per-tree cache miss. When misses exceed the array length, fraction=1.0 (all remaining).
 
-**Why two schedules?** SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately. SCAN queries need everything upfront and bypass schedules entirely (plan-aware bulk prefetch).
+**Why two reactive schedules?** SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately.
 
 ### Runtime tuning
 
@@ -211,6 +213,44 @@ Changes take effect on the next query. Zero overhead when not used.
 | Conservative (bursty serverless) | `prefetch_search=0.1,0.2,0.3`, `prefetch_lookup=0,0,0.1` | Minimal prefetch noise. |
 
 **Note**: prefetch is per-connection. Each new connection starts with cold per-tree miss counters. The cache is shared, so a second connection benefits from pages cached by the first.
+
+### Storage backend matters
+
+Optimal prefetch schedules depend on your S3 backend's latency-bandwidth tradeoff. We tested 10 schedule pairs across 6 queries on both S3 Express (~4ms GET) and Tigris (~25ms GET):
+
+| Backend | GET latency | Best point lookup | Best profile | Tuning gain |
+|---------|-------------|-------------------|-------------|-------------|
+| **S3 Express** | ~4ms | 74ms (off/off: 96ms) | 188ms (off/off: 212ms) | 5-23% over no prefetch |
+| **Tigris** | ~25ms | 219ms (off/off: 244ms) | 549ms (off/off: 727ms) | 10-39% over no prefetch |
+
+On S3 Express, `off/off` (no prefetch at all) is surprisingly competitive for point queries because each sub-chunk range GET is only ~4ms. The gap between "no prefetch" and "optimal prefetch" is small (23% for point lookups) because individual GETs are cheap. On Tigris, the same query benefits much more from prefetch (up to 39% on idx-filter) because each wasted round trip costs 25ms.
+
+The practical effect: on high-latency backends, push search schedules harder and keep lookup schedules with more leading zeros. On S3 Express, the defaults work well and tuning provides smaller gains. Full scan performance is schedule-insensitive on both backends because query-plan frontrunning bulk-prefetches the entire table upfront.
+
+Use `tiered-tune` (see below) to find optimal schedules for your specific backend and queries.
+
+### Tuning tool
+
+`tiered-tune` connects to an existing turbolite database and sweeps prefetch schedules against your actual queries. Instead of guessing schedules, run your real workload and let the tool find the best pair:
+
+```bash
+# Connect to existing database, test your queries
+cargo run --release --features tiered,zstd --bin tiered-tune -- \
+  --prefix "databases/tenant-123" \
+  --query "SELECT * FROM users WHERE id = ?1" \
+  --query "SELECT p.*, u.name FROM posts p JOIN users u ON p.user_id = u.id WHERE p.id = ?1" \
+  --iterations 10
+
+# Custom schedule grid
+cargo run --release --features tiered,zstd --bin tiered-tune -- \
+  --prefix "databases/tenant-123" \
+  --query "SELECT * FROM orders WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 20" \
+  --search-schedules "0.3,0.3,0.4;0.5,0.5;1.0" \
+  --lookup-schedules "0;0,0,0.1;0,0,0,0.1,0.2" \
+  --iterations 10
+```
+
+Output is a per-query comparison table (like `tiered-bench --matrix`) showing p50, p90, GET count, and bytes for each schedule pair. The tool recommends a schedule and prints the `turbolite_config_set` SQL to apply it.
 
 ## Durability
 
@@ -463,7 +503,19 @@ cargo run --features zstd,tiered --bin tiered-bench --release -- \
 cargo run --example quick-bench --features encryption --release
 ```
 
-Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-search` (SEARCH schedule), `--prefetch-lookup` (lookup schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch).
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-search` (SEARCH schedule), `--prefetch-lookup` (lookup schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch), `--matrix` (sweep schedule pairs).
+
+```bash
+# Matrix mode: test 10 schedule pairs x 6 queries at cold level
+cargo run --features zstd,tiered --bin tiered-bench --release -- \
+    --sizes 1000000 --import auto --plan-aware --matrix --iterations 10
+
+# Tune schedules for your own database and queries
+cargo run --features zstd,tiered --bin tiered-tune --release -- \
+    --prefix "databases/my-db" \
+    --query "SELECT * FROM users WHERE id = ?1" --param 42 \
+    --plan-aware --iterations 10
+```
 
 ## Testing
 

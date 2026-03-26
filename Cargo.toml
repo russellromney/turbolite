@@ -105,6 +105,11 @@ name = "bench-validate"
 path = "benchmark/bench-validate.rs"
 required-features = ["tiered", "zstd"]
 
+[[bin]]
+name = "tiered-tune"
+path = "benchmark/tiered-tune.rs"
+required-features = ["tiered"]
+
 [[example]]
 name = "quick-bench"
 path = "benchmark/quick-bench.rs"

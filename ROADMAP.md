@@ -234,16 +234,55 @@ Extend tree-level prediction with frame granularity. Instead of "fetch all of tr
 ---
 
 ## Marne (Query Plan remaining): Benchmark
-> After: Verdun (remaining) · Before: Jena
+> After: Verdun (remaining) · Before: Austerlitz
 
-- [ ] `--plan-aware` flag in tiered-bench
-- [ ] Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate trace callback
-- [ ] Compare plan-aware vs hop-schedule on all query types, cache levels none/interior/index
+- [x] `--plan-aware` flag in tiered-bench
+- [x] Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate trace callback
+- [x] Compare plan-aware vs hop-schedule on all query types, cache levels none/interior/index
+- [x] `--matrix` mode: sweep 10 schedule pairs x 6 queries at cold level
+- [x] `tiered-tune` binary: connect to existing database, sweep schedules against user queries
+- [x] Storage backend comparison: S3 Express vs Tigris results documented
+
+---
+
+## Austerlitz: Per-Query Adaptive Prefetch Schedules
+> After: Marne (Query Plan remaining) · Before: Jena
+
+The VFS already selects search vs lookup schedule based on EQP output. Extend this to automatically tune schedules per query pattern over time, based on observed access patterns.
+
+### a. Range-GET budget per tree
+- [ ] `max_range_gets_per_tree: u8` config field (default 2)
+- [ ] `tree_range_get_count: HashMap<String, u8>` on TieredHandle
+- [ ] When count >= max for a tree: skip inline range GET, submit ALL of that tree's groups to prefetch pool, wait
+- [ ] Point queries (1 GET per tree in a join) stay fast; scans (2+ GETs to same tree) switch to bulk prefetch after 2 range GETs
+- [ ] `group_to_tree_name: HashMap<u64, String>` on Manifest (built on load from btrees)
+- [ ] Graceful degradation for Positional strategy (no tree info = budget never triggers)
+- [ ] `--max-range-gets` CLI flag in tiered-bench
+- [ ] Tests: budget increment, independent per-tree counts, exhaustion triggers wait, max=0 always waits, max=255 unlimited, all tree groups submitted on exhaustion
+
+### b. Extended-zero lookup schedules
+- [ ] Test lookup schedules with 3-4 leading zeros: `[0,0,0,0.1,0.2]`, `[0,0,0,0,0.2]`
+- [ ] Hypothesis: more leading zeros improve point queries further (sub-70ms on S3 Express)
+- [ ] Matrix benchmark with extended-zero grid
+- [ ] Update defaults if results justify it
+
+### c. Per-query schedule learning
+- [ ] Track (query_hash, tree_name, miss_count) over time
+- [ ] After N executions of the same query pattern, adjust schedule based on observed miss distribution
+- [ ] Queries that consistently miss 1-2 times get conservative schedule; queries with 10+ misses get aggressive
+- [ ] Persist learned schedules in manifest (per query hash)
+- [ ] `turbolite_config_set('prefetch_auto', 'true')` to enable
+
+### d. Backend-adaptive defaults
+- [ ] Measure GET latency on first S3 request (or during interior page load)
+- [ ] If latency > 15ms (standard S3/Tigris): shift search schedule more aggressive, keep lookup conservative
+- [ ] If latency < 8ms (S3 Express): use current defaults
+- [ ] Log detected backend class on connection open
 
 ---
 
 ## Jena: Interior Page Introspection for Precise Prefetch
-> After: Marne (Query Plan remaining) · Before: Rosetta
+> After: Austerlitz · Before: Rosetta
 
 The B-tree structure is fully known from interior pages (cached/pinned). By extracting child pointers at checkpoint and persisting them in the manifest, we can predict exact leaf pages for any query without guessing. Replaces the hop schedule heuristic with direct structural knowledge.
 

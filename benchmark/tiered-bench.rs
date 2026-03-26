@@ -211,6 +211,18 @@ struct Cli {
     /// Default: "off" (plan-aware bulk prefetch handles this, schedule irrelevant).
     #[arg(long, default_value = "off", env = "BENCH_SCAN_FILTER_PREFETCH")]
     scan_filter_prefetch: String,
+
+    /// Matrix mode: test each query at "none" level with every schedule in --matrix-schedules.
+    /// Outputs a comparison table per query: schedule vs latency/GETs.
+    #[arg(long, env = "BENCH_MATRIX")]
+    matrix: bool,
+
+    /// Schedule pairs to test in matrix mode (semicolon-separated).
+    /// Format: "search/lookup" per entry. "off" = both disabled.
+    /// No slash = same schedule for both search and lookup.
+    /// 10 pairs covering off -> aggressive, symmetric and asymmetric.
+    #[arg(long, default_value = "off;0.33,0.33,0.34;0.3,0.3,0.4/0,0.1,0.2;0.3,0.3,0.4/0.3,0.3,0.4;0.5,0.5/0,0,0.1;0.5,0.5/0.1,0.2,0.3;0.5,0.3,0.2/0.1,0.1,0.2;1.0/0;0.2,0.3,0.5/0,0,0.2;0.4,0.3,0.3/0.1,0.2,0.3", env = "BENCH_MATRIX_SCHEDULES")]
+    matrix_schedules: String,
 }
 
 // =========================================================================
@@ -716,6 +728,49 @@ fn push_query_plan(conn: &Connection, sql: &str, params: &[rusqlite::types::Valu
     push_planned_accesses(accesses);
 }
 
+/// A pair of search/lookup schedules to push before a query.
+/// When `unified` is Some, it sets both via "prefetch".
+/// When `search`/`lookup` are set, they push independently.
+#[derive(Clone, Debug)]
+struct SchedulePair {
+    search: Option<Vec<f32>>,
+    lookup: Option<Vec<f32>>,
+}
+
+impl SchedulePair {
+    /// Unified schedule: sets both search and lookup to the same values.
+    fn unified(sched: Option<Vec<f32>>) -> Self {
+        Self { search: sched.clone(), lookup: sched }
+    }
+
+    /// Independent search/lookup pair.
+    fn pair(search: Option<Vec<f32>>, lookup: Option<Vec<f32>>) -> Self {
+        Self { search, lookup }
+    }
+
+    fn push(&self) {
+        let zeros = "0,0,0,0,0,0,0,0,0,0".to_string();
+        let search_str = self.search.as_ref()
+            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
+            .unwrap_or_else(|| zeros.clone());
+        let lookup_str = self.lookup.as_ref()
+            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
+            .unwrap_or(zeros);
+        push_setting("prefetch_search".to_string(), search_str);
+        push_setting("prefetch_lookup".to_string(), lookup_str);
+    }
+
+    fn label(&self) -> String {
+        let fmt = |s: &Option<Vec<f32>>| -> String {
+            match s {
+                Some(v) => v.iter().map(|f| format!("{:.2}", f)).collect::<Vec<_>>().join(","),
+                None => "off".to_string(),
+            }
+        };
+        format!("{} / {}", fmt(&self.search), fmt(&self.lookup))
+    }
+}
+
 fn run_query(
     conn: &Connection,
     sql: &str,
@@ -738,6 +793,32 @@ fn run_query(
         push_query_plan(conn, sql, params);
     } else if std::env::var("BENCH_VERBOSE").is_ok() {
         eprintln!("  [run-query] plan_aware=false, skipping push");
+    }
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows: Vec<Vec<rusqlite::types::Value>> = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            let n = row.as_ref().column_count();
+            let mut vals = Vec::with_capacity(n);
+            for i in 0..n {
+                vals.push(row.get::<_, rusqlite::types::Value>(i)?);
+            }
+            Ok(vals)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.len())
+}
+
+/// Like run_query but pushes a SchedulePair (independent search/lookup).
+fn run_query_pair(
+    conn: &Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+    plan_aware: bool,
+    pair: &SchedulePair,
+) -> Result<usize, rusqlite::Error> {
+    pair.push();
+    if plan_aware {
+        push_query_plan(conn, sql, params);
     }
     let mut stmt = conn.prepare_cached(sql)?;
     let rows: Vec<Vec<rusqlite::types::Value>> = stmt
@@ -955,6 +1036,60 @@ fn bench_none(
     }
 
     BenchResult { label: format!("[none] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+}
+
+/// Like bench_none but uses a SchedulePair for independent search/lookup schedules.
+fn bench_none_pair(
+    vfs_name: &str,
+    db_name: &str,
+    handle: &TieredBenchHandle,
+    label: &str,
+    sql: &str,
+    param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
+    warmup: usize,
+    iterations: usize,
+    plan_aware: bool,
+    pair: &SchedulePair,
+) -> BenchResult {
+    for i in 0..warmup {
+        handle.clear_cache_all();
+        handle.reset_s3_counters();
+        let params = param_fn(i);
+        let conn = Connection::open_with_flags_and_vfs(
+            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
+        ).expect("none-level connection");
+        if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, pair) {
+            eprintln!("    [matrix] {} warmup {} error: {}", label, i, e);
+        }
+        drop(conn);
+    }
+
+    let mut latencies = Vec::with_capacity(iterations);
+    let mut s3_fetches = Vec::with_capacity(iterations);
+    let mut s3_bytes = Vec::with_capacity(iterations);
+
+    for i in 0..iterations {
+        handle.clear_cache_all();
+        handle.reset_s3_counters();
+
+        let params = param_fn(warmup + i);
+        let start = Instant::now();
+        let conn = Connection::open_with_flags_and_vfs(
+            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
+        ).expect("none-level connection");
+        match run_query_pair(&conn, sql, &params, plan_aware, pair) {
+            Ok(_) => {
+                latencies.push(start.elapsed().as_micros() as f64);
+                let (fc, fb) = handle.s3_counters();
+                s3_fetches.push(fc);
+                s3_bytes.push(fb);
+            }
+            Err(e) => eprintln!("    [matrix] {} iter {} error: {}", label, i, e),
+        }
+        drop(conn);
+    }
+
+    BenchResult { label: format!("[matrix] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
 }
 
 // =========================================================================
@@ -1333,6 +1468,73 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         print_header();
         for q in &queries {
             print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, q.prefetch_schedule.as_ref()));
+        }
+    }
+
+    // =====================================================================
+    // Matrix mode: test each query with search/lookup schedule pairs
+    // =====================================================================
+    if cli.matrix {
+        // Parse matrix schedules: "search/lookup;search/lookup;..."
+        // Each entry is "search_schedule/lookup_schedule" or "off" for both off.
+        let pairs: Vec<SchedulePair> = cli.matrix_schedules
+            .split(';')
+            .map(|entry| {
+                let entry = entry.trim();
+                if entry.eq_ignore_ascii_case("off") || entry.eq_ignore_ascii_case("none") {
+                    return SchedulePair::pair(None, None);
+                }
+                if let Some((search_str, lookup_str)) = entry.split_once('/') {
+                    let search = parse_query_prefetch(search_str.trim());
+                    let lookup = parse_query_prefetch(lookup_str.trim());
+                    SchedulePair::pair(search, lookup)
+                } else {
+                    // No slash = same schedule for both
+                    let sched = parse_query_prefetch(entry);
+                    SchedulePair::unified(sched)
+                }
+            })
+            .collect();
+
+        println!();
+        println!("=== MATRIX MODE: search/lookup schedule pairs at NONE level ===");
+        println!("  {} pairs x {} queries x {} iterations", pairs.len(), queries.len(), cli.iterations);
+        println!();
+
+        for q in &queries {
+            println!("  --- {} ---", q.label);
+            println!(
+                "  {:<36} {:>10} {:>10} {:>10} {:>12}",
+                "search / lookup", "p50", "p90", "GETs", "bytes"
+            );
+            println!(
+                "  {:-<36} {:->10} {:->10} {:->10} {:->12}",
+                "", "", "", "", ""
+            );
+
+            for pair in &pairs {
+                let r = bench_none_pair(
+                    &reader_vfs_name,
+                    &db_name,
+                    &bench_handle,
+                    q.label,
+                    q.sql,
+                    &q.param_fn,
+                    cli.warmup,
+                    cli.iterations,
+                    plan_aware,
+                    pair,
+                );
+                println!(
+                    "  {:<36} {:>10} {:>10} {:>10} {:>12}",
+                    pair.label(),
+                    format_ms(r.p50()),
+                    format_ms(r.p90()),
+                    format!("{:.1}", r.avg_fetches()),
+                    format_kb(r.avg_bytes_kb()),
+                );
+            }
+            println!();
         }
     }
 
