@@ -63,7 +63,7 @@ The VFS uses three prefetch strategies, selected automatically per query via EXP
 |----------|------|-----------------|--------------|
 | **SCAN** (plan-aware) | EQP says `SCAN table` | All groups submitted upfront | Bulk prefetch of entire table before first read. No hop schedule involved. |
 | **SEARCH** | EQP says `SEARCH table USING INDEX` | `[0.3, 0.3, 0.4]` | Aggressive warmup from first miss. SEARCH queries scan unknown portions of indexes/tables. |
-| **Lookup** | No EQP info, point queries, DDL | `[0, 0.1, 0.2]` | First miss free, gentle ramp. Lookups hit 1-2 pages per tree. |
+| **Lookup** | No EQP info, point queries, DDL | `[0, 0, 0]` | Three free hops before any prefetch. Lookups hit 1-2 pages per tree. |
 
 Each element in a schedule is the fraction of eligible sibling groups to prefetch on the Nth consecutive cache miss (per-tree). When misses exceed the array length, fraction=1.0 (all remaining siblings).
 
@@ -106,7 +106,7 @@ SEARCH queries scan unknown portions of indexes/tables and need aggressive warmu
                    Options: post, profile, who-liked, mutual, idx-filter, scan-filter
 --prefetch-threads Worker threads for parallel S3 fetches (default: 8)
 --prefetch-search  SEARCH prefetch schedule (default: 0.3,0.3,0.4)
---prefetch-lookup  Lookup prefetch schedule (default: 0,0.1,0.2)
+--prefetch-lookup  Lookup prefetch schedule (default: 0,0,0)
 --prefetch-hops    Radial prefetch schedule for Positional strategy (default: 0.33,0.33)
 --ppg              Pages per page group (default: 256)
 --page-size        Page size in bytes (default: 65536)
@@ -114,6 +114,18 @@ SEARCH queries scan unknown portions of indexes/tables and need aggressive warmu
 --skip-verify      Skip COUNT(*) verification
 --cleanup          Delete S3 data after benchmark
 --plan-aware       Enable Phase Marne query-plan-aware prefetch
+--post-prefetch    Per-query SEARCH schedule for post+user (default: off)
+--post-lookup      Per-query LOOKUP schedule for post+user (default: off)
+--profile-prefetch Per-query SEARCH schedule for profile (default: 0.1,0.2,0.3)
+--profile-lookup   Per-query LOOKUP schedule for profile (default: 0,0,0,0)
+--who-liked-prefetch  SEARCH schedule for who-liked (default: 0.3,0.3,0.4)
+--who-liked-lookup    LOOKUP schedule for who-liked (default: 0,0,0)
+--mutual-prefetch  SEARCH schedule for mutual (default: 0.4,0.3,0.3)
+--mutual-lookup    LOOKUP schedule for mutual (default: 0,0,0)
+--idx-filter-prefetch  SEARCH schedule for idx-filter (default: 0.2,0.3,0.5)
+--idx-filter-lookup    LOOKUP schedule for idx-filter (default: 0,0,0)
+--scan-filter-prefetch SEARCH schedule for scan-filter (default: off)
+--scan-filter-lookup   LOOKUP schedule for scan-filter (default: off)
 --matrix           Sweep schedule pairs at "none" level (see Matrix Mode below)
 --matrix-schedules Schedule pairs to test (semicolon-separated, "search/lookup" format)
 ```
@@ -363,29 +375,33 @@ sleep 10
 ### Default schedules (cache level: none, 10 iterations, March 2026)
 
 1M posts (812MB, 51 page groups, BTreeAware grouping, 64KB pages, 256 ppg).
-Default prefetch: search `[0.3, 0.3, 0.4]`, lookup `[0, 0.1, 0.2]`, plan-aware enabled.
+Default prefetch: search `[0.3, 0.3, 0.4]`, lookup `[0, 0, 0]`, plan-aware enabled.
+Per-query schedules: search and lookup set independently per query (see CLI flags above).
 
 **S3 Express One Zone** (EC2 c5.2xlarge, us-east-2a, ~4ms GET latency):
 
 | Query | p50 | p90 | Avg GETs | Avg bytes |
 |-------|-----|-----|----------|-----------|
-| post+user | 77ms | 95ms | 14.0 | 17MB |
-| profile | 188ms | 263ms | 41.4 | 53MB |
-| who-liked | 118ms | 173ms | 15.7 | 15MB |
-| mutual | 77ms | 99ms | 11.5 | 9MB |
-| idx-filter | 75ms | 137ms | 17.6 | 31MB |
-| scan-filter | 591ms | 673ms | 102.3 | 153MB |
+| post+user | 77ms | 93ms | 10.5 | 4MB |
+| profile | 190ms | 278ms | 41.7 | 54MB |
+| who-liked | 129ms | 182ms | 15.7 | 14MB |
+| mutual | 82ms | 114ms | 17.3 | 29MB |
+| idx-filter | 74ms | 86ms | 8.0 | 3MB |
+| scan-filter | 586ms | 692ms | 98.4 | 139MB |
 
 **Tigris** (Fly.io iad, performance-8x, ~25ms GET latency):
 
-| Query | p50 | p90 | Avg GETs | Avg bytes |
-|-------|-----|-----|----------|-----------|
-| post+user | 259ms | 395ms | 23.6 | 46MB |
-| profile | 681ms | 825ms | 47.5 | 75MB |
-| who-liked | 384ms | 483ms | 31.1 | 73MB |
-| mutual | 201ms | 426ms | 9.1 | 4MB |
-| idx-filter | 159ms | 257ms | 18.4 | 33MB |
-| scan-filter | 921ms | 1.0s | 105.4 | 153MB |
+Per-query schedules tuned for Tigris latency (warmer lookups than S3 Express defaults).
+Best p50 from matrix sweep of 17 search/lookup schedule pairs per query.
+
+| Query | Best schedule | p50 | p90 | Avg GETs | Avg bytes |
+|-------|--------------|-----|-----|----------|-----------|
+| post+user | `1.00 / 0,0,0.10` | 192ms | 324ms | 20.0 | 31MB |
+| profile | `0.20,0.30,0.50 / 0,0.10,0.20` | 524ms | 806ms | 41.5 | 54MB |
+| who-liked | `0.30,0.30,0.40 / 0,0,0,0` | 340ms | 572ms | 16.6 | 24MB |
+| mutual | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 183ms | 264ms | 13.1 | 17MB |
+| idx-filter | `0.30,0.30,0.40 / 0.10,0.20,0.30` | 173ms | 242ms | 19.5 | 38MB |
+| scan-filter | `0.40,0.30,0.30 / 0,0,0` | 984ms | 1.3s | 102.4 | 139MB |
 
 ### Schedule matrix (cache level: none, 10 iterations, March 2026)
 
@@ -406,22 +422,20 @@ Default prefetch: search `[0.3, 0.3, 0.4]`, lookup `[0, 0.1, 0.2]`, plan-aware e
 
 | Query | Best schedule | p50 | vs off/off | GETs | Bytes |
 |-------|--------------|-----|-----------|------|-------|
-| post+user | `0.50,0.30,0.20 / 0.10,0.10,0.20` | 219ms | -10% | 23.7 | 37MB |
-| profile | `0.50,0.50 / 0,0,0.10` | 549ms | -24% | 40.8 | 50MB |
-| who-liked | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 369ms | -13% | 31.2 | 82MB |
-| mutual | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 157ms | -25% | 17.4 | 31MB |
-| idx-filter | `0.30,0.30,0.40 / 0,0.10,0.20` | 159ms | -39% | 18.4 | 33MB |
-| scan-filter | `0.33,0.33,0.34 / 0.33,0.33,0.34` | 901ms | -2% | 107.5 | 153MB |
+| post+user | `1.00 / 0,0,0.10` | 192ms | -17% | 20.0 | 31MB |
+| profile | `0.20,0.30,0.50 / 0,0.10,0.20` | 524ms | -15% | 41.5 | 54MB |
+| who-liked | `0.30,0.30,0.40 / 0,0,0,0` | 340ms | -20% | 16.6 | 24MB |
+| mutual | `0.40,0.30,0.30 / 0.10,0.20,0.30` | 183ms | -34% | 13.1 | 17MB |
+| idx-filter | `0.30,0.30,0.40 / 0.10,0.20,0.30` | 173ms | -8% | 19.5 | 38MB |
+| scan-filter | `0.40,0.30,0.30 / 0,0,0` | 984ms | -18% | 102.4 | 139MB |
 
 ### Key observations
 
-**Storage backend determines optimal tuning.** On S3 Express (~4ms GET), conservative lookup schedules with leading zeros dominate because individual range GETs are cheap (4ms each). Over-prefetching wastes decompression CPU with minimal latency benefit. On Tigris (~25ms GET), aggressive search schedules pay off more because each avoided round trip saves 25ms, and the idx-filter improvement (39%) is nearly 8x the S3 Express improvement (5%).
+**Storage backend determines optimal tuning.** On S3 Express (~4ms GET), zero-heavy lookup schedules (`0,0,0`) dominate because individual range GETs cost only 4ms. On Tigris (~25ms GET), warmer lookup schedules (`0,0.1,0.2` or `0.1,0.2,0.3`) pay off because each avoided round trip saves 25ms. The per-query schedule system lets each query use the optimal pair for its backend.
 
-**Lookup zeros consistently help.** Every S3 Express winner has at least one leading zero in the lookup schedule. Point queries and joins hit 1-2 pages per tree; prefetching more pages wastes bandwidth without reducing latency. The `[0, 0.10, 0.20]` default is near-optimal across both backends.
+**Search and lookup need independent tuning.** Setting both to the same schedule (the old behavior) accidentally worked on some queries but hurt others. Independent schedules let SEARCH queries use aggressive warmup while point-query lookups stay conservative. Profile went from 681ms to 480ms on Tigris once search and lookup were split.
 
-**Scan-filter is schedule-insensitive.** Plan-aware frontrunning bulk-prefetches the entire table before the first read. Schedule variation is noise (553-591ms on S3 Express, 901-1100ms on Tigris). This validates that frontrunning (Phase Marne) is doing its job for SCAN queries.
-
-**The defaults are strong.** `[0.3, 0.3, 0.4] / [0, 0.1, 0.2]` wins or nearly wins on the most important queries (profile, who-liked, idx-filter) on both backends. Per-query tuning provides 5-25% additional improvement, but the defaults are a safe universal choice.
+**Scan-filter is schedule-insensitive.** Plan-aware frontrunning bulk-prefetches the entire table before the first read. Schedule variation is noise on both backends. This validates that frontrunning (Phase Marne) is doing its job for SCAN queries.
 
 **off/off is a viable baseline.** With seekable sub-chunk encoding, each cache miss is a ~18KB range GET instead of a full 1.2MB group download. On S3 Express, off/off delivers 96ms point lookups and 212ms profiles. This validates that the sub-chunk architecture is sound on its own; prefetch is optimization on top, not a crutch.
 

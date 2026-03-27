@@ -18,7 +18,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY bin/ bin/
 COPY benchmark/ benchmark/
-RUN cargo build --release --features tiered,zstd,bundled-sqlite --bin tiered-bench
+RUN cargo build --release --features tiered,zstd,bundled-sqlite --bin tiered-bench --bin tiered-tune
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl unzip && \
@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y ca-certificates curl unzip && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/tiered-bench /usr/local/bin/tiered-bench
+COPY --from=builder /app/target/release/tiered-tune /usr/local/bin/tiered-tune
 COPY benchmark/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

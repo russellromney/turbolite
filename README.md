@@ -20,12 +20,12 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 
 | Query | Type | Cold (S3 Express) | Cold (Tigris) |
 |-------|------|-------------------|---------------|
-| Post + user | point lookup + join | 77ms | 259ms |
-| Profile | multi-table join (5 JOINs) | 188ms | 681ms |
-| Who-liked | index search + join | 118ms | 384ms |
-| Mutual friends | multi-search join | 77ms | 201ms |
-| Indexed filter | covered index scan | 75ms | 159ms |
-| Full scan + filter | full table scan | 591ms | 921ms |
+| Post + user | point lookup + join | 77ms | 192ms |
+| Profile | multi-table join (5 JOINs) | 190ms | 524ms |
+| Who-liked | index search + join | 129ms | 340ms |
+| Mutual friends | multi-search join | 82ms | 183ms |
+| Indexed filter | covered index scan | 74ms | 173ms |
+| Full scan + filter | full table scan | 586ms | 984ms |
 
 1M rows, 1.5GB at with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 8 prefetch threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
 
@@ -116,7 +116,7 @@ Miss counters are tracked **per B-tree, not globally**. A profile query that hit
 
 Each consecutive miss advances through a **prefetch schedule** that controls what fraction of same-tree groups to prefetch. turbolite selects a schedule automatically based on the query plan:
 - **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
-- **Lookup schedule** `[0.0, 0.1, 0.2]`: for point queries and index lookups that hit 1-2 pages per tree. Conservative because these rarely need prefetch at all.
+- **Lookup schedule** `[0.0, 0.0, 0.0]`: for point queries and index lookups that hit 1-2 pages per tree. Three free hops before any prefetch. Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
 
 You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
 
@@ -183,7 +183,7 @@ Query-plan frontrunning (see Architecture) is the primary prefetch mechanism. Th
 |----------|------|-----------------|--------------|
 | **SCAN** (frontrun) | EQP says `SCAN table` | All groups upfront | Bulk prefetch of entire table before first read. No hop schedule needed. |
 | **SEARCH** (reactive) | EQP says `SEARCH ... USING INDEX` | `[0.3, 0.3, 0.4]` | Aggressive prefetch from first miss; scans unknown index portions. |
-| **Lookup** (reactive) | Point queries, no EQP info | `[0.0, 0.1, 0.2]` | Conservative; point queries rarely need prefetch. |
+| **Lookup** (reactive) | Point queries, no EQP info | `[0.0, 0.0, 0.0]` | Three free hops, zero prefetch. Point queries rarely benefit from prefetch. |
 
 Each element is the fraction of sibling groups to prefetch on the Nth consecutive per-tree cache miss. When misses exceed the array length, fraction=1.0 (all remaining).
 
@@ -221,7 +221,7 @@ Optimal prefetch schedules depend on your S3 backend's latency-bandwidth tradeof
 | Backend | GET latency | Best point lookup | Best profile | Tuning gain |
 |---------|-------------|-------------------|-------------|-------------|
 | **S3 Express** | ~4ms | 74ms (off/off: 96ms) | 188ms (off/off: 212ms) | 5-23% over no prefetch |
-| **Tigris** | ~25ms | 219ms (off/off: 244ms) | 549ms (off/off: 727ms) | 10-39% over no prefetch |
+| **Tigris** | ~25ms | 192ms (off/off: 231ms) | 524ms (off/off: 616ms) | 8-34% over no prefetch |
 
 On S3 Express, `off/off` (no prefetch at all) is surprisingly competitive for point queries because each sub-chunk range GET is only ~4ms. The gap between "no prefetch" and "optimal prefetch" is small (23% for point lookups) because individual GETs are cheap. On Tigris, the same query benefits much more from prefetch (up to 39% on idx-filter) because each wasted round trip costs 25ms.
 
@@ -503,7 +503,7 @@ cargo run --features zstd,tiered --bin tiered-bench --release -- \
 cargo run --example quick-bench --features encryption --release
 ```
 
-Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-search` (SEARCH schedule), `--prefetch-lookup` (lookup schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch), `--matrix` (sweep schedule pairs).
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-search` (SEARCH schedule), `--prefetch-lookup` (lookup schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch), `--matrix` (sweep schedule pairs). Per-query schedules: `--post-prefetch`/`--post-lookup`, `--profile-prefetch`/`--profile-lookup`, etc. (search and lookup are independent per query).
 
 ```bash
 # Matrix mode: test 10 schedule pairs x 6 queries at cold level

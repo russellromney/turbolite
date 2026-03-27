@@ -1,0 +1,31 @@
+app = "turbolite-tiered-tune"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "warn"
+  BENCH_BIN = "tiered-tune"
+  TUNE_PREFIX = "social_100000_btree"
+  TUNE_PARAMS = "42"
+  TUNE_ITERATIONS = "10"
+  TUNE_WARMUP = "2"
+  TUNE_BASELINE = "true"
+  TUNE_PLAN_AWARE = "true"
+  TUNE_SEARCH_SCHEDULES = "0.3,0.3,0.4;0.5,0.5;1.0;0.2,0.3,0.5"
+  TUNE_LOOKUP_SCHEDULES = "0;0,0;0,0,0;0,0,0,0;0,0,0,0,0;0,0,0,0.1;0,0,0,0,0.1;0,0,0,0,0,0.1;0,0,0.1;0,0,0,0,0.1,0.2;0,0.1,0.2;0.1,0.1,0.2"
+  TUNE_QUERY_1 = "SELECT posts.id, posts.content, posts.created_at, posts.like_count, users.first_name, users.last_name, users.school, users.city FROM posts JOIN users ON users.id = posts.user_id WHERE posts.id = ?1"
+  TUNE_QUERY_2 = "SELECT users.first_name, users.last_name, users.school, users.city, users.bio, posts.id, posts.content, posts.created_at, posts.like_count FROM users JOIN posts ON posts.user_id = users.id WHERE users.id = ?1 ORDER BY posts.created_at DESC LIMIT 10"
+  TUNE_QUERY_3 = "SELECT COUNT(*) FROM posts WHERE user_id = ?1"
+
+[mounts]
+  source = "tune_data"
+  destination = "/data"
+
+[processes]
+  app = ""
+
+[[vm]]
+  size = "performance-8x"
+  memory = "16384"

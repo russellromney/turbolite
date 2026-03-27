@@ -15,7 +15,7 @@
 //! Example:
 //! ```sql
 //! SELECT turbolite_config_set('prefetch_search', '0.3,0.3,0.4');
-//! SELECT turbolite_config_set('prefetch_lookup', '0,0.1,0.2');
+//! SELECT turbolite_config_set('prefetch_lookup', '0,0,0');
 //! SELECT turbolite_config_set('prefetch', '0.2,0.3,0.5');  -- sets both
 //! SELECT turbolite_config_set('prefetch_reset', '');         -- reset to defaults
 //! SELECT turbolite_config_set('plan_aware', 'true');

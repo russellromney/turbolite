@@ -5,6 +5,19 @@ if [ -d /data ]; then
   export TMPDIR=/data
 fi
 
+# Build the command. For tiered-tune, queries must be passed as separate --query args
+# to preserve spaces and commas. Other args come from env vars (TUNE_*) or "$@".
+BENCH_CMD="${BENCH_BIN:-tiered-bench}"
+EXTRA_ARGS=()
+if [ "$BENCH_CMD" = "tiered-tune" ] && [ -n "$TUNE_QUERY_1" ]; then
+  EXTRA_ARGS+=(--query "$TUNE_QUERY_1")
+  [ -n "$TUNE_QUERY_2" ] && EXTRA_ARGS+=(--query "$TUNE_QUERY_2")
+  [ -n "$TUNE_QUERY_3" ] && EXTRA_ARGS+=(--query "$TUNE_QUERY_3")
+  [ -n "$TUNE_QUERY_4" ] && EXTRA_ARGS+=(--query "$TUNE_QUERY_4")
+  [ -n "$TUNE_QUERY_5" ] && EXTRA_ARGS+=(--query "$TUNE_QUERY_5")
+  [ -n "$TUNE_QUERY_6" ] && EXTRA_ARGS+=(--query "$TUNE_QUERY_6")
+fi
+
 # Log output to S3 if bucket is configured
 if [ -n "$TIERED_TEST_BUCKET" ]; then
   TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -23,7 +36,7 @@ if [ -n "$TIERED_TEST_BUCKET" ]; then
   fi
 
   # Run benchmark, tee output to file and stdout
-  tiered-bench "$@" 2>&1 | tee "$LOG_FILE"
+  $BENCH_CMD "${EXTRA_ARGS[@]}" "$@" 2>&1 | tee "$LOG_FILE"
   EXIT_CODE=$?
 
   # Kill background uploader
@@ -36,5 +49,5 @@ if [ -n "$TIERED_TEST_BUCKET" ]; then
 
   exit $EXIT_CODE
 else
-  exec tiered-bench "$@"
+  exec $BENCH_CMD "${EXTRA_ARGS[@]}" "$@"
 fi

@@ -234,7 +234,7 @@ Extend tree-level prediction with frame granularity. Instead of "fetch all of tr
 ---
 
 ## Marne (Query Plan remaining): Benchmark
-> After: Verdun (remaining) · Before: Austerlitz
+> After: Verdun (remaining) · Before: Stalingrad
 
 - [x] `--plan-aware` flag in tiered-bench
 - [x] Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate trace callback
@@ -245,8 +245,175 @@ Extend tree-level prediction with frame granularity. Instead of "fetch all of tr
 
 ---
 
+## Stalingrad: Cache Eviction Policies
+> After: Marne (Query Plan remaining) · Before: Austerlitz
+
+Production cache management: size limits, observability, manual control, and smart eviction. Without this, a machine serving many tenant databases will grow the cache unbounded.
+
+### a. Size-based eviction
+
+Cache grows unbounded today. Add a global byte budget enforced between queries. The cache limit is "what you keep between queries," not "what you're allowed to use." Active queries and writes get whatever they need; eviction runs after.
+
+**Semantics:**
+- Eviction NEVER fires during `read_exact_at()` or active query execution
+- Eviction fires between queries (on next trace callback), on checkpoint, and on explicit `turbolite_evict()` calls
+- Cache can temporarily exceed the limit during a query; trimmed back after
+- Never evict sub-chunks containing dirty pages (any journal mode) or pending flush pages (LocalThenFlush)
+- Minimum floor: `max(all_interior_groups_size, prefetch_threads * sub_frame_size)`. Reject config below this.
+
+- [ ] `max_cache_bytes: Option<u64>` in TieredConfig
+- [ ] `TURBOLITE_CACHE_LIMIT` env var (e.g., `512MB`, `2GB`), parsed at VFS registration
+- [ ] `turbolite_config_set('cache_limit', '512MB')` for runtime adjustment
+- [ ] `current_cache_bytes: AtomicU64` on DiskCache, updated on write/evict
+- [ ] `is_evictable(sub_chunk)`: false if dirty, pending flush, or Pinned
+- [ ] `evict_to_budget()`: loop `evict_one()` over evictable sub-chunks until under limit
+- [ ] Between-query trigger: trace callback calls `evict_to_budget()` if over limit before processing next query's EQP
+- [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
+- [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
+
+### b. Access count tracking + weighted eviction
+
+Replace pure LRU with weighted scoring that considers both recency and frequency. Sub-chunks accessed 100 times should survive longer than sub-chunks accessed once, even if the single-access one was touched more recently.
+
+- [ ] `access_count: HashMap<SubChunkId, u32>` on SubChunkTracker
+- [ ] Increment on `touch()`, reset on eviction
+- [ ] Weighted eviction score: `score = tier_weight * (recency_score + frequency_score)`
+- [ ] `evict_one()` picks lowest score across all evictable sub-chunks
+- [ ] Frequency score: `min(access_count, cap) / cap` (cap e.g., 64, prevents runaway counts from making data immortal)
+- [ ] Recency score: `1.0 - (age / max_age)` (normalized to 0-1)
+- [ ] Tests: frequently-accessed sub-chunk survives over rarely-accessed one at same tier, tier still dominates (data evicts before index regardless of access count)
+
+### c. Cache observability
+
+No other SQLite VFS lets you introspect the cache. This is a devex differentiator.
+
+- [ ] `turbolite_cache_info()` SQL function returning JSON:
+  ```json
+  {
+    "size_bytes": 52428800,
+    "limit_bytes": 536870912,
+    "groups_cached": 24,
+    "groups_total": 48,
+    "tiers": {
+      "pinned": {"groups": 1, "bytes": 262144},
+      "index": {"groups": 5, "bytes": 5242880},
+      "data": {"groups": 18, "bytes": 46923776}
+    },
+    "hit_rate": 0.94,
+    "evictions_since_open": 12
+  }
+  ```
+- [ ] `turbolite_cache_stats()` SQL function: `{hits, misses, evictions, bytes_evicted, bytes_fetched}`
+- [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in stats:
+  `{"last_query_evictions": 847, "cache_churn": "high", "recommendation": "cache_limit >= 512MB would eliminate churn"}`
+- [ ] Track peak working set over connection lifetime for recommendations
+- [ ] Track hit/miss counters on `read_exact_at` (cache hit vs S3 fetch)
+- [ ] Track eviction counters in `evict_one()` / `evict_to_budget()`
+- [ ] Log at WARN level when between-query eviction sheds >50% of cache (visible in app logs without checking SQL functions)
+- [ ] FFI: Rust functions exposed via ext_entry.c, same pattern as bench functions
+- [ ] Tests: stats increment correctly, info reflects actual cache state, churn warning triggers at threshold, peak working set tracked
+
+### c2. Query cost estimation
+
+Before running an expensive query, users can check how much cache it would need. Uses EQP + manifest tree sizes to compute upper bounds. SCAN = exact (all groups). SEARCH = range (1 sub-frame best case, all groups worst case). Uncompressed cache bytes, not S3 transfer bytes.
+
+- [ ] `turbolite_query_cost('SELECT ...')` SQL function returning JSON:
+  ```json
+  {
+    "trees": [
+      {"name": "users", "access": "SEARCH", "groups": 2,
+       "best_bytes": 262144, "worst_bytes": 33554432},
+      {"name": "posts", "access": "SCAN", "groups": 12,
+       "best_bytes": 201326592, "worst_bytes": 201326592}
+    ],
+    "total_best_bytes": 786432,
+    "total_worst_bytes": 234881024,
+    "cache_limit_bytes": 536870912,
+    "worst_fits_in_cache": true,
+    "worst_pct_of_cache": "44%"
+  }
+  ```
+- [ ] Reuses frontrun EQP parsing (parse_eqp_output)
+- [ ] Per-tree worst case: `num_groups * pages_per_group * page_size` from manifest
+- [ ] Per-tree best case: SCAN = worst case (exact). SEARCH = 1 sub-frame per tree (`sub_pages_per_frame * page_size`)
+- [ ] `worst_fits_in_cache`: compare total worst against cache_limit (if set)
+- [ ] FFI + ext_entry.c registration
+- [ ] Tests: SCAN returns exact size, SEARCH returns range, JOIN sums across trees, no cache_limit returns null for fit check
+
+### c3. Query analysis (diagnostic tool)
+
+`tiered-bench` as a SQL function. Runs a query at a specified cache temperature, measures predicted vs actual cache usage. Not for production use; for development/tuning, like EXPLAIN QUERY PLAN.
+
+- [ ] `turbolite_analyze_query('SELECT ...', cache_level)` SQL function
+  - `cache_level`: `'current'` (no eviction, measure at whatever state cache is in), `'interior'` (clear to interior-only), `'index'` (clear to interior+index), `'none'` (clear everything)
+  - Runs the query (results discarded), measures real cache activity
+  - Returns JSON:
+    ```json
+    {
+      "trees": [
+        {"name": "idx_report_date", "access": "SEARCH",
+         "predicted_best": 262144, "predicted_worst": 8388608,
+         "actual_bytes": 524288, "actual_groups": 2, "hits": 1, "misses": 1},
+        {"name": "big_report", "access": "SEARCH",
+         "predicted_best": 262144, "predicted_worst": 201326592,
+         "actual_bytes": 1048576, "actual_groups": 4, "hits": 0, "misses": 4}
+      ],
+      "total_predicted_worst": 209715200,
+      "total_actual": 1572864,
+      "cache_limit": 536870912,
+      "execution_time_ns": 48000000
+    }
+    ```
+  - No concurrent reader problem: single controlled execution with local counters
+- [ ] Reuses query cost estimation (c2) for predicted values
+- [ ] Reuses existing clear_cache infrastructure for cache level setup
+- [ ] Register trace profile callback (`SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE`) for execution timing
+- [ ] FFI + ext_entry.c registration
+- [ ] Tests: predicted vs actual for SCAN (actual = predicted), SEARCH (actual <= predicted worst), cache level clears correctly before run, 'current' doesn't evict
+
+### d. Manual eviction controls
+
+Application-level cache control via SQL functions. Most important for multi-tenant: the application knows when a tenant is cold.
+
+- [ ] `turbolite_evict('data')` / `turbolite_evict('index')` / `turbolite_evict('all')` -- evict by tier
+- [ ] `turbolite_evict_tree('table_name')` -- evict specific tree's cached data
+  - Looks up `tree_name_to_groups` in manifest, evicts those groups' sub-chunks
+  - Accepts comma-separated names: `turbolite_evict_tree('audit_log, idx_audit_date')`
+- [ ] `turbolite_evict_query('SELECT ...')` -- run EQP, extract trees, evict their data
+  - Reuses frontrun EQP parsing infrastructure
+  - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
+  - Default: evict data tier only (keep index for potential re-query)
+- [ ] FFI + ext_entry.c registration for all functions
+- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages
+
+### e. Checkpoint eviction
+
+Clear interval where the cache resets after successful S3 upload. Good for serverless/bursty workloads where you want a clean slate after committing.
+
+- [ ] `evict_on_checkpoint: bool` in TieredConfig (default: false)
+- [ ] `TURBOLITE_EVICT_ON_CHECKPOINT=true` env var
+- [ ] `turbolite_config_set('evict_on_checkpoint', 'true')` runtime toggle
+- [ ] After successful checkpoint S3 upload: if enabled, call `clear_cache_data_only()`
+- [ ] Only evicts data tier (interior + index remain for next query's fast path)
+- [ ] Tests: data tier empty after checkpoint when enabled, interior/index survive, disabled by default
+
+### f. Speculative warm
+
+Pre-warm pages for anticipated queries before they execute. Different from frontrun (which fires ~10us before step): warm fires seconds/minutes ahead so pages are already cached when the query runs.
+
+Use case: user logs in, app fires `turbolite_warm('SELECT * FROM dashboard WHERE user_id = ?')` during auth. By the time user clicks dashboard, pages are cached. Zero cold penalty.
+
+- [ ] `turbolite_warm('SELECT ...')` SQL function
+- [ ] Run EQP, extract planned accesses (reuses frontrun parse_eqp_output)
+- [ ] Submit all tree page groups to prefetch pool (non-blocking, returns immediately)
+- [ ] No bound parameters needed: warms all groups for the tables/indexes in the plan
+- [ ] Returns JSON: `{"trees_warmed": ["users", "idx_users_id"], "groups_submitted": 12}`
+- [ ] Tests: warm submits correct groups, warm on already-cached data is no-op, warm with invalid SQL returns error
+
+---
+
 ## Austerlitz: Per-Query Adaptive Prefetch Schedules
-> After: Marne (Query Plan remaining) · Before: Jena
+> After: Stalingrad · Before: Jena
 
 The VFS already selects search vs lookup schedule based on EQP output. Extend this to automatically tune schedules per query pattern over time, based on observed access patterns.
 
@@ -349,6 +516,32 @@ When a leaf page arrives from S3, parse its cells to extract rowids/foreign keys
 - [ ] Start with integer rowids only (covers profile query: idx_posts_user leaf -> post rowids -> posts data groups)
 - [ ] Tests: parse leaf cells for integer PK, composite index, overflow pages (payload > page), string keys
 - [ ] Benchmark: profile query with leaf chasing vs without (expect 53 GETs / 67MB -> ~6 GETs / 5MB)
+
+### e. Overflow chain prefetch
+
+When a leaf page arrives and contains overflow pointers (payload > maxLocal), prefetch the overflow chain proactively instead of blocking on each link. Subframe range GETs already handle small overflow within a group, but multi-MB TEXT/BLOB values with chains spanning multiple page groups cause sequential blocking faults.
+
+Inspired by sqlite-prefetch's overflow cascading (https://github.com/wjordan/sqlite-prefetch).
+
+- [ ] On leaf page (0x0D) fetch completion: parse cells, detect overflow (payload > maxLocal), extract first overflow page number
+- [ ] Map overflow page to group via `page_location()`, submit group to prefetch pool
+- [ ] On overflow page arrival: read next-page pointer (first 4 bytes), cascade to next group
+- [ ] Repeat until next-page pointer is 0 (end of chain)
+- [ ] Cap cascade depth (e.g., 64) to bound runaway chains
+- [ ] Tests: single overflow page, multi-group chain, chain within same group (no-op), cap enforced, no overflow (common case, zero overhead)
+- [ ] Benchmark: table with 1MB+ TEXT values, with/without overflow prefetch
+
+### f. Multi-level interior group lookahead
+
+For very large databases where interior pages span multiple page groups, prefetch the next interior sibling group before SQLite descends into it. Avoids a blocking fault when the current interior group's children are exhausted and SQLite needs the next interior page.
+
+Inspired by sqlite-prefetch's multi-level lookahead (https://github.com/wjordan/sqlite-prefetch).
+
+- [ ] Track remaining sibling groups under current parent interior page during scan
+- [ ] When remaining sibling count drops below threshold (e.g., 5 groups), prefetch the next interior sibling's group from the parent level
+- [ ] Only relevant when interior pages span multiple groups (very large databases, 10M+ rows)
+- [ ] No-op for databases where all interior pages fit in group 0 (the common case today)
+- [ ] Tests: synthetic multi-group interior layout, lookahead triggers at threshold, no-op for small databases
 
 ---
 
@@ -454,6 +647,14 @@ Value partitions are read-only, built at import. Handle staleness gracefully.
 ### Hole tracking
 - Manifest tracks freed pages per group
 - Groups with >N% dead pages are compaction candidates
+
+### turbolite_recommend()
+- [ ] `turbolite_recommend()` SQL function: analyzes connection's access history, returns JSON with:
+  - Recommended cache_limit based on peak working set
+  - Recommended prefetch schedules based on observed index-lookup vs table-scan ratio
+  - Hottest/coldest trees by access frequency
+  - Specific suggestions ("evict_tree('audit_log') would free 180MB")
+- [ ] Track peak working set, per-tree access counts, scan vs search ratio over connection lifetime
 
 ### Multi-writer coordination
 - [ ] Distributed locks for concurrent writers (if needed)

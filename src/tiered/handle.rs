@@ -309,7 +309,7 @@ impl TieredHandle {
             default_miss_count: 0,
             prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
-            prefetch_lookup: vec![0.0, 0.1, 0.2],
+            prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
             prefetch_pool: None,
             gc_enabled: false,
@@ -938,7 +938,7 @@ impl DatabaseHandle for TieredHandle {
                     }
                     "prefetch_reset" => {
                         self.prefetch_search = vec![0.3, 0.3, 0.4];
-                        self.prefetch_lookup = vec![0.0, 0.1, 0.2];
+                        self.prefetch_lookup = vec![0.0, 0.0, 0.0];
                     }
                     "plan_aware" => {
                         self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");

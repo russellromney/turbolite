@@ -7,13 +7,25 @@ primary_region = "iad"
 [env]
   RUST_LOG = "warn"
   BENCH_VERBOSE = "1"
+  BENCH_POST_PREFETCH = "off"
+  BENCH_POST_LOOKUP = "off"
+  BENCH_PROFILE_PREFETCH = "0.2,0.3,0.5"
+  BENCH_PROFILE_LOOKUP = "0,0.1,0.2"
+  BENCH_WHO_LIKED_PREFETCH = "0.3,0.3,0.4"
+  BENCH_WHO_LIKED_LOOKUP = "0,0,0,0"
+  BENCH_MUTUAL_PREFETCH = "0.4,0.3,0.3"
+  BENCH_MUTUAL_LOOKUP = "0.1,0.2,0.3"
+  BENCH_IDX_FILTER_PREFETCH = "0.3,0.3,0.4"
+  BENCH_IDX_FILTER_LOOKUP = "0.1,0.2,0.3"
+  BENCH_SCAN_FILTER_PREFETCH = "off"
+  BENCH_SCAN_FILTER_LOOKUP = "off"
 
 [mounts]
   source = "bench_data"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --grouping btree --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0.1,0.2 --plan-aware"
+  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --grouping btree --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0,0 --plan-aware"
 
 [[vm]]
   size = "performance-8x"

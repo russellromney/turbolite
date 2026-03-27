@@ -105,8 +105,9 @@ pub struct TieredConfig {
     pub prefetch_search: Vec<f32>,
     /// Prefetch schedule for index lookups / point queries (BTreeAware strategy).
     /// Lookups hit 1-2 pages per tree, so prefetch should be conservative.
-    /// Default [0, 0.1, 0.2] = first miss free, then gentle ramp.
-    /// Tunable at runtime via `turbolite_config_set('prefetch_lookup', '0,0.1,0.2')`.
+    /// Default [0, 0, 0] = three free hops before any prefetch.
+    /// Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
+    /// Tunable at runtime via `turbolite_config_set('prefetch_lookup', '0,0,0')`.
     pub prefetch_lookup: Vec<f32>,
     /// Number of prefetch worker threads (default: num_cpus + 1).
     /// N+1 keeps the pipeline full: when a thread blocks on S3 I/O,
@@ -171,7 +172,7 @@ impl Default for TieredConfig {
             cache_ttl_secs: 3600,
             prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
-            prefetch_lookup: vec![0.0, 0.1, 0.2],
+            prefetch_lookup: vec![0.0, 0.0, 0.0],
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())

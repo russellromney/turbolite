@@ -16,7 +16,7 @@ fn test_tiered_config_default() {
     assert_eq!(c.cache_ttl_secs, 3600);
     assert_eq!(c.prefetch_hops, vec![0.33, 0.33]);
     assert_eq!(c.prefetch_search, vec![0.3, 0.3, 0.4]);
-    assert_eq!(c.prefetch_lookup, vec![0.0, 0.1, 0.2]);
+    assert_eq!(c.prefetch_lookup, vec![0.0, 0.0, 0.0]);
     let expected_threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(2) + 1;
