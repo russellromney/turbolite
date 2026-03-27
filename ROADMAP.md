@@ -383,8 +383,17 @@ Application-level cache control via SQL functions. Most important for multi-tena
   - Reuses frontrun EQP parsing infrastructure
   - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
   - Default: evict data tier only (keep index for potential re-query)
+- [ ] Per-tree always-evict rules: data fetched during query but never kept between queries
+  - `turbolite_config_set('evict_always', 'audit_log, idx_audit_date')` -- set rule
+  - `turbolite_config_set('evict_always_remove', 'audit_log')` -- remove rule
+  - `TURBOLITE_EVICT_ALWAYS=audit_log,idx_audit_date` env var for startup config
+  - Between-query eviction (trace profile callback) checks always-evict set, sheds those trees first
+  - Stored as `HashSet<String>` on VFS, checked during `evict_to_budget()` and between-query cleanup
 - [ ] FFI + ext_entry.c registration for all functions
-- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages
+- [ ] `turbolite_config()` -- returns current config as JSON (cache_limit, TTL, evict_on_checkpoint, evict_always trees, prefetch schedules, all runtime-tunable settings)
+- [ ] `turbolite_config_reset()` -- resets all runtime config to env var / startup defaults
+- [ ] FFI + ext_entry.c registration for all functions
+- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages, always-evict rule sheds tree after every query, rule removal stops eviction, env var parsed at startup, config() reflects current state, config_reset() restores defaults
 
 ### e. Checkpoint eviction
 
