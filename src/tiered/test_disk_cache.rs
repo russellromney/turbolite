@@ -1230,3 +1230,107 @@ fn test_present_group_cannot_be_unclaimed() {
     cache.unclaim_group(0);
     assert_eq!(cache.group_state(0), GroupState::None);
 }
+
+// ── Phase Stalingrad: evict_to_budget tests ──
+
+#[test]
+fn test_evict_to_budget_shrinks_cache() {
+    let dir = TempDir::new().unwrap();
+    // 4 pages/group, 2 pages/sub-chunk, page_size=64, 32 pages total (8 groups)
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32, None, Vec::new()).unwrap();
+
+    // Write 4 groups (16 pages). Each group = 2 sub-chunks. sub_chunk_bytes = 2*64 = 128.
+    for gid in 0..4u64 {
+        assert!(cache.try_claim_group(gid));
+        let start = gid * 4;
+        let data = vec![0xABu8; 4 * 64]; // 4 pages
+        cache.write_pages_bulk(start, &data, 4);
+        cache.mark_group_present(gid);
+    }
+
+    // 4 groups * 2 sub-chunks/group = 8 sub-chunks * 128 bytes = 1024 bytes
+    let total = cache.cache_bytes();
+    assert_eq!(total, 1024, "expected 1024 bytes cached, got {}", total);
+
+    // Evict to 512 bytes (half)
+    let skip = HashSet::new();
+    let evicted = cache.evict_to_budget(512, &skip);
+    assert!(evicted > 0, "should have evicted at least one sub-chunk");
+
+    let after = cache.cache_bytes();
+    assert!(after <= 512, "cache should be at or below budget: got {} bytes", after);
+}
+
+#[test]
+fn test_evict_to_budget_respects_skip_groups() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+
+    // Write 2 groups
+    for gid in 0..2u64 {
+        assert!(cache.try_claim_group(gid));
+        let data = vec![0xABu8; 4 * 64];
+        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.mark_group_present(gid);
+    }
+
+    // 2 groups * 2 sub-chunks = 4 sub-chunks * 128 bytes = 512 bytes
+    assert_eq!(cache.cache_bytes(), 512);
+
+    // Skip group 0 and 1, try to evict to 0 bytes
+    let mut skip = HashSet::new();
+    skip.insert(0u64);
+    skip.insert(1u64);
+    let evicted = cache.evict_to_budget(0, &skip);
+    assert_eq!(evicted, 0, "all groups are skipped, nothing should be evicted");
+    assert_eq!(cache.cache_bytes(), 512);
+}
+
+#[test]
+fn test_evict_to_budget_never_evicts_pinned() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+
+    // Write 2 groups
+    for gid in 0..2u64 {
+        assert!(cache.try_claim_group(gid));
+        let data = vec![0xABu8; 4 * 64];
+        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.mark_group_present(gid);
+    }
+
+    // Pin all sub-chunks in group 0 (mark as interior pages)
+    {
+        let mut tracker = cache.tracker.lock();
+        let id0 = SubChunkId { group_id: 0, frame_index: 0 };
+        let id1 = SubChunkId { group_id: 0, frame_index: 1 };
+        tracker.mark_pinned(id0);
+        tracker.mark_pinned(id1);
+    }
+
+    // Evict to 0 bytes with empty skip
+    let skip = HashSet::new();
+    let evicted = cache.evict_to_budget(0, &skip);
+
+    // Group 1's sub-chunks should be evicted, group 0's pinned sub-chunks remain
+    let after = cache.cache_bytes();
+    let pinned = cache.tracker.lock().pinned_bytes();
+    assert_eq!(after, pinned, "only pinned sub-chunks should remain");
+    assert!(evicted > 0, "should have evicted group 1's sub-chunks");
+}
+
+#[test]
+fn test_evict_to_budget_already_under() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+    assert!(cache.try_claim_group(0));
+    let data = vec![0xABu8; 4 * 64];
+    cache.write_pages_bulk(0, &data, 4);
+    cache.mark_group_present(0);
+
+    // Budget is larger than cache
+    let skip = HashSet::new();
+    let evicted = cache.evict_to_budget(999999, &skip);
+    assert_eq!(evicted, 0);
+}

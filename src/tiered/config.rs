@@ -16,7 +16,7 @@ pub enum SyncMode {
     /// - Process crash: data survives (on local disk)
     /// - Machine loss: data lost (not yet on S3)
     ///
-    /// Call `flush_to_s3()` (on TieredVfs or TieredBenchHandle) to upload.
+    /// Call `flush_to_s3()` (on TieredVfs or TieredSharedState) to upload.
     LocalThenFlush,
 }
 
@@ -28,16 +28,14 @@ impl Default for SyncMode {
 
 // ===== Grouping strategy =====
 
-/// How pages are assigned to groups and how prefetch neighbors are selected.
+/// Grouping strategy marker. Only BTreeAware is supported.
+/// Kept as an enum for serde backward compatibility with existing manifests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupingStrategy {
-    /// Legacy positional mapping: gid = page_num / ppg, idx = page_num % ppg.
-    /// Group g contains pages [g*ppg .. min((g+1)*ppg, page_count)].
-    /// Prefetch uses radial fan-out from current group.
+    /// Legacy positional mapping. No longer used for new databases.
+    /// Existing Positional manifests are read-only compatible.
     Positional,
     /// B-tree-aware: explicit page-to-group mapping from btree walking.
-    /// group_pages[gid] = ordered list of page numbers.
-    /// Prefetch uses sibling groups from the same B-tree.
     BTreeAware,
 }
 
@@ -45,14 +43,6 @@ impl Default for GroupingStrategy {
     fn default() -> Self {
         GroupingStrategy::BTreeAware
     }
-}
-
-/// Prefetch neighbor selection returned by `Manifest::prefetch_neighbors()`.
-pub enum PrefetchNeighbors {
-    /// Radial fan-out from current gid (positional strategy).
-    RadialFanout { total_groups: u64 },
-    /// Sibling groups from the same B-tree (btree-aware strategy).
-    BTreeSiblings(Vec<u64>),
 }
 
 // ===== Group state for prefetch coordination =====
@@ -93,10 +83,6 @@ pub struct TieredConfig {
     /// Page groups not accessed within this window are evicted from local NVMe.
     /// Interior page groups (B-tree internal nodes) are pinned permanently.
     pub cache_ttl_secs: u64,
-    /// Radial prefetch schedule (Positional strategy). Each element is the fraction of
-    /// total page groups to prefetch on consecutive cache misses.
-    /// Default [0.33, 0.33] = 3-hop: miss 1 fetches 33%, miss 2 fetches 33%, miss 3+ fetches all.
-    pub prefetch_hops: Vec<f32>,
     /// Prefetch schedule for SEARCH queries (BTreeAware strategy).
     /// SEARCH queries scan unknown portions of indexes/tables, need aggressive warmup.
     /// Default [0.3, 0.3, 0.4] = prefetch 30% of siblings on first miss, ramp up.
@@ -123,8 +109,8 @@ pub struct TieredConfig {
     pub sub_pages_per_frame: u32,
     /// Enable automatic garbage collection after each checkpoint.
     /// When true, old page group versions replaced during checkpoint are
-    /// deleted from S3 immediately after the new manifest is uploaded.
-    /// Default: false (old versions accumulate, enabling point-in-time restore).
+    /// deleted from S3 asynchronously after the new manifest is uploaded.
+    /// Default: true. Set to false only for debugging or if external tooling manages S3 lifecycle.
     pub gc_enabled: bool,
     /// Load all index leaf bundles on VFS open (default true).
     /// When true, index leaf pages are fetched in parallel during connection open,
@@ -136,10 +122,6 @@ pub struct TieredConfig {
     /// The manifest is NOT encrypted (it contains only S3 keys and byte offsets, no user data).
     /// Requires the `encryption` feature for actual encryption; without it, the key is ignored.
     pub encryption_key: Option<[u8; 32]>,
-    /// Page grouping strategy for import. Default: BTreeAware.
-    /// Positional: sequential chunking (page N -> group N/ppg).
-    /// BTreeAware: B-tree walking + bin-packing by B-tree.
-    pub grouping_strategy: GroupingStrategy,
     /// Phase Verdun: enable predictive cross-tree prefetch + access history.
     /// When true, the VFS learns which B-trees appear together in transactions
     /// and prefetches them in parallel on subsequent queries.
@@ -155,6 +137,17 @@ pub struct TieredConfig {
     /// the loadable extension populates the queue via EQP at start of step().
     /// Default: true (no-op if the extension trace callback is not installed).
     pub query_plan_prefetch: bool,
+    /// Phase Stalingrad: maximum cache size in bytes (sub-chunk granularity).
+    /// When set, the VFS evicts sub-chunks between queries to stay within budget.
+    /// None = unlimited (default). 0 = unlimited.
+    /// Active queries can temporarily exceed this limit; eviction only fires between queries.
+    /// Also settable via TURBOLITE_CACHE_LIMIT env var or turbolite_config_set('cache_limit', '512MB').
+    pub max_cache_bytes: Option<u64>,
+    /// Phase Stalingrad-e: evict data tier after successful checkpoint S3 upload.
+    /// Good for serverless/bursty workloads where you want a clean slate after committing.
+    /// Only evicts Data tier (interior + index remain for next query's fast path).
+    /// Default: false. Also settable via turbolite_config_set('evict_on_checkpoint', 'true').
+    pub evict_on_checkpoint: bool,
 }
 
 impl Default for TieredConfig {
@@ -170,7 +163,6 @@ impl Default for TieredConfig {
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             region: None,
             cache_ttl_secs: 3600,
-            prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
@@ -185,13 +177,19 @@ impl Default for TieredConfig {
             #[cfg(feature = "zstd")]
             dictionary: None,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
-            gc_enabled: false,
+            gc_enabled: true,
             eager_index_load: true,
             encryption_key: None,
-            grouping_strategy: GroupingStrategy::default(),
             prediction_enabled: false,
             sync_mode: SyncMode::default(),
             query_plan_prefetch: true,
+            max_cache_bytes: std::env::var("TURBOLITE_CACHE_LIMIT")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .and_then(|n| if n == 0 { None } else { Some(n) }),
+            evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
         }
     }
 }

@@ -16,7 +16,7 @@
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{
-    TieredBenchHandle, TieredConfig, TieredVfs,
+    TieredSharedState, TieredConfig, TieredVfs,
     parse_eqp_output, push_planned_accesses, push_setting,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -274,7 +274,7 @@ fn run_query_pair(
 fn bench_cold(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -332,7 +332,7 @@ fn bench_cold(
 fn bench_index_level(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -461,7 +461,7 @@ fn main() {
     };
 
     let vfs = TieredVfs::new(config).expect("failed to create VFS");
-    let handle = vfs.bench_handle();
+    let handle = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
 
     let db_name = "tune.db";

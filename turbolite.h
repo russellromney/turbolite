@@ -13,6 +13,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#if defined(TURBOLITE_TIERED)
+/**
+ * Minimum confidence to fire a prediction.
+ */
+#define CONFIDENCE_THRESHOLD 0.5
+#endif
+
 /**
  * Opaque database connection handle.
  */
@@ -159,6 +166,145 @@ void turbolite_free_string(char *s);
  * Close a database connection opened with `turbolite_open`.
  */
 void turbolite_close(struct TurboliteDb *db);
+
+/**
+ * Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
+ * Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
+ *
+ * Always registers "turbolite" (local compressed VFS).
+ * If TURBOLITE_BUCKET is set, also registers "turbolite-s3" (tiered VFS).
+ * Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
+ */
+int turbolite_ext_register_vfs(void);
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
+ * Returns 0 on success, 1 if no tiered VFS.
+ */
+int32_t turbolite_bench_clear_cache(int32_t mode);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Reset S3 counters. Returns 0 on success.
+ */
+int32_t turbolite_bench_reset_s3(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Get S3 GET count since last reset.
+ */
+int64_t turbolite_bench_s3_gets(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Get S3 GET bytes since last reset.
+ */
+int64_t turbolite_bench_s3_bytes(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Evict cached data for named trees. tree_names is a comma-separated C string.
+ * Returns number of groups evicted, or -1 if no tiered VFS.
+ */
+int32_t turbolite_evict_tree(const char *tree_names);
+#endif
+
+#if !defined(TURBOLITE_TIERED)
+int32_t turbolite_evict_tree(const char *_tree_names);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Return cache info as a JSON C string. Caller must treat as SQLITE_TRANSIENT.
+ * Returns null if no tiered VFS.
+ *
+ * Uses a thread-local buffer to avoid allocation lifetime issues across FFI.
+ */
+const char *turbolite_cache_info(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
+ * Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
+ * db must be a valid sqlite3 handle, sql must be a valid C string.
+ */
+const char *turbolite_warm(void *db, const char *sql);
+#endif
+
+#if !defined(TURBOLITE_TIERED)
+const char *turbolite_warm(void *_db, const char *_sql);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
+ * Returns number of sub-chunks evicted, or -1 if no tiered VFS.
+ */
+int32_t turbolite_evict(const char *tier);
+#endif
+
+#if !defined(TURBOLITE_TIERED)
+int32_t turbolite_evict(const char *_tier);
+#endif
+
+#if !defined(TURBOLITE_TIERED)
+const char *turbolite_cache_info(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+extern int32_t sqlite3_prepare_v2(void *db,
+                                  const char *sql,
+                                  int32_t nbyte,
+                                  void **stmt,
+                                  const char **tail);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+extern int32_t sqlite3_step(void *stmt);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+extern const char *sqlite3_column_text(void *stmt, int32_t col);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+extern int32_t sqlite3_finalize(void *stmt);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * FFI entry point called from C trace callback.
+ * Runs EQP, parses, and pushes to global queue.
+ *
+ * # Safety
+ * `db` must be a valid sqlite3 handle. `sql` must be a valid C string.
+ */
+void turbolite_trace_push_plan(void *db, const char *sql);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * FFI entry point called from C trace profile callback.
+ * Signals query completion for between-query eviction.
+ */
+void turbolite_trace_end_query(void);
+#endif
+
+#if defined(TURBOLITE_TIERED)
+/**
+ * FFI entry point: `turbolite_config_set(key, value)` SQL function.
+ *
+ * # Safety
+ * `key` and `value` must be valid C strings.
+ */
+int32_t turbolite_config_set(const char *key, const char *value);
+#endif
 
 #ifdef __cplusplus
 }  // extern "C"

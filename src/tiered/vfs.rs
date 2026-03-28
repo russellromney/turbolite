@@ -146,10 +146,10 @@ impl TieredVfs {
         })
     }
 
-    /// Get a lightweight handle for benchmarking (clear_cache, S3 counters, flush_to_s3).
+    /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
-    pub fn bench_handle(&self) -> TieredBenchHandle {
-        TieredBenchHandle {
+    pub fn shared_state(&self) -> TieredSharedState {
+        TieredSharedState {
             s3: Arc::clone(&self.s3),
             cache: Arc::clone(&self.cache),
             prefetch_pool: Arc::clone(&self.prefetch_pool),
@@ -317,7 +317,9 @@ impl TieredVfs {
 
         // Build set of live keys from manifest
         let mut live_keys: HashSet<String> = HashSet::new();
-        live_keys.insert(self.s3.manifest_key());
+        // Phase Thermopylae: msgpack manifest is the live one.
+        // Old manifest.json is an orphan and will be GC'd.
+        live_keys.insert(self.s3.manifest_key_msgpack());
         for key in &manifest.page_group_keys {
             if !key.is_empty() {
                 live_keys.insert(key.clone());
@@ -475,7 +477,6 @@ impl Vfs for TieredVfs {
                 self.config.compression_level,
                 self.config.read_only,
                 self.config.sync_mode,
-                self.config.prefetch_hops.clone(),
                 self.config.prefetch_search.clone(),
                 self.config.prefetch_lookup.clone(),
                 Some(Arc::clone(&self.prefetch_pool)),
@@ -487,6 +488,8 @@ impl Vfs for TieredVfs {
                 self.prediction.clone(),
                 self.access_history.clone(),
                 self.config.query_plan_prefetch,
+                self.config.max_cache_bytes,
+                self.config.evict_on_checkpoint,
             ))
         } else {
             if let Some(parent) = path.parent() {

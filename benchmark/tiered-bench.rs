@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
+use turbolite::tiered::{TieredSharedState, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -128,11 +128,6 @@ struct Cli {
     #[arg(long, default_value = "8", env = "BENCH_PREFETCH_THREADS")]
     prefetch_threads: u32,
 
-    /// Radial prefetch hop schedule (Positional). Comma-separated fractions.
-    /// Default "0.33,0.33" = 3 hops: 33% on 1st miss, 33% on 2nd, remaining on 3rd+.
-    #[arg(long, default_value = "0.33,0.33", env = "BENCH_PREFETCH_HOPS")]
-    prefetch_hops: String,
-
     /// Prefetch schedule for SEARCH queries (aggressive warmup).
     /// Comma-separated fractions. Default "0.3,0.3,0.4".
     /// SCAN queries use plan-aware bulk prefetch (bypasses schedule entirely).
@@ -161,12 +156,6 @@ struct Cli {
     /// Skip COUNT(*) verification (avoids full table scan on tiny machines)
     #[arg(long, env = "BENCH_SKIP_VERIFY")]
     skip_verify: bool,
-
-    /// Page grouping strategy: "positional" or "btree" (default: btree).
-    /// Positional: sequential chunking (page N -> group N/ppg).
-    /// BTree: B-tree-aware bin-packing by B-tree structure.
-    #[arg(long, default_value = "btree", env = "BENCH_GROUPING")]
-    grouping: String,
 
     /// Phase Marne: query-plan-aware prefetch. Before each query, runs
     /// EXPLAIN QUERY PLAN and pushes planned B-tree accesses to the global
@@ -360,23 +349,13 @@ fn parse_prefetch_hops(s: &str) -> Vec<f32> {
         .collect()
 }
 
-fn parse_grouping(s: &str) -> GroupingStrategy {
-    match s.to_lowercase().as_str() {
-        "positional" | "pos" => GroupingStrategy::Positional,
-        "btree" | "btree-aware" | "btreeaware" => GroupingStrategy::BTreeAware,
-        other => panic!("unknown grouping strategy '{}': use 'positional' or 'btree'", other),
-    }
-}
-
 fn make_config(
     prefix: &str,
     cache_dir: &std::path::Path,
     ppg: u32,
     prefetch_threads: u32,
-    prefetch_hops: Vec<f32>,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
-    grouping: GroupingStrategy,
 ) -> TieredConfig {
     TieredConfig {
         bucket: test_bucket(),
@@ -387,10 +366,8 @@ fn make_config(
         region: std::env::var("AWS_REGION").ok(),
         pages_per_group: ppg,
         prefetch_threads,
-        prefetch_hops,
         prefetch_search,
         prefetch_lookup,
-        grouping_strategy: grouping,
         ..Default::default()
     }
 }
@@ -400,10 +377,8 @@ fn make_reader_config(
     cache_dir: &std::path::Path,
     ppg: u32,
     prefetch_threads: u32,
-    prefetch_hops: Vec<f32>,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
-    grouping: GroupingStrategy,
 ) -> TieredConfig {
     TieredConfig {
         bucket: test_bucket(),
@@ -415,10 +390,8 @@ fn make_reader_config(
         region: std::env::var("AWS_REGION").ok(),
         pages_per_group: ppg,
         prefetch_threads,
-        prefetch_hops,
         prefetch_search,
         prefetch_lookup,
-        grouping_strategy: grouping,
         ..Default::default()
     }
 }
@@ -831,7 +804,7 @@ fn run_query_pair(
 /// Cache level: data — everything cached, reuse connection. Measures pread latency.
 fn bench_data(
     conn: &Connection,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -870,7 +843,7 @@ fn bench_data(
 fn bench_index(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -925,7 +898,7 @@ fn bench_index(
 fn bench_interior(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -980,7 +953,7 @@ fn bench_interior(
 fn bench_none(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1034,7 +1007,7 @@ fn bench_none(
 fn bench_none_pair(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1128,19 +1101,15 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let est_page_groups = est_pages / ppg + 1;
     let db_name = format!("social_{}.db", n_posts);
 
-    let grouping = parse_grouping(&cli.grouping);
     println!();
     let prefetch_search = parse_prefetch_hops(&cli.prefetch_search);
     let prefetch_lookup = parse_prefetch_hops(&cli.prefetch_lookup);
     println!(
-        "--- {} posts, {} users (~{:.1} MB, ~{} pages, ~{} page groups, {:?}) ---",
-        format_number(n_posts), format_number(n_users), db_size_mb, est_pages, est_page_groups, grouping,
+        "--- {} posts, {} users (~{:.1} MB, ~{} pages, ~{} page groups) ---",
+        format_number(n_posts), format_number(n_users), db_size_mb, est_pages, est_page_groups,
     );
-    if grouping == GroupingStrategy::BTreeAware {
-        println!("    prefetch_search: {:?}", prefetch_search);
-        println!("    prefetch_lookup: {:?}", prefetch_lookup);
-    }
-    println!("    radial hops: {:?}", parse_prefetch_hops(&cli.prefetch_hops));
+    println!("    prefetch_search: {:?}", prefetch_search);
+    println!("    prefetch_lookup: {:?}", prefetch_lookup);
 
     let cache_dir = TempDir::new().expect("failed to create temp dir");
 
@@ -1149,11 +1118,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // 1. --import: generate locally + upload to S3 (fast path)
     // 2. --force: generate through VFS (legacy path)
     // 3. Default: reuse existing S3 data at social_{n_posts}
-    let strategy_suffix = match grouping {
-        GroupingStrategy::Positional => "pos",
-        GroupingStrategy::BTreeAware => "btree",
-    };
-    let s3_prefix = format!("social_{}_{}", n_posts, strategy_suffix);
+    let s3_prefix = format!("social_{}_btree", n_posts);
     if cli.import.is_some() {
         // Fast path: generate plain SQLite DB locally, then import to S3.
         // When --import auto and data already exists on S3, skip generation and import.
@@ -1192,7 +1157,6 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             };
 
             let import_start = Instant::now();
-            let grouping = parse_grouping(&cli.grouping);
             let config = turbolite::tiered::TieredConfig {
                 bucket: test_bucket(),
                 prefix: s3_prefix.clone(),
@@ -1200,7 +1164,6 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 region: std::env::var("AWS_REGION").ok(),
                 pages_per_group: cli.ppg,
                 compression_level: 1,
-                grouping_strategy: grouping,
                 ..Default::default()
             };
             let manifest = turbolite::tiered::import_sqlite_file(
@@ -1216,7 +1179,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         }
     } else if cli.force {
         // Legacy VFS generation path
-        let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), prefetch_search.clone(), prefetch_lookup.clone(), parse_grouping(&cli.grouping));
+        let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
         let vfs_name = unique_vfs_name("write");
         let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -1267,7 +1230,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // Create reader VFS + bench handle
     eprintln!("[bench] creating reader VFS...");
     let reader_cache = TempDir::new().expect("reader temp dir");
-    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), prefetch_search.clone(), prefetch_lookup.clone(), parse_grouping(&cli.grouping));
+    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
     if std::env::var("BENCH_NO_EAGER_INDEX").is_ok() {
         reader_config.eager_index_load = false;
         eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
@@ -1275,7 +1238,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     eprintln!("[bench] calling TieredVfs::new()...");
     let reader_vfs = TieredVfs::new(reader_config).expect("reader VFS");
     eprintln!("[bench] TieredVfs::new() returned OK");
-    let bench_handle = reader_vfs.bench_handle();
+    let shared_state = reader_vfs.shared_state();
     let reader_vfs_name = unique_vfs_name("reader");
     eprintln!("[bench] registering VFS '{}'", reader_vfs_name);
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
@@ -1434,7 +1397,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_data(&warm_conn, &shared_state, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1445,7 +1408,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1454,7 +1417,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1463,7 +1426,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_none(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1512,7 +1475,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let r = bench_none_pair(
                     &reader_vfs_name,
                     &db_name,
-                    &bench_handle,
+                    &shared_state,
                     q.label,
                     q.sql,
                     &q.param_fn,
