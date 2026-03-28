@@ -19,4 +19,6 @@ mod tiered {
     #[cfg(feature = "encryption")]
     mod encryption;
     mod advanced;
+    mod eviction;
+    mod manifest_persistence;
 }

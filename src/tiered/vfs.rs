@@ -67,10 +67,25 @@ impl TieredVfs {
         let s3 = S3Client::new_blocking(&config, &runtime_handle)?;
         eprintln!("[tiered] S3 client created, fetching manifest...");
 
-        // Fetch manifest to get page_size for cache initialization
-        let mut manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        // Phase Gallipoli: try local manifest first for cache initialization.
+        // This is critical for crash recovery: if the process died after a local
+        // checkpoint but before flush_to_s3, the S3 manifest is stale/empty but
+        // the local manifest has the correct page_count and group layout.
+        let (mut manifest, recovered_dirty_groups) = match manifest::LocalManifest::load(&config.cache_dir) {
+            Ok(Some(local)) => {
+                eprintln!(
+                    "[tiered] loaded local manifest for cache init (v{}, {} pages, {} dirty groups)",
+                    local.manifest.version, local.manifest.page_count, local.dirty_groups.len(),
+                );
+                (local.manifest, local.dirty_groups)
+            }
+            _ => {
+                eprintln!("[tiered] no local manifest, fetching from S3 for cache init...");
+                (s3.get_manifest()?.unwrap_or_else(Manifest::empty), Vec::new())
+            }
+        };
         manifest.detect_and_normalize_strategy();
-        eprintln!("[tiered] manifest fetched (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
+        eprintln!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
         let page_size = if manifest.page_size > 0 {
             manifest.page_size
         } else {
@@ -128,7 +143,12 @@ impl TieredVfs {
 
         // Shared state for two-phase checkpoint (flush_to_s3)
         let shared_manifest = Arc::new(RwLock::new(manifest));
-        let shared_dirty_groups = Arc::new(Mutex::new(HashSet::new()));
+        // Phase Gallipoli: recover dirty groups from local manifest
+        let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
+        if !initial_dirty.is_empty() {
+            eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
+        }
+        let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
 
         Ok(Self {
