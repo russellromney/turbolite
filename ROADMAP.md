@@ -15,15 +15,6 @@
 
 Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
 
-### Remove Positional strategy (f3)
-BTreeAware is strictly better with per-query schedule tuning. Remove Positional to simplify the codebase.
-- [ ] Remove `GroupingStrategy` enum, `PrefetchNeighbors` enum
-- [ ] Remove Positional branches from manifest `page_location()`, `group_page_nums()`
-- [ ] Remove Positional import path (sequential chunking)
-- [ ] Remove `--grouping` CLI flag from tiered-bench
-- [ ] Remove Positional-specific tests
-- [ ] Verify all existing tests pass with BTreeAware only
-
 ### Compaction (g)
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
 - [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
@@ -40,20 +31,41 @@ BTreeAware is strictly better with per-query schedule tuning. Remove Positional 
 
 ---
 
-## Gallipoli: Connection Open Performance + Packaging
+## Gallipoli: Local Manifest Persistence
 > After: Midway (remaining) · Before: Somme
 
-### a. Skip S3 manifest fetch on reconnect
-Every `open()` call hits S3 to fetch the manifest, even when the VFS already has a fresh copy in memory. For multi-tenant servers opening hundreds of connections/sec, this is redundant latency and S3 cost.
+The manifest only lives in S3 and in-memory on the VFS. No local persistence. This causes two problems:
+1. **Performance:** Every `open()` hits S3 to fetch the manifest, even when the VFS has a fresh copy.
+2. **Durability bug (LocalThenFlush):** If the process dies between a local checkpoint and `flush_to_s3()`, dirty pages are on disk in the cache file but the S3 manifest doesn't reference them. On restart, the stale S3 manifest is fetched, and unflushed work is silently lost.
 
-- [ ] Use `shared_manifest` (already on TieredVfs) instead of `s3.get_manifest()` when the manifest is already loaded
-- [ ] First open (cold start): fetch from S3 as today
-- [ ] Subsequent opens: use in-memory manifest (checkpoints already update it)
-- [ ] Add `manifest_loaded: AtomicBool` on TieredVfs to track whether first fetch has happened
-- [ ] Test: second connection open does zero S3 GETs (check s3.fetch_count before/after)
-- [ ] Test: checkpoint updates shared manifest, next open sees new page count without S3 fetch
+### a. Persist manifest locally
 
-### b. Packaging cleanup
+Write `manifest.msgpack` to `cache_dir/` alongside the cache file. This is the same manifest that goes to S3, plus a `dirty_groups` field for unflushed pages.
+
+- [ ] On every checkpoint (both Durable and LocalThenFlush): write manifest to `cache_dir/manifest.msgpack`
+- [ ] Include `dirty_groups: Vec<u64>` in local manifest (not in S3 manifest) for unflushed page tracking
+- [ ] On flush_to_s3(): clear dirty_groups from local manifest after successful upload
+- [ ] Test: local checkpoint writes manifest to disk, manifest contains dirty_groups
+- [ ] Test: process restart after local checkpoint, dirty_groups survive, flush_to_s3 works
+
+### b. Manifest source config
+
+- [ ] `manifest_source: Auto | S3` on TieredConfig
+  - `Auto` (default): load local manifest if present, fall back to S3. Correct for single-writer.
+  - `S3`: always fetch from S3 on open. For HA followers and multi-reader setups.
+- [ ] `TURBOLITE_MANIFEST_SOURCE` env var
+- [ ] `turbolite_config_set('manifest_source', 'auto')` runtime toggle
+- [ ] Test: Auto mode uses local on warm reconnect (zero S3 GETs on second open)
+- [ ] Test: S3 mode always fetches (S3 GET count increments on every open)
+
+### c. Dirty group recovery
+
+- [ ] On open with Auto mode: if local manifest has dirty_groups, log warning and populate s3_dirty_groups
+- [ ] `flush_to_s3()` picks up recovered dirty groups and uploads them
+- [ ] Test: crash simulation (kill after local checkpoint, restart, verify flush recovers all data)
+- [ ] Test: no dirty_groups on clean shutdown (Durable mode never has dirty_groups in local manifest)
+
+### d. Packaging cleanup
 - [ ] Test: missing .so in Python package produces clear error message
 - [ ] pkg-config `.pc` file for system install discovery
 
