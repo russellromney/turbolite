@@ -73,13 +73,18 @@ impl DiskCache {
         let spf = if sub_pages_per_frame > 0 { sub_pages_per_frame } else { pages_per_group };
         let tracker_path = cache_dir.join("sub_chunk_tracker");
         #[cfg(feature = "encryption")]
-        let tracker = if encryption_key.is_some() {
+        let mut tracker = if encryption_key.is_some() {
             SubChunkTracker::new_encrypted(tracker_path, pages_per_group, spf, encryption_key)
         } else {
             SubChunkTracker::new(tracker_path, pages_per_group, spf)
         };
         #[cfg(not(feature = "encryption"))]
-        let tracker = SubChunkTracker::new(tracker_path, pages_per_group, spf);
+        let mut tracker = SubChunkTracker::new(tracker_path, pages_per_group, spf);
+
+        // Set sub-chunk byte size if page_size is known at construction
+        if page_size > 0 && spf > 0 {
+            tracker.set_sub_chunk_byte_size(spf as u64 * page_size as u64);
+        }
 
         // Legacy bitmap (kept for backward compat during migration)
         let bitmap_path = cache_dir.join("page_bitmap");
@@ -535,34 +540,52 @@ impl DiskCache {
         }
     }
 
-    /// Evict a single page group from the local cache.
-    pub(crate) fn evict_group(&self, gid: u64) {
+    /// Get page numbers for a group (BTreeAware lookup or Positional fallback).
+    fn group_page_nums(&self, gid: u64) -> Vec<u64> {
         let gp = self.group_pages.read();
-        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(gid as usize) {
-            // BTreeAware: explicit page list
+        if let Some(explicit) = gp.get(gid as usize) {
             explicit.clone()
         } else {
-            // Positional fallback: [gid*ppg .. (gid+1)*ppg)
             let ppg = self.pages_per_group as u64;
             let start = gid * ppg;
             (start..start + ppg).collect()
-        };
-        drop(gp);
+        }
+    }
 
+    /// Get page numbers for a sub-chunk within a group.
+    fn sub_chunk_page_nums(&self, id: SubChunkId) -> Vec<u64> {
+        let gp = self.group_pages.read();
+        if let Some(explicit) = gp.get(id.group_id as usize) {
+            let spf = self.sub_pages_per_frame as usize;
+            let start = id.frame_index as usize * spf;
+            let end = std::cmp::min(start + spf, explicit.len());
+            if start < explicit.len() {
+                explicit[start..end].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            let ppg = self.pages_per_group as u64;
+            let spf = self.sub_pages_per_frame as u64;
+            let start = id.group_id as u64 * ppg + id.frame_index as u64 * spf;
+            (start..start + spf).collect()
+        }
+    }
+
+    /// Clear bitmap bits and hole-punch pages on Linux.
+    fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
             let mut bitmap = self.bitmap.lock();
-            for &pnum in &page_nums {
+            for &pnum in page_nums {
                 bitmap.clear(pnum);
             }
         }
-
-        // On Linux: hole punch each page to reclaim NVMe blocks
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
             let file = self.cache_file.write();
             let ps = self.page_size.load(Ordering::Acquire) as u64;
-            for &pnum in &page_nums {
+            for &pnum in page_nums {
                 let offset = (pnum * ps) as libc::off_t;
                 let len = ps as libc::off_t;
                 unsafe {
@@ -575,10 +598,14 @@ impl DiskCache {
                 }
             }
         }
-        // Also remove all sub-chunks for this group from tracker
+    }
+
+    /// Evict a single page group from the local cache.
+    pub(crate) fn evict_group(&self, gid: u64) {
+        let page_nums = self.group_page_nums(gid);
+        self.clear_pages_from_disk(&page_nums);
         self.tracker.lock().remove_group(gid as u32);
 
-        // Reset group state to None
         let states = self.group_states.lock();
         if let Some(s) = states.get(gid as usize) {
             s.store(GroupState::None as u8, Ordering::Release);
@@ -593,139 +620,47 @@ impl DiskCache {
     /// Evict a single sub-chunk from the cache. Clears bitmap, hole-punches on Linux,
     /// removes from tracker. Does NOT reset group state (other sub-chunks may remain).
     pub(crate) fn evict_sub_chunk(&self, id: SubChunkId) {
-        // Determine which pages this sub-chunk covers
-        let gp = self.group_pages.read();
-        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(id.group_id as usize) {
-            // BTreeAware: slice from the group's page list
-            let spf = self.sub_pages_per_frame as usize;
-            let start = id.frame_index as usize * spf;
-            let end = std::cmp::min(start + spf, explicit.len());
-            if start < explicit.len() {
-                explicit[start..end].to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            // Positional fallback
-            let ppg = self.pages_per_group as u64;
-            let spf = self.sub_pages_per_frame as u64;
-            let start = id.group_id as u64 * ppg + id.frame_index as u64 * spf;
-            let end = start + spf;
-            (start..end).collect()
-        };
-        drop(gp);
-
-        // Clear bitmap
-        {
-            let mut bitmap = self.bitmap.lock();
-            for &pnum in &page_nums {
-                bitmap.clear(pnum);
-            }
-        }
-
-        // Hole punch on Linux to reclaim NVMe blocks
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let file = self.cache_file.write();
-            let ps = self.page_size.load(Ordering::Acquire) as u64;
-            for &pnum in &page_nums {
-                let offset = (pnum * ps) as libc::off_t;
-                let len = ps as libc::off_t;
-                unsafe {
-                    libc::fallocate(
-                        file.as_raw_fd(),
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        offset,
-                        len,
-                    );
-                }
-            }
-        }
-
-        // Remove from tracker (byte accounting handled inside remove())
+        let page_nums = self.sub_chunk_page_nums(id);
+        self.clear_pages_from_disk(&page_nums);
         self.tracker.lock().remove(id);
     }
 
     /// Evict sub-chunks until cache is within budget. Skips groups in skip_groups
     /// (dirty, pending flush, or currently being fetched). Returns number evicted.
     ///
-    /// Each iteration: lock tracker -> pick victim -> unlock -> evict from disk.
-    /// This avoids holding the tracker lock during I/O.
+    /// Collects all evictable sub-chunks, sorts by score (ascending = most evictable
+    /// first), then evicts in order. O(n log n) total instead of O(n^2) per-iteration scan.
     pub(crate) fn evict_to_budget(&self, budget_bytes: u64, skip_groups: &HashSet<u64>) -> u32 {
+        // Collect and sort victims in one tracker lock
+        let victims: Vec<SubChunkId> = {
+            let mut tracker = self.tracker.lock();
+            if tracker.current_cache_bytes <= budget_bytes {
+                return 0;
+            }
+            if tracker.current_cache_bytes <= tracker.pinned_bytes() {
+                return 0;
+            }
+            let mut scored = tracker.score_evictable(skip_groups);
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.into_iter().map(|(id, _)| id).collect()
+        };
+
         let mut evicted = 0u32;
-        loop {
-            // Check current size and find victim (single lock acquisition)
-            let victim = {
-                let mut tracker = self.tracker.lock();
+        for id in victims {
+            // Check if we're under budget (re-lock tracker briefly)
+            {
+                let tracker = self.tracker.lock();
                 if tracker.current_cache_bytes <= budget_bytes {
                     break;
                 }
-                // Don't evict below pinned floor
-                if tracker.current_cache_bytes <= tracker.pinned_bytes() {
-                    break;
-                }
-                tracker.evict_one_skipping(skip_groups)
-            };
-            match victim {
-                Some(id) => {
-                    self.evict_sub_chunk_disk_only(id);
-                    evicted += 1;
-                }
-                None => break, // nothing evictable
             }
+            // Remove from tracker, then clean disk
+            self.tracker.lock().remove(id);
+            let page_nums = self.sub_chunk_page_nums(id);
+            self.clear_pages_from_disk(&page_nums);
+            evicted += 1;
         }
         evicted
-    }
-
-    /// Evict a sub-chunk's disk presence (bitmap + hole punch) WITHOUT touching tracker.
-    /// Used by evict_to_budget where tracker.remove() is called inside the lock
-    /// and disk cleanup happens outside it.
-    fn evict_sub_chunk_disk_only(&self, id: SubChunkId) {
-        let gp = self.group_pages.read();
-        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(id.group_id as usize) {
-            let spf = self.sub_pages_per_frame as usize;
-            let start = id.frame_index as usize * spf;
-            let end = std::cmp::min(start + spf, explicit.len());
-            if start < explicit.len() {
-                explicit[start..end].to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            let ppg = self.pages_per_group as u64;
-            let spf = self.sub_pages_per_frame as u64;
-            let start = id.group_id as u64 * ppg + id.frame_index as u64 * spf;
-            let end = start + spf;
-            (start..end).collect()
-        };
-        drop(gp);
-
-        {
-            let mut bitmap = self.bitmap.lock();
-            for &pnum in &page_nums {
-                bitmap.clear(pnum);
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let file = self.cache_file.write();
-            let ps = self.page_size.load(Ordering::Acquire) as u64;
-            for &pnum in &page_nums {
-                let offset = (pnum * ps) as libc::off_t;
-                let len = ps as libc::off_t;
-                unsafe {
-                    libc::fallocate(
-                        file.as_raw_fd(),
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        offset,
-                        len,
-                    );
-                }
-            }
-        }
     }
 
     /// Persist the page bitmap and sub-chunk tracker to disk.

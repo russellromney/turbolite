@@ -771,6 +771,51 @@ fn test_set_sub_chunk_byte_size_recomputes() {
     assert_eq!(t.current_cache_bytes, 2048);
 }
 
+#[test]
+fn test_access_counts_persisted_and_loaded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+
+    // Create tracker, add sub-chunks, touch them, persist
+    {
+        let mut t = SubChunkTracker::new(path.clone(), 8, 4);
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        t.mark_present(id, SubChunkTier::Data);
+        for _ in 0..15 {
+            t.touch(id);
+        }
+        assert_eq!(t.access_counts[&id], 15);
+        t.persist().unwrap();
+    }
+
+    // Load fresh tracker from disk, verify count survived
+    {
+        let t = SubChunkTracker::new(path.clone(), 8, 4);
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        assert!(t.present.contains(&id));
+        assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 15,
+            "access count should survive persist/load cycle");
+    }
+}
+
+#[test]
+fn test_v1_format_backward_compat() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+
+    // Write v1 format manually: Vec<(SubChunkId, u8)>
+    let id = SubChunkId { group_id: 5, frame_index: 2 };
+    let v1_data: Vec<(SubChunkId, u8)> = vec![(id, 2)]; // tier=Data
+    let json = serde_json::to_vec(&v1_data).unwrap();
+    std::fs::write(&path, &json).unwrap();
+
+    // Load should handle v1 gracefully (zero access counts)
+    let t = SubChunkTracker::new(path, 8, 4);
+    assert!(t.present.contains(&id));
+    assert_eq!(t.tiers[&id], SubChunkTier::Data);
+    assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 0);
+}
+
 // ── Phase Stalingrad-b: weighted eviction tests ──
 
 #[test]
