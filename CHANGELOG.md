@@ -21,6 +21,57 @@
 
 ---
 
+## Marathon: Local Disk Compaction
+
+Cache file truncation after VACUUM. When checkpoint detects the cache file is larger than `page_count * page_size`, it truncates the file to match. Frees disk space without requiring a fresh reader.
+
+- Truncation runs after bitmap persist, before async GC
+- Compares `file.metadata().len()` against `manifest.page_count * page_size`
+- Integration test: insert 1000 rows, VACUUM, verify cache file shrinks to match new page_count
+
+---
+
+## Stalingrad: Cache Eviction Policies (complete)
+
+Production cache management: size limits, observability, manual control, and smart eviction.
+
+### a. Size-based eviction
+- `max_cache_bytes: Option<u64>` on TieredConfig, `TURBOLITE_CACHE_LIMIT` env var, `turbolite_config_set('cache_limit', '512MB')`
+- `current_cache_bytes` on SubChunkTracker (inside mutex, not atomic). Updated on mark_present/remove/clear.
+- `evict_to_budget(limit, skip_groups)` on DiskCache: sorts evictable sub-chunks by score, evicts lowest first (O(n log n))
+- Between-query trigger in VFS read path (step 3d): builds skip_groups from dirty pages + pending flush + fetching groups
+- `parse_byte_size()` supports "512MB", "2GB", raw bytes, fractional ("1.5GB")
+
+### b. Access count tracking + weighted eviction
+- `access_counts: HashMap<SubChunkId, u32>` on SubChunkTracker, capped at 64
+- Score = tier_bonus + recency_score + frequency_score
+- tier_bonus: Data=0, Index=10 (additive: ANY Index beats ANY Data)
+- recency_score: 0.0 (1hr+) to 1.0 (just accessed). Window: RECENCY_WINDOW_SECS=3600
+- frequency_score: 0.0 (untouched) to 1.0 (64+ accesses)
+- Access counts persisted in tracker v2 format (backward compatible with v1)
+
+### c. Cache observability
+- Hit/miss/eviction/bytes_evicted counters on DiskCache (AtomicU64)
+- cache_info JSON includes: size_bytes, groups, tiers, hits, misses, hit_rate, evictions, bytes_evicted, s3_gets_total
+
+### d. Manual eviction controls
+- `turbolite_evict_tree(names)`: comma-separated tree names, BTreeAware only
+- `turbolite_evict('data'/'index'/'all')`: evict by tier, skips pending flush
+
+### e. Checkpoint eviction
+- `evict_on_checkpoint: bool`, TURBOLITE_EVICT_ON_CHECKPOINT env, turbolite_config_set runtime toggle
+- After S3 upload, evicts Data tier (interior + index remain)
+
+### f. Speculative warm
+- `turbolite_warm('SELECT ...')`: runs EQP, submits tree groups to prefetch pool (non-blocking)
+- Returns JSON: {"trees_warmed": [...], "groups_submitted": N}
+
+### Infrastructure
+- DRY: extracted group_page_nums(), sub_chunk_page_nums(), clear_pages_from_disk() helpers
+- 306 unit tests, 3 integration tests
+
+---
+
 ## Stalingrad (items 1-3): Cache Eviction Foundations
 
 Between-query eviction boundary, manual tree eviction, and cache observability. The building blocks for production cache management.

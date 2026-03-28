@@ -10,32 +10,19 @@
 
 ---
 
-## Marathon: Local Disk Compaction
-> After: Thermopylae · Before: Midway (remaining)
-
-The local cache file is a sparse file sized to `page_count * page_size`. After VACUUM reduces page_count, a fresh reader creates a smaller cache, but the existing cache doesn't shrink in-place.
-
-- [ ] On checkpoint, if manifest page_count decreased, truncate cache file to match
-- [ ] Add `TieredVfs::compact_cache()` -- shrink cache file to current manifest size
-- [ ] Test: VACUUM -> checkpoint -> verify cache file size matches new page_count
-
-Note: minor optimization. S3 is the source of truth, local disk is ephemeral cache.
-
----
-
-## Midway (remaining): GroupingStrategy + Compaction + Tests
-> After: Marathon · Before: Gallipoli
+## Midway (remaining): Remove Positional + Compaction + Tests
+> After: Thermopylae · Before: Gallipoli
 
 Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
 
-### GroupingStrategy dispatch (f3)
-- [ ] `GroupingStrategy` enum: dispatch methods compute positions arithmetically (Positional) or via explicit lookup (BTreeAware)
-- [ ] `PrefetchNeighbors` enum: `RadialFanout` (positional) vs `BTreeSiblings` (btree)
-- [ ] Manifest dispatch: `page_location()`, `group_page_nums()`, `prefetch_neighbors()` branch on `strategy`
-- [ ] handle.rs: `trigger_prefetch()` radial fan-out for Positional, sibling groups for BTreeAware
-- [ ] import.rs: Positional path (sequential chunking, no btree walk)
-- [ ] disk_cache.rs + vfs.rs: handle empty `group_pages` for Positional
-- [ ] Benchmark: `--grouping positional` and `--grouping btree` flags in tiered-bench
+### Remove Positional strategy (f3)
+BTreeAware is strictly better with per-query schedule tuning. Remove Positional to simplify the codebase.
+- [ ] Remove `GroupingStrategy` enum, `PrefetchNeighbors` enum
+- [ ] Remove Positional branches from manifest `page_location()`, `group_page_nums()`
+- [ ] Remove Positional import path (sequential chunking)
+- [ ] Remove `--grouping` CLI flag from tiered-bench
+- [ ] Remove Positional-specific tests
+- [ ] Verify all existing tests pass with BTreeAware only
 
 ### Compaction (g)
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
@@ -227,33 +214,15 @@ Between-query eviction hook is wired (step 3d in VFS read path, end-query signal
 - [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
 - [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
 
-### b. Access count tracking + weighted eviction
+### b-f. Completed (see CHANGELOG)
 
-Replace pure LRU with weighted scoring that considers both recency and frequency. Sub-chunks accessed 100 times should survive longer than sub-chunks accessed once, even if the single-access one was touched more recently.
+Items b (weighted eviction), c (observability counters), d (tier eviction), e (checkpoint eviction), and f (speculative warm) are implemented. See CHANGELOG for details.
 
-- [ ] `access_count: HashMap<SubChunkId, u32>` on SubChunkTracker
-- [ ] Increment on `touch()`, reset on eviction
-- [ ] Weighted eviction score: `score = tier_weight * (recency_score + frequency_score)`
-- [ ] `evict_one()` picks lowest score across all evictable sub-chunks
-- [ ] Frequency score: `min(access_count, cap) / cap` (cap e.g., 64, prevents runaway counts from making data immortal)
-- [ ] Recency score: `1.0 - (age / max_age)` (normalized to 0-1)
-- [ ] Tests: frequently-accessed sub-chunk survives over rarely-accessed one at same tier, tier still dominates (data evicts before index regardless of access count)
+### Remaining observability (c+)
 
-### c. Cache observability
-
-No other SQLite VFS lets you introspect the cache. This is a devex differentiator.
-
-`turbolite_cache_info()` is implemented (size_bytes, groups_cached/total, tier breakdown, s3_gets_total). Remaining work adds richer stats and churn detection:
-
-- [ ] Add `limit_bytes`, `hit_rate`, `evictions_since_open` fields to cache_info JSON (after size-based eviction lands)
-- [ ] `turbolite_cache_stats()` SQL function: `{hits, misses, evictions, bytes_evicted, bytes_fetched}`
-- [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in stats:
-  `{"last_query_evictions": 847, "cache_churn": "high", "recommendation": "cache_limit >= 512MB would eliminate churn"}`
+- [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in cache_info
 - [ ] Track peak working set over connection lifetime for recommendations
-- [ ] Track hit/miss counters on `read_exact_at` (cache hit vs S3 fetch)
-- [ ] Track eviction counters in `evict_one()` / `evict_to_budget()`
-- [ ] Log at WARN level when between-query eviction sheds >50% of cache (visible in app logs without checking SQL functions)
-- [ ] Tests: stats increment correctly, info reflects actual cache state, churn warning triggers at threshold, peak working set tracked
+- [ ] Log at WARN level when between-query eviction sheds >50% of cache
 
 ### c2. Query cost estimation
 
@@ -313,43 +282,15 @@ Before running an expensive query, users can check how much cache it would need.
 - [ ] FFI + ext_entry.c registration
 - [ ] Tests: predicted vs actual for SCAN (actual = predicted), SEARCH (actual <= predicted worst), cache level clears correctly before run, 'current' doesn't evict
 
-### d. Manual eviction controls
+### d+. Remaining manual eviction
 
-Application-level cache control via SQL functions. Most important for multi-tenant: the application knows when a tenant is cold.
-
-`turbolite_evict_tree(names)` is implemented (comma-separated tree names, skips pending/interior groups, BTreeAware only). Remaining:
-
-- [ ] `turbolite_evict('data')` / `turbolite_evict('index')` / `turbolite_evict('all')` -- evict by tier
 - [ ] `turbolite_evict_query('SELECT ...')` -- run EQP, extract trees, evict their data
   - Reuses frontrun EQP parsing infrastructure
   - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
-  - Default: evict data tier only (keep index for potential re-query)
-- [ ] FFI + ext_entry.c registration for remaining functions
-- [ ] Tests: query eviction matches EQP output, evict('all') resets everything except pending flush pages
 
-### e. Checkpoint eviction
+### g. Naming cleanup
 
-Clear interval where the cache resets after successful S3 upload. Good for serverless/bursty workloads where you want a clean slate after committing.
-
-- [ ] `evict_on_checkpoint: bool` in TieredConfig (default: false)
-- [ ] `TURBOLITE_EVICT_ON_CHECKPOINT=true` env var
-- [ ] `turbolite_config_set('evict_on_checkpoint', 'true')` runtime toggle
-- [ ] After successful checkpoint S3 upload: if enabled, call `clear_cache_data_only()`
-- [ ] Only evicts data tier (interior + index remain for next query's fast path)
-- [ ] Tests: data tier empty after checkpoint when enabled, interior/index survive, disabled by default
-
-### f. Speculative warm
-
-Pre-warm pages for anticipated queries before they execute. Different from frontrun (which fires ~10us before step): warm fires seconds/minutes ahead so pages are already cached when the query runs.
-
-Use case: user logs in, app fires `turbolite_warm('SELECT * FROM dashboard WHERE user_id = ?')` during auth. By the time user clicks dashboard, pages are cached. Zero cold penalty.
-
-- [ ] `turbolite_warm('SELECT ...')` SQL function
-- [ ] Run EQP, extract planned accesses (reuses frontrun parse_eqp_output)
-- [ ] Submit all tree page groups to prefetch pool (non-blocking, returns immediately)
-- [ ] No bound parameters needed: warms all groups for the tables/indexes in the plan
-- [ ] Returns JSON: `{"trees_warmed": ["users", "idx_users_id"], "groups_submitted": 12}`
-- [ ] Tests: warm submits correct groups, warm on already-cached data is no-op, warm with invalid SQL returns error
+- [ ] Rename `TieredBenchHandle` to `TieredSharedState` (it's used by both benchmarks and SQL functions, not just benchmarks)
 
 ---
 
