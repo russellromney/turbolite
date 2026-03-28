@@ -69,11 +69,15 @@ Production cache management: size limits, observability, manual control, and sma
 
 ### c. Cache observability
 - Hit/miss/eviction/bytes_evicted counters on DiskCache (AtomicU64)
-- cache_info JSON includes: size_bytes, groups, tiers, hits, misses, hit_rate, evictions, bytes_evicted, s3_gets_total
+- Peak cache size tracking (`stat_peak_cache_bytes`) updated on every group present
+- Churn detection: WARN log when between-query eviction sheds >50% of cache
+- `stat_last_eviction_count` for per-pass eviction tracking
+- cache_info JSON includes: size_bytes, peak_bytes, groups, tiers, hits, misses, hit_rate, evictions, bytes_evicted, last_eviction_count, s3_gets_total
 
 ### d. Manual eviction controls
 - `turbolite_evict_tree(names)`: comma-separated tree names, BTreeAware only
 - `turbolite_evict('data'/'index'/'all')`: evict by tier, skips pending flush
+- `turbolite_evict_query('SELECT ...')`: runs EQP, extracts tree names, evicts their groups
 
 ### e. Checkpoint eviction
 - `evict_on_checkpoint: bool`, TURBOLITE_EVICT_ON_CHECKPOINT env, turbolite_config_set runtime toggle
@@ -82,6 +86,10 @@ Production cache management: size limits, observability, manual control, and sma
 ### f. Speculative warm
 - `turbolite_warm('SELECT ...')`: runs EQP, submits tree groups to prefetch pool (non-blocking)
 - Returns JSON: {"trees_warmed": [...], "groups_submitted": N}
+
+### g. Naming cleanup
+- Renamed `TieredBenchHandle` to `TieredSharedState` (used by SQL functions + benchmarks)
+- Renamed `bench_handle()` to `shared_state()`
 
 ### Infrastructure
 - DRY: extracted group_page_nums(), sub_chunk_page_nums(), clear_pages_from_disk() helpers

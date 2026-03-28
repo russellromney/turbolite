@@ -214,83 +214,16 @@ Between-query eviction hook is wired (step 3d in VFS read path, end-query signal
 - [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
 - [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
 
-### b-f. Completed (see CHANGELOG)
+### b-g. Completed (see CHANGELOG)
 
-Items b (weighted eviction), c (observability counters), d (tier eviction), e (checkpoint eviction), and f (speculative warm) are implemented. See CHANGELOG for details.
+All Stalingrad items implemented: weighted eviction (b), observability with churn detection and peak tracking (c), tier eviction + evict_query (d), checkpoint eviction (e), speculative warm (f), TieredSharedState rename (g).
 
-### Remaining observability (c+)
+### Future: query cost estimation (c2) + query analysis (c3)
 
-- [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in cache_info
-- [ ] Track peak working set over connection lifetime for recommendations
-- [ ] Log at WARN level when between-query eviction sheds >50% of cache
+Diagnostic tools, not blocking production use. Build when needed.
 
-### c2. Query cost estimation
-
-Before running an expensive query, users can check how much cache it would need. Uses EQP + manifest tree sizes to compute upper bounds. SCAN = exact (all groups). SEARCH = range (1 sub-frame best case, all groups worst case). Uncompressed cache bytes, not S3 transfer bytes.
-
-- [ ] `turbolite_query_cost('SELECT ...')` SQL function returning JSON:
-  ```json
-  {
-    "trees": [
-      {"name": "users", "access": "SEARCH", "groups": 2,
-       "best_bytes": 262144, "worst_bytes": 33554432},
-      {"name": "posts", "access": "SCAN", "groups": 12,
-       "best_bytes": 201326592, "worst_bytes": 201326592}
-    ],
-    "total_best_bytes": 786432,
-    "total_worst_bytes": 234881024,
-    "cache_limit_bytes": 536870912,
-    "worst_fits_in_cache": true,
-    "worst_pct_of_cache": "44%"
-  }
-  ```
-- [ ] Reuses frontrun EQP parsing (parse_eqp_output)
-- [ ] Per-tree worst case: `num_groups * pages_per_group * page_size` from manifest
-- [ ] Per-tree best case: SCAN = worst case (exact). SEARCH = 1 sub-frame per tree (`sub_pages_per_frame * page_size`)
-- [ ] `worst_fits_in_cache`: compare total worst against cache_limit (if set)
-- [ ] FFI + ext_entry.c registration
-- [ ] Tests: SCAN returns exact size, SEARCH returns range, JOIN sums across trees, no cache_limit returns null for fit check
-
-### c3. Query analysis (diagnostic tool)
-
-`tiered-bench` as a SQL function. Runs a query at a specified cache temperature, measures predicted vs actual cache usage. Not for production use; for development/tuning, like EXPLAIN QUERY PLAN.
-
-- [ ] `turbolite_analyze_query('SELECT ...', cache_level)` SQL function
-  - `cache_level`: `'current'` (no eviction, measure at whatever state cache is in), `'interior'` (clear to interior-only), `'index'` (clear to interior+index), `'none'` (clear everything)
-  - Runs the query (results discarded), measures real cache activity
-  - Returns JSON:
-    ```json
-    {
-      "trees": [
-        {"name": "idx_report_date", "access": "SEARCH",
-         "predicted_best": 262144, "predicted_worst": 8388608,
-         "actual_bytes": 524288, "actual_groups": 2, "hits": 1, "misses": 1},
-        {"name": "big_report", "access": "SEARCH",
-         "predicted_best": 262144, "predicted_worst": 201326592,
-         "actual_bytes": 1048576, "actual_groups": 4, "hits": 0, "misses": 4}
-      ],
-      "total_predicted_worst": 209715200,
-      "total_actual": 1572864,
-      "cache_limit": 536870912,
-      "execution_time_ns": 48000000
-    }
-    ```
-  - No concurrent reader problem: single controlled execution with local counters
-- [ ] Reuses query cost estimation (c2) for predicted values
-- [ ] Reuses existing clear_cache infrastructure for cache level setup
-- [ ] Register trace profile callback (`SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE`) for execution timing
-- [ ] FFI + ext_entry.c registration
-- [ ] Tests: predicted vs actual for SCAN (actual = predicted), SEARCH (actual <= predicted worst), cache level clears correctly before run, 'current' doesn't evict
-
-### d+. Remaining manual eviction
-
-- [ ] `turbolite_evict_query('SELECT ...')` -- run EQP, extract trees, evict their data
-  - Reuses frontrun EQP parsing infrastructure
-  - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
-
-### g. Naming cleanup
-
-- [ ] Rename `TieredSharedState` to `TieredSharedState` (it's used by both benchmarks and SQL functions, not just benchmarks)
+- [ ] `turbolite_query_cost('SELECT ...')` -- EQP + manifest tree sizes -> upper bound cache cost per tree
+- [ ] `turbolite_analyze_query('SELECT ...', cache_level)` -- run query at specified cache temp, measure actual vs predicted
 
 ---
 
