@@ -2,6 +2,25 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Midway: Remove Positional Strategy + turbolite_gc() + Marathon
+
+### Remove Positional strategy
+- Removed `PrefetchNeighbors` enum, `prefetch_hops` config field, `grouping_strategy` config field
+- `GroupingStrategy` enum kept for serde backward compat but only `BTreeAware` is used
+- Removed Positional import path, radial fan-out prefetch, `--grouping`/`--prefetch-hops` CLI flags
+- `manifest.prefetch_neighbors()` replaced with `manifest.prefetch_siblings()` (returns `Vec<u64>` directly)
+- ~200 lines removed across 10 files
+
+### turbolite_gc() SQL function
+- `SELECT turbolite_gc()` runs full orphan scan (list all S3 keys, diff against manifest, delete orphans)
+- Returns count of deleted objects. FFI: ext.rs + ext_entry.c, same pattern as turbolite_cache_info
+
+### Marathon: Local Disk Compaction
+- Cache file truncation after VACUUM: when checkpoint detects cache file > `page_count * page_size`, truncates to match
+- Integration test: insert 1000 rows, VACUUM, verify cache file shrinks
+
+---
+
 ## Phase 35: Tiered VFS Test Refactor
 
 Split `tests/tiered_test.rs` (5,399 lines, 49 tests) into domain-focused submodules under `tests/tiered/`.

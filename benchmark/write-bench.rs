@@ -122,7 +122,6 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TieredCo
         region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
-        prefetch_hops: vec![0.33, 0.33],
         gc_enabled: true,
         ..Default::default()
     }
@@ -139,7 +138,6 @@ fn make_reader_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> T
         region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
-        prefetch_hops: vec![0.33, 0.33],
         ..Default::default()
     }
 }

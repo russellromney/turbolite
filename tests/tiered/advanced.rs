@@ -1,6 +1,6 @@
 //! Advanced tests: PPG config, TTL eviction, compression/dictionary, cache management, autovacuum.
 
-use turbolite::tiered::{GroupingStrategy, TieredConfig, TieredVfs};
+use turbolite::tiered::{TieredConfig, TieredVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -511,7 +511,6 @@ fn test_evict_tree_by_name() {
     // Step 2: Import via import_sqlite_file (builds BTreeAware manifest)
     let mut config = test_config("evict_tree", cache_dir.path());
     config.pages_per_group = 8;
-    config.grouping_strategy = turbolite::tiered::GroupingStrategy::BTreeAware;
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
@@ -667,7 +666,6 @@ fn test_evict_tree_skips_pending_flush_groups() {
     // Step 2: Import via import_sqlite_file (builds BTreeAware manifest with tree_name_to_groups)
     let mut config = test_config("evict_tree_pending", cache_dir.path());
     config.pages_per_group = 8;
-    config.grouping_strategy = GroupingStrategy::BTreeAware;
     config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();

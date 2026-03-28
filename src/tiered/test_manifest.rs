@@ -631,23 +631,7 @@ fn test_btreeaware_group_size() {
 }
 
 #[test]
-fn test_positional_prefetch_neighbors() {
-    let m = Manifest {
-        page_count: 100,
-        pages_per_group: 32,
-        strategy: GroupingStrategy::Positional,
-        ..Manifest::empty()
-    };
-    match m.prefetch_neighbors(1) {
-        PrefetchNeighbors::RadialFanout { total_groups } => {
-            assert_eq!(total_groups, 4); // ceil(100/32)
-        }
-        _ => panic!("Positional should return RadialFanout"),
-    }
-}
-
-#[test]
-fn test_btreeaware_prefetch_neighbors() {
+fn test_prefetch_siblings() {
     let mut m = Manifest {
         page_count: 20,
         pages_per_group: 8,
@@ -669,20 +653,10 @@ fn test_btreeaware_prefetch_neighbors() {
     m.build_page_index();
 
     // gid=0 is in a btree with siblings [0, 1]
-    match m.prefetch_neighbors(0) {
-        PrefetchNeighbors::BTreeSiblings(siblings) => {
-            assert_eq!(siblings, vec![0, 1]);
-        }
-        _ => panic!("BTreeAware should return BTreeSiblings"),
-    }
+    assert_eq!(m.prefetch_siblings(0), vec![0, 1]);
 
     // gid=2 is NOT in any btree
-    match m.prefetch_neighbors(2) {
-        PrefetchNeighbors::BTreeSiblings(siblings) => {
-            assert!(siblings.is_empty(), "non-btree group should have empty siblings");
-        }
-        _ => panic!("BTreeAware should return BTreeSiblings"),
-    }
+    assert!(m.prefetch_siblings(2).is_empty(), "non-btree group should have empty siblings");
 }
 
 #[test]

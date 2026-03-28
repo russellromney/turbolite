@@ -477,7 +477,6 @@ impl Vfs for TieredVfs {
                 self.config.compression_level,
                 self.config.read_only,
                 self.config.sync_mode,
-                self.config.prefetch_hops.clone(),
                 self.config.prefetch_search.clone(),
                 self.config.prefetch_lookup.clone(),
                 Some(Arc::clone(&self.prefetch_pool)),

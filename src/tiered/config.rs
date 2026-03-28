@@ -163,7 +163,6 @@ impl Default for TieredConfig {
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             region: None,
             cache_ttl_secs: 3600,
-            prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")

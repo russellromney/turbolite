@@ -29,10 +29,6 @@ pub struct TieredHandle {
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
     tree_miss_counts: HashMap<String, u8>,
-    /// Miss counter for pages not belonging to any known tree (Positional strategy).
-    default_miss_count: u8,
-    /// Radial prefetch schedule (Positional strategy).
-    prefetch_hops: Vec<f32>,
     /// Prefetch schedule for SEARCH queries (aggressive warmup).
     prefetch_search: Vec<f32>,
     /// Prefetch schedule for index lookups / point queries (conservative).
@@ -104,7 +100,6 @@ impl TieredHandle {
         compression_level: i32,
         read_only: bool,
         sync_mode: SyncMode,
-        prefetch_hops: Vec<f32>,
         prefetch_search: Vec<f32>,
         prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
@@ -277,8 +272,6 @@ impl TieredHandle {
             read_only,
             sync_mode,
             tree_miss_counts: HashMap::new(),
-            default_miss_count: 0,
-            prefetch_hops,
             prefetch_search,
             prefetch_lookup,
             search_trees: HashSet::new(),
@@ -318,8 +311,6 @@ impl TieredHandle {
             read_only: false,
             sync_mode: SyncMode::Durable,
             tree_miss_counts: HashMap::new(),
-            default_miss_count: 0,
-            prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
@@ -349,30 +340,26 @@ impl TieredHandle {
         self.passthrough_file.is_some()
     }
 
-    /// Get miss count for a tree (or default if no tree name).
+    /// Get miss count for a tree. Returns 0 for unknown trees.
     fn miss_count(&self, tree_name: Option<&String>) -> u8 {
         match tree_name {
             Some(name) => *self.tree_miss_counts.get(name).unwrap_or(&0),
-            None => self.default_miss_count,
+            None => 0,
         }
     }
 
-    /// Increment miss count for a tree (or default).
+    /// Increment miss count for a tree.
     fn increment_misses(&mut self, tree_name: Option<&String>) {
-        match tree_name {
-            Some(name) => {
-                let count = self.tree_miss_counts.entry(name.clone()).or_insert(0);
-                *count = count.saturating_add(1);
-            }
-            None => self.default_miss_count = self.default_miss_count.saturating_add(1),
+        if let Some(name) = tree_name {
+            let count = self.tree_miss_counts.entry(name.clone()).or_insert(0);
+            *count = count.saturating_add(1);
         }
     }
 
-    /// Reset miss count for a tree (or default) on cache hit.
+    /// Reset miss count for a tree on cache hit.
     fn reset_misses(&mut self, tree_name: Option<&String>) {
-        match tree_name {
-            Some(name) => { self.tree_miss_counts.remove(name); }
-            None => self.default_miss_count = 0,
+        if let Some(name) = tree_name {
+            self.tree_miss_counts.remove(name);
         }
     }
 
@@ -638,95 +625,53 @@ impl TieredHandle {
             false
         };
 
-        match manifest.prefetch_neighbors(current_gid) {
-            PrefetchNeighbors::BTreeSiblings(siblings) => {
-                let eligible: Vec<u64> = siblings.iter()
-                    .copied()
-                    .filter(|&gid| gid != current_gid && cache.group_state(gid) == GroupState::None)
-                    .collect();
-                if eligible.is_empty() {
-                    return;
-                }
+        // BTreeAware: prefetch sibling groups from the same B-tree.
+        let siblings = manifest.prefetch_siblings(current_gid);
+        let eligible: Vec<u64> = siblings.iter()
+            .copied()
+            .filter(|&gid| gid != current_gid && cache.group_state(gid) == GroupState::None)
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
 
-                // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
-                // Per-tree miss counts ensure independent tracking across trees in a query.
-                let tree_name = manifest.group_to_tree_name.get(&current_gid);
-                let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
-                let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
+        // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
+        let tree_name = manifest.group_to_tree_name.get(&current_gid);
+        let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
+        let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
 
-                let miss_count = self.miss_count(tree_name);
-                let hop_idx = miss_count.saturating_sub(1) as usize;
-                let fraction = if hop_idx < hops.len() {
-                    hops[hop_idx]
-                } else {
-                    1.0
-                };
-                if fraction <= 0.0 {
-                    if std::env::var("BENCH_VERBOSE").is_ok() {
-                        eprintln!(
-                            "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
-                            current_gid, miss_count,
-                            if is_search { "search " } else { "" },
-                        );
-                    }
-                    return;
-                }
-                let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
-                let mut submitted = 0usize;
-
-                for &gid in &eligible {
-                    if submitted >= max_submit { break; }
-                    try_submit(gid, &mut submitted);
-                }
-
-                if std::env::var("BENCH_VERBOSE").is_ok() {
-                    eprintln!(
-                        "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
-                        current_gid, miss_count, fraction * 100.0,
-                        eligible.len(), submitted,
-                        if is_search { "search" } else { "default" },
-                    );
-                }
+        let miss_count = self.miss_count(tree_name);
+        let hop_idx = miss_count.saturating_sub(1) as usize;
+        let fraction = if hop_idx < hops.len() {
+            hops[hop_idx]
+        } else {
+            1.0
+        };
+        if fraction <= 0.0 {
+            if std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!(
+                    "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
+                    current_gid, miss_count,
+                    if is_search { "search " } else { "" },
+                );
             }
+            return;
+        }
+        let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
+        let mut submitted = 0usize;
 
-            PrefetchNeighbors::RadialFanout { total_groups } => {
-                if total_groups <= 1 {
-                    return;
-                }
+        for &gid in &eligible {
+            if submitted >= max_submit { break; }
+            try_submit(gid, &mut submitted);
+        }
 
-                let hop_idx = (self.default_miss_count as usize).saturating_sub(1);
-                let fraction = if hop_idx < self.prefetch_hops.len() {
-                    self.prefetch_hops[hop_idx]
-                } else {
-                    1.0
-                };
-                let prefetch_count = ((total_groups as f32) * fraction).ceil() as u64;
-                if prefetch_count == 0 {
-                    return;
-                }
-
-                let mut submitted = 0usize;
-                for delta in 1..=total_groups {
-                    if submitted as u64 >= prefetch_count { break; }
-                    // Forward
-                    let fwd = current_gid + delta;
-                    if fwd < total_groups {
-                        try_submit(fwd, &mut submitted);
-                    }
-                    // Backward
-                    if delta <= current_gid && (submitted as u64) < prefetch_count {
-                        let bwd = current_gid - delta;
-                        try_submit(bwd, &mut submitted);
-                    }
-                }
-
-                if std::env::var("BENCH_VERBOSE").is_ok() {
-                    eprintln!(
-                        "  [prefetch] from gid={} miss={} hop_frac={:.2} submitted={}/{}",
-                        current_gid, self.default_miss_count, fraction, submitted, prefetch_count,
-                    );
-                }
-            }
+        if std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
+                current_gid, miss_count, fraction * 100.0,
+                eligible.len(), submitted,
+                if is_search { "search" } else { "default" },
+            );
         }
     }
 

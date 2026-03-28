@@ -62,29 +62,14 @@ pub fn import_sqlite_file(
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
     let version = 1u64;
-    let strategy = config.grouping_strategy;
-
     eprintln!(
-        "[import] encoding: {} (sub_ppf={}) strategy={:?}",
+        "[import] encoding: {} (sub_ppf={})",
         if use_seekable { "seekable multi-frame" } else { "legacy single-frame" },
         sub_ppf,
-        strategy,
     );
 
-    // Build group page lists and btree manifest based on strategy
-    let (group_pages_list, btrees_manifest) = match strategy {
-        GroupingStrategy::Positional => {
-            // Sequential chunking: group g = pages [g*ppg .. (g+1)*ppg)
-            let mut groups: Vec<Vec<u64>> = Vec::new();
-            for gid in 0..total_groups {
-                let start = gid * ppg as u64;
-                let end = std::cmp::min(start + ppg as u64, page_count);
-                groups.push((start..end).collect());
-            }
-            eprintln!("[import] positional: {} groups", groups.len());
-            (groups, HashMap::new())
-        }
-        GroupingStrategy::BTreeAware => {
+    // Walk B-trees to discover page ownership and build groups
+    let (group_pages_list, btrees_manifest) = {
             // Walk B-trees to discover page ownership
             eprintln!("[import] walking B-trees...");
             let walk_result = crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
@@ -163,7 +148,6 @@ pub fn import_sqlite_file(
             }
 
             (group_pages_list, btrees_manifest)
-        }
     };
 
     let actual_groups = group_pages_list.len();
@@ -355,8 +339,8 @@ pub fn import_sqlite_file(
         index_chunk_keys,
         frame_tables,
         sub_pages_per_frame: if use_seekable { sub_ppf } else { 0 },
-        strategy,
-        group_pages: if strategy == GroupingStrategy::Positional { Vec::new() } else { group_pages_list },
+        strategy: GroupingStrategy::BTreeAware,
+        group_pages: group_pages_list,
         btrees: btrees_manifest,
         page_index: HashMap::new(),
         btree_groups: HashMap::new(),
