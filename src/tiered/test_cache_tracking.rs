@@ -770,3 +770,119 @@ fn test_set_sub_chunk_byte_size_recomputes() {
     t.set_sub_chunk_byte_size(1024);
     assert_eq!(t.current_cache_bytes, 2048);
 }
+
+// ── Phase Stalingrad-b: weighted eviction tests ──
+
+#[test]
+fn test_touch_increments_access_count() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    t.mark_present(id, SubChunkTier::Data);
+
+    assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 0);
+    t.touch(id);
+    assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 1);
+    t.touch(id);
+    assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 2);
+}
+
+#[test]
+fn test_access_count_capped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+
+    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    t.mark_present(id, SubChunkTier::Data);
+
+    for _ in 0..200 {
+        t.touch(id);
+    }
+    // Should be capped at ACCESS_COUNT_CAP (64)
+    assert_eq!(t.access_counts[&id], 64);
+}
+
+#[test]
+fn test_weighted_eviction_frequency_matters() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let rarely = SubChunkId { group_id: 0, frame_index: 0 };
+    let often = SubChunkId { group_id: 1, frame_index: 0 };
+
+    // Both Data tier, same recency (close enough)
+    t.mark_present(rarely, SubChunkTier::Data);
+    t.mark_present(often, SubChunkTier::Data);
+
+    // Touch `often` many times to boost its frequency score
+    for _ in 0..30 {
+        t.touch(often);
+    }
+    // Touch `rarely` just once (same recency as often now)
+    t.touch(rarely);
+
+    // Evict should pick `rarely` (lower frequency = lower score)
+    let evicted = t.evict_one();
+    assert_eq!(evicted, Some(rarely), "rarely-accessed should be evicted first");
+}
+
+#[test]
+fn test_weighted_eviction_tier_dominates_frequency() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let data_hot = SubChunkId { group_id: 0, frame_index: 0 };
+    let index_cold = SubChunkId { group_id: 1, frame_index: 0 };
+
+    t.mark_present(data_hot, SubChunkTier::Data);
+    t.mark_present(index_cold, SubChunkTier::Index);
+
+    // Max out data_hot frequency (score approaches Data max = 2.0)
+    for _ in 0..64 {
+        t.touch(data_hot);
+    }
+    // index_cold: zero frequency, but tier bonus = 10.0 (score >= 10.0)
+
+    // Touch both to give similar recency
+    t.touch(data_hot);
+    t.touch(index_cold);
+
+    // Data max score ~2.0, Index min score ~10.0
+    // Tier dominates: hottest Data evicts before coldest Index
+    let evicted = t.evict_one();
+    assert_eq!(evicted, Some(data_hot),
+        "Data tier should be evicted before Index regardless of frequency");
+}
+
+#[test]
+fn test_weighted_eviction_cold_index_survives_hot_data() {
+    // Even a completely cold Index (loaded once, never accessed again)
+    // survives over a heavily-accessed Data sub-chunk.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let data = SubChunkId { group_id: 0, frame_index: 0 };
+    let index = SubChunkId { group_id: 1, frame_index: 0 };
+
+    t.mark_present(data, SubChunkTier::Data);
+    t.mark_present(index, SubChunkTier::Index);
+
+    // Don't touch index at all after mark_present
+    // Touch data heavily
+    for _ in 0..64 {
+        t.touch(data);
+    }
+
+    let evicted = t.evict_one();
+    assert_eq!(evicted, Some(data), "Data evicts before Index even when Data is hot");
+}

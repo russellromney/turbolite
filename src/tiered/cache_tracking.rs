@@ -101,6 +101,11 @@ pub(crate) enum SubChunkTier {
     Data = 2,
 }
 
+/// Maximum access count before capping. Prevents a heavily-accessed sub-chunk
+/// from becoming effectively immortal. At cap=64, a sub-chunk accessed 64 times
+/// gets max frequency score but can still be evicted if tier + recency say so.
+const ACCESS_COUNT_CAP: u32 = 64;
+
 /// Tracks which sub-chunks are present in the local cache file.
 /// Replaces per-page PageBitmap with per-sub-chunk granularity.
 /// Eviction operates on sub-chunks with tiered priority (Pinned > Index > Data).
@@ -111,6 +116,9 @@ pub(crate) struct SubChunkTracker {
     pub(crate) tiers: HashMap<SubChunkId, SubChunkTier>,
     /// Last access time per sub-chunk (for LRU within a tier).
     pub(crate) access_times: HashMap<SubChunkId, Instant>,
+    /// Access count per sub-chunk (for frequency-weighted eviction).
+    /// Capped at ACCESS_COUNT_CAP to prevent immortal sub-chunks.
+    pub(crate) access_counts: HashMap<SubChunkId, u32>,
     /// Current total cached bytes (sub-chunk granularity). Updated inside mutex
     /// alongside `present` for perfect consistency with tracker state.
     pub(crate) current_cache_bytes: u64,
@@ -139,6 +147,7 @@ impl SubChunkTracker {
             present,
             tiers,
             access_times,
+            access_counts: HashMap::new(),
             current_cache_bytes: 0, // recomputed once sub_chunk_byte_size is set
             sub_chunk_byte_size: 0,
             pages_per_group,
@@ -158,6 +167,7 @@ impl SubChunkTracker {
             present,
             tiers,
             access_times,
+            access_counts: HashMap::new(),
             current_cache_bytes: 0,
             sub_chunk_byte_size: 0,
             pages_per_group,
@@ -254,9 +264,13 @@ impl SubChunkTracker {
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
 
-    /// Touch a sub-chunk's access time (for LRU).
+    /// Touch a sub-chunk: update access time and increment access count (capped).
     pub(crate) fn touch(&mut self, id: SubChunkId) {
         self.access_times.insert(id, Instant::now());
+        let count = self.access_counts.entry(id).or_insert(0);
+        if *count < ACCESS_COUNT_CAP {
+            *count += 1;
+        }
     }
 
     /// Touch the sub-chunk containing a page.
@@ -273,11 +287,24 @@ impl SubChunkTracker {
     }
 
     /// Evict one sub-chunk, skipping groups in skip_groups (dirty/pending/fetching).
-    /// Picks highest tier number (Data first), then oldest access time within tier.
-    /// Never evicts Pinned sub-chunks.
+    /// Uses weighted scoring: tier bonus (dominant) + recency + frequency.
+    /// Lower score = more evictable. Never evicts Pinned sub-chunks.
+    ///
+    /// Score = tier_bonus + recency_score + frequency_score
+    /// - tier_bonus: Data=0.0, Index=10.0 (additive, so ANY Index always beats ANY Data)
+    /// - recency_score: 0.0 (oldest, 1hr+) to 1.0 (just accessed)
+    /// - frequency_score: 0.0 (never touched) to 1.0 (hit ACCESS_COUNT_CAP times)
+    ///
+    /// Data scores range [0.0, 2.0]. Index scores range [10.0, 12.0].
+    /// Tier always dominates: the hottest Data (2.0) is evicted before the coldest Index (10.0).
+    /// Within a tier, frequency + recency break ties.
     pub(crate) fn evict_one_skipping(&mut self, skip_groups: &HashSet<u64>) -> Option<SubChunkId> {
-        let epoch = Instant::now() - Duration::from_secs(3600);
-        let mut candidate: Option<(SubChunkId, SubChunkTier, Instant)> = None;
+        let now = Instant::now();
+        let max_age = Duration::from_secs(3600);
+        let epoch = now - max_age;
+        let cap = ACCESS_COUNT_CAP as f64;
+
+        let mut candidate: Option<(SubChunkId, f64)> = None; // (id, score)
         for id in &self.present {
             let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
             if tier == SubChunkTier::Pinned {
@@ -286,17 +313,32 @@ impl SubChunkTracker {
             if skip_groups.contains(&(id.group_id as u64)) {
                 continue;
             }
+
+            let tier_bonus = match tier {
+                SubChunkTier::Data => 0.0,
+                SubChunkTier::Index => 10.0,
+                SubChunkTier::Pinned => unreachable!(),
+            };
+
             let access = self.access_times.get(id).copied().unwrap_or(epoch);
+            let age_secs = now.duration_since(access).as_secs_f64();
+            let recency_score = 1.0 - (age_secs / max_age.as_secs_f64()).min(1.0);
+
+            let count = self.access_counts.get(id).copied().unwrap_or(0) as f64;
+            let frequency_score = (count / cap).min(1.0);
+
+            let score = tier_bonus + recency_score + frequency_score;
+
             match &candidate {
-                None => candidate = Some((*id, tier, access)),
-                Some((_, ct, ca)) => {
-                    if tier > *ct || (tier == *ct && access < *ca) {
-                        candidate = Some((*id, tier, access));
+                None => candidate = Some((*id, score)),
+                Some((_, cs)) => {
+                    if score < *cs {
+                        candidate = Some((*id, score));
                     }
                 }
             }
         }
-        if let Some((id, _, _)) = candidate {
+        if let Some((id, _)) = candidate {
             self.remove(id);
             Some(id)
         } else {
@@ -329,6 +371,7 @@ impl SubChunkTracker {
         }
         self.tiers.remove(&id);
         self.access_times.remove(&id);
+        self.access_counts.remove(&id);
     }
 
     /// Remove all sub-chunks for a given group.
@@ -389,6 +432,7 @@ impl SubChunkTracker {
         self.present.clear();
         self.tiers.clear();
         self.access_times.clear();
+        self.access_counts.clear();
         self.current_cache_bytes = 0;
     }
 
