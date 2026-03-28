@@ -40,11 +40,20 @@ BTreeAware is strictly better with per-query schedule tuning. Remove Positional 
 
 ---
 
-## Gallipoli: Normandy Leftovers
+## Gallipoli: Connection Open Performance + Packaging
 > After: Midway (remaining) · Before: Somme
 
-- [ ] `SELECT turbolite_register('vfs_name', '/path/to/base', 3)` SQL function for runtime VFS registration
-- [ ] Integration test: C program loads extension, registers VFS, roundtrip
+### a. Skip S3 manifest fetch on reconnect
+Every `open()` call hits S3 to fetch the manifest, even when the VFS already has a fresh copy in memory. For multi-tenant servers opening hundreds of connections/sec, this is redundant latency and S3 cost.
+
+- [ ] Use `shared_manifest` (already on TieredVfs) instead of `s3.get_manifest()` when the manifest is already loaded
+- [ ] First open (cold start): fetch from S3 as today
+- [ ] Subsequent opens: use in-memory manifest (checkpoints already update it)
+- [ ] Add `manifest_loaded: AtomicBool` on TieredVfs to track whether first fetch has happened
+- [ ] Test: second connection open does zero S3 GETs (check s3.fetch_count before/after)
+- [ ] Test: checkpoint updates shared manifest, next open sees new page count without S3 fetch
+
+### b. Packaging cleanup
 - [ ] Test: missing .so in Python package produces clear error message
 - [ ] pkg-config `.pc` file for system install discovery
 
