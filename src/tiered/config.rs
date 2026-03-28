@@ -123,8 +123,8 @@ pub struct TieredConfig {
     pub sub_pages_per_frame: u32,
     /// Enable automatic garbage collection after each checkpoint.
     /// When true, old page group versions replaced during checkpoint are
-    /// deleted from S3 immediately after the new manifest is uploaded.
-    /// Default: false (old versions accumulate, enabling point-in-time restore).
+    /// deleted from S3 asynchronously after the new manifest is uploaded.
+    /// Default: true. Set to false only for debugging or if external tooling manages S3 lifecycle.
     pub gc_enabled: bool,
     /// Load all index leaf bundles on VFS open (default true).
     /// When true, index leaf pages are fetched in parallel during connection open,
@@ -191,7 +191,7 @@ impl Default for TieredConfig {
             #[cfg(feature = "zstd")]
             dictionary: None,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
-            gc_enabled: false,
+            gc_enabled: true,
             eager_index_load: true,
             encryption_key: None,
             grouping_strategy: GroupingStrategy::default(),

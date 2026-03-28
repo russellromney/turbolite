@@ -1983,14 +1983,15 @@ impl DatabaseHandle for TieredHandle {
         // Persist bitmap
         let _ = cache.persist_bitmap();
 
-        // Post-checkpoint GC: delete old page group/interior chunk versions
+        // Post-checkpoint GC: delete old page group/interior chunk versions asynchronously.
+        // Phase Thermopylae: fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
         if self.gc_enabled && !replaced_keys.is_empty() {
-            eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
-            if let Err(e) = s3.delete_objects(&replaced_keys) {
-                eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
-            } else {
-                eprintln!("[gc] deleted {} old versions", replaced_keys.len());
-            }
+            let gc_s3 = Arc::clone(self.s3.as_ref().expect("s3 client required"));
+            let runtime = gc_s3.runtime.clone();
+            eprintln!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
+            runtime.spawn(async move {
+                gc_s3.delete_objects_async_owned(replaced_keys).await;
+            });
         }
 
         Ok(())

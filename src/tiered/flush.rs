@@ -465,7 +465,8 @@ pub(crate) fn flush_dirty_groups_to_s3(
     // Persist bitmap
     let _ = cache.persist_bitmap();
 
-    // 10. Post-flush GC: delete old page group/interior chunk versions
+    // 10. Post-flush GC: delete old page group/interior chunk versions.
+    // Sync here (flush_to_s3 is user-initiated, blocking is acceptable).
     if gc_enabled && !replaced_keys.is_empty() {
         eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
         if let Err(e) = s3.delete_objects(&replaced_keys) {

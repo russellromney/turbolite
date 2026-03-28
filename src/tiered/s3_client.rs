@@ -93,7 +93,11 @@ impl S3Client {
         }
     }
 
-    pub(crate) fn manifest_key(&self) -> String {
+    pub(crate) fn manifest_key_msgpack(&self) -> String {
+        self.s3_key("manifest.msgpack")
+    }
+
+    pub(crate) fn manifest_key_json(&self) -> String {
         self.s3_key("manifest.json")
     }
 
@@ -381,9 +385,23 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.get_manifest_async())
     }
 
+    /// Phase Thermopylae: try msgpack first, fall back to JSON for automigration.
     pub(crate) async fn get_manifest_async(&self) -> io::Result<Option<Manifest>> {
-        let key = self.manifest_key();
-        match self.get_object_async(&key).await? {
+        // Try msgpack first
+        let msgpack_key = self.manifest_key_msgpack();
+        if let Some(bytes) = self.get_object_async(&msgpack_key).await? {
+            let mut manifest: Manifest = rmp_serde::from_slice(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid manifest msgpack: {}", e),
+                )
+            })?;
+            manifest.build_page_index();
+            return Ok(Some(manifest));
+        }
+        // Fall back to JSON (pre-Thermopylae manifests)
+        let json_key = self.manifest_key_json();
+        match self.get_object_async(&json_key).await? {
             Some(bytes) => {
                 let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
                     io::Error::new(
@@ -402,11 +420,12 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.put_manifest_async(manifest))
     }
 
+    /// Phase Thermopylae: always write msgpack.
     pub(crate) async fn put_manifest_async(&self, manifest: &Manifest) -> io::Result<()> {
-        let key = self.manifest_key();
-        let json = serde_json::to_vec(manifest)
+        let key = self.manifest_key_msgpack();
+        let data = rmp_serde::to_vec(manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.put_object_async(&key, json, Some("application/json")).await
+        self.put_object_async(&key, data, Some("application/msgpack")).await
     }
 
     /// Delete a batch of S3 objects by key. Handles batching (AWS limit: 1000/request).
@@ -454,6 +473,17 @@ impl S3Client {
                 })?;
         }
         Ok(())
+    }
+
+    /// Fire-and-forget async delete for background GC. Owns the keys vec.
+    /// Logs errors internally instead of returning them.
+    pub(crate) async fn delete_objects_async_owned(&self, keys: Vec<String>) {
+        let count = keys.len();
+        if let Err(e) = self.delete_objects_async(&keys).await {
+            eprintln!("[gc] ERROR: background delete of {} objects failed: {}", count, e);
+        } else {
+            eprintln!("[gc] deleted {} old versions", count);
+        }
     }
 
     /// List all S3 object keys under this client's prefix.

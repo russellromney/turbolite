@@ -1,27 +1,12 @@
 # turbolite Roadmap
 
-## Thermopylae: Tunable GC + Autovacuum Integration
+## Thermopylae: GC + Msgpack Manifest + Autovacuum
 > After: Kursk · Before: Marathon
 
-### a. Tunable GC policy
-- [ ] `gc_keep_versions: u32` -- number of old page group versions to retain (default 0 = delete all). Enables point-in-time restore window.
-- [ ] `gc_max_age_secs: u64` -- delete old versions older than N seconds. Alternative to version count.
-- [ ] Combine with existing `gc_enabled` flag: `gc_enabled=true, gc_keep_versions=5` keeps last 5 versions.
-
-### b. Autovacuum-triggered GC
-- [ ] Hook GC into SQLite's autovacuum: after incremental autovacuum frees pages and checkpoint flushes to S3, automatically GC orphaned page groups.
-- [ ] `PRAGMA auto_vacuum=INCREMENTAL` + periodic `PRAGMA incremental_vacuum(N)` should "just work" through the VFS -- verify with integration test.
-- [ ] Test: enable autovacuum, insert/delete cycles, verify S3 object count stabilizes.
-
-### c. CLI
-- [ ] `turbolite gc --bucket X --prefix Y` -- one-shot full GC scan
-- [ ] `turbolite gc --dry-run` -- list orphans without deleting
-
-### d. Msgpack manifest
-- [ ] Replace JSON manifest with msgpack (`rmp-serde`). Smaller, faster serialize/deserialize.
-- [ ] S3 key: `manifest.msgpack` (content type `application/msgpack`)
-- [ ] Automigrate: `get_manifest` tries msgpack first, falls back to JSON. Next `put_manifest` writes msgpack. Old `manifest.json` cleaned up by GC.
-- [ ] `SubChunkTracker` local persistence can stay JSON (local-only, not worth changing)
+### b. `turbolite_gc()` SQL function
+- [ ] `turbolite_gc()`: full orphan scan (list all S3 keys, diff against manifest, delete orphans), returns deleted count
+- [ ] FFI + ext_entry.c registration, same pattern as turbolite_cache_info
+- [ ] Tests: orphans cleaned up, live keys preserved, returns correct count, no-op when no orphans
 
 ---
 

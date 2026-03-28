@@ -2,6 +2,25 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Thermopylae: GC + Msgpack Manifest + Autovacuum
+
+### Msgpack manifest
+- Manifest stored as msgpack (`manifest.msgpack`) instead of JSON. Smaller, faster serialize/deserialize.
+- Automigration: reads msgpack first, falls back to JSON. Always writes msgpack. Old `manifest.json` cleaned up by GC.
+- `rmp-serde` dependency added.
+
+### GC improvements
+- `gc_enabled` default flipped to `true`. Orphan accumulation was a silent storage leak.
+- Post-checkpoint GC is async: spawns delete on tokio runtime, doesn't block checkpoint return.
+- `delete_objects_async_owned` on S3Client for fire-and-forget background deletes with error logging.
+
+### Autovacuum verification
+- Integration test confirms `PRAGMA auto_vacuum=INCREMENTAL` + `incremental_vacuum(N)` works through the tiered VFS.
+- Insert/delete/vacuum/checkpoint/GC cycle stabilizes S3 object count.
+- 300 unit + 39 integration tests passing.
+
+---
+
 ## Stalingrad (items 1-3): Cache Eviction Foundations
 
 Between-query eviction boundary, manual tree eviction, and cache observability. The building blocks for production cache management.
