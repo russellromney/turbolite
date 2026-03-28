@@ -490,6 +490,7 @@ impl Vfs for TieredVfs {
                 self.access_history.clone(),
                 self.config.query_plan_prefetch,
                 self.config.max_cache_bytes,
+                self.config.evict_on_checkpoint,
             ))
         } else {
             if let Some(parent) = path.parent() {

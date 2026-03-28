@@ -225,6 +225,77 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     }
 }
 
+/// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
+/// Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
+/// db must be a valid sqlite3 handle, sql must be a valid C string.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_warm(
+    db: *mut std::ffi::c_void,
+    sql: *const std::os::raw::c_char,
+) -> *const std::os::raw::c_char {
+    thread_local! {
+        static WARM_BUF: std::cell::RefCell<std::ffi::CString> =
+            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
+    }
+    if sql.is_null() {
+        return std::ptr::null();
+    }
+    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            let json = h.warm_from_plan(&accesses);
+            match std::ffi::CString::new(json) {
+                Ok(c) => {
+                    WARM_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    })
+                }
+                Err(_) => std::ptr::null(),
+            }
+        }
+        None => std::ptr::null(),
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_warm(
+    _db: *mut std::ffi::c_void,
+    _sql: *const std::os::raw::c_char,
+) -> *const std::os::raw::c_char {
+    std::ptr::null()
+}
+
+/// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
+/// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {
+    if tier.is_null() {
+        return -1;
+    }
+    let tier_str = match std::ffi::CStr::from_ptr(tier).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => h.evict_tier(tier_str) as i32,
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict(_tier: *const std::os::raw::c_char) -> i32 {
+    -1
+}
+
 #[cfg(not(feature = "tiered"))]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {

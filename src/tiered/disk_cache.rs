@@ -44,6 +44,16 @@ pub(crate) struct DiskCache {
     /// Used by evict_group and clear_cache to clear the correct bitmap bits.
     /// Updated when the manifest changes (via set_group_pages).
     pub(crate) group_pages: parking_lot::RwLock<Vec<Vec<u64>>>,
+
+    // ── Phase Stalingrad-c: cache stats counters ──
+    /// Cache hits (page was in bitmap/cache, served from local disk).
+    pub(crate) stat_hits: AtomicU64,
+    /// Cache misses (page not cached, triggered S3 fetch).
+    pub(crate) stat_misses: AtomicU64,
+    /// Sub-chunks evicted (by budget enforcement, TTL, or manual eviction).
+    pub(crate) stat_evictions: AtomicU64,
+    /// Bytes evicted from cache.
+    pub(crate) stat_bytes_evicted: AtomicU64,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -146,6 +156,10 @@ impl DiskCache {
             page_size: std::sync::atomic::AtomicU32::new(page_size),
             encryption_key,
             group_pages: parking_lot::RwLock::new(group_pages),
+            stat_hits: AtomicU64::new(0),
+            stat_misses: AtomicU64::new(0),
+            stat_evictions: AtomicU64::new(0),
+            stat_bytes_evicted: AtomicU64::new(0),
         })
     }
 
@@ -553,7 +567,7 @@ impl DiskCache {
     }
 
     /// Get page numbers for a sub-chunk within a group.
-    fn sub_chunk_page_nums(&self, id: SubChunkId) -> Vec<u64> {
+    pub(crate) fn sub_chunk_page_nums(&self, id: SubChunkId) -> Vec<u64> {
         let gp = self.group_pages.read();
         if let Some(explicit) = gp.get(id.group_id as usize) {
             let spf = self.sub_pages_per_frame as usize;
@@ -573,7 +587,7 @@ impl DiskCache {
     }
 
     /// Clear bitmap bits and hole-punch pages on Linux.
-    fn clear_pages_from_disk(&self, page_nums: &[u64]) {
+    pub(crate) fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
             let mut bitmap = self.bitmap.lock();
             for &pnum in page_nums {
@@ -622,7 +636,10 @@ impl DiskCache {
     pub(crate) fn evict_sub_chunk(&self, id: SubChunkId) {
         let page_nums = self.sub_chunk_page_nums(id);
         self.clear_pages_from_disk(&page_nums);
+        let scbs = self.tracker.lock().sub_chunk_byte_size;
         self.tracker.lock().remove(id);
+        self.stat_evictions.fetch_add(1, Ordering::Relaxed);
+        self.stat_bytes_evicted.fetch_add(scbs, Ordering::Relaxed);
     }
 
     /// Evict sub-chunks until cache is within budget. Skips groups in skip_groups
@@ -655,9 +672,16 @@ impl DiskCache {
                 }
             }
             // Remove from tracker, then clean disk
-            self.tracker.lock().remove(id);
+            let scbs = {
+                let mut tracker = self.tracker.lock();
+                let scbs = tracker.sub_chunk_byte_size;
+                tracker.remove(id);
+                scbs
+            };
             let page_nums = self.sub_chunk_page_nums(id);
             self.clear_pages_from_disk(&page_nums);
+            self.stat_evictions.fetch_add(1, Ordering::Relaxed);
+            self.stat_bytes_evicted.fetch_add(scbs, Ordering::Relaxed);
             evicted += 1;
         }
         evicted

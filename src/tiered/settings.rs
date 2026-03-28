@@ -134,8 +134,12 @@ pub unsafe extern "C" fn turbolite_config_set(
             }
         }
         "cache_limit" => {
-            // "0" means unlimited, otherwise must parse as byte size
             if parse_byte_size(value_str).is_none() {
+                return 1;
+            }
+        }
+        "evict_on_checkpoint" => {
+            if !matches!(value_str, "true" | "false" | "1" | "0") {
                 return 1;
             }
         }

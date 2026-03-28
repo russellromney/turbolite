@@ -71,6 +71,8 @@ pub struct TieredHandle {
     // --- Phase Stalingrad: cache eviction ---
     /// Maximum cache size in bytes. None = unlimited.
     cache_limit: Option<u64>,
+    /// Evict data tier after successful checkpoint S3 upload.
+    evict_on_checkpoint: bool,
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
@@ -114,6 +116,7 @@ impl TieredHandle {
         access_history: Option<prediction::SharedAccessHistory>,
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
+        evict_on_checkpoint: bool,
     ) -> Self {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
@@ -292,6 +295,7 @@ impl TieredHandle {
             access_history,
             dirty_btrees: HashSet::new(),
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
+            evict_on_checkpoint,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -332,6 +336,7 @@ impl TieredHandle {
             access_history: None,
             dirty_btrees: HashSet::new(),
             cache_limit: None,
+            evict_on_checkpoint: false,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -997,6 +1002,9 @@ impl DatabaseHandle for TieredHandle {
                             self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
                         }
                     }
+                    "evict_on_checkpoint" => {
+                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
+                    }
                     _ => {}
                 }
             }
@@ -1082,10 +1090,12 @@ impl DatabaseHandle for TieredHandle {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
+            cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
         // 5. Cache miss - fetch from S3.
+        cache.stat_misses.fetch_add(1, Ordering::Relaxed);
         let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
@@ -1096,6 +1106,9 @@ impl DatabaseHandle for TieredHandle {
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
+            // Convert miss to hit (prefetch completed between check and fetch)
+            cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
+            cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -1983,6 +1996,27 @@ impl DatabaseHandle for TieredHandle {
         // Persist bitmap
         let _ = cache.persist_bitmap();
 
+        // Phase Marathon: truncate cache file if it's larger than current page_count.
+        // After VACUUM, page_count decreases but the sparse cache file retains its old size.
+        {
+            let current_page_count = self.manifest.read().page_count;
+            let ps = *self.page_size.read() as u64;
+            if current_page_count > 0 && ps > 0 {
+                let target_size = current_page_count * ps;
+                let file = cache.cache_file.write();
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > target_size {
+                        if let Err(e) = file.set_len(target_size) {
+                            eprintln!("[sync] WARN: cache truncation failed: {}", e);
+                        } else {
+                            eprintln!("[sync] cache truncated: {}B -> {}B ({} pages)",
+                                meta.len(), target_size, current_page_count);
+                        }
+                    }
+                }
+            }
+        }
+
         // Post-checkpoint GC: delete old page group/interior chunk versions asynchronously.
         // Phase Thermopylae: fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
         if self.gc_enabled && !replaced_keys.is_empty() {
@@ -1992,6 +2026,33 @@ impl DatabaseHandle for TieredHandle {
             runtime.spawn(async move {
                 gc_s3.delete_objects_async_owned(replaced_keys).await;
             });
+        }
+
+        // Phase Stalingrad-e: evict data tier after successful checkpoint upload.
+        if self.evict_on_checkpoint {
+            if let Some(cache) = &self.cache {
+                let mut tracker = cache.tracker.lock();
+                let to_evict: Vec<SubChunkId> = tracker.present.iter()
+                    .filter(|id| {
+                        let t = tracker.tiers.get(id).copied().unwrap_or(cache_tracking::SubChunkTier::Data);
+                        t == cache_tracking::SubChunkTier::Data
+                    })
+                    .copied()
+                    .collect();
+                let scbs = tracker.sub_chunk_byte_size;
+                let count = to_evict.len();
+                for id in &to_evict {
+                    tracker.remove(*id);
+                }
+                drop(tracker);
+                for id in &to_evict {
+                    let page_nums = cache.sub_chunk_page_nums(*id);
+                    cache.clear_pages_from_disk(&page_nums);
+                }
+                cache.stat_evictions.fetch_add(count as u64, Ordering::Relaxed);
+                cache.stat_bytes_evicted.fetch_add(count as u64 * scbs, Ordering::Relaxed);
+                eprintln!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
+            }
         }
 
         Ok(())

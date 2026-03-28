@@ -47,7 +47,9 @@ extern int turbolite_config_set(const char *key, const char *value);
 /* Rust functions -- Phase Stalingrad: cache eviction + observability.
  * Defined in src/ext.rs. */
 extern int turbolite_evict_tree(const char *tree_names);
+extern int turbolite_evict(const char *tier);
 extern const char *turbolite_cache_info(void);
+extern const char *turbolite_warm(sqlite3 *db, const char *sql);
 
 /* ── SQL functions ──────────────────────────────────────────────── */
 
@@ -188,6 +190,56 @@ static void turbolite_cache_info_func(
     const char *json = turbolite_cache_info();
     if (!json) {
         sqlite3_result_error(ctx, "turbolite_cache_info: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/*
+ * turbolite_evict(tier TEXT)
+ * Evict cached sub-chunks by tier: 'data', 'index', or 'all'.
+ * Returns number of sub-chunks evicted.
+ */
+static void turbolite_evict_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *tier = (const char *)sqlite3_value_text(argv[0]);
+    if (!tier) {
+        sqlite3_result_error(ctx, "turbolite_evict: tier argument required ('data', 'index', or 'all')", -1);
+        return;
+    }
+    int evicted = turbolite_evict(tier);
+    if (evicted < 0) {
+        sqlite3_result_error(ctx, "turbolite_evict: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, evicted);
+}
+
+/*
+ * turbolite_warm(sql TEXT)
+ * Pre-warm cache for a planned query. Runs EQP, extracts tree names,
+ * submits their page groups to the prefetch pool. Non-blocking.
+ * Returns JSON: {"trees_warmed": [...], "groups_submitted": N}
+ */
+static void turbolite_warm_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *sql = (const char *)sqlite3_value_text(argv[0]);
+    if (!sql) {
+        sqlite3_result_error(ctx, "turbolite_warm: SQL argument required", -1);
+        return;
+    }
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    const char *json = turbolite_warm(db, sql);
+    if (!json) {
+        sqlite3_result_error(ctx, "turbolite_warm: no tiered VFS registered", -1);
         return;
     }
     sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
@@ -337,6 +389,14 @@ int sqlite3_turbolite_init(
     sqlite3_create_function_v2(
         db, "turbolite_cache_info", 0,
         SQLITE_UTF8, 0, turbolite_cache_info_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_evict", 1,
+        SQLITE_UTF8, 0, turbolite_evict_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_warm", 1,
+        SQLITE_UTF8, 0, turbolite_warm_func, 0, 0, 0
     );
 
     return SQLITE_OK;

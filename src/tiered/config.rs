@@ -161,6 +161,11 @@ pub struct TieredConfig {
     /// Active queries can temporarily exceed this limit; eviction only fires between queries.
     /// Also settable via TURBOLITE_CACHE_LIMIT env var or turbolite_config_set('cache_limit', '512MB').
     pub max_cache_bytes: Option<u64>,
+    /// Phase Stalingrad-e: evict data tier after successful checkpoint S3 upload.
+    /// Good for serverless/bursty workloads where you want a clean slate after committing.
+    /// Only evicts Data tier (interior + index remain for next query's fast path).
+    /// Default: false. Also settable via turbolite_config_set('evict_on_checkpoint', 'true').
+    pub evict_on_checkpoint: bool,
 }
 
 impl Default for TieredConfig {
@@ -202,6 +207,9 @@ impl Default for TieredConfig {
                 .ok()
                 .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
                 .and_then(|n| if n == 0 { None } else { Some(n) }),
+            evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
         }
     }
 }
