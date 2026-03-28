@@ -2,6 +2,23 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Phase 35: Tiered VFS Test Refactor
+
+Split `tests/tiered_test.rs` (5,399 lines, 49 tests) into domain-focused submodules under `tests/tiered/`.
+
+- Entry point: `tests/tiered.rs` declaring submodules
+- `helpers.rs` (179 lines): shared setup, S3 verification, unique VFS names
+- `basic.rs` (1,122 lines, 13 tests): core I/O, checkpoint, manifest, cold read, caching
+- `data_ops.rs` (1,100 lines, 9 tests): UPDATE/DELETE, VACUUM, rollback, BLOBs, journal modes
+- `indexes.rs` (547 lines, 4 tests): index bundles, eager load, OLTP, small-PPG integrity
+- `gc.rs` (282 lines, 4 tests): post-checkpoint GC, disabled GC, full scan, no-orphan safety
+- `encryption.rs` (1,142 lines, 9 tests): encryption, wrong key, key rotation, add/remove
+- `advanced.rs` (954 lines, 10 tests): PPG config, TTL eviction, dictionary, cache management, autovacuum
+
+Tests can now run by domain: `cargo test --test tiered tiered::gc`
+
+---
+
 ## Thermopylae: GC + Msgpack Manifest + Autovacuum
 
 ### Msgpack manifest
