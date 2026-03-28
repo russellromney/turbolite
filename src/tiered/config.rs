@@ -155,6 +155,12 @@ pub struct TieredConfig {
     /// the loadable extension populates the queue via EQP at start of step().
     /// Default: true (no-op if the extension trace callback is not installed).
     pub query_plan_prefetch: bool,
+    /// Phase Stalingrad: maximum cache size in bytes (sub-chunk granularity).
+    /// When set, the VFS evicts sub-chunks between queries to stay within budget.
+    /// None = unlimited (default). 0 = unlimited.
+    /// Active queries can temporarily exceed this limit; eviction only fires between queries.
+    /// Also settable via TURBOLITE_CACHE_LIMIT env var or turbolite_config_set('cache_limit', '512MB').
+    pub max_cache_bytes: Option<u64>,
 }
 
 impl Default for TieredConfig {
@@ -192,6 +198,10 @@ impl Default for TieredConfig {
             prediction_enabled: false,
             sync_mode: SyncMode::default(),
             query_plan_prefetch: true,
+            max_cache_bytes: std::env::var("TURBOLITE_CACHE_LIMIT")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .and_then(|n| if n == 0 { None } else { Some(n) }),
         }
     }
 }

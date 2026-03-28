@@ -604,3 +604,169 @@ fn test_sub_chunk_tracker_no_encryption_stays_plaintext() {
     let parse_result: Result<Vec<(SubChunkId, u8)>, _> = serde_json::from_slice(&raw);
     assert!(parse_result.is_ok(), "unencrypted tracker file must be valid JSON");
 }
+
+// ── Phase Stalingrad: cache byte tracking tests ──
+
+#[test]
+fn test_current_cache_bytes_tracks_mark_present() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(256 * 1024); // 256KB per sub-chunk
+
+    assert_eq!(t.current_cache_bytes, 0);
+
+    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
+    let id2 = SubChunkId { group_id: 0, frame_index: 1 };
+    t.mark_present(id1, SubChunkTier::Data);
+    assert_eq!(t.current_cache_bytes, 256 * 1024);
+
+    t.mark_present(id2, SubChunkTier::Index);
+    assert_eq!(t.current_cache_bytes, 512 * 1024);
+
+    // Marking same sub-chunk again doesn't double-count
+    t.mark_present(id1, SubChunkTier::Data);
+    assert_eq!(t.current_cache_bytes, 512 * 1024);
+}
+
+#[test]
+fn test_current_cache_bytes_tracks_remove() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
+    let id2 = SubChunkId { group_id: 1, frame_index: 0 };
+    t.mark_present(id1, SubChunkTier::Data);
+    t.mark_present(id2, SubChunkTier::Data);
+    assert_eq!(t.current_cache_bytes, 200);
+
+    t.remove(id1);
+    assert_eq!(t.current_cache_bytes, 100);
+
+    // Removing non-existent doesn't go negative
+    t.remove(id1);
+    assert_eq!(t.current_cache_bytes, 100);
+}
+
+#[test]
+fn test_current_cache_bytes_clear_all_resets() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    for i in 0..10 {
+        t.mark_present(SubChunkId { group_id: i, frame_index: 0 }, SubChunkTier::Data);
+    }
+    assert_eq!(t.current_cache_bytes, 1000);
+
+    t.clear_all();
+    assert_eq!(t.current_cache_bytes, 0);
+}
+
+#[test]
+fn test_mark_pinned_and_index_track_bytes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
+    let id2 = SubChunkId { group_id: 1, frame_index: 0 };
+
+    // mark_pinned on new sub-chunk increments bytes
+    t.mark_pinned(id1);
+    assert_eq!(t.current_cache_bytes, 100);
+
+    // mark_index on new sub-chunk increments bytes
+    t.mark_index(id2);
+    assert_eq!(t.current_cache_bytes, 200);
+
+    // Promoting existing to pinned doesn't double-count
+    t.mark_pinned(id2);
+    assert_eq!(t.current_cache_bytes, 200);
+}
+
+#[test]
+fn test_pinned_bytes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
+    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Index);
+    t.mark_present(SubChunkId { group_id: 2, frame_index: 0 }, SubChunkTier::Data);
+
+    assert_eq!(t.pinned_bytes(), 100);
+    assert_eq!(t.current_cache_bytes, 300);
+}
+
+#[test]
+fn test_evict_one_skipping() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    let id_skip = SubChunkId { group_id: 0, frame_index: 0 };
+    let id_keep = SubChunkId { group_id: 1, frame_index: 0 };
+    let id_evict = SubChunkId { group_id: 2, frame_index: 0 };
+
+    // All Data tier, stagger access times
+    t.mark_present(id_skip, SubChunkTier::Data);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    t.mark_present(id_keep, SubChunkTier::Data);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    t.mark_present(id_evict, SubChunkTier::Data);
+
+    // Group 0 is in skip set, so id_skip won't be evicted
+    // Oldest non-skipped is id_keep (group 1)
+    let mut skip = HashSet::new();
+    skip.insert(0u64);
+
+    let evicted = t.evict_one_skipping(&skip);
+    assert_eq!(evicted, Some(id_keep));
+    assert_eq!(t.current_cache_bytes, 200);
+
+    // id_skip and id_evict remain
+    assert!(t.present.contains(&id_skip));
+    assert!(t.present.contains(&id_evict));
+}
+
+#[test]
+fn test_evict_one_skipping_all_skipped_returns_none() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+    t.set_sub_chunk_byte_size(100);
+
+    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
+    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Pinned);
+
+    let mut skip = HashSet::new();
+    skip.insert(0u64); // skip the only Data sub-chunk
+
+    // Only Pinned and skipped remain, nothing evictable
+    let evicted = t.evict_one_skipping(&skip);
+    assert!(evicted.is_none());
+    assert_eq!(t.current_cache_bytes, 200);
+}
+
+#[test]
+fn test_set_sub_chunk_byte_size_recomputes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tracker.json");
+    let mut t = SubChunkTracker::new(path, 8, 4);
+
+    // Add sub-chunks before byte size is known
+    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
+    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Data);
+    assert_eq!(t.current_cache_bytes, 0); // byte size unknown
+
+    // Now set byte size: recomputes from present.len()
+    t.set_sub_chunk_byte_size(1024);
+    assert_eq!(t.current_cache_bytes, 2048);
+}

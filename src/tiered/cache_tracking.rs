@@ -111,6 +111,12 @@ pub(crate) struct SubChunkTracker {
     pub(crate) tiers: HashMap<SubChunkId, SubChunkTier>,
     /// Last access time per sub-chunk (for LRU within a tier).
     pub(crate) access_times: HashMap<SubChunkId, Instant>,
+    /// Current total cached bytes (sub-chunk granularity). Updated inside mutex
+    /// alongside `present` for perfect consistency with tracker state.
+    pub(crate) current_cache_bytes: u64,
+    /// Bytes per sub-chunk (sub_pages_per_frame * page_size). Set at construction
+    /// or updated via set_sub_chunk_byte_size() when page_size becomes known.
+    pub(crate) sub_chunk_byte_size: u64,
     /// Config: pages per group.
     pub(crate) pages_per_group: u32,
     /// Config: pages per sub-chunk frame.
@@ -128,10 +134,13 @@ impl SubChunkTracker {
         let (present, tiers) = Self::load_from_disk(&path, None);
         let now = Instant::now();
         let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
+        // sub_chunk_byte_size starts at 0; set once page_size is known via set_sub_chunk_byte_size()
         Self {
             present,
             tiers,
             access_times,
+            current_cache_bytes: 0, // recomputed once sub_chunk_byte_size is set
+            sub_chunk_byte_size: 0,
             pages_per_group,
             sub_pages_per_frame,
             path,
@@ -149,6 +158,8 @@ impl SubChunkTracker {
             present,
             tiers,
             access_times,
+            current_cache_bytes: 0,
+            sub_chunk_byte_size: 0,
             pages_per_group,
             sub_pages_per_frame,
             path,
@@ -189,10 +200,25 @@ impl SubChunkTracker {
         self.present.contains(id)
     }
 
+    /// Set the sub-chunk byte size (sub_pages_per_frame * page_size).
+    /// Called once page_size is known. Recomputes current_cache_bytes from present count.
+    pub(crate) fn set_sub_chunk_byte_size(&mut self, byte_size: u64) {
+        self.sub_chunk_byte_size = byte_size;
+        self.current_cache_bytes = self.present.len() as u64 * byte_size;
+    }
+
+    /// Bytes used by Pinned sub-chunks (cache floor, never evicted).
+    pub(crate) fn pinned_bytes(&self) -> u64 {
+        self.count_tier(SubChunkTier::Pinned) as u64 * self.sub_chunk_byte_size
+    }
+
     /// Record a sub-chunk as cached with the given tier.
     /// If already present at a higher priority (lower tier number), keeps the higher priority.
     pub(crate) fn mark_present(&mut self, id: SubChunkId, tier: SubChunkTier) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(t) if t <= tier => {} // already at equal or higher priority
@@ -205,22 +231,26 @@ impl SubChunkTracker {
     /// Also ensures the sub-chunk is in the present set — pages may have been
     /// written via write_page (bitmap-only), so tracker may not know about them yet.
     pub(crate) fn mark_pinned(&mut self, id: SubChunkId) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         self.tiers.insert(id, SubChunkTier::Pinned);
-        // Ensure access time exists
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
 
     /// Promote a sub-chunk to Index tier (index leaf pages).
     /// Also ensures the sub-chunk is in the present set.
     pub(crate) fn mark_index(&mut self, id: SubChunkId) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(SubChunkTier::Pinned) => {} // don't demote from pinned
             _ => { self.tiers.insert(id, SubChunkTier::Index); }
         }
-        // Ensure access time exists
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
 
@@ -239,21 +269,27 @@ impl SubChunkTracker {
     /// least-recently-used sub-chunk. Returns the evicted sub-chunk or None if empty.
     /// Never evicts Pinned (tier 0) sub-chunks.
     pub(crate) fn evict_one(&mut self) -> Option<SubChunkId> {
-        // Find eviction candidate: highest tier number, oldest access time
-        // Use a single "epoch" instant for sub-chunks missing access times,
-        // so they are treated as the oldest (most evictable) entries.
+        self.evict_one_skipping(&HashSet::new())
+    }
+
+    /// Evict one sub-chunk, skipping groups in skip_groups (dirty/pending/fetching).
+    /// Picks highest tier number (Data first), then oldest access time within tier.
+    /// Never evicts Pinned sub-chunks.
+    pub(crate) fn evict_one_skipping(&mut self, skip_groups: &HashSet<u64>) -> Option<SubChunkId> {
         let epoch = Instant::now() - Duration::from_secs(3600);
         let mut candidate: Option<(SubChunkId, SubChunkTier, Instant)> = None;
         for id in &self.present {
             let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
             if tier == SubChunkTier::Pinned {
-                continue; // never evict pinned
+                continue;
+            }
+            if skip_groups.contains(&(id.group_id as u64)) {
+                continue;
             }
             let access = self.access_times.get(id).copied().unwrap_or(epoch);
             match &candidate {
                 None => candidate = Some((*id, tier, access)),
                 Some((_, ct, ca)) => {
-                    // Prefer higher tier number (Data > Index), then older access
                     if tier > *ct || (tier == *ct && access < *ca) {
                         candidate = Some((*id, tier, access));
                     }
@@ -288,7 +324,9 @@ impl SubChunkTracker {
 
     /// Remove a sub-chunk from tracking (does NOT zero disk).
     pub(crate) fn remove(&mut self, id: SubChunkId) {
-        self.present.remove(&id);
+        if self.present.remove(&id) {
+            self.current_cache_bytes = self.current_cache_bytes.saturating_sub(self.sub_chunk_byte_size);
+        }
         self.tiers.remove(&id);
         self.access_times.remove(&id);
     }
@@ -351,6 +389,7 @@ impl SubChunkTracker {
         self.present.clear();
         self.tiers.clear();
         self.access_times.clear();
+        self.current_cache_bytes = 0;
     }
 
     /// Number of tracked sub-chunks.

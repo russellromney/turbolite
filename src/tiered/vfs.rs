@@ -317,7 +317,9 @@ impl TieredVfs {
 
         // Build set of live keys from manifest
         let mut live_keys: HashSet<String> = HashSet::new();
-        live_keys.insert(self.s3.manifest_key());
+        // Phase Thermopylae: msgpack manifest is the live one.
+        // Old manifest.json is an orphan and will be GC'd.
+        live_keys.insert(self.s3.manifest_key_msgpack());
         for key in &manifest.page_group_keys {
             if !key.is_empty() {
                 live_keys.insert(key.clone());
@@ -487,6 +489,7 @@ impl Vfs for TieredVfs {
                 self.prediction.clone(),
                 self.access_history.clone(),
                 self.config.query_plan_prefetch,
+                self.config.max_cache_bytes,
             ))
         } else {
             if let Some(parent) = path.parent() {

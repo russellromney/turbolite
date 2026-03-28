@@ -61,6 +61,42 @@ pub fn parse_hops(value: &str) -> Option<Vec<f32>> {
     hops.ok().filter(|v| !v.is_empty())
 }
 
+/// Parse a human-readable byte size string into u64 bytes.
+/// Supports: "512MB", "2GB", "512M", "2G", "1073741824", "0" (unlimited).
+/// Case-insensitive suffixes. Returns None on parse failure.
+pub fn parse_byte_size(value: &str) -> Option<u64> {
+    let s = value.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Try pure numeric first
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    // Split into number + suffix
+    let s_upper = s.to_uppercase();
+    let (num_part, multiplier) = if s_upper.ends_with("GB") {
+        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
+    } else if s_upper.ends_with("MB") {
+        (&s[..s.len() - 2], 1024u64 * 1024)
+    } else if s_upper.ends_with("KB") {
+        (&s[..s.len() - 2], 1024u64)
+    } else if s_upper.ends_with('G') {
+        (&s[..s.len() - 1], 1024u64 * 1024 * 1024)
+    } else if s_upper.ends_with('M') {
+        (&s[..s.len() - 1], 1024u64 * 1024)
+    } else if s_upper.ends_with('K') {
+        (&s[..s.len() - 1], 1024u64)
+    } else {
+        return None;
+    };
+    let num: f64 = num_part.trim().parse().ok()?;
+    if num < 0.0 {
+        return None;
+    }
+    Some((num * multiplier as f64) as u64)
+}
+
 /// FFI entry point: `turbolite_config_set(key, value)` SQL function.
 ///
 /// # Safety
@@ -94,6 +130,12 @@ pub unsafe extern "C" fn turbolite_config_set(
         }
         "plan_aware" => {
             if !matches!(value_str, "true" | "false" | "1" | "0") {
+                return 1;
+            }
+        }
+        "cache_limit" => {
+            // "0" means unlimited, otherwise must parse as byte size
+            if parse_byte_size(value_str).is_none() {
                 return 1;
             }
         }
@@ -198,6 +240,59 @@ mod tests {
         // Invalid: plan_aware bad value
         let bad_plan = CString::new("maybe").unwrap();
         assert_eq!(unsafe { turbolite_config_set(plan_key.as_ptr(), bad_plan.as_ptr()) }, 1);
+
+        drain_settings();
+    }
+
+    #[test]
+    fn test_parse_byte_size_numeric() {
+        assert_eq!(parse_byte_size("0"), Some(0));
+        assert_eq!(parse_byte_size("1073741824"), Some(1073741824));
+        assert_eq!(parse_byte_size("512"), Some(512));
+    }
+
+    #[test]
+    fn test_parse_byte_size_suffixes() {
+        assert_eq!(parse_byte_size("512MB"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_byte_size("512mb"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2GB"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2G"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("512M"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_byte_size("64KB"), Some(64 * 1024));
+        assert_eq!(parse_byte_size("64K"), Some(64 * 1024));
+    }
+
+    #[test]
+    fn test_parse_byte_size_fractional() {
+        assert_eq!(parse_byte_size("1.5GB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+        assert_eq!(parse_byte_size("0.5M"), Some((0.5 * 1024.0 * 1024.0) as u64));
+    }
+
+    #[test]
+    fn test_parse_byte_size_invalid() {
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("abc"), None);
+        assert_eq!(parse_byte_size("MB"), None);
+        assert_eq!(parse_byte_size("-1GB"), None);
+    }
+
+    #[test]
+    fn test_cache_limit_ffi() {
+        use std::ffi::CString;
+        drain_settings();
+
+        // Valid: cache_limit with size
+        let key = CString::new("cache_limit").unwrap();
+        let value = CString::new("512MB").unwrap();
+        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), value.as_ptr()) }, 0);
+
+        // Valid: cache_limit 0 (unlimited)
+        let value = CString::new("0").unwrap();
+        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), value.as_ptr()) }, 0);
+
+        // Invalid: bad value
+        let bad = CString::new("not_a_size").unwrap();
+        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), bad.as_ptr()) }, 1);
 
         drain_settings();
     }

@@ -68,6 +68,10 @@ pub struct TieredHandle {
     /// B-tree names that had dirty pages this session (for write decay, applied once per flush).
     dirty_btrees: HashSet<String>,
 
+    // --- Phase Stalingrad: cache eviction ---
+    /// Maximum cache size in bytes. None = unlimited.
+    cache_limit: Option<u64>,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -109,6 +113,7 @@ impl TieredHandle {
         prediction: Option<prediction::SharedPrediction>,
         access_history: Option<prediction::SharedAccessHistory>,
         query_plan_prefetch: bool,
+        max_cache_bytes: Option<u64>,
     ) -> Self {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
@@ -286,6 +291,7 @@ impl TieredHandle {
             prediction,
             access_history,
             dirty_btrees: HashSet::new(),
+            cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -325,6 +331,7 @@ impl TieredHandle {
             prediction: None,
             access_history: None,
             dirty_btrees: HashSet::new(),
+            cache_limit: None,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -914,11 +921,38 @@ impl DatabaseHandle for TieredHandle {
         // cached data down to the budget.
         //
         // Order matters: evict BEFORE draining settings and plan queue, so the
-        // new query starts with a trimmed cache. The eviction itself is a no-op
-        // until size-based eviction is wired up (Phase Stalingrad a).
+        // new query starts with a trimmed cache.
         if query_plan::check_and_clear_end_query() {
-            // TODO(Stalingrad-a): call self.evict_to_budget() here once
-            // size-based eviction is implemented.
+            if let Some(limit) = self.cache_limit {
+                if let Some(cache) = &self.cache {
+                    // Build skip set: dirty pages + pending flush + fetching groups
+                    let mut skip_groups: HashSet<u64> = HashSet::new();
+                    // Dirty page groups
+                    {
+                        let dirty = self.dirty_page_nums.read();
+                        let manifest = self.manifest.read();
+                        for &pn in dirty.iter() {
+                            if let Some(loc) = manifest.page_location(pn) {
+                                skip_groups.insert(loc.group_id);
+                            }
+                        }
+                    }
+                    // Pending S3 flush groups
+                    if let Ok(pending) = self.s3_dirty_groups.lock() {
+                        skip_groups.extend(pending.iter());
+                    }
+                    // Groups currently being fetched by prefetch workers
+                    {
+                        let states = cache.group_states.lock();
+                        for (i, s) in states.iter().enumerate() {
+                            if s.load(Ordering::Acquire) == GroupState::Fetching as u8 {
+                                skip_groups.insert(i as u64);
+                            }
+                        }
+                    }
+                    cache.evict_to_budget(limit, &skip_groups);
+                }
+            }
         }
 
         // 3e. Drain per-connection settings (turbolite_config_set SQL function).
@@ -957,6 +991,11 @@ impl DatabaseHandle for TieredHandle {
                     }
                     "plan_aware" => {
                         self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    "cache_limit" => {
+                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
+                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                        }
                     }
                     _ => {}
                 }

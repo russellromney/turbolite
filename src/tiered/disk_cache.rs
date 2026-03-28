@@ -344,6 +344,9 @@ impl DiskCache {
     /// Update the page size (needed when writer VFS learns page size from first write).
     pub(crate) fn set_page_size(&self, new_page_size: u32) {
         self.page_size.store(new_page_size, Ordering::Release);
+        // Update tracker's sub_chunk_byte_size so cache byte accounting is correct
+        let scbs = self.sub_pages_per_frame as u64 * new_page_size as u64;
+        self.tracker.lock().set_sub_chunk_byte_size(scbs);
     }
 
     /// Check if a page is present in the local cache.
@@ -579,6 +582,149 @@ impl DiskCache {
         let states = self.group_states.lock();
         if let Some(s) = states.get(gid as usize) {
             s.store(GroupState::None as u8, Ordering::Release);
+        }
+    }
+
+    /// Current cache size in bytes (sub-chunk granularity).
+    pub(crate) fn cache_bytes(&self) -> u64 {
+        self.tracker.lock().current_cache_bytes
+    }
+
+    /// Evict a single sub-chunk from the cache. Clears bitmap, hole-punches on Linux,
+    /// removes from tracker. Does NOT reset group state (other sub-chunks may remain).
+    pub(crate) fn evict_sub_chunk(&self, id: SubChunkId) {
+        // Determine which pages this sub-chunk covers
+        let gp = self.group_pages.read();
+        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(id.group_id as usize) {
+            // BTreeAware: slice from the group's page list
+            let spf = self.sub_pages_per_frame as usize;
+            let start = id.frame_index as usize * spf;
+            let end = std::cmp::min(start + spf, explicit.len());
+            if start < explicit.len() {
+                explicit[start..end].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            // Positional fallback
+            let ppg = self.pages_per_group as u64;
+            let spf = self.sub_pages_per_frame as u64;
+            let start = id.group_id as u64 * ppg + id.frame_index as u64 * spf;
+            let end = start + spf;
+            (start..end).collect()
+        };
+        drop(gp);
+
+        // Clear bitmap
+        {
+            let mut bitmap = self.bitmap.lock();
+            for &pnum in &page_nums {
+                bitmap.clear(pnum);
+            }
+        }
+
+        // Hole punch on Linux to reclaim NVMe blocks
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = self.cache_file.write();
+            let ps = self.page_size.load(Ordering::Acquire) as u64;
+            for &pnum in &page_nums {
+                let offset = (pnum * ps) as libc::off_t;
+                let len = ps as libc::off_t;
+                unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len,
+                    );
+                }
+            }
+        }
+
+        // Remove from tracker (byte accounting handled inside remove())
+        self.tracker.lock().remove(id);
+    }
+
+    /// Evict sub-chunks until cache is within budget. Skips groups in skip_groups
+    /// (dirty, pending flush, or currently being fetched). Returns number evicted.
+    ///
+    /// Each iteration: lock tracker -> pick victim -> unlock -> evict from disk.
+    /// This avoids holding the tracker lock during I/O.
+    pub(crate) fn evict_to_budget(&self, budget_bytes: u64, skip_groups: &HashSet<u64>) -> u32 {
+        let mut evicted = 0u32;
+        loop {
+            // Check current size and find victim (single lock acquisition)
+            let victim = {
+                let mut tracker = self.tracker.lock();
+                if tracker.current_cache_bytes <= budget_bytes {
+                    break;
+                }
+                // Don't evict below pinned floor
+                if tracker.current_cache_bytes <= tracker.pinned_bytes() {
+                    break;
+                }
+                tracker.evict_one_skipping(skip_groups)
+            };
+            match victim {
+                Some(id) => {
+                    self.evict_sub_chunk_disk_only(id);
+                    evicted += 1;
+                }
+                None => break, // nothing evictable
+            }
+        }
+        evicted
+    }
+
+    /// Evict a sub-chunk's disk presence (bitmap + hole punch) WITHOUT touching tracker.
+    /// Used by evict_to_budget where tracker.remove() is called inside the lock
+    /// and disk cleanup happens outside it.
+    fn evict_sub_chunk_disk_only(&self, id: SubChunkId) {
+        let gp = self.group_pages.read();
+        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(id.group_id as usize) {
+            let spf = self.sub_pages_per_frame as usize;
+            let start = id.frame_index as usize * spf;
+            let end = std::cmp::min(start + spf, explicit.len());
+            if start < explicit.len() {
+                explicit[start..end].to_vec()
+            } else {
+                Vec::new()
+            }
+        } else {
+            let ppg = self.pages_per_group as u64;
+            let spf = self.sub_pages_per_frame as u64;
+            let start = id.group_id as u64 * ppg + id.frame_index as u64 * spf;
+            let end = start + spf;
+            (start..end).collect()
+        };
+        drop(gp);
+
+        {
+            let mut bitmap = self.bitmap.lock();
+            for &pnum in &page_nums {
+                bitmap.clear(pnum);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = self.cache_file.write();
+            let ps = self.page_size.load(Ordering::Acquire) as u64;
+            for &pnum in &page_nums {
+                let offset = (pnum * ps) as libc::off_t;
+                let len = ps as libc::off_t;
+                unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len,
+                    );
+                }
+            }
         }
     }
 
