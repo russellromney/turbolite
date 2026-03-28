@@ -54,7 +54,6 @@ extern int turbolite_evict(const char *tier);
 extern const char *turbolite_cache_info(void);
 extern const char *turbolite_warm(sqlite3 *db, const char *sql);
 extern int turbolite_evict_query(sqlite3 *db, const char *sql);
-
 /* ── SQL functions ──────────────────────────────────────────────── */
 
 static void turbolite_version_func(
@@ -456,7 +455,6 @@ int sqlite3_turbolite_init(
         db, "turbolite_gc", 0,
         SQLITE_UTF8, 0, turbolite_gc_func, 0, 0, 0
     );
-
     return SQLITE_OK;
 }
 
