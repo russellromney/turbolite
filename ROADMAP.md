@@ -25,27 +25,79 @@ upload all repacked groups, GC old keys. Cold reader verified with index scans.
 
 ---
 
-## Somme: Built-in WAL Shipping
+## Somme: WAL Durability via walrust Integration
 > After: Gallipoli · Before: Verdun (remaining)
 
-Close the durability gap between checkpoints. Ship WAL frames to S3 in the background so writes are durable before checkpoint.
+Close the durability gap between checkpoints. walrust ships WAL frames to S3; turbolite page groups serve as the snapshot. No WAL parsing in turbolite.
 
-### a. WAL frame capture + upload
-- [ ] Intercept WAL `write_all_at()` -- buffer frame bytes
-- [ ] Batch frames into segments (every 100 frames or N ms) to amortize PUT cost
-- [ ] Upload segments to `{prefix}/wal/{sequence_number}` via existing S3 client
+**Architecture:** turbolite and walrust are independent layers that compose:
+- **turbolite** owns pages: S3 page groups + local cache. The manifest version = checkpoint marker.
+- **walrust** owns WAL: ships WAL frames to S3 as LTX segments. Replays on recovery.
+- The page groups ARE the snapshot. walrust doesn't need its own snapshot mechanism.
+- WAL segments with txid > manifest version are the ones to replay on cold start.
 
-### b. Recovery
-- [ ] On open: after manifest download, list `{prefix}/wal/` objects newer than manifest version
-- [ ] Replay WAL frames into local cache before serving queries
-- [ ] Test: write data, kill before checkpoint, recover from S3 WAL segments
+**Cold start flow:**
+1. Fetch manifest from S3 (turbolite, already works)
+2. Hydrate full DB from page groups into local file (turbolite, new: `materialize_to_file()`)
+3. Download + apply WAL segments since manifest version (walrust `pull_and_apply_incrementals()`)
+4. Open DB via turbolite VFS (SQLite sees a clean DB, WAL already applied)
+5. Checkpoint (turbolite uploads dirty pages, walrust GCs old segments)
 
-### c. Cleanup
-- [ ] After checkpoint, WAL segments older than manifest version are garbage
-- [ ] Integrate with existing GC
+**Key integration: `SnapshotSource` trait.** walrust currently downloads a full LTX snapshot file for restore. With turbolite, it calls a trait method to materialize the base DB from page groups instead. This is the only cross-crate interface needed.
 
-### d. WAL write callback (future)
-- [ ] `TieredConfig::on_wal_write(fn(&[u8]))` -- optional hook for external tools
+### a. `SnapshotSource` trait (in walrust-core)
+- [ ] Define trait:
+  ```rust
+  #[async_trait]
+  pub trait SnapshotSource: Send + Sync {
+      /// Materialize the database at the given checkpoint version to a local file.
+      /// Returns the checkpoint version that was materialized.
+      async fn materialize(&self, output: &Path) -> Result<u64>;
+      /// Return the current checkpoint version (manifest version).
+      async fn checkpoint_version(&self) -> Result<u64>;
+  }
+  ```
+- [ ] walrust `restore()` accepts optional `SnapshotSource` instead of downloading LTX snapshot
+- [ ] If `SnapshotSource` provided: call `materialize()`, then apply incrementals after returned version
+- [ ] If no `SnapshotSource`: use existing LTX snapshot download (backward compat)
+- [ ] Tests: mock SnapshotSource, verify incrementals applied after materialized version
+
+### b. `materialize_to_file()` in turbolite
+- [ ] New function on `TieredSharedState` (or standalone):
+  ```rust
+  pub fn materialize_to_file(&self, output: &Path) -> io::Result<u64>
+  ```
+- [ ] Downloads ALL page groups from S3 (parallel, batched)
+- [ ] Writes pages to output file in page-number order (standard SQLite file layout)
+- [ ] Returns manifest version (= checkpoint version for walrust)
+- [ ] Implement `SnapshotSource` for turbolite's shared state
+- [ ] Tests: materialize, verify SQLite can open the file, row counts match
+
+### c. walrust integration in turbolite VFS open
+- [ ] `TieredConfig::wal_replication: bool` (default false)
+- [ ] `TURBOLITE_WAL_REPLICATION=true` env var
+- [ ] When enabled on VFS open:
+  1. Fetch manifest (existing)
+  2. Call `materialize_to_file()` to local temp file
+  3. Call walrust `pull_and_apply_incrementals()` with manifest version
+  4. Initialize VFS cache from the materialized + WAL-replayed file
+  5. Clean up temp file
+- [ ] When enabled during runtime:
+  - walrust `sync_wal()` runs on a background interval (ships WAL frames to S3)
+  - After turbolite checkpoint: signal walrust that manifest version advanced (GC old segments)
+- [ ] Tests: write data, kill before checkpoint, cold start recovers WAL-shipped data
+
+### d. WAL segment GC coordination
+- [ ] After checkpoint uploads new manifest version N, WAL segments with txid <= N are garbage
+- [ ] turbolite signals walrust (or walrust polls manifest version)
+- [ ] walrust deletes obsolete LTX segments from S3
+- [ ] Tests: segments accumulate between checkpoints, cleaned after checkpoint
+
+### e. Shared S3 credentials
+- [ ] walrust uses same bucket + endpoint as turbolite
+- [ ] WAL segments stored under `{turbolite_prefix}/wal/` (same prefix, `/wal/` subdirectory)
+- [ ] Or separate walrust prefix configurable via `TURBOLITE_WAL_PREFIX`
+- [ ] `ObjectStore` adapter: implement walrust's `ObjectStore` trait using turbolite's `S3Client` (or use `S3Backend::from_env()` with same env vars)
 
 ---
 
