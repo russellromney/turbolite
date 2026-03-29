@@ -13,6 +13,7 @@
 mod tiered {
     pub mod helpers;
     mod basic;
+    mod btree_grouping;
     mod compact;
     mod data_ops;
     mod indexes;
@@ -22,4 +23,5 @@ mod tiered {
     mod advanced;
     mod eviction;
     mod manifest_persistence;
+    mod prediction;
 }
