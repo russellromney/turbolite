@@ -23,5 +23,6 @@ mod tiered {
     mod advanced;
     mod eviction;
     mod manifest_persistence;
+    mod materialize;
     mod prediction;
 }

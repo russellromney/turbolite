@@ -638,6 +638,116 @@ impl TieredSharedState {
         ))
     }
 
+    /// Materialize the full database from S3 page groups into a local SQLite file.
+    ///
+    /// Downloads ALL page groups, decodes them, and writes pages in order to produce
+    /// a standard SQLite database file. Returns the manifest version (checkpoint version).
+    ///
+    /// This is the "snapshot source" for walrust integration: turbolite page groups
+    /// serve as the snapshot, walrust applies WAL increments on top.
+    pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
+        use std::os::unix::fs::FileExt;
+
+        let manifest = self.shared_manifest.read().clone();
+        let page_size = manifest.page_size;
+        let page_count = manifest.page_count;
+
+        if page_count == 0 || page_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "empty manifest, no data to materialize"));
+        }
+
+        eprintln!(
+            "[materialize] page_count={}, page_size={}, groups={}, version={}",
+            page_count, page_size, manifest.page_group_keys.len(), manifest.version,
+        );
+
+        // Create output file
+        let file = std::fs::File::create(output)?;
+        // Pre-allocate the file to the correct size
+        let total_size = page_count * page_size as u64;
+        file.set_len(total_size)?;
+
+        // Collect non-empty page group keys
+        let keys_with_gids: Vec<(u64, String)> = manifest.page_group_keys.iter()
+            .enumerate()
+            .filter(|(_, k)| !k.is_empty())
+            .map(|(gid, k)| (gid as u64, k.clone()))
+            .collect();
+
+        // Download in batches of 50 (parallel within each batch)
+        let batch_size = 50;
+        let total = keys_with_gids.len();
+        let use_seekable = manifest.sub_pages_per_frame > 0;
+
+        for (batch_idx, batch) in keys_with_gids.chunks(batch_size).enumerate() {
+            let keys: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
+            let data_map = self.s3.get_page_groups_by_key(&keys)?;
+
+            for &(gid, ref key) in batch {
+                let pg_data = match data_map.get(key) {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("[materialize] WARNING: missing S3 object for group {} key {}", gid, key);
+                        continue;
+                    }
+                };
+
+                let page_nums = manifest.group_page_nums(gid);
+
+                // Decode the page group
+                let ft = manifest.frame_tables.get(gid as usize);
+                let has_ft = use_seekable && ft.map(|f| !f.is_empty()).unwrap_or(false);
+
+                let decoded_pages: Vec<u8> = if has_ft {
+                    let ft = ft.unwrap();
+                    let (_pc, _ps, bulk) = decode_page_group_seekable_full(
+                        pg_data,
+                        ft,
+                        page_size,
+                        page_nums.len() as u32,
+                        page_count,
+                        0,
+                        #[cfg(feature = "zstd")]
+                        None,
+                        self.encryption_key.as_ref(),
+                    )?;
+                    bulk
+                } else {
+                    let (_pc, _ps, pages) = decode_page_group(
+                        pg_data,
+                        #[cfg(feature = "zstd")]
+                        None,
+                        self.encryption_key.as_ref(),
+                    )?;
+                    pages.into_iter().flatten().collect()
+                };
+
+                // Write each page to the correct offset in the output file
+                let ps = page_size as usize;
+                for (i, &pnum) in page_nums.iter().enumerate() {
+                    if pnum >= page_count { break; }
+                    let start = i * ps;
+                    let end = start + ps;
+                    if end <= decoded_pages.len() {
+                        file.write_all_at(&decoded_pages[start..end], pnum * page_size as u64)?;
+                    }
+                }
+            }
+
+            let done = std::cmp::min((batch_idx + 1) * batch_size, total);
+            eprintln!("[materialize] downloaded {}/{} page groups", done, total);
+        }
+
+        eprintln!(
+            "[materialize] wrote {:.1}MB to {} (version {})",
+            total_size as f64 / (1024.0 * 1024.0),
+            output.display(),
+            manifest.version,
+        );
+
+        Ok(manifest.version)
+    }
+
     /// Full GC: list all S3 objects, diff against manifest, delete orphans.
     /// Returns count of objects deleted.
     pub fn gc(&self) -> io::Result<usize> {
