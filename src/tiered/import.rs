@@ -62,7 +62,8 @@ pub fn import_sqlite_file(
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
     // Phase Somme: use SQLite's file change counter as manifest version.
-    let version = read_file_change_counter(&header).max(1);
+    let version = read_file_change_counter(&header);
+    assert!(version > 0, "file change counter must be > 0 for import (is this a valid SQLite DB with committed data?)");
     eprintln!(
         "[import] encoding: {} (sub_ppf={})",
         if use_seekable { "seekable multi-frame" } else { "legacy single-frame" },
