@@ -149,6 +149,34 @@ pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> 
     s3.get_manifest()
 }
 
+// ===== SQLite file change counter =====
+
+/// Read SQLite's file change counter from page 0 data.
+/// Offset 24 in the database header, 4 bytes big-endian.
+/// Returns 0 if page data is too short.
+///
+/// This counter increments on every transaction commit. Used as the unified
+/// version number for both turbolite manifests and walrust WAL txids (Phase Somme).
+pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
+    if page0.len() < 28 {
+        return 0;
+    }
+    u32::from_be_bytes([page0[24], page0[25], page0[26], page0[27]]) as u64
+}
+
+/// Read the file change counter from page 0 in the disk cache.
+/// Returns the current manifest version as fallback if page 0 is not cached.
+pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32, fallback_version: u64) -> u64 {
+    let mut page0 = vec![0u8; page_size as usize];
+    if cache.read_page(0, &mut page0).is_ok() {
+        let counter = read_file_change_counter(&page0);
+        if counter > 0 {
+            return counter;
+        }
+    }
+    fallback_version
+}
+
 // ===== Page group coordinate math =====
 
 pub fn group_id(page_num: u64, ppg: u32) -> u64 {

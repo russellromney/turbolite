@@ -1664,7 +1664,11 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        let next_version = self.manifest.read().version + 1;
+        // Phase Somme: use SQLite's file change counter as manifest version.
+        // Both turbolite and walrust derive version/txid from this counter,
+        // so they stay synchronized without any coordination protocol.
+        let current_version = self.manifest.read().version;
+        let next_version = read_change_counter_from_cache(&cache, page_size, current_version + 1);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut new_keys = self.manifest.read().page_group_keys.clone();
         // Track old keys being replaced (for post-checkpoint GC)

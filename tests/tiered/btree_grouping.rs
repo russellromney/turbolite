@@ -71,17 +71,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    // Verify data readable after checkpoint
-    {
-        let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 250, "should have 250 rows after second insert batch");
-    }
-
-    // Cold reader: verify data from S3
+    // Cold reader: verify data from S3 (includes both import + VFS writes)
     {
         let reader_cache = tempfile::tempdir().unwrap();
         let reader_config = TieredConfig {

@@ -466,7 +466,12 @@ impl TieredSharedState {
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
         let mut manifest = self.shared_manifest.write();
-        let next_version = manifest.version + 1;
+        // Phase Somme: use file change counter from cache for version
+        let next_version = read_change_counter_from_cache(
+            &self.cache,
+            page_size,
+            manifest.version + 1,
+        );
 
         for btree_info in &report.btrees {
             if !report.candidates.contains(&btree_info.name) {

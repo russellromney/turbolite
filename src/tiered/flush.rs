@@ -64,7 +64,12 @@ pub(crate) fn flush_dirty_groups_to_s3(
     let decoder_dict = dictionary
         .map(zstd::dict::DecoderDictionary::copy);
 
-    let next_version = manifest_snap.version + 1;
+    // Phase Somme: use SQLite's file change counter as manifest version.
+    let next_version = read_change_counter_from_cache(
+        cache,
+        manifest_snap.page_size,
+        manifest_snap.version + 1,
+    );
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();
