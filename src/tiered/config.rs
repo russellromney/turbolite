@@ -171,6 +171,16 @@ pub struct TieredConfig {
     /// Auto (default): use local manifest if present, fall back to S3.
     /// S3: always fetch from S3 (for HA followers, multi-reader).
     pub manifest_source: ManifestSource,
+    /// Phase Somme: enable WAL replication via walrust.
+    /// Ships WAL frames to S3 for transaction-level durability between checkpoints.
+    /// Requires the `wal` feature flag.
+    /// Default: false. `TURBOLITE_WAL_REPLICATION=true` to enable.
+    #[cfg(feature = "wal")]
+    pub wal_replication: bool,
+    /// Phase Somme: WAL sync interval (how often walrust ships WAL frames to S3).
+    /// Default: 1 second.
+    #[cfg(feature = "wal")]
+    pub wal_sync_interval_ms: u64,
 }
 
 impl Default for TieredConfig {
@@ -220,6 +230,15 @@ impl Default for TieredConfig {
                     _ => ManifestSource::Auto,
                 })
                 .unwrap_or_default(),
+            #[cfg(feature = "wal")]
+            wal_replication: std::env::var("TURBOLITE_WAL_REPLICATION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            #[cfg(feature = "wal")]
+            wal_sync_interval_ms: std::env::var("TURBOLITE_WAL_SYNC_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
         }
     }
 }
