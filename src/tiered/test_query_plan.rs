@@ -199,3 +199,53 @@ SEARCH users USING INDEX idx_users_email (email=?)";
     assert_eq!(result[1].tree_name, "idx_users_email");
     assert_eq!(result[1].access_type, AccessType::Search);
 }
+
+// ── End-query signal tests (Phase Stalingrad) ──
+
+#[test]
+fn test_end_query_signal_default_false() {
+    check_and_clear_end_query();
+    assert!(!check_and_clear_end_query());
+}
+
+#[test]
+fn test_end_query_signal_set_and_clear() {
+    check_and_clear_end_query();
+    signal_end_query();
+    assert!(check_and_clear_end_query());
+    assert!(!check_and_clear_end_query());
+}
+
+#[test]
+fn test_end_query_signal_multiple_signals_collapse() {
+    check_and_clear_end_query();
+    signal_end_query();
+    signal_end_query();
+    signal_end_query();
+    assert!(check_and_clear_end_query());
+    assert!(!check_and_clear_end_query());
+}
+
+#[test]
+fn test_end_query_ffi_entry_point() {
+    check_and_clear_end_query();
+    turbolite_trace_end_query();
+    assert!(check_and_clear_end_query());
+    assert!(!check_and_clear_end_query());
+}
+
+#[test]
+fn test_end_query_signal_independent_of_plan_queue() {
+    check_and_clear_end_query();
+    drain_planned_accesses();
+
+    signal_end_query();
+    push_planned_accesses(vec![
+        PlannedAccess { tree_name: "users".into(), access_type: AccessType::Scan },
+    ]);
+
+    assert!(check_and_clear_end_query());
+    let planned = drain_planned_accesses();
+    assert_eq!(planned.len(), 1);
+    assert!(!check_and_clear_end_query());
+}

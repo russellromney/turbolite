@@ -29,6 +29,10 @@ extern int turbolite_ext_register_vfs(void);
  * Defined in src/tiered/query_plan.rs (Phase Marne). */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
 
+/* Rust function -- signals query completion for between-query eviction.
+ * Defined in src/tiered/query_plan.rs (Phase Stalingrad). */
+extern void turbolite_trace_end_query(void);
+
 /* Rust bench functions -- cache control and S3 counters.
  * Defined in src/ext.rs. Available when built with tiered feature. */
 extern int turbolite_bench_clear_cache(int mode);
@@ -36,10 +40,20 @@ extern int turbolite_bench_reset_s3(void);
 extern long long turbolite_bench_s3_gets(void);
 extern long long turbolite_bench_s3_bytes(void);
 
+/* Rust function -- full GC scan. Defined in src/ext.rs. */
+extern int turbolite_gc(void);
+
 /* Rust function -- runtime config (prefetch tuning).
  * Defined in src/tiered/settings.rs. */
 extern int turbolite_config_set(const char *key, const char *value);
 
+/* Rust functions -- Phase Stalingrad: cache eviction + observability.
+ * Defined in src/ext.rs. */
+extern int turbolite_evict_tree(const char *tree_names);
+extern int turbolite_evict(const char *tier);
+extern const char *turbolite_cache_info(void);
+extern const char *turbolite_warm(sqlite3 *db, const char *sql);
+extern int turbolite_evict_query(sqlite3 *db, const char *sql);
 /* ── SQL functions ──────────────────────────────────────────────── */
 
 static void turbolite_version_func(
@@ -140,13 +154,160 @@ static void turbolite_config_set_func(
     sqlite3_result_int(ctx, 0);
 }
 
-/* ── Phase Marne: trace callback for query-plan-aware prefetch ──── */
+/*
+ * turbolite_evict_tree(tree_names TEXT)
+ * Evict cached data for named B-trees. Accepts comma-separated names.
+ * Example: SELECT turbolite_evict_tree('audit_log, idx_audit_date');
+ * Returns number of groups evicted.
+ */
+static void turbolite_evict_tree_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *names = (const char *)sqlite3_value_text(argv[0]);
+    if (!names) {
+        sqlite3_result_error(ctx, "turbolite_evict_tree: tree names required", -1);
+        return;
+    }
+    int evicted = turbolite_evict_tree(names);
+    if (evicted < 0) {
+        sqlite3_result_error(ctx, "turbolite_evict_tree: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, evicted);
+}
 
 /*
- * Trace callback installed via sqlite3_trace_v2(SQLITE_TRACE_STMT).
- * Fires at the start of sqlite3_step(), before the VDBE executes.
- * Calls Rust to run EQP on the SQL string and push planned accesses
- * to the global queue. The VFS drains the queue on first cache miss.
+ * turbolite_cache_info()
+ * Returns JSON with cache size, tier breakdown, group counts, S3 stats.
+ */
+static void turbolite_cache_info_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    const char *json = turbolite_cache_info();
+    if (!json) {
+        sqlite3_result_error(ctx, "turbolite_cache_info: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/*
+ * turbolite_evict(tier TEXT)
+ * Evict cached sub-chunks by tier: 'data', 'index', or 'all'.
+ * Returns number of sub-chunks evicted.
+ */
+static void turbolite_evict_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *tier = (const char *)sqlite3_value_text(argv[0]);
+    if (!tier) {
+        sqlite3_result_error(ctx, "turbolite_evict: tier argument required ('data', 'index', or 'all')", -1);
+        return;
+    }
+    int evicted = turbolite_evict(tier);
+    if (evicted < 0) {
+        sqlite3_result_error(ctx, "turbolite_evict: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, evicted);
+}
+
+/*
+ * turbolite_evict_query(sql TEXT)
+ * Evict cached data for trees referenced by a SQL query. Runs EQP,
+ * extracts tree names, evicts their groups.
+ * Returns number of groups evicted.
+ */
+static void turbolite_evict_query_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *sql = (const char *)sqlite3_value_text(argv[0]);
+    if (!sql) {
+        sqlite3_result_error(ctx, "turbolite_evict_query: SQL argument required", -1);
+        return;
+    }
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    int evicted = turbolite_evict_query(db, sql);
+    if (evicted < 0) {
+        sqlite3_result_error(ctx, "turbolite_evict_query: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, evicted);
+}
+
+/*
+ * turbolite_warm(sql TEXT)
+ * Pre-warm cache for a planned query. Runs EQP, extracts tree names,
+ * submits their page groups to the prefetch pool. Non-blocking.
+ * Returns JSON: {"trees_warmed": [...], "groups_submitted": N}
+ */
+static void turbolite_warm_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *sql = (const char *)sqlite3_value_text(argv[0]);
+    if (!sql) {
+        sqlite3_result_error(ctx, "turbolite_warm: SQL argument required", -1);
+        return;
+    }
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    const char *json = turbolite_warm(db, sql);
+    if (!json) {
+        sqlite3_result_error(ctx, "turbolite_warm: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/*
+ * turbolite_gc()
+ * Full orphan scan: list all S3 objects under prefix, delete those not in manifest.
+ * Returns number of deleted objects.
+ */
+static void turbolite_gc_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    int deleted = turbolite_gc();
+    if (deleted < 0) {
+        sqlite3_result_error(ctx, "turbolite_gc: no tiered VFS registered or S3 error", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, deleted);
+}
+
+/* ── Trace callback: frontrun prefetch + between-query eviction ─── */
+
+/*
+ * Trace callback installed via sqlite3_trace_v2 with two event types:
+ *
+ * SQLITE_TRACE_STMT (Phase Marne): fires at the start of sqlite3_step(),
+ * before the VDBE executes. Calls Rust to run EQP on the SQL string and
+ * push planned accesses to the global queue. The VFS drains the queue on
+ * first cache miss.
+ *
+ * SQLITE_TRACE_PROFILE (Phase Stalingrad): fires when a statement
+ * finishes. Signals query completion so the VFS can run between-query
+ * eviction on the next read. The x argument points to an int64_t with
+ * elapsed nanoseconds (unused for now, available for future stats).
  *
  * IMPORTANT: sqlite3_trace_v2 supports exactly ONE callback per
  * connection. Installing this callback overwrites any previously
@@ -160,12 +321,14 @@ static void turbolite_config_set_func(
  *
  * Overhead: EQP adds ~10us per sqlite3_step() call. This is
  * negligible for cold/warm queries where prefetch saves 100ms+,
- * but is non-zero overhead for fully-cached hot queries.
+ * but is non-zero overhead for fully-cached hot queries. The
+ * PROFILE callback is near-zero cost (one atomic store).
  *
  * Reentrant guard: running EQP inside the callback triggers another
  * sqlite3_step() which fires the trace again. The Rust side filters
  * out EXPLAIN statements, but the C guard prevents the FFI roundtrip
- * entirely for the inner call.
+ * entirely for the inner call. The guard also prevents profile events
+ * from inner EQP statements from signaling false query completions.
  */
 static __thread int turbolite_trace_reentrant = 0;
 
@@ -173,22 +336,25 @@ static int turbolite_trace_callback(
     unsigned trace_type,
     void *ctx,
     void *p,       /* sqlite3_stmt* */
-    void *x        /* const char* expanded SQL */
+    void *x        /* STMT: const char* SQL; PROFILE: int64_t* nanoseconds */
 ) {
     (void)ctx;
-    if (trace_type != SQLITE_TRACE_STMT) return 0;
     if (turbolite_trace_reentrant) return 0;
 
-    const char *sql = (const char *)x;
-    if (!sql || sql[0] == '\0') return 0;
+    if (trace_type == SQLITE_TRACE_STMT) {
+        const char *sql = (const char *)x;
+        if (!sql || sql[0] == '\0') return 0;
 
-    /* Get the db handle from the statement */
-    sqlite3_stmt *stmt = (sqlite3_stmt *)p;
-    sqlite3 *db = sqlite3_db_handle(stmt);
+        sqlite3_stmt *stmt = (sqlite3_stmt *)p;
+        sqlite3 *db = sqlite3_db_handle(stmt);
 
-    turbolite_trace_reentrant = 1;
-    turbolite_trace_push_plan(db, sql);
-    turbolite_trace_reentrant = 0;
+        turbolite_trace_reentrant = 1;
+        turbolite_trace_push_plan(db, sql);
+        turbolite_trace_reentrant = 0;
+    }
+    else if (trace_type == SQLITE_TRACE_PROFILE) {
+        turbolite_trace_end_query();
+    }
     return 0;
 }
 
@@ -216,14 +382,16 @@ int sqlite3_turbolite_init(
         return rc;
     }
 
-    /* Phase Marne: install trace callback for query-plan-aware prefetch.
-     * SQLITE_TRACE_STMT fires at start of sqlite3_step() with the SQL string.
-     * The callback runs EQP and pushes planned B-tree accesses to the global
-     * queue, which the VFS drains on first cache miss.
+    /* Install trace callback for frontrun prefetch + between-query eviction.
+     * SQLITE_TRACE_STMT: fires at start of sqlite3_step(), runs EQP, pushes
+     * planned B-tree accesses to the global queue (VFS drains on first read).
+     * SQLITE_TRACE_PROFILE: fires when statement finishes, signals end-of-query
+     * so VFS can run eviction on next read.
      *
      * WARNING: this overwrites any existing trace callback on this connection.
      * See the comment on turbolite_trace_callback above for details. */
-    rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT, turbolite_trace_callback, 0);
+    rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE,
+                          turbolite_trace_callback, 0);
     if (rc != SQLITE_OK) {
         /* Non-fatal: VFS falls back to hop schedule without query plan */
     }
@@ -262,6 +430,31 @@ int sqlite3_turbolite_init(
         SQLITE_UTF8, 0, turbolite_config_set_func, 0, 0, 0
     );
 
+    /* Phase Stalingrad: cache eviction + observability. */
+    sqlite3_create_function_v2(
+        db, "turbolite_evict_tree", 1,
+        SQLITE_UTF8, 0, turbolite_evict_tree_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_cache_info", 0,
+        SQLITE_UTF8, 0, turbolite_cache_info_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_evict", 1,
+        SQLITE_UTF8, 0, turbolite_evict_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_warm", 1,
+        SQLITE_UTF8, 0, turbolite_warm_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_evict_query", 1,
+        SQLITE_UTF8, 0, turbolite_evict_query_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_gc", 0,
+        SQLITE_UTF8, 0, turbolite_gc_func, 0, 0, 0
+    );
     return SQLITE_OK;
 }
 

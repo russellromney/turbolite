@@ -12,8 +12,10 @@ pub struct TieredHandle {
     cache: Option<Arc<DiskCache>>,
     /// Shared manifest (Arc'd so flush_to_s3 can read/update outside SQLite lock).
     manifest: Arc<RwLock<Manifest>>,
-    /// Dirty pages buffered in memory: page_num → raw (uncompressed) data
-    dirty_pages: RwLock<HashMap<u64, Vec<u8>>>,
+    /// Dirty page numbers (data lives in disk cache, not in memory).
+    /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
+    /// holding a second copy of every dirty page in memory.
+    dirty_page_nums: RwLock<HashSet<u64>>,
     /// Page group IDs that were locally checkpointed but not yet synced to S3.
     /// Populated during local-checkpoint-only mode; drained by flush_to_s3().
     /// Arc'd so flush_to_s3 can drain from outside SQLite lock.
@@ -27,10 +29,6 @@ pub struct TieredHandle {
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
     tree_miss_counts: HashMap<String, u8>,
-    /// Miss counter for pages not belonging to any known tree (Positional strategy).
-    default_miss_count: u8,
-    /// Radial prefetch schedule (Positional strategy).
-    prefetch_hops: Vec<f32>,
     /// Prefetch schedule for SEARCH queries (aggressive warmup).
     prefetch_search: Vec<f32>,
     /// Prefetch schedule for index lookups / point queries (conservative).
@@ -66,6 +64,12 @@ pub struct TieredHandle {
     /// B-tree names that had dirty pages this session (for write decay, applied once per flush).
     dirty_btrees: HashSet<String>,
 
+    // --- Phase Stalingrad: cache eviction ---
+    /// Maximum cache size in bytes. None = unlimited.
+    cache_limit: Option<u64>,
+    /// Evict data tier after successful checkpoint S3 upload.
+    evict_on_checkpoint: bool,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -96,7 +100,6 @@ impl TieredHandle {
         compression_level: i32,
         read_only: bool,
         sync_mode: SyncMode,
-        prefetch_hops: Vec<f32>,
         prefetch_search: Vec<f32>,
         prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
@@ -107,6 +110,8 @@ impl TieredHandle {
         prediction: Option<prediction::SharedPrediction>,
         access_history: Option<prediction::SharedAccessHistory>,
         query_plan_prefetch: bool,
+        max_cache_bytes: Option<u64>,
+        evict_on_checkpoint: bool,
     ) -> Self {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
@@ -259,7 +264,7 @@ impl TieredHandle {
             s3: Some(s3),
             cache: Some(cache),
             manifest: shared_manifest,
-            dirty_pages: RwLock::new(HashMap::new()),
+            dirty_page_nums: RwLock::new(HashSet::new()),
             s3_dirty_groups: shared_dirty_groups,
             page_size: RwLock::new(page_size),
             pages_per_group,
@@ -267,8 +272,6 @@ impl TieredHandle {
             read_only,
             sync_mode,
             tree_miss_counts: HashMap::new(),
-            default_miss_count: 0,
-            prefetch_hops,
             prefetch_search,
             prefetch_lookup,
             search_trees: HashSet::new(),
@@ -284,6 +287,8 @@ impl TieredHandle {
             prediction,
             access_history,
             dirty_btrees: HashSet::new(),
+            cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
+            evict_on_checkpoint,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -298,7 +303,7 @@ impl TieredHandle {
             s3: None,
             cache: None,
             manifest: Arc::new(RwLock::new(Manifest::empty())),
-            dirty_pages: RwLock::new(HashMap::new()),
+            dirty_page_nums: RwLock::new(HashSet::new()),
             s3_dirty_groups: Arc::new(Mutex::new(HashSet::new())),
             page_size: RwLock::new(0),
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
@@ -306,8 +311,6 @@ impl TieredHandle {
             read_only: false,
             sync_mode: SyncMode::Durable,
             tree_miss_counts: HashMap::new(),
-            default_miss_count: 0,
-            prefetch_hops: vec![0.33, 0.33],
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
@@ -323,6 +326,8 @@ impl TieredHandle {
             prediction: None,
             access_history: None,
             dirty_btrees: HashSet::new(),
+            cache_limit: None,
+            evict_on_checkpoint: false,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -335,30 +340,26 @@ impl TieredHandle {
         self.passthrough_file.is_some()
     }
 
-    /// Get miss count for a tree (or default if no tree name).
+    /// Get miss count for a tree. Returns 0 for unknown trees.
     fn miss_count(&self, tree_name: Option<&String>) -> u8 {
         match tree_name {
             Some(name) => *self.tree_miss_counts.get(name).unwrap_or(&0),
-            None => self.default_miss_count,
+            None => 0,
         }
     }
 
-    /// Increment miss count for a tree (or default).
+    /// Increment miss count for a tree.
     fn increment_misses(&mut self, tree_name: Option<&String>) {
-        match tree_name {
-            Some(name) => {
-                let count = self.tree_miss_counts.entry(name.clone()).or_insert(0);
-                *count = count.saturating_add(1);
-            }
-            None => self.default_miss_count = self.default_miss_count.saturating_add(1),
+        if let Some(name) = tree_name {
+            let count = self.tree_miss_counts.entry(name.clone()).or_insert(0);
+            *count = count.saturating_add(1);
         }
     }
 
-    /// Reset miss count for a tree (or default) on cache hit.
+    /// Reset miss count for a tree on cache hit.
     fn reset_misses(&mut self, tree_name: Option<&String>) {
-        match tree_name {
-            Some(name) => { self.tree_miss_counts.remove(name); }
-            None => self.default_miss_count = 0,
+        if let Some(name) = tree_name {
+            self.tree_miss_counts.remove(name);
         }
     }
 
@@ -624,95 +625,53 @@ impl TieredHandle {
             false
         };
 
-        match manifest.prefetch_neighbors(current_gid) {
-            PrefetchNeighbors::BTreeSiblings(siblings) => {
-                let eligible: Vec<u64> = siblings.iter()
-                    .copied()
-                    .filter(|&gid| gid != current_gid && cache.group_state(gid) == GroupState::None)
-                    .collect();
-                if eligible.is_empty() {
-                    return;
-                }
+        // BTreeAware: prefetch sibling groups from the same B-tree.
+        let siblings = manifest.prefetch_siblings(current_gid);
+        let eligible: Vec<u64> = siblings.iter()
+            .copied()
+            .filter(|&gid| gid != current_gid && cache.group_state(gid) == GroupState::None)
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
 
-                // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
-                // Per-tree miss counts ensure independent tracking across trees in a query.
-                let tree_name = manifest.group_to_tree_name.get(&current_gid);
-                let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
-                let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
+        // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
+        let tree_name = manifest.group_to_tree_name.get(&current_gid);
+        let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
+        let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
 
-                let miss_count = self.miss_count(tree_name);
-                let hop_idx = miss_count.saturating_sub(1) as usize;
-                let fraction = if hop_idx < hops.len() {
-                    hops[hop_idx]
-                } else {
-                    1.0
-                };
-                if fraction <= 0.0 {
-                    if std::env::var("BENCH_VERBOSE").is_ok() {
-                        eprintln!(
-                            "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
-                            current_gid, miss_count,
-                            if is_search { "search " } else { "" },
-                        );
-                    }
-                    return;
-                }
-                let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
-                let mut submitted = 0usize;
-
-                for &gid in &eligible {
-                    if submitted >= max_submit { break; }
-                    try_submit(gid, &mut submitted);
-                }
-
-                if std::env::var("BENCH_VERBOSE").is_ok() {
-                    eprintln!(
-                        "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
-                        current_gid, miss_count, fraction * 100.0,
-                        eligible.len(), submitted,
-                        if is_search { "search" } else { "default" },
-                    );
-                }
+        let miss_count = self.miss_count(tree_name);
+        let hop_idx = miss_count.saturating_sub(1) as usize;
+        let fraction = if hop_idx < hops.len() {
+            hops[hop_idx]
+        } else {
+            1.0
+        };
+        if fraction <= 0.0 {
+            if std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!(
+                    "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
+                    current_gid, miss_count,
+                    if is_search { "search " } else { "" },
+                );
             }
+            return;
+        }
+        let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
+        let mut submitted = 0usize;
 
-            PrefetchNeighbors::RadialFanout { total_groups } => {
-                if total_groups <= 1 {
-                    return;
-                }
+        for &gid in &eligible {
+            if submitted >= max_submit { break; }
+            try_submit(gid, &mut submitted);
+        }
 
-                let hop_idx = (self.default_miss_count as usize).saturating_sub(1);
-                let fraction = if hop_idx < self.prefetch_hops.len() {
-                    self.prefetch_hops[hop_idx]
-                } else {
-                    1.0
-                };
-                let prefetch_count = ((total_groups as f32) * fraction).ceil() as u64;
-                if prefetch_count == 0 {
-                    return;
-                }
-
-                let mut submitted = 0usize;
-                for delta in 1..=total_groups {
-                    if submitted as u64 >= prefetch_count { break; }
-                    // Forward
-                    let fwd = current_gid + delta;
-                    if fwd < total_groups {
-                        try_submit(fwd, &mut submitted);
-                    }
-                    // Backward
-                    if delta <= current_gid && (submitted as u64) < prefetch_count {
-                        let bwd = current_gid - delta;
-                        try_submit(bwd, &mut submitted);
-                    }
-                }
-
-                if std::env::var("BENCH_VERBOSE").is_ok() {
-                    eprintln!(
-                        "  [prefetch] from gid={} miss={} hop_frac={:.2} submitted={}/{}",
-                        current_gid, self.default_miss_count, fraction, submitted, prefetch_count,
-                    );
-                }
-            }
+        if std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
+                current_gid, miss_count, fraction * 100.0,
+                eligible.len(), submitted,
+                if is_search { "search" } else { "default" },
+            );
         }
     }
 
@@ -814,13 +773,11 @@ impl DatabaseHandle for TieredHandle {
         };
         let page_num = offset / page_size;
 
-        // 1. Check dirty pages first (new pages may not be in manifest yet)
-        {
-            let dirty = self.dirty_pages.read();
-            if let Some(raw) = dirty.get(&page_num) {
-                // No miss reset here: dirty pages are local writes, tree context
-                // isn't resolved yet. Per-tree reset happens at cache hit paths below.
-                Self::copy_raw_into_buf(raw, buf, offset, page_size);
+        // 1. Check dirty pages first (new pages may not be in manifest yet).
+        // Phase Marne: data lives in disk cache, not in memory.
+        if self.dirty_page_nums.read().contains(&page_num) {
+            if let Some(cache) = &self.cache {
+                cache.read_page(page_num, buf)?;
                 return Ok(());
             }
         }
@@ -833,9 +790,9 @@ impl DatabaseHandle for TieredHandle {
         }
 
         // 3. Look up page location (Phase Midway). Safe to .expect() here because:
-        //    - New pages (not in manifest) are always in dirty_pages (returned above)
+        //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
         //    - Pages beyond page_count are zero-filled (returned above)
-        //    - sync() assigns new pages to groups before clearing dirty_pages
+        //    - sync() assigns new pages to groups before clearing dirty_page_nums
         let manifest_ref = self.manifest.read();
         let loc = manifest_ref.page_location(page_num)
             .expect("page within manifest bounds must have group assignment");
@@ -906,7 +863,49 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // 3d. Drain per-connection settings (turbolite_config_set SQL function).
+        // 3d. Phase Stalingrad: between-query eviction trigger.
+        //
+        // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
+        // fires on statement completion and sets the end-query signal). If so,
+        // this is the boundary between two queries: the right time to evict
+        // cached data down to the budget.
+        //
+        // Order matters: evict BEFORE draining settings and plan queue, so the
+        // new query starts with a trimmed cache.
+        if query_plan::check_and_clear_end_query() {
+            if let Some(limit) = self.cache_limit {
+                if let Some(cache) = &self.cache {
+                    // Build skip set: dirty pages + pending flush + fetching groups
+                    let mut skip_groups: HashSet<u64> = HashSet::new();
+                    // Dirty page groups
+                    {
+                        let dirty = self.dirty_page_nums.read();
+                        let manifest = self.manifest.read();
+                        for &pn in dirty.iter() {
+                            if let Some(loc) = manifest.page_location(pn) {
+                                skip_groups.insert(loc.group_id);
+                            }
+                        }
+                    }
+                    // Pending S3 flush groups
+                    if let Ok(pending) = self.s3_dirty_groups.lock() {
+                        skip_groups.extend(pending.iter());
+                    }
+                    // Groups currently being fetched by prefetch workers
+                    {
+                        let states = cache.group_states.lock();
+                        for (i, s) in states.iter().enumerate() {
+                            if s.load(Ordering::Acquire) == GroupState::Fetching as u8 {
+                                skip_groups.insert(i as u64);
+                            }
+                        }
+                    }
+                    cache.evict_to_budget(limit, &skip_groups);
+                }
+            }
+        }
+
+        // 3e. Drain per-connection settings (turbolite_config_set SQL function).
         // Same global-queue pattern as plan drain. Users can tune prefetch schedules
         // before each query without reopening the connection.
         //
@@ -943,12 +942,20 @@ impl DatabaseHandle for TieredHandle {
                     "plan_aware" => {
                         self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
                     }
+                    "cache_limit" => {
+                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
+                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                        }
+                    }
+                    "evict_on_checkpoint" => {
+                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
+                    }
                     _ => {}
                 }
             }
         }
 
-        // 3e. Phase Marne: query-plan-aware prefetch.
+        // 3f. Phase Marne: query-plan-aware prefetch.
         //
         // Drain the global plan queue and submit ALL planned groups to the
         // prefetch pool in EQP order: all groups for tree 1, then all groups
@@ -1028,10 +1035,12 @@ impl DatabaseHandle for TieredHandle {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
+            cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
         // 5. Cache miss - fetch from S3.
+        cache.stat_misses.fetch_add(1, Ordering::Relaxed);
         let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
@@ -1042,6 +1051,9 @@ impl DatabaseHandle for TieredHandle {
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
+            // Convert miss to hit (prefetch completed between check and fetch)
+            cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
+            cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -1344,14 +1356,11 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // Buffer raw page as dirty (compression happens at sync time, whole-group)
-        let mut dirty = self.dirty_pages.write();
-        dirty.insert(page_num, buf.to_vec());
-
-        // Also write to local cache for fast reads
+        // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
         if let Some(cache) = &self.cache {
-            let _ = cache.write_page(page_num, buf);
+            cache.write_page(page_num, buf)?;
         }
+        self.dirty_page_nums.write().insert(page_num);
 
         // Update manifest page_count if this page extends the database
         {
@@ -1391,9 +1400,9 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // Clone dirty pages — keep them readable during upload.
-        let dirty_snapshot: HashMap<u64, Vec<u8>> = {
-            let dirty = self.dirty_pages.read();
+        // Phase Marne: snapshot is just page numbers, not page data.
+        let dirty_snapshot: HashSet<u64> = {
+            let dirty = self.dirty_page_nums.read();
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
                 return Ok(());
@@ -1412,31 +1421,41 @@ impl DatabaseHandle for TieredHandle {
             let mut pending = self.s3_dirty_groups.lock().unwrap();
             let mut interior_found = 0usize;
             // Assign new pages (not in page_index) to new groups before recording dirty groups
-            let unassigned: Vec<u64> = dirty_snapshot.keys()
+            let unassigned: Vec<u64> = dirty_snapshot.iter()
                 .filter(|&&pn| manifest.page_location(pn).is_none())
                 .copied()
                 .collect();
             if !unassigned.is_empty() {
                 Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
             }
-            for (&page_num, data) in &dirty_snapshot {
+            let page_size = *self.page_size.read() as usize;
+            let mut type_buf = vec![0u8; page_size];
+            for &page_num in &dirty_snapshot {
                 let loc = manifest.page_location(page_num)
                     .expect("page must have group assignment after new-page assignment");
                 pending.insert(loc.group_id);
-                // Track interior pages so final sync builds correct interior chunks
-                let type_byte = if page_num == 0 { data.get(100) } else { data.get(0) };
-                if let Some(&b) = type_byte {
-                    if b == 0x05 || b == 0x02 {
-                        cache.mark_interior_group(loc.group_id, page_num, loc.index);
-                        interior_found += 1;
+                // Track interior pages so final sync builds correct interior chunks.
+                // Phase Marne: read page type byte from cache instead of in-memory buffer.
+                match cache.read_page(page_num, &mut type_buf) {
+                    Ok(()) => {
+                        let type_byte = if page_num == 0 { type_buf.get(100) } else { type_buf.get(0) };
+                        if let Some(&b) = type_byte {
+                            if b == 0x05 || b == 0x02 {
+                                cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                                interior_found += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during local checkpoint interior scan: {}", page_num, e);
                     }
                 }
             }
             drop(manifest);
             let n = dirty_snapshot.len();
             let total_interior = cache.interior_pages.lock().len();
-            // Free in-memory dirty pages — they're already on local disk
-            self.dirty_pages.write().clear();
+            // Free dirty page tracking
+            self.dirty_page_nums.write().clear();
             eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending.len());
             return Ok(());
         }
@@ -1447,7 +1466,7 @@ impl DatabaseHandle for TieredHandle {
         // Assign new pages (not in page_index) to new groups before grouping
         {
             let mut manifest = self.manifest.write();
-            let unassigned: Vec<u64> = dirty_snapshot.keys()
+            let unassigned: Vec<u64> = dirty_snapshot.iter()
                 .filter(|&&pn| manifest.page_location(pn).is_none())
                 .copied()
                 .collect();
@@ -1461,7 +1480,7 @@ impl DatabaseHandle for TieredHandle {
 
         // Group dirty pages by page group
         let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
-        for &page_num in dirty_snapshot.keys() {
+        for &page_num in &dirty_snapshot {
             let gid = manifest_snap.page_location(page_num)
                 .expect("page must have group assignment after new-page assignment")
                 .group_id;
@@ -1629,17 +1648,25 @@ impl DatabaseHandle for TieredHandle {
         // Only re-upload chunks that contain dirty interior pages.
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new(); // pnum → data
         {
-            // Collect interior pages from dirty snapshot (fastest — already in memory)
+            // Phase Marne: collect interior pages from cache (dirty_snapshot is just page numbers)
             let mut dirty_interior_count = 0usize;
-            for (&pnum, data) in &dirty_snapshot {
-                let type_byte = if pnum == 0 { data.get(100) } else { data.get(0) };
-                if let Some(&b) = type_byte {
-                    if b == 0x05 || b == 0x02 {
-                        all_interior.insert(pnum, data.clone());
-                        if let Some(loc) = manifest_snap.page_location(pnum) {
-                            cache.mark_interior_group(loc.group_id, pnum, loc.index);
+            let mut read_buf = vec![0u8; page_size as usize];
+            for &pnum in &dirty_snapshot {
+                match cache.read_page(pnum, &mut read_buf) {
+                    Ok(()) => {
+                        let type_byte = if pnum == 0 { read_buf.get(100) } else { read_buf.get(0) };
+                        if let Some(&b) = type_byte {
+                            if b == 0x05 || b == 0x02 {
+                                if let Some(loc) = manifest_snap.page_location(pnum) {
+                                    cache.mark_interior_group(loc.group_id, pnum, loc.index);
+                                }
+                                all_interior.insert(pnum, read_buf.clone());
+                                dirty_interior_count += 1;
+                            }
                         }
-                        dirty_interior_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during interior collection: {}", pnum, e);
                     }
                 }
             }
@@ -1652,7 +1679,7 @@ impl DatabaseHandle for TieredHandle {
             for &pnum in &known_interior {
                 if pnum >= page_count {
                     cache_skipped_bounds += 1;
-                } else if dirty_snapshot.contains_key(&pnum) || all_interior.contains_key(&pnum) {
+                } else if dirty_snapshot.contains(&pnum) || all_interior.contains_key(&pnum) {
                     cache_skipped_dup += 1;
                 } else {
                     let mut buf = vec![0u8; page_size as usize];
@@ -1671,6 +1698,12 @@ impl DatabaseHandle for TieredHandle {
             );
         }
 
+        // Determine which chunks are dirty BEFORE moving all_interior into chunks.
+        let dirty_chunk_ids: HashSet<u32> = all_interior.keys()
+            .filter(|pnum| dirty_snapshot.contains(pnum))
+            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
+            .collect();
+
         // Group interior pages by chunk_id
         let mut chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for (pnum, data) in all_interior {
@@ -1681,15 +1714,6 @@ impl DatabaseHandle for TieredHandle {
         for pages in chunks.values_mut() {
             pages.sort_by_key(|(pnum, _)| *pnum);
         }
-
-        // Determine which chunks are dirty (have at least one dirty interior page)
-        let dirty_chunk_ids: HashSet<u32> = dirty_snapshot.keys()
-            .filter(|&&pnum| {
-                let type_byte = if pnum == 0 { dirty_snapshot[&pnum].get(100) } else { dirty_snapshot[&pnum].get(0) };
-                type_byte.map_or(false, |&b| b == 0x05 || b == 0x02)
-            })
-            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
-            .collect();
 
         // Build new chunk keys: dirty chunks get re-uploaded, clean chunks carry forward
         let old_chunk_keys = self.manifest.read().interior_chunk_keys.clone();
@@ -1745,14 +1769,23 @@ impl DatabaseHandle for TieredHandle {
         eprintln!("[sync] building index leaf bundles...");
         let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
         {
+            // Phase Marne: read dirty pages from cache for index leaf classification
             let mut dirty_index_count = 0usize;
-            for (&pnum, data) in &dirty_snapshot {
-                let hdr_off = if pnum == 0 { 100 } else { 0 };
-                let type_byte = data.get(hdr_off);
-                if let Some(&b) = type_byte {
-                    if b == 0x0A && is_valid_btree_page(data, hdr_off) {
-                        all_index_leaves.insert(pnum, data.clone());
-                        dirty_index_count += 1;
+            let mut read_buf = vec![0u8; page_size as usize];
+            for &pnum in &dirty_snapshot {
+                match cache.read_page(pnum, &mut read_buf) {
+                    Ok(()) => {
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let type_byte = read_buf.get(hdr_off);
+                        if let Some(&b) = type_byte {
+                            if b == 0x0A && is_valid_btree_page(&read_buf, hdr_off) {
+                                all_index_leaves.insert(pnum, read_buf.clone());
+                                dirty_index_count += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during index leaf collection: {}", pnum, e);
                     }
                 }
             }
@@ -1772,7 +1805,7 @@ impl DatabaseHandle for TieredHandle {
                 let page_range = tracker.pages_for_sub_chunk(*sc, page_count);
                 drop(tracker);
                 for pnum in page_range {
-                    if pnum >= page_count || all_index_leaves.contains_key(&pnum) || dirty_snapshot.contains_key(&pnum) {
+                    if pnum >= page_count || all_index_leaves.contains_key(&pnum) || dirty_snapshot.contains(&pnum) {
                         continue;
                     }
                     let mut buf = vec![0u8; page_size as usize];
@@ -1793,6 +1826,12 @@ impl DatabaseHandle for TieredHandle {
             );
         }
 
+        // Determine dirty index chunks BEFORE moving all_index_leaves into index_chunks.
+        let dirty_index_chunk_ids: HashSet<u32> = all_index_leaves.keys()
+            .filter(|pnum| dirty_snapshot.contains(pnum))
+            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
+            .collect();
+
         // Group index leaf pages by chunk_id
         let mut index_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for (pnum, data) in all_index_leaves {
@@ -1802,17 +1841,6 @@ impl DatabaseHandle for TieredHandle {
         for pages in index_chunks.values_mut() {
             pages.sort_by_key(|(pnum, _)| *pnum);
         }
-
-        // Determine dirty index chunks
-        let dirty_index_chunk_ids: HashSet<u32> = dirty_snapshot.keys()
-            .filter(|&&pnum| {
-                let data = &dirty_snapshot[&pnum];
-                let hdr_off = if pnum == 0 { 100 } else { 0 };
-                let type_byte = data.get(hdr_off);
-                type_byte.map_or(false, |&b| b == 0x0A && is_valid_btree_page(data, hdr_off))
-            })
-            .map(|&pnum| (pnum / bundle_chunk_range(page_size)) as u32)
-            .collect();
 
         let old_index_chunk_keys = self.manifest.read().index_chunk_keys.clone();
         let mut new_index_chunk_keys: HashMap<u32, String> = HashMap::new();
@@ -1904,22 +1932,71 @@ impl DatabaseHandle for TieredHandle {
             *m = new_manifest;
         }
         {
-            let mut dirty = self.dirty_pages.write();
-            for page_num in dirty_snapshot.keys() {
-                dirty.remove(page_num);
+            let mut dirty = self.dirty_page_nums.write();
+            for &page_num in &dirty_snapshot {
+                dirty.remove(&page_num);
             }
         }
 
         // Persist bitmap
         let _ = cache.persist_bitmap();
 
-        // Post-checkpoint GC: delete old page group/interior chunk versions
+        // Phase Marathon: truncate cache file if it's larger than current page_count.
+        // After VACUUM, page_count decreases but the sparse cache file retains its old size.
+        {
+            let current_page_count = self.manifest.read().page_count;
+            let ps = *self.page_size.read() as u64;
+            if current_page_count > 0 && ps > 0 {
+                let target_size = current_page_count * ps;
+                let file = cache.cache_file.write();
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > target_size {
+                        if let Err(e) = file.set_len(target_size) {
+                            eprintln!("[sync] WARN: cache truncation failed: {}", e);
+                        } else {
+                            eprintln!("[sync] cache truncated: {}B -> {}B ({} pages)",
+                                meta.len(), target_size, current_page_count);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Post-checkpoint GC: delete old page group/interior chunk versions asynchronously.
+        // Phase Thermopylae: fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
         if self.gc_enabled && !replaced_keys.is_empty() {
-            eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
-            if let Err(e) = s3.delete_objects(&replaced_keys) {
-                eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
-            } else {
-                eprintln!("[gc] deleted {} old versions", replaced_keys.len());
+            let gc_s3 = Arc::clone(self.s3.as_ref().expect("s3 client required"));
+            let runtime = gc_s3.runtime.clone();
+            eprintln!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
+            runtime.spawn(async move {
+                gc_s3.delete_objects_async_owned(replaced_keys).await;
+            });
+        }
+
+        // Phase Stalingrad-e: evict data tier after successful checkpoint upload.
+        if self.evict_on_checkpoint {
+            if let Some(cache) = &self.cache {
+                let mut tracker = cache.tracker.lock();
+                let to_evict: Vec<SubChunkId> = tracker.present.iter()
+                    .filter(|id| {
+                        let t = tracker.tiers.get(id).copied().unwrap_or(cache_tracking::SubChunkTier::Data);
+                        t == cache_tracking::SubChunkTier::Data
+                    })
+                    .copied()
+                    .collect();
+                let scbs = tracker.sub_chunk_byte_size;
+                let count = to_evict.len();
+                for id in &to_evict {
+                    tracker.remove(*id);
+                }
+                drop(tracker);
+                for id in &to_evict {
+                    let page_nums = cache.sub_chunk_page_nums(*id);
+                    cache.clear_pages_from_disk(&page_nums);
+                }
+                cache.stat_evictions.fetch_add(count as u64, Ordering::Relaxed);
+                cache.stat_bytes_evicted.fetch_add(count as u64 * scbs, Ordering::Relaxed);
+                eprintln!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
             }
         }
 
@@ -1951,8 +2028,8 @@ impl DatabaseHandle for TieredHandle {
         manifest.page_count = new_page_count;
 
         // Remove dirty pages beyond new size
-        let mut dirty = self.dirty_pages.write();
-        dirty.retain(|&pn, _| pn < new_page_count);
+        let mut dirty = self.dirty_page_nums.write();
+        dirty.retain(|&pn| pn < new_page_count);
 
         Ok(())
     }

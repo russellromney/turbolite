@@ -34,7 +34,7 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
 #[cfg(feature = "tiered")]
-static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredBenchHandle> = std::sync::OnceLock::new();
+static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredSharedState> = std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -122,7 +122,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     }
 
     let vfs = TieredVfs::new(config)?;
-    let _ = BENCH_HANDLE.set(vfs.bench_handle());
+    let _ = BENCH_HANDLE.set(vfs.shared_state());
     crate::tiered::register("turbolite-s3", vfs)
 }
 
@@ -169,6 +169,193 @@ pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
     BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().1 as i64)
+}
+
+// ── Phase Stalingrad: cache eviction + observability ──────────────────
+
+/// Evict cached data for named trees. tree_names is a comma-separated C string.
+/// Returns number of groups evicted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
+    if tree_names.is_null() {
+        return -1;
+    }
+    let names = match std::ffi::CStr::from_ptr(tree_names).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => h.evict_tree(names) as i32,
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::c_char) -> i32 {
+    -1
+}
+
+/// Return cache info as a JSON C string. Caller must treat as SQLITE_TRANSIENT.
+/// Returns null if no tiered VFS.
+///
+/// Uses a thread-local buffer to avoid allocation lifetime issues across FFI.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
+    thread_local! {
+        static CACHE_INFO_BUF: std::cell::RefCell<std::ffi::CString> =
+            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
+    }
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let json = h.cache_info();
+            match std::ffi::CString::new(json) {
+                Ok(c) => {
+                    CACHE_INFO_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    })
+                }
+                Err(_) => std::ptr::null(),
+            }
+        }
+        None => std::ptr::null(),
+    }
+}
+
+/// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
+/// Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
+/// db must be a valid sqlite3 handle, sql must be a valid C string.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_warm(
+    db: *mut std::ffi::c_void,
+    sql: *const std::os::raw::c_char,
+) -> *const std::os::raw::c_char {
+    thread_local! {
+        static WARM_BUF: std::cell::RefCell<std::ffi::CString> =
+            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
+    }
+    if sql.is_null() {
+        return std::ptr::null();
+    }
+    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            let json = h.warm_from_plan(&accesses);
+            match std::ffi::CString::new(json) {
+                Ok(c) => {
+                    WARM_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    })
+                }
+                Err(_) => std::ptr::null(),
+            }
+        }
+        None => std::ptr::null(),
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_warm(
+    _db: *mut std::ffi::c_void,
+    _sql: *const std::os::raw::c_char,
+) -> *const std::os::raw::c_char {
+    std::ptr::null()
+}
+
+/// Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
+/// tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_query(
+    db: *mut std::ffi::c_void,
+    sql: *const std::os::raw::c_char,
+) -> i32 {
+    if sql.is_null() {
+        return -1;
+    }
+    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            h.evict_query(&accesses) as i32
+        }
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_query(
+    _db: *mut std::ffi::c_void,
+    _sql: *const std::os::raw::c_char,
+) -> i32 {
+    -1
+}
+
+/// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
+/// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {
+    if tier.is_null() {
+        return -1;
+    }
+    let tier_str = match std::ffi::CStr::from_ptr(tier).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => h.evict_tier(tier_str) as i32,
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict(_tier: *const std::os::raw::c_char) -> i32 {
+    -1
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
+    std::ptr::null()
+}
+
+/// Full GC: list all S3 objects under prefix, delete orphans not in manifest.
+/// Returns number of objects deleted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_gc() -> i32 {
+    match BENCH_HANDLE.get() {
+        Some(h) => match h.gc() {
+            Ok(count) => count as i32,
+            Err(e) => {
+                eprintln!("[gc] ERROR: {}", e);
+                -1
+            }
+        },
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub extern "C" fn turbolite_gc() -> i32 {
+    -1
 }
 
 #[cfg(not(feature = "tiered"))]

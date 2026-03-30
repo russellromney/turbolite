@@ -1,87 +1,19 @@
 # turbolite Roadmap
 
-## Tannenberg: lib.rs Split
-> After: Kursk · Before: Marne (Memory)
+## Thermopylae: GC + Msgpack Manifest + Autovacuum
+> After: Kursk · Before: Marathon
 
-Split `lib.rs` (2,595 lines) into focused modules. Tiered split is done (see CHANGELOG). lib.rs remains.
-
-- [ ] `lib.rs` -- module declarations, public re-exports only
-- [ ] `locks.rs` -- `InProcessLocks`, `SlotState`, `SHARED_FILE_CACHE`, lock/unlock functions, debug tracing
-- [ ] `file_format.rs` -- `FileHeader`, `PageIndex`, magic bytes, constants
-- [ ] `compressed_handle.rs` -- `CompressedHandle` struct, page ops, `DatabaseHandle` trait impl, `FileWalIndex`
-- [ ] `compressed_vfs.rs` -- `CompressedVfs`, `Vfs` trait impl
-- [ ] `maintenance.rs` -- `inspect_database()`, `compact()`, `compact_with_recompression()`, `CompactionConfig`
-- [ ] `cargo test` passes with no changes to public API
-- [ ] `make ext` builds successfully
-- [ ] All `use turbolite::` paths in bin/, tests/, examples/ still compile
+### b. `turbolite_gc()` SQL function
+- [ ] `turbolite_gc()`: full orphan scan (list all S3 keys, diff against manifest, delete orphans), returns deleted count
+- [ ] FFI + ext_entry.c registration, same pattern as turbolite_cache_info
+- [ ] Tests: orphans cleaned up, live keys preserved, returns correct count, no-op when no orphans
 
 ---
 
-## Marne (Memory): Dirty Page Memory Optimization
-> After: Tannenberg · Before: Thermopylae
-
-`write_all_at()` stores a full page copy in `dirty_pages: HashMap<u64, Vec<u8>>` AND writes it to the cache file. The HashMap copy is only needed at checkpoint to know which groups to re-encode, but the data is already in the cache. Holding it twice wastes memory: 1000 dirty 64KB pages = 64MB in the HashMap alone.
-
-- [ ] Replace `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>` (8 bytes per page instead of 64KB)
-- [ ] At checkpoint, read dirty pages back from cache file via `cache.read_page()` (microsecond pread, trivial vs S3 PUT)
-- [ ] Remove the `dirty_snapshot.clone()` in `sync()` -- just clone the HashSet
-- [ ] Update `read_exact_at()` to check cache instead of HashMap for dirty page reads (cache is already up-to-date from `write_all_at`)
-- [ ] Test: write 1000 pages, verify memory usage doesn't scale with page count
-- [ ] Test: checkpoint after dirty page optimization still produces correct S3 data
-
----
-
-## Thermopylae: Tunable GC + Autovacuum Integration
-> After: Marne (Memory) · Before: Marathon
-
-### a. Tunable GC policy
-- [ ] `gc_keep_versions: u32` -- number of old page group versions to retain (default 0 = delete all). Enables point-in-time restore window.
-- [ ] `gc_max_age_secs: u64` -- delete old versions older than N seconds. Alternative to version count.
-- [ ] Combine with existing `gc_enabled` flag: `gc_enabled=true, gc_keep_versions=5` keeps last 5 versions.
-
-### b. Autovacuum-triggered GC
-- [ ] Hook GC into SQLite's autovacuum: after incremental autovacuum frees pages and checkpoint flushes to S3, automatically GC orphaned page groups.
-- [ ] `PRAGMA auto_vacuum=INCREMENTAL` + periodic `PRAGMA incremental_vacuum(N)` should "just work" through the VFS -- verify with integration test.
-- [ ] Test: enable autovacuum, insert/delete cycles, verify S3 object count stabilizes.
-
-### c. CLI
-- [ ] `turbolite gc --bucket X --prefix Y` -- one-shot full GC scan
-- [ ] `turbolite gc --dry-run` -- list orphans without deleting
-
-### d. Msgpack manifest
-- [ ] Replace JSON manifest with msgpack (`rmp-serde`). Smaller, faster serialize/deserialize.
-- [ ] S3 key: `manifest.msgpack` (content type `application/msgpack`)
-- [ ] Automigrate: `get_manifest` tries msgpack first, falls back to JSON. Next `put_manifest` writes msgpack. Old `manifest.json` cleaned up by GC.
-- [ ] `SubChunkTracker` local persistence can stay JSON (local-only, not worth changing)
-
----
-
-## Marathon: Local Disk Compaction
-> After: Thermopylae · Before: Midway (remaining)
-
-The local cache file is a sparse file sized to `page_count * page_size`. After VACUUM reduces page_count, a fresh reader creates a smaller cache, but the existing cache doesn't shrink in-place.
-
-- [ ] On checkpoint, if manifest page_count decreased, truncate cache file to match
-- [ ] Add `TieredVfs::compact_cache()` -- shrink cache file to current manifest size
-- [ ] Test: VACUUM -> checkpoint -> verify cache file size matches new page_count
-
-Note: minor optimization. S3 is the source of truth, local disk is ephemeral cache.
-
----
-
-## Midway (remaining): GroupingStrategy + Compaction + Tests
-> After: Marathon · Before: Gallipoli
+## Midway (remaining): Remove Positional + Compaction + Tests
+> After: Thermopylae · Before: Gallipoli
 
 Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
-
-### GroupingStrategy dispatch (f3)
-- [ ] `GroupingStrategy` enum: dispatch methods compute positions arithmetically (Positional) or via explicit lookup (BTreeAware)
-- [ ] `PrefetchNeighbors` enum: `RadialFanout` (positional) vs `BTreeSiblings` (btree)
-- [ ] Manifest dispatch: `page_location()`, `group_page_nums()`, `prefetch_neighbors()` branch on `strategy`
-- [ ] handle.rs: `trigger_prefetch()` radial fan-out for Positional, sibling groups for BTreeAware
-- [ ] import.rs: Positional path (sequential chunking, no btree walk)
-- [ ] disk_cache.rs + vfs.rs: handle empty `group_pages` for Positional
-- [ ] Benchmark: `--grouping positional` and `--grouping btree` flags in tiered-bench
 
 ### Compaction (g)
 - [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
@@ -99,11 +31,41 @@ Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
 
 ---
 
-## Gallipoli: Normandy Leftovers
+## Gallipoli: Local Manifest Persistence
 > After: Midway (remaining) · Before: Somme
 
-- [ ] `SELECT turbolite_register('vfs_name', '/path/to/base', 3)` SQL function for runtime VFS registration
-- [ ] Integration test: C program loads extension, registers VFS, roundtrip
+The manifest only lives in S3 and in-memory on the VFS. No local persistence. This causes two problems:
+1. **Performance:** Every `open()` hits S3 to fetch the manifest, even when the VFS has a fresh copy.
+2. **Durability bug (LocalThenFlush):** If the process dies between a local checkpoint and `flush_to_s3()`, dirty pages are on disk in the cache file but the S3 manifest doesn't reference them. On restart, the stale S3 manifest is fetched, and unflushed work is silently lost.
+
+### a. Persist manifest locally
+
+Write `manifest.msgpack` to `cache_dir/` alongside the cache file. This is the same manifest that goes to S3, plus a `dirty_groups` field for unflushed pages.
+
+- [ ] On every checkpoint (both Durable and LocalThenFlush): write manifest to `cache_dir/manifest.msgpack`
+- [ ] Include `dirty_groups: Vec<u64>` in local manifest (not in S3 manifest) for unflushed page tracking
+- [ ] On flush_to_s3(): clear dirty_groups from local manifest after successful upload
+- [ ] Test: local checkpoint writes manifest to disk, manifest contains dirty_groups
+- [ ] Test: process restart after local checkpoint, dirty_groups survive, flush_to_s3 works
+
+### b. Manifest source config
+
+- [ ] `manifest_source: Auto | S3` on TieredConfig
+  - `Auto` (default): load local manifest if present, fall back to S3. Correct for single-writer.
+  - `S3`: always fetch from S3 on open. For HA followers and multi-reader setups.
+- [ ] `TURBOLITE_MANIFEST_SOURCE` env var
+- [ ] `turbolite_config_set('manifest_source', 'auto')` runtime toggle
+- [ ] Test: Auto mode uses local on warm reconnect (zero S3 GETs on second open)
+- [ ] Test: S3 mode always fetches (S3 GET count increments on every open)
+
+### c. Dirty group recovery
+
+- [ ] On open with Auto mode: if local manifest has dirty_groups, log warning and populate s3_dirty_groups
+- [ ] `flush_to_s3()` picks up recovered dirty groups and uploads them
+- [ ] Test: crash simulation (kill after local checkpoint, restart, verify flush recovers all data)
+- [ ] Test: no dirty_groups on clean shutdown (Durable mode never has dirty_groups in local manifest)
+
+### d. Packaging cleanup
 - [ ] Test: missing .so in Python package produces clear error message
 - [ ] pkg-config `.pc` file for system install discovery
 
@@ -261,154 +223,28 @@ Cache grows unbounded today. Add a global byte budget enforced between queries. 
 - Never evict sub-chunks containing dirty pages (any journal mode) or pending flush pages (LocalThenFlush)
 - Minimum floor: `max(all_interior_groups_size, prefetch_threads * sub_frame_size)`. Reject config below this.
 
+Between-query eviction hook is wired (step 3d in VFS read path, end-query signal via SQLITE_TRACE_PROFILE). Remaining work is the eviction logic itself:
+
 - [ ] `max_cache_bytes: Option<u64>` in TieredConfig
 - [ ] `TURBOLITE_CACHE_LIMIT` env var (e.g., `512MB`, `2GB`), parsed at VFS registration
 - [ ] `turbolite_config_set('cache_limit', '512MB')` for runtime adjustment
 - [ ] `current_cache_bytes: AtomicU64` on DiskCache, updated on write/evict
 - [ ] `is_evictable(sub_chunk)`: false if dirty, pending flush, or Pinned
 - [ ] `evict_to_budget()`: loop `evict_one()` over evictable sub-chunks until under limit
-- [ ] Between-query trigger: trace callback calls `evict_to_budget()` if over limit before processing next query's EQP
+- [ ] Wire `evict_to_budget()` into the existing between-query hook (handle.rs step 3d TODO)
 - [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
 - [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
 
-### b. Access count tracking + weighted eviction
+### b-g. Completed (see CHANGELOG)
 
-Replace pure LRU with weighted scoring that considers both recency and frequency. Sub-chunks accessed 100 times should survive longer than sub-chunks accessed once, even if the single-access one was touched more recently.
+All Stalingrad items implemented: weighted eviction (b), observability with churn detection and peak tracking (c), tier eviction + evict_query (d), checkpoint eviction (e), speculative warm (f), TieredSharedState rename (g).
 
-- [ ] `access_count: HashMap<SubChunkId, u32>` on SubChunkTracker
-- [ ] Increment on `touch()`, reset on eviction
-- [ ] Weighted eviction score: `score = tier_weight * (recency_score + frequency_score)`
-- [ ] `evict_one()` picks lowest score across all evictable sub-chunks
-- [ ] Frequency score: `min(access_count, cap) / cap` (cap e.g., 64, prevents runaway counts from making data immortal)
-- [ ] Recency score: `1.0 - (age / max_age)` (normalized to 0-1)
-- [ ] Tests: frequently-accessed sub-chunk survives over rarely-accessed one at same tier, tier still dominates (data evicts before index regardless of access count)
+### Future: query cost estimation (c2) + query analysis (c3)
 
-### c. Cache observability
+Diagnostic tools, not blocking production use. Build when needed.
 
-No other SQLite VFS lets you introspect the cache. This is a devex differentiator.
-
-- [ ] `turbolite_cache_info()` SQL function returning JSON:
-  ```json
-  {
-    "size_bytes": 52428800,
-    "limit_bytes": 536870912,
-    "groups_cached": 24,
-    "groups_total": 48,
-    "tiers": {
-      "pinned": {"groups": 1, "bytes": 262144},
-      "index": {"groups": 5, "bytes": 5242880},
-      "data": {"groups": 18, "bytes": 46923776}
-    },
-    "hit_rate": 0.94,
-    "evictions_since_open": 12
-  }
-  ```
-- [ ] `turbolite_cache_stats()` SQL function: `{hits, misses, evictions, bytes_evicted, bytes_fetched}`
-- [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in stats:
-  `{"last_query_evictions": 847, "cache_churn": "high", "recommendation": "cache_limit >= 512MB would eliminate churn"}`
-- [ ] Track peak working set over connection lifetime for recommendations
-- [ ] Track hit/miss counters on `read_exact_at` (cache hit vs S3 fetch)
-- [ ] Track eviction counters in `evict_one()` / `evict_to_budget()`
-- [ ] Log at WARN level when between-query eviction sheds >50% of cache (visible in app logs without checking SQL functions)
-- [ ] FFI: Rust functions exposed via ext_entry.c, same pattern as bench functions
-- [ ] Tests: stats increment correctly, info reflects actual cache state, churn warning triggers at threshold, peak working set tracked
-
-### c2. Query cost estimation
-
-Before running an expensive query, users can check how much cache it would need. Uses EQP + manifest tree sizes to compute upper bounds. SCAN = exact (all groups). SEARCH = range (1 sub-frame best case, all groups worst case). Uncompressed cache bytes, not S3 transfer bytes.
-
-- [ ] `turbolite_query_cost('SELECT ...')` SQL function returning JSON:
-  ```json
-  {
-    "trees": [
-      {"name": "users", "access": "SEARCH", "groups": 2,
-       "best_bytes": 262144, "worst_bytes": 33554432},
-      {"name": "posts", "access": "SCAN", "groups": 12,
-       "best_bytes": 201326592, "worst_bytes": 201326592}
-    ],
-    "total_best_bytes": 786432,
-    "total_worst_bytes": 234881024,
-    "cache_limit_bytes": 536870912,
-    "worst_fits_in_cache": true,
-    "worst_pct_of_cache": "44%"
-  }
-  ```
-- [ ] Reuses frontrun EQP parsing (parse_eqp_output)
-- [ ] Per-tree worst case: `num_groups * pages_per_group * page_size` from manifest
-- [ ] Per-tree best case: SCAN = worst case (exact). SEARCH = 1 sub-frame per tree (`sub_pages_per_frame * page_size`)
-- [ ] `worst_fits_in_cache`: compare total worst against cache_limit (if set)
-- [ ] FFI + ext_entry.c registration
-- [ ] Tests: SCAN returns exact size, SEARCH returns range, JOIN sums across trees, no cache_limit returns null for fit check
-
-### c3. Query analysis (diagnostic tool)
-
-`tiered-bench` as a SQL function. Runs a query at a specified cache temperature, measures predicted vs actual cache usage. Not for production use; for development/tuning, like EXPLAIN QUERY PLAN.
-
-- [ ] `turbolite_analyze_query('SELECT ...', cache_level)` SQL function
-  - `cache_level`: `'current'` (no eviction, measure at whatever state cache is in), `'interior'` (clear to interior-only), `'index'` (clear to interior+index), `'none'` (clear everything)
-  - Runs the query (results discarded), measures real cache activity
-  - Returns JSON:
-    ```json
-    {
-      "trees": [
-        {"name": "idx_report_date", "access": "SEARCH",
-         "predicted_best": 262144, "predicted_worst": 8388608,
-         "actual_bytes": 524288, "actual_groups": 2, "hits": 1, "misses": 1},
-        {"name": "big_report", "access": "SEARCH",
-         "predicted_best": 262144, "predicted_worst": 201326592,
-         "actual_bytes": 1048576, "actual_groups": 4, "hits": 0, "misses": 4}
-      ],
-      "total_predicted_worst": 209715200,
-      "total_actual": 1572864,
-      "cache_limit": 536870912,
-      "execution_time_ns": 48000000
-    }
-    ```
-  - No concurrent reader problem: single controlled execution with local counters
-- [ ] Reuses query cost estimation (c2) for predicted values
-- [ ] Reuses existing clear_cache infrastructure for cache level setup
-- [ ] Register trace profile callback (`SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE`) for execution timing
-- [ ] FFI + ext_entry.c registration
-- [ ] Tests: predicted vs actual for SCAN (actual = predicted), SEARCH (actual <= predicted worst), cache level clears correctly before run, 'current' doesn't evict
-
-### d. Manual eviction controls
-
-Application-level cache control via SQL functions. Most important for multi-tenant: the application knows when a tenant is cold.
-
-- [ ] `turbolite_evict('data')` / `turbolite_evict('index')` / `turbolite_evict('all')` -- evict by tier
-- [ ] `turbolite_evict_tree('table_name')` -- evict specific tree's cached data
-  - Looks up `tree_name_to_groups` in manifest, evicts those groups' sub-chunks
-  - Accepts comma-separated names: `turbolite_evict_tree('audit_log, idx_audit_date')`
-- [ ] `turbolite_evict_query('SELECT ...')` -- run EQP, extract trees, evict their data
-  - Reuses frontrun EQP parsing infrastructure
-  - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
-  - Default: evict data tier only (keep index for potential re-query)
-- [ ] FFI + ext_entry.c registration for all functions
-- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages
-
-### e. Checkpoint eviction
-
-Clear interval where the cache resets after successful S3 upload. Good for serverless/bursty workloads where you want a clean slate after committing.
-
-- [ ] `evict_on_checkpoint: bool` in TieredConfig (default: false)
-- [ ] `TURBOLITE_EVICT_ON_CHECKPOINT=true` env var
-- [ ] `turbolite_config_set('evict_on_checkpoint', 'true')` runtime toggle
-- [ ] After successful checkpoint S3 upload: if enabled, call `clear_cache_data_only()`
-- [ ] Only evicts data tier (interior + index remain for next query's fast path)
-- [ ] Tests: data tier empty after checkpoint when enabled, interior/index survive, disabled by default
-
-### f. Speculative warm
-
-Pre-warm pages for anticipated queries before they execute. Different from frontrun (which fires ~10us before step): warm fires seconds/minutes ahead so pages are already cached when the query runs.
-
-Use case: user logs in, app fires `turbolite_warm('SELECT * FROM dashboard WHERE user_id = ?')` during auth. By the time user clicks dashboard, pages are cached. Zero cold penalty.
-
-- [ ] `turbolite_warm('SELECT ...')` SQL function
-- [ ] Run EQP, extract planned accesses (reuses frontrun parse_eqp_output)
-- [ ] Submit all tree page groups to prefetch pool (non-blocking, returns immediately)
-- [ ] No bound parameters needed: warms all groups for the tables/indexes in the plan
-- [ ] Returns JSON: `{"trees_warmed": ["users", "idx_users_id"], "groups_submitted": 12}`
-- [ ] Tests: warm submits correct groups, warm on already-cached data is no-op, warm with invalid SQL returns error
+- [ ] `turbolite_query_cost('SELECT ...')` -- EQP + manifest tree sizes -> upper bound cache cost per tree
+- [ ] `turbolite_analyze_query('SELECT ...', cache_level)` -- run query at specified cache temp, measure actual vs predicted
 
 ---
 

@@ -73,13 +73,13 @@ mod settings;
 mod vfs;
 
 // Public API (visible outside the crate)
-pub use bench::TieredBenchHandle;
-pub use config::{GroupState, GroupingStrategy, PrefetchNeighbors, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
+pub use bench::TieredSharedState;
+pub use config::{GroupState, GroupingStrategy, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
 pub use vfs::TieredVfs;
-pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses};
+pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query};
 pub use settings::{turbolite_config_set, push_setting};
 #[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;

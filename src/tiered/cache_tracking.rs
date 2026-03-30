@@ -101,6 +101,16 @@ pub(crate) enum SubChunkTier {
     Data = 2,
 }
 
+/// Maximum access count before capping. Prevents a heavily-accessed sub-chunk
+/// from becoming effectively immortal. At cap=64, a sub-chunk accessed 64 times
+/// gets max frequency score but can still be evicted if tier + recency say so.
+const ACCESS_COUNT_CAP: u32 = 64;
+
+/// Recency window in seconds. Sub-chunks older than this all get recency_score=0.
+/// 1 hour is a reasonable default: most query workloads have a working set that
+/// cycles within an hour. Sub-chunks untouched for >1hr are equally "cold."
+const RECENCY_WINDOW_SECS: u64 = 3600;
+
 /// Tracks which sub-chunks are present in the local cache file.
 /// Replaces per-page PageBitmap with per-sub-chunk granularity.
 /// Eviction operates on sub-chunks with tiered priority (Pinned > Index > Data).
@@ -111,6 +121,15 @@ pub(crate) struct SubChunkTracker {
     pub(crate) tiers: HashMap<SubChunkId, SubChunkTier>,
     /// Last access time per sub-chunk (for LRU within a tier).
     pub(crate) access_times: HashMap<SubChunkId, Instant>,
+    /// Access count per sub-chunk (for frequency-weighted eviction).
+    /// Capped at ACCESS_COUNT_CAP to prevent immortal sub-chunks.
+    pub(crate) access_counts: HashMap<SubChunkId, u32>,
+    /// Current total cached bytes (sub-chunk granularity). Updated inside mutex
+    /// alongside `present` for perfect consistency with tracker state.
+    pub(crate) current_cache_bytes: u64,
+    /// Bytes per sub-chunk (sub_pages_per_frame * page_size). Set at construction
+    /// or updated via set_sub_chunk_byte_size() when page_size becomes known.
+    pub(crate) sub_chunk_byte_size: u64,
     /// Config: pages per group.
     pub(crate) pages_per_group: u32,
     /// Config: pages per sub-chunk frame.
@@ -124,14 +143,16 @@ pub(crate) struct SubChunkTracker {
 
 impl SubChunkTracker {
     pub(crate) fn new(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32) -> Self {
-        // Try to load from disk (no encryption key yet — loaded as plaintext or fails gracefully)
-        let (present, tiers) = Self::load_from_disk(&path, None);
+        let (present, tiers, access_counts) = Self::load_from_disk(&path, None);
         let now = Instant::now();
         let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
         Self {
             present,
             tiers,
             access_times,
+            access_counts,
+            current_cache_bytes: 0, // recomputed once sub_chunk_byte_size is set
+            sub_chunk_byte_size: 0,
             pages_per_group,
             sub_pages_per_frame,
             path,
@@ -142,13 +163,16 @@ impl SubChunkTracker {
 
     #[cfg(feature = "encryption")]
     pub(crate) fn new_encrypted(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32, encryption_key: Option<[u8; 32]>) -> Self {
-        let (present, tiers) = Self::load_from_disk(&path, encryption_key.as_ref());
+        let (present, tiers, access_counts) = Self::load_from_disk(&path, encryption_key.as_ref());
         let now = Instant::now();
         let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
         Self {
             present,
             tiers,
             access_times,
+            access_counts,
+            current_cache_bytes: 0,
+            sub_chunk_byte_size: 0,
             pages_per_group,
             sub_pages_per_frame,
             path,
@@ -189,10 +213,25 @@ impl SubChunkTracker {
         self.present.contains(id)
     }
 
+    /// Set the sub-chunk byte size (sub_pages_per_frame * page_size).
+    /// Called once page_size is known. Recomputes current_cache_bytes from present count.
+    pub(crate) fn set_sub_chunk_byte_size(&mut self, byte_size: u64) {
+        self.sub_chunk_byte_size = byte_size;
+        self.current_cache_bytes = self.present.len() as u64 * byte_size;
+    }
+
+    /// Bytes used by Pinned sub-chunks (cache floor, never evicted).
+    pub(crate) fn pinned_bytes(&self) -> u64 {
+        self.count_tier(SubChunkTier::Pinned) as u64 * self.sub_chunk_byte_size
+    }
+
     /// Record a sub-chunk as cached with the given tier.
     /// If already present at a higher priority (lower tier number), keeps the higher priority.
     pub(crate) fn mark_present(&mut self, id: SubChunkId, tier: SubChunkTier) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(t) if t <= tier => {} // already at equal or higher priority
@@ -205,28 +244,36 @@ impl SubChunkTracker {
     /// Also ensures the sub-chunk is in the present set — pages may have been
     /// written via write_page (bitmap-only), so tracker may not know about them yet.
     pub(crate) fn mark_pinned(&mut self, id: SubChunkId) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         self.tiers.insert(id, SubChunkTier::Pinned);
-        // Ensure access time exists
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
 
     /// Promote a sub-chunk to Index tier (index leaf pages).
     /// Also ensures the sub-chunk is in the present set.
     pub(crate) fn mark_index(&mut self, id: SubChunkId) {
-        self.present.insert(id);
+        let is_new = self.present.insert(id);
+        if is_new {
+            self.current_cache_bytes += self.sub_chunk_byte_size;
+        }
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(SubChunkTier::Pinned) => {} // don't demote from pinned
             _ => { self.tiers.insert(id, SubChunkTier::Index); }
         }
-        // Ensure access time exists
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
 
-    /// Touch a sub-chunk's access time (for LRU).
+    /// Touch a sub-chunk: update access time and increment access count (capped).
     pub(crate) fn touch(&mut self, id: SubChunkId) {
         self.access_times.insert(id, Instant::now());
+        let count = self.access_counts.entry(id).or_insert(0);
+        if *count < ACCESS_COUNT_CAP {
+            *count += 1;
+        }
     }
 
     /// Touch the sub-chunk containing a page.
@@ -239,33 +286,103 @@ impl SubChunkTracker {
     /// least-recently-used sub-chunk. Returns the evicted sub-chunk or None if empty.
     /// Never evicts Pinned (tier 0) sub-chunks.
     pub(crate) fn evict_one(&mut self) -> Option<SubChunkId> {
-        // Find eviction candidate: highest tier number, oldest access time
-        // Use a single "epoch" instant for sub-chunks missing access times,
-        // so they are treated as the oldest (most evictable) entries.
-        let epoch = Instant::now() - Duration::from_secs(3600);
-        let mut candidate: Option<(SubChunkId, SubChunkTier, Instant)> = None;
+        self.evict_one_skipping(&HashSet::new())
+    }
+
+    /// Evict one sub-chunk, skipping groups in skip_groups (dirty/pending/fetching).
+    /// Uses weighted scoring: tier bonus (dominant) + recency + frequency.
+    /// Lower score = more evictable. Never evicts Pinned sub-chunks.
+    ///
+    /// Score = tier_bonus + recency_score + frequency_score
+    /// - tier_bonus: Data=0.0, Index=10.0 (additive, so ANY Index always beats ANY Data)
+    /// - recency_score: 0.0 (oldest, 1hr+) to 1.0 (just accessed)
+    /// - frequency_score: 0.0 (never touched) to 1.0 (hit ACCESS_COUNT_CAP times)
+    ///
+    /// Data scores range [0.0, 2.0]. Index scores range [10.0, 12.0].
+    /// Tier always dominates: the hottest Data (2.0) is evicted before the coldest Index (10.0).
+    /// Within a tier, frequency + recency break ties.
+    pub(crate) fn evict_one_skipping(&mut self, skip_groups: &HashSet<u64>) -> Option<SubChunkId> {
+        let now = Instant::now();
+        let max_age = Duration::from_secs(RECENCY_WINDOW_SECS);
+        let epoch = now - max_age;
+        let cap = ACCESS_COUNT_CAP as f64;
+
+        let mut candidate: Option<(SubChunkId, f64)> = None; // (id, score)
         for id in &self.present {
             let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
             if tier == SubChunkTier::Pinned {
-                continue; // never evict pinned
+                continue;
             }
+            if skip_groups.contains(&(id.group_id as u64)) {
+                continue;
+            }
+
+            let tier_bonus = match tier {
+                SubChunkTier::Data => 0.0,
+                SubChunkTier::Index => 10.0,
+                SubChunkTier::Pinned => unreachable!(),
+            };
+
             let access = self.access_times.get(id).copied().unwrap_or(epoch);
+            let age_secs = now.duration_since(access).as_secs_f64();
+            let recency_score = 1.0 - (age_secs / max_age.as_secs_f64()).min(1.0);
+
+            let count = self.access_counts.get(id).copied().unwrap_or(0) as f64;
+            let frequency_score = (count / cap).min(1.0);
+
+            let score = tier_bonus + recency_score + frequency_score;
+
             match &candidate {
-                None => candidate = Some((*id, tier, access)),
-                Some((_, ct, ca)) => {
-                    // Prefer higher tier number (Data > Index), then older access
-                    if tier > *ct || (tier == *ct && access < *ca) {
-                        candidate = Some((*id, tier, access));
+                None => candidate = Some((*id, score)),
+                Some((_, cs)) => {
+                    if score < *cs {
+                        candidate = Some((*id, score));
                     }
                 }
             }
         }
-        if let Some((id, _, _)) = candidate {
+        if let Some((id, _)) = candidate {
             self.remove(id);
             Some(id)
         } else {
             None
         }
+    }
+
+    /// Score all evictable sub-chunks without removing them. Returns (id, score) pairs.
+    /// Used by evict_to_budget to sort once and evict in order (O(n log n) vs O(n^2)).
+    pub(crate) fn score_evictable(&self, skip_groups: &HashSet<u64>) -> Vec<(SubChunkId, f64)> {
+        let now = Instant::now();
+        let max_age = Duration::from_secs(RECENCY_WINDOW_SECS);
+        let epoch = now - max_age;
+        let cap = ACCESS_COUNT_CAP as f64;
+
+        let mut scored = Vec::new();
+        for id in &self.present {
+            let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+            if tier == SubChunkTier::Pinned {
+                continue;
+            }
+            if skip_groups.contains(&(id.group_id as u64)) {
+                continue;
+            }
+
+            let tier_bonus = match tier {
+                SubChunkTier::Data => 0.0,
+                SubChunkTier::Index => 10.0,
+                SubChunkTier::Pinned => unreachable!(),
+            };
+
+            let access = self.access_times.get(id).copied().unwrap_or(epoch);
+            let age_secs = now.duration_since(access).as_secs_f64();
+            let recency_score = 1.0 - (age_secs / max_age.as_secs_f64()).min(1.0);
+
+            let count = self.access_counts.get(id).copied().unwrap_or(0) as f64;
+            let frequency_score = (count / cap).min(1.0);
+
+            scored.push((*id, tier_bonus + recency_score + frequency_score));
+        }
+        scored
     }
 
     /// Evict all sub-chunks in a specific tier that are older than `ttl`.
@@ -288,9 +405,12 @@ impl SubChunkTracker {
 
     /// Remove a sub-chunk from tracking (does NOT zero disk).
     pub(crate) fn remove(&mut self, id: SubChunkId) {
-        self.present.remove(&id);
+        if self.present.remove(&id) {
+            self.current_cache_bytes = self.current_cache_bytes.saturating_sub(self.sub_chunk_byte_size);
+        }
         self.tiers.remove(&id);
         self.access_times.remove(&id);
+        self.access_counts.remove(&id);
     }
 
     /// Remove all sub-chunks for a given group.
@@ -351,6 +471,8 @@ impl SubChunkTracker {
         self.present.clear();
         self.tiers.clear();
         self.access_times.clear();
+        self.access_counts.clear();
+        self.current_cache_bytes = 0;
     }
 
     /// Number of tracked sub-chunks.
@@ -366,13 +488,15 @@ impl SubChunkTracker {
     }
 
     /// Persist tracker state to disk for crash recovery.
-    /// Serializes as JSON: vec of (SubChunkId, tier). CTR-encrypted with random nonce if key present.
-    /// File format when encrypted: [8-byte random nonce][CTR-encrypted JSON]
+    /// Format v2: JSON vec of (SubChunkId, tier_u8, access_count_u32).
+    /// Backward-compatible: load_from_disk also reads v1 format (SubChunkId, tier_u8).
+    /// CTR-encrypted with random nonce if key present.
     pub(crate) fn persist(&self) -> io::Result<()> {
-        let entries: Vec<(SubChunkId, u8)> = self.present.iter()
+        let entries: Vec<(SubChunkId, u8, u32)> = self.present.iter()
             .map(|id| {
                 let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data) as u8;
-                (*id, tier)
+                let count = self.access_counts.get(id).copied().unwrap_or(0);
+                (*id, tier, count)
             })
             .collect();
         let data = serde_json::to_vec(&entries).map_err(|e| {
@@ -400,41 +524,64 @@ impl SubChunkTracker {
     }
 
     /// Load tracker state from disk. Decrypts with CTR if key provided.
+    /// Tries v2 format (id, tier, count) first, falls back to v1 (id, tier).
     /// Encrypted format: [8-byte random nonce][CTR-encrypted JSON]
-    pub(crate) fn load_from_disk(path: &Path, _encryption_key: Option<&[u8; 32]>) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>) {
+    pub(crate) fn load_from_disk(path: &Path, _encryption_key: Option<&[u8; 32]>) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>, HashMap<SubChunkId, u32>) {
         let data = match fs::read(path) {
             Ok(d) => d,
-            Err(_) => return (HashSet::new(), HashMap::new()),
+            Err(_) => return (HashSet::new(), HashMap::new(), HashMap::new()),
         };
         #[cfg(feature = "encryption")]
         let data = if let Some(key) = _encryption_key {
             if data.len() < 8 {
-                return (HashSet::new(), HashMap::new());
+                return (HashSet::new(), HashMap::new(), HashMap::new());
             }
             let nonce_u64 = u64::from_le_bytes(data[..8].try_into().unwrap());
             match compress::decrypt_ctr(&data[8..], nonce_u64, key) {
                 Ok(d) => d,
-                Err(_) => return (HashSet::new(), HashMap::new()),
+                Err(_) => return (HashSet::new(), HashMap::new(), HashMap::new()),
             }
         } else {
             data
         };
-        let entries: Vec<(SubChunkId, u8)> = match serde_json::from_slice(&data) {
-            Ok(e) => e,
-            Err(_) => return (HashSet::new(), HashMap::new()),
-        };
-        let mut present = HashSet::new();
-        let mut tiers = HashMap::new();
-        for (id, tier_byte) in entries {
-            present.insert(id);
-            let tier = match tier_byte {
-                0 => SubChunkTier::Pinned,
-                1 => SubChunkTier::Index,
-                _ => SubChunkTier::Data,
-            };
-            tiers.insert(id, tier);
+
+        // Try v2 format: (SubChunkId, tier_u8, access_count_u32)
+        if let Ok(entries) = serde_json::from_slice::<Vec<(SubChunkId, u8, u32)>>(&data) {
+            let mut present = HashSet::new();
+            let mut tiers = HashMap::new();
+            let mut counts = HashMap::new();
+            for (id, tier_byte, count) in entries {
+                present.insert(id);
+                let tier = match tier_byte {
+                    0 => SubChunkTier::Pinned,
+                    1 => SubChunkTier::Index,
+                    _ => SubChunkTier::Data,
+                };
+                tiers.insert(id, tier);
+                if count > 0 {
+                    counts.insert(id, count);
+                }
+            }
+            return (present, tiers, counts);
         }
-        (present, tiers)
+
+        // Fall back to v1 format: (SubChunkId, tier_u8)
+        if let Ok(entries) = serde_json::from_slice::<Vec<(SubChunkId, u8)>>(&data) {
+            let mut present = HashSet::new();
+            let mut tiers = HashMap::new();
+            for (id, tier_byte) in entries {
+                present.insert(id);
+                let tier = match tier_byte {
+                    0 => SubChunkTier::Pinned,
+                    1 => SubChunkTier::Index,
+                    _ => SubChunkTier::Data,
+                };
+                tiers.insert(id, tier);
+            }
+            return (present, tiers, HashMap::new());
+        }
+
+        (HashSet::new(), HashMap::new(), HashMap::new())
     }
 
     /// Get all pages covered by a sub-chunk (for cache invalidation / hole punching).

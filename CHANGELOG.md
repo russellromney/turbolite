@@ -2,6 +2,158 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Midway: Remove Positional Strategy + turbolite_gc() + Marathon
+
+### Remove Positional strategy
+- Removed `PrefetchNeighbors` enum, `prefetch_hops` config field, `grouping_strategy` config field
+- `GroupingStrategy` enum kept for serde backward compat but only `BTreeAware` is used
+- Removed Positional import path, radial fan-out prefetch, `--grouping`/`--prefetch-hops` CLI flags
+- `manifest.prefetch_neighbors()` replaced with `manifest.prefetch_siblings()` (returns `Vec<u64>` directly)
+- ~200 lines removed across 10 files
+
+### turbolite_gc() SQL function
+- `SELECT turbolite_gc()` runs full orphan scan (list all S3 keys, diff against manifest, delete orphans)
+- Returns count of deleted objects. FFI: ext.rs + ext_entry.c, same pattern as turbolite_cache_info
+
+### Marathon: Local Disk Compaction
+- Cache file truncation after VACUUM: when checkpoint detects cache file > `page_count * page_size`, truncates to match
+- Integration test: insert 1000 rows, VACUUM, verify cache file shrinks
+
+---
+
+## Phase 35: Tiered VFS Test Refactor
+
+Split `tests/tiered_test.rs` (5,399 lines, 49 tests) into domain-focused submodules under `tests/tiered/`.
+
+- Entry point: `tests/tiered.rs` declaring submodules
+- `helpers.rs` (179 lines): shared setup, S3 verification, unique VFS names
+- `basic.rs` (1,122 lines, 13 tests): core I/O, checkpoint, manifest, cold read, caching
+- `data_ops.rs` (1,100 lines, 9 tests): UPDATE/DELETE, VACUUM, rollback, BLOBs, journal modes
+- `indexes.rs` (547 lines, 4 tests): index bundles, eager load, OLTP, small-PPG integrity
+- `gc.rs` (282 lines, 4 tests): post-checkpoint GC, disabled GC, full scan, no-orphan safety
+- `encryption.rs` (1,142 lines, 9 tests): encryption, wrong key, key rotation, add/remove
+- `advanced.rs` (954 lines, 10 tests): PPG config, TTL eviction, dictionary, cache management, autovacuum
+
+Tests can now run by domain: `cargo test --test tiered tiered::gc`
+
+---
+
+## Thermopylae: GC + Msgpack Manifest + Autovacuum
+
+### Msgpack manifest
+- Manifest stored as msgpack (`manifest.msgpack`) instead of JSON. Smaller, faster serialize/deserialize.
+- Automigration: reads msgpack first, falls back to JSON. Always writes msgpack. Old `manifest.json` cleaned up by GC.
+- `rmp-serde` dependency added.
+
+### GC improvements
+- `gc_enabled` default flipped to `true`. Orphan accumulation was a silent storage leak.
+- Post-checkpoint GC is async: spawns delete on tokio runtime, doesn't block checkpoint return.
+- `delete_objects_async_owned` on S3Client for fire-and-forget background deletes with error logging.
+
+### Autovacuum verification
+- Integration test confirms `PRAGMA auto_vacuum=INCREMENTAL` + `incremental_vacuum(N)` works through the tiered VFS.
+- Insert/delete/vacuum/checkpoint/GC cycle stabilizes S3 object count.
+- 300 unit + 39 integration tests passing.
+
+---
+
+## Marathon: Local Disk Compaction
+
+Cache file truncation after VACUUM. When checkpoint detects the cache file is larger than `page_count * page_size`, it truncates the file to match. Frees disk space without requiring a fresh reader.
+
+- Truncation runs after bitmap persist, before async GC
+- Compares `file.metadata().len()` against `manifest.page_count * page_size`
+- Integration test: insert 1000 rows, VACUUM, verify cache file shrinks to match new page_count
+
+---
+
+## Stalingrad: Cache Eviction Policies (complete)
+
+Production cache management: size limits, observability, manual control, and smart eviction.
+
+### a. Size-based eviction
+- `max_cache_bytes: Option<u64>` on TieredConfig, `TURBOLITE_CACHE_LIMIT` env var, `turbolite_config_set('cache_limit', '512MB')`
+- `current_cache_bytes` on SubChunkTracker (inside mutex, not atomic). Updated on mark_present/remove/clear.
+- `evict_to_budget(limit, skip_groups)` on DiskCache: sorts evictable sub-chunks by score, evicts lowest first (O(n log n))
+- Between-query trigger in VFS read path (step 3d): builds skip_groups from dirty pages + pending flush + fetching groups
+- `parse_byte_size()` supports "512MB", "2GB", raw bytes, fractional ("1.5GB")
+
+### b. Access count tracking + weighted eviction
+- `access_counts: HashMap<SubChunkId, u32>` on SubChunkTracker, capped at 64
+- Score = tier_bonus + recency_score + frequency_score
+- tier_bonus: Data=0, Index=10 (additive: ANY Index beats ANY Data)
+- recency_score: 0.0 (1hr+) to 1.0 (just accessed). Window: RECENCY_WINDOW_SECS=3600
+- frequency_score: 0.0 (untouched) to 1.0 (64+ accesses)
+- Access counts persisted in tracker v2 format (backward compatible with v1)
+
+### c. Cache observability
+- Hit/miss/eviction/bytes_evicted counters on DiskCache (AtomicU64)
+- Peak cache size tracking (`stat_peak_cache_bytes`) updated on every group present
+- Churn detection: WARN log when between-query eviction sheds >50% of cache
+- `stat_last_eviction_count` for per-pass eviction tracking
+- cache_info JSON includes: size_bytes, peak_bytes, groups, tiers, hits, misses, hit_rate, evictions, bytes_evicted, last_eviction_count, s3_gets_total
+
+### d. Manual eviction controls
+- `turbolite_evict_tree(names)`: comma-separated tree names, BTreeAware only
+- `turbolite_evict('data'/'index'/'all')`: evict by tier, skips pending flush
+- `turbolite_evict_query('SELECT ...')`: runs EQP, extracts tree names, evicts their groups
+
+### e. Checkpoint eviction
+- `evict_on_checkpoint: bool`, TURBOLITE_EVICT_ON_CHECKPOINT env, turbolite_config_set runtime toggle
+- After S3 upload, evicts Data tier (interior + index remain)
+
+### f. Speculative warm
+- `turbolite_warm('SELECT ...')`: runs EQP, submits tree groups to prefetch pool (non-blocking)
+- Returns JSON: {"trees_warmed": [...], "groups_submitted": N}
+
+### g. Naming cleanup
+- Renamed `TieredBenchHandle` to `TieredSharedState` (used by SQL functions + benchmarks)
+- Renamed `bench_handle()` to `shared_state()`
+
+### Infrastructure
+- DRY: extracted group_page_nums(), sub_chunk_page_nums(), clear_pages_from_disk() helpers
+- 306 unit tests, 3 integration tests
+
+---
+
+## Stalingrad (items 1-3): Cache Eviction Foundations
+
+Between-query eviction boundary, manual tree eviction, and cache observability. The building blocks for production cache management.
+
+### 1. SQLITE_TRACE_PROFILE + end-query signal
+- `turbolite_trace_end_query()` FFI entry point, called from C trace profile callback
+- AtomicBool end-query signal: set on statement completion, checked+cleared by VFS on next read
+- Multiple signals collapse to one check (idempotent). Trace callback handles both SQLITE_TRACE_STMT (plan-aware prefetch) and SQLITE_TRACE_PROFILE (end-query signal)
+- Reentrant guard prevents false PROFILE events from inner EQP statements
+- Between-query eviction hook wired in VFS read path (step 3d), no-op until size-based eviction (item 4)
+- 5 unit tests
+
+### 2. `turbolite_evict_tree(names)` SQL function
+- Evicts cached groups for named B-trees via `tree_name_to_groups` manifest lookup
+- Accepts comma-separated names: `SELECT turbolite_evict_tree('audit_log, idx_audit_date')`
+- Skips groups pending S3 upload (dirty page safety) and interior/pinned groups
+- Works with BTreeAware grouping strategy (Positional has no tree-to-group mapping)
+- FFI: `turbolite_evict_tree()` in ext.rs, C wrapper in ext_entry.c
+- Integration test with BTreeAware import, pending-flush safety test
+
+### 3. `turbolite_cache_info()` SQL function
+- Returns JSON: `size_bytes`, `groups_cached`, `groups_total`, tier breakdown (pinned/index/data chunks and bytes), `s3_gets_total`
+- Thread-local CString buffer for FFI safety (SQLITE_TRANSIENT copies immediately)
+- Integration test: JSON structure validation, size decrease after cache clear
+
+---
+
+## Marne (Memory): Dirty Page Memory Optimization
+
+Replaced `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>`. Dirty page data lives only in the disk cache file, not duplicated in memory. Saves 64KB per dirty page (1000 dirty 64KB pages = 64MB saved).
+
+- `write_all_at()` writes to cache file and inserts page number into HashSet (was: clone page data into HashMap + write to cache)
+- `read_exact_at()` checks HashSet membership, reads from cache (was: read from HashMap)
+- `sync()` snapshots HashSet (was: clone entire HashMap with page data). Interior/index page classification reads from cache at checkpoint time.
+- 282 unit tests passing, no regressions
+
+---
+
 ## Marne: Query-Plan-Aware Prefetch
 
 The VFS knows which B-trees a query will access BEFORE the first page read. A trace callback runs EXPLAIN QUERY PLAN at the start of sqlite3_step(), parses SCAN/SEARCH + table/index names, and pushes them to a global queue. The VFS drains the queue on first cache miss and submits all planned groups to the prefetch pool in one batch. Falls back to hop schedule when queue is empty.
@@ -100,7 +252,7 @@ Two-phase checkpoint: fast local WAL compaction (~1ms lock) + async S3 upload (n
 
 ### Two-phase checkpoint (flush_to_s3)
 - Shared `Arc<RwLock<Manifest>>` and `Arc<Mutex<HashSet<u64>>>` between handle and VFS for lock-free flush
-- `flush_to_s3()` on both `TieredVfs` and `TieredBenchHandle`
+- `flush_to_s3()` on both `TieredVfs` and `TieredSharedState`
 - Uploads page groups, interior chunks, and index leaf bundles outside any SQLite lock
 - `flush_lock` mutex prevents concurrent flush races on version numbers and S3 keys
 - Cache eviction protects pending-upload groups from eviction (all `clear_cache*` methods)

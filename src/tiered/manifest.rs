@@ -237,20 +237,9 @@ impl Manifest {
         }
     }
 
-    /// Select prefetch neighbors based on strategy.
-    /// Positional: radial fan-out from current gid.
-    /// BTreeAware: sibling groups from the same B-tree.
-    pub fn prefetch_neighbors(&self, gid: u64) -> PrefetchNeighbors {
-        match self.strategy {
-            GroupingStrategy::Positional => {
-                PrefetchNeighbors::RadialFanout { total_groups: self.total_groups() }
-            }
-            GroupingStrategy::BTreeAware => {
-                PrefetchNeighbors::BTreeSiblings(
-                    self.btree_groups.get(&gid).cloned().unwrap_or_default()
-                )
-            }
-        }
+    /// Get sibling groups from the same B-tree for prefetch.
+    pub fn prefetch_siblings(&self, gid: u64) -> Vec<u64> {
+        self.btree_groups.get(&gid).cloned().unwrap_or_default()
     }
 
     /// Detect strategy from manifest contents (for backward compat with manifests

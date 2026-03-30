@@ -11,6 +11,7 @@
 //! When the queue is empty (extension not loaded, or DDL/PRAGMA), the VFS
 //! falls back to the hop schedule.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Access type from EXPLAIN QUERY PLAN output.
@@ -57,6 +58,27 @@ pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
         return Vec::new();
     }
     std::mem::take(&mut *queue)
+}
+
+/// End-of-query signal. Set by the SQLITE_TRACE_PROFILE callback when a
+/// statement finishes. The VFS checks this on the next read to trigger
+/// between-query eviction (Phase Stalingrad).
+///
+/// AtomicBool is sufficient: we only need "at least one query ended since
+/// last check." Multiple concurrent completions collapse to one eviction
+/// pass, which is correct (eviction is idempotent).
+static END_QUERY_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// Signal that a query has completed. Called from the C trace profile callback.
+pub fn signal_end_query() {
+    END_QUERY_SIGNAL.store(true, Ordering::Release);
+}
+
+/// Check and clear the end-of-query signal. Returns true if at least one
+/// query completed since the last check. The VFS calls this on every read
+/// to decide whether to run between-query eviction.
+pub fn check_and_clear_end_query() -> bool {
+    END_QUERY_SIGNAL.swap(false, Ordering::AcqRel)
 }
 
 /// Parse EXPLAIN QUERY PLAN output text into PlannedAccess entries.
@@ -258,6 +280,13 @@ pub unsafe extern "C" fn turbolite_trace_push_plan(
 
     let accesses = run_eqp_and_parse(db, sql_str);
     push_planned_accesses(accesses);
+}
+
+/// FFI entry point called from C trace profile callback.
+/// Signals query completion for between-query eviction.
+#[no_mangle]
+pub extern "C" fn turbolite_trace_end_query() {
+    signal_end_query();
 }
 
 #[cfg(test)]
