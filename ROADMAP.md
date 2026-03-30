@@ -51,58 +51,93 @@ Close the durability gap between checkpoints. walrust ships WAL frames to S3; tu
 - [x] `materialize_to_file()` on TieredSharedState
 - [x] Tests: 12 turbolite + 8 walrust unit + 3 walrust S3 integration
 
-### b. Unified version counter (file change counter)
-
-Both turbolite and walrust derive version/txid from SQLite's file change counter. No mapping, no coordination. The counter comes from the source of truth (SQLite itself).
-
-**turbolite changes:**
-- [ ] `manifest.version` = file change counter from page 0 at checkpoint time
-  - In `sync()`: read page 0 offset 24 (4 bytes BE) from cache, use as `version`
-  - Replace current `version + 1` incrementing with actual change counter value
-  - Backward compat: old manifests with small version numbers still work (version is still monotonically increasing, just gaps between values)
-- [ ] `materialize_to_file()` returns the change counter (already returns `manifest.version`, so this follows automatically)
-- [ ] Track change counter in `write_all_at()` when page 0 is written (already partially done for VACUUM detection)
-- [ ] Tests: version matches `PRAGMA data_version` after checkpoint, version advances on writes
-
-**walrust changes:**
-- [ ] `current_txid` = file change counter from the latest commit frame's page 0 data
-  - In `sync_wal()`: when reading WAL frames, extract change counter from page 0 frames (frames where page_number=1, since WAL uses 1-based page numbers)
-  - Use as `max_txid` for LTX key naming instead of current page-count arithmetic
-  - If no page 0 frame in this batch: use `state.current_txid` (no commit happened, or page 0 wasn't modified -- should not happen since SQLite always writes page 0 on commit)
-- [ ] `take_snapshot()`: read change counter from DB file page 0, use as txid
-- [ ] LTX filenames still use hex txid format, just the number source changes
-- [ ] Backward compat: old LTX files with old-style txids still discoverable (filename format unchanged)
-- [ ] Tests: txid matches file change counter after sync, txid advances with commits
+### b. Unified version counter (file change counter) -- DONE
+- [x] turbolite: `manifest.version` = file change counter, no fallback (panics if missing)
+- [x] walrust: `current_txid` = file change counter from WAL page 0 / DB file, no fallback
+- [x] import: reads change counter from source file header, panics if 0
 
 ### c. walrust as optional turbolite dependency
-- [ ] `wal` feature flag in turbolite Cargo.toml: `wal = ["dep:walrust-core"]`
-- [ ] `TieredConfig::wal_replication: bool` (default false), `TURBOLITE_WAL_REPLICATION=true`
-- [ ] Only available when `features = ["wal"]`, compile error otherwise
-- [ ] Tests: feature-gated compilation
 
-### d. VFS open with WAL recovery
-- [ ] When `wal_replication` enabled on VFS open:
-  1. Fetch manifest (existing)
-  2. `materialize_to_file()` to local temp file
-  3. walrust `restore_with_snapshot_source()` applies WAL with txid > manifest.version
-  4. Initialize VFS cache from the restored file
-  5. Clean up temp file
-- [ ] When enabled during runtime:
-  - walrust `sync_wal()` runs on background interval (ships WAL frames to S3)
-  - Background task started in `TieredVfs::new()` when wal_replication=true
-- [ ] Tests: write data, kill before checkpoint, cold start recovers WAL-shipped data
+Add walrust-core as an optional dep behind a feature flag. This step is pure plumbing, no behavior changes.
+
+- [ ] Add to Cargo.toml:
+  ```toml
+  [features]
+  wal = ["dep:walrust-core", "dep:hadb-io"]
+  [dependencies]
+  walrust-core = { path = "../walrust/crates/walrust-core", optional = true }
+  hadb-io = { path = "../../hadb/hadb-io", optional = true }
+  ```
+- [ ] `TieredConfig` fields (behind `#[cfg(feature = "wal")]`):
+  - `wal_replication: bool` (default false)
+  - `wal_sync_interval: Duration` (default 1s)
+  - `wal_db_name: Option<String>` (default: derive from prefix)
+- [ ] `TURBOLITE_WAL_REPLICATION=true`, `TURBOLITE_WAL_SYNC_INTERVAL=1000` env vars
+- [ ] `cargo check --features tiered,zstd` still works (no wal dep)
+- [ ] `cargo check --features tiered,zstd,wal` compiles with wal dep
+- [ ] Tests: config parsing, feature gate compile check
+
+### d. Runtime WAL shipping
+
+When `wal_replication=true`, turbolite starts a background walrust replication loop alongside the VFS. WAL frames are shipped to S3 on a timer. This provides transaction-level durability.
+
+**d1. Start walrust replication on VFS creation**
+- [ ] In `TieredVfs::new()` when `wal_replication=true`:
+  1. Create `S3Backend::from_env()` for walrust (same bucket/endpoint as turbolite, from env vars)
+  2. Determine WAL file path: `{cache_dir}/{db_name}.db-wal` (same file the VFS passthrough writes to)
+  3. Create `SyncState::new()` for the DB
+  4. Initialize: read current manifest.version, set `state.current_txid = manifest.version`
+  5. Take initial snapshot via `take_snapshot()` (walrust requires this before incrementals)
+  6. Spawn background task: `tokio::spawn(run_replication(storage, prefix, db_path, config, cancel_rx))`
+  7. Store `cancel_tx` on `TieredVfs` so `Drop` can signal shutdown
+- [ ] WAL segments stored under `{turbolite_prefix}/wal/{db_name}/0000/` (incrementals)
+- [ ] Tests:
+  - VFS creates + walrust replication starts without error
+  - WAL frames appear in S3 after writes
+  - Shutdown triggers final sync (cancel signal)
+
+**d2. WAL recovery on VFS open (cold start)**
+- [ ] In `TieredVfs::new()` when `wal_replication=true` AND manifest exists:
+  1. `materialize_to_file()` to `{cache_dir}/recovery.db`
+  2. Create walrust `S3Backend` + implement `SnapshotSource` for turbolite
+  3. Call `restore_with_snapshot_source()` with manifest.version as checkpoint_version
+  4. If WAL segments were applied: read recovered pages into VFS cache
+     - Open recovered.db, read each page, write to cache via `DiskCache::write_page()`
+     - Update manifest page_count if DB grew
+  5. Delete recovery.db (it was temporary)
+  6. Then start runtime replication (d1)
+- [ ] If no manifest exists (first open): skip recovery, just start replication
+- [ ] Tests:
+  - Write 100 rows, ship WAL, kill (no checkpoint), cold start recovers all 100 rows
+  - Write 100 rows, checkpoint, write 50 more, ship WAL, kill, recover: 150 rows
+  - Write + checkpoint (no WAL to replay): recovery is a no-op, data correct
+  - Multiple checkpoints with WAL between each: only latest WAL segments applied
 
 ### e. WAL segment GC after checkpoint
-- [ ] After checkpoint uploads manifest with version=N, WAL segments with txid <= N are garbage
-- [ ] In `sync()` after manifest upload: call walrust to delete old segments
-- [ ] Or: walrust background task polls manifest version and self-cleans
-- [ ] Tests: segments accumulate between checkpoints, cleaned after checkpoint
 
-### f. Shared S3 credentials
-- [ ] Two-client approach: turbolite uses its `S3Client`, walrust uses `S3Backend::from_env()`
-- [ ] Same bucket, same creds from env vars
-- [ ] WAL segments under `{turbolite_prefix}/wal/` (walrust's db_name = turbolite prefix)
-- [ ] No `ObjectStore` adapter needed (separate clients, shared credentials)
+After turbolite checkpoint uploads manifest with version=N, all WAL segments with txid <= N are redundant (the page groups contain that data).
+
+- [ ] In `sync()` after manifest upload, if `wal_replication=true`:
+  1. List WAL segments under `{prefix}/wal/{db_name}/0000/` with txid <= N
+  2. Delete them via `S3Backend::delete_objects()`
+  3. Log count of deleted segments
+- [ ] Same in `flush_dirty_groups_to_s3()`
+- [ ] Tests:
+  - Write 10 commits (10 WAL segments in S3), checkpoint, verify segments deleted
+  - GC is idempotent (running twice doesn't error)
+  - Segments newer than checkpoint are preserved
+  - No GC when `wal_replication=false`
+
+### f. End-to-end integration tests (real S3)
+
+These are the tests that prove the whole thing works. No mocks.
+
+- [ ] **Version agreement**: import DB, checkpoint (manifest.version=V), then sync WAL (txid=V+N). Verify manifest.version and walrust txid derive from same change counter.
+- [ ] **Crash recovery**: write through VFS, walrust ships WAL, simulate crash (drop VFS without checkpoint), new VFS cold starts with WAL recovery, verify all data present.
+- [ ] **Checkpoint + WAL**: write, checkpoint, write more, ship WAL, crash, recover. Verify both checkpointed and WAL-shipped data present.
+- [ ] **GC after checkpoint**: write 10 commits, verify 10 WAL segments in S3, checkpoint, verify segments cleaned.
+- [ ] **No WAL segments**: write + checkpoint immediately, no WAL to ship. Recovery is materialize only, no WAL replay.
+- [ ] **Large data**: 1000 rows, 5 checkpoints, WAL between each, crash after last WAL ship, recover, verify all data.
 
 ---
 
