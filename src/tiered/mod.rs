@@ -71,7 +71,10 @@ mod query_plan;
 mod rotation;
 mod s3_client;
 mod settings;
+mod staging;
 mod vfs;
+#[cfg(feature = "wal")]
+mod wal_replication;
 
 // Public API (visible outside the crate)
 pub use bench::TieredSharedState;
