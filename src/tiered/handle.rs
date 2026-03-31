@@ -84,6 +84,8 @@ pub struct TieredHandle {
     staging_writer: Option<staging::StagingWriter>,
     /// Shared pending flushes. Populated by sync(), drained by flush_to_s3().
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    /// Monotonic counter for staging log filenames (avoids version collisions).
+    staging_seq: Arc<AtomicU64>,
     /// Staging directory path (cache_dir/staging).
     staging_dir: PathBuf,
 
@@ -113,6 +115,7 @@ impl TieredHandle {
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
         pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+        staging_seq: Arc<AtomicU64>,
         db_path: PathBuf,
         pages_per_group: u32,
         compression_level: i32,
@@ -313,6 +316,7 @@ impl TieredHandle {
             evict_on_checkpoint,
             staging_writer: None,
             pending_flushes,
+            staging_seq,
             staging_dir,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
@@ -357,6 +361,7 @@ impl TieredHandle {
             evict_on_checkpoint: false,
             staging_writer: None,
             pending_flushes: Arc::new(Mutex::new(Vec::new())),
+            staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
@@ -1419,9 +1424,9 @@ impl DatabaseHandle for TieredHandle {
         if self.sync_mode == SyncMode::LocalThenFlush {
             let ps = *self.page_size.read();
             if self.staging_writer.is_none() && ps > 0 {
-                let version = self.manifest.read().version + 1;
+                let seq = self.staging_seq.fetch_add(1, Ordering::Relaxed);
                 self.staging_writer = Some(
-                    staging::StagingWriter::open(&self.staging_dir, version, ps)?
+                    staging::StagingWriter::open(&self.staging_dir, seq, ps)?
                 );
             }
             if let Some(ref mut writer) = self.staging_writer {
@@ -1533,8 +1538,12 @@ impl DatabaseHandle for TieredHandle {
             // The staging log captured exact page contents during write_all_at(),
             // immune to overwrite by subsequent checkpoints.
             if let Some(writer) = self.staging_writer.take() {
-                let version = self.manifest.read().version + 1;
                 let (staging_path, pages_written) = writer.finalize()?;
+                // Version from filename (seq counter assigned at open time)
+                let version = staging_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 eprintln!(
                     "[sync] staging log finalized: {} pages, version {}, path {}",
                     pages_written, version, staging_path.display(),

@@ -59,6 +59,13 @@ impl StagingWriter {
     /// Append a page to the staging log.
     /// Format: [page_num: u64 LE][page_data: [u8; page_size]]
     pub fn append(&mut self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        debug_assert_eq!(
+            data.len(),
+            self.page_size as usize,
+            "staging append: data.len()={} != page_size={}",
+            data.len(),
+            self.page_size,
+        );
         self.writer.write_all(&page_num.to_le_bytes())?;
         self.writer.write_all(data)?;
         self.pages_written += 1;

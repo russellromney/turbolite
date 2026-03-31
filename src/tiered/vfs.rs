@@ -41,6 +41,10 @@ pub struct TieredVfs {
     /// Phase Kursk: pending staging log flushes. Populated by sync() in
     /// LocalThenFlush mode, drained by flush_to_s3().
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    /// Phase Kursk: monotonic counter for staging log filenames.
+    /// Avoids version collisions when manifest version is updated by flush
+    /// between two checkpoints.
+    staging_seq: Arc<AtomicU64>,
     /// Serializes flush_to_s3() calls. Prevents two concurrent flushes from
     /// racing on version numbers and S3 keys. Also prevents a durable-mode
     /// checkpoint (which drains s3_dirty_groups in sync()) from interleaving
@@ -169,6 +173,9 @@ impl TieredVfs {
                 recovered_staging.len(),
             );
         }
+        // Staging seq starts above any recovered log version to avoid filename collisions
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
         let pending_flushes = Arc::new(Mutex::new(recovered_staging));
 
         let vfs = Self {
@@ -183,6 +190,7 @@ impl TieredVfs {
             shared_manifest,
             shared_dirty_groups,
             pending_flushes,
+            staging_seq,
             flush_lock,
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
@@ -620,6 +628,7 @@ impl Vfs for TieredVfs {
                 Arc::clone(&self.shared_manifest),
                 Arc::clone(&self.shared_dirty_groups),
                 Arc::clone(&self.pending_flushes),
+                Arc::clone(&self.staging_seq),
                 lock_path,
                 ppg,
                 self.config.compression_level,

@@ -50,11 +50,48 @@ pub(crate) fn flush_dirty_groups_to_s3(
         return Ok(());
     }
 
+    // Run the actual flush, restoring drained state on error so nothing is lost.
+    let result = flush_inner(
+        s3, cache, shared_manifest, compression_level,
+        #[cfg(feature = "zstd")] dictionary,
+        encryption_key, gc_enabled, access_history, prediction,
+        &flushes, &legacy_dirty_groups,
+    );
+
+    if let Err(ref e) = result {
+        eprintln!("[flush] ERROR: flush failed, restoring pending state: {}", e);
+        // Push staging logs back so next flush_to_s3() retries them
+        if !flushes.is_empty() {
+            pending_flushes.lock().unwrap().extend(flushes);
+        }
+        // Push legacy dirty groups back
+        if !legacy_dirty_groups.is_empty() {
+            shared_dirty_groups.lock().unwrap().extend(legacy_dirty_groups);
+        }
+    }
+
+    result
+}
+
+/// Inner flush logic. Separated so the outer function can restore state on error.
+fn flush_inner(
+    s3: &S3Client,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+    gc_enabled: bool,
+    access_history: Option<&prediction::SharedAccessHistory>,
+    prediction: Option<&prediction::SharedPrediction>,
+    flushes: &[staging::PendingFlush],
+    legacy_dirty_groups: &HashSet<u64>,
+) -> io::Result<()> {
     // 2. Read all staging logs and merge into a single page map.
     // Later staging logs overwrite earlier ones (correct: later checkpoint wins).
     let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
-    for flush_entry in &flushes {
+    for flush_entry in flushes {
         let pages = staging::read_staging_log(
             &flush_entry.staging_path,
             flush_entry.page_size,
@@ -94,7 +131,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
         .map(zstd::dict::DecoderDictionary::copy);
 
     // 5. Determine all dirty groups: from staged pages + legacy dirty groups
-    let mut dirty_groups: HashSet<u64> = legacy_dirty_groups;
+    let mut dirty_groups: HashSet<u64> = legacy_dirty_groups.clone();
     for &pnum in staged_pages.keys() {
         if let Some(loc) = manifest_snap.page_location(pnum) {
             dirty_groups.insert(loc.group_id);
