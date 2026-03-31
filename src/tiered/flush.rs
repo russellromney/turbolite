@@ -29,8 +29,6 @@ pub(crate) fn flush_dirty_groups_to_s3(
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
     gc_enabled: bool,
-    access_history: Option<&prediction::SharedAccessHistory>,
-    prediction: Option<&prediction::SharedPrediction>,
 ) -> io::Result<()> {
     // 1. Drain pending flushes (staging logs) + legacy dirty groups
     let flushes: Vec<staging::PendingFlush> = {
@@ -54,7 +52,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
     let result = flush_inner(
         s3, cache, shared_manifest, compression_level,
         #[cfg(feature = "zstd")] dictionary,
-        encryption_key, gc_enabled, access_history, prediction,
+        encryption_key, gc_enabled,
         &flushes, &legacy_dirty_groups,
     );
 
@@ -82,8 +80,6 @@ fn flush_inner(
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
     gc_enabled: bool,
-    access_history: Option<&prediction::SharedAccessHistory>,
-    prediction: Option<&prediction::SharedPrediction>,
     flushes: &[staging::PendingFlush],
     legacy_dirty_groups: &HashSet<u64>,
 ) -> io::Result<()> {
@@ -536,20 +532,6 @@ fn flush_inner(
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            btree_access_freq: access_history
-                .map(|ah| {
-                    let mut h = ah.write();
-                    h.decay_and_prune();
-                    h.freq.clone()
-                })
-                .unwrap_or_else(|| old_manifest.btree_access_freq.clone()),
-            prediction_patterns: prediction
-                .map(|p| {
-                    let mut t = p.write();
-                    t.prune();
-                    t.to_persisted()
-                })
-                .unwrap_or_else(|| old_manifest.prediction_patterns.clone()),
         };
         m.build_page_index();
         m

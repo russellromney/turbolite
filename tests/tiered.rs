@@ -24,8 +24,8 @@ mod tiered {
     mod eviction;
     mod manifest_persistence;
     mod materialize;
-    mod prediction;
     mod staging;
+    mod borodino;
     #[cfg(feature = "wal")]
     mod wal_integration;
 }

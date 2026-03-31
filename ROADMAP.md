@@ -1,5 +1,86 @@
 # turbolite Roadmap
 
+## Borodino: Version Counter + Cross-Cutting Correctness
+> After: Kursk (CHANGELOG) · Before: Stalingrad (remaining)
+
+Blocking bugs and untested interactions discovered during Kursk stress testing. Each subsection is a specific issue with a failing test that must pass before shipping.
+
+### a. Version counter: file change counter produces duplicate versions in WAL mode
+
+**Problem:** In WAL mode, SQLite does not guarantee the file change counter (page 0, offset 24) increments on every transaction. The counter may stay the same across consecutive checkpoints. This causes duplicate S3 keys (`pg/0_v2` written twice), and GC deletes "old" versions that are actually the current version.
+
+**Failing tests:**
+- [ ] `test_manifest_version_increments`: two INSERT batches + checkpoints produce v1=2, v2=2
+- [ ] `test_gc_disabled_preserves_old_versions`: same version means GC can't distinguish old from current
+- [ ] `test_materialize_after_multiple_checkpoints`: materialize fetches `pg/0_v2` which GC deleted
+- [ ] `test_materialize_after_vfs_writes`: same root cause
+
+**Fix:** Use both counters. `manifest.version` stays monotonic (`version + 1`) for S3 key uniqueness. Add `manifest.change_counter` field that stores the file change counter for walrust WAL segment replay. S3 keys use `manifest.version`. walrust uses `manifest.change_counter`.
+
+### b. Walrust sync after version fix
+
+**Problem:** Somme designed `manifest.version = file change counter` so walrust knows which WAL segments to replay. Splitting into two fields means walrust must use `manifest.change_counter` instead of `manifest.version`. Cold start flow: `restore_with_snapshot_source()` replays WAL segments with txid > `manifest.change_counter`.
+
+**Tests (require `wal` feature):**
+- [ ] WAL segment replay uses `change_counter`, not `version`, for txid comparison
+- [ ] After checkpoint, `manifest.change_counter` matches `PRAGMA data_version` or file change counter
+- [ ] Cold start with WAL segments: replays correct segments based on `change_counter`
+- [ ] `change_counter` survives manifest roundtrip (serialize/deserialize)
+
+### c. Encryption + staging log interaction
+
+**Problem:** `write_all_at()` receives plaintext from SQLite, writes encrypted to cache (if encryption enabled), and appends to staging log. If the staging log captures encrypted data, `flush_to_s3()` would double-encrypt during encoding. If it captures plaintext, the staging file on disk is unencrypted (data at rest exposure).
+
+**Tests:**
+- [ ] Staging log with encryption enabled: flush produces correct S3 data, cold reader decrypts successfully
+- [ ] Staging log bytes are encrypted on disk (not plaintext)
+- [ ] Wrong encryption key on recovery VFS: staging log read fails cleanly (not silent corruption)
+
+### d. VACUUM + LocalThenFlush interaction
+
+**Problem:** VACUUM detection + B-tree re-walk runs in the durable sync path. In LocalThenFlush mode, the staging log captures pages during `write_all_at()` (before sync). If VACUUM fires, sync() re-walks B-trees and rebuilds `group_pages`. But the staging log has page data under the old group assignments. `flush_to_s3()` would use the re-walked manifest but the staging pages map to old groups.
+
+**Tests:**
+- [ ] LocalThenFlush: INSERT, checkpoint, VACUUM, checkpoint, flush, cold reader sees correct data
+- [ ] Staging log pages are assigned to correct groups after VACUUM re-walk
+- [ ] VACUUM detection fires in LocalThenFlush mode (not skipped)
+
+### e. Compaction between checkpoint and flush
+
+**Problem:** `turbolite_compact()` repacks page groups with new group IDs. If called between a LocalThenFlush checkpoint and flush, the staging log references group assignments that compaction just invalidated.
+
+**Tests:**
+- [ ] LocalThenFlush: checkpoint, compact, flush. Flush uses pre-compaction group assignments (staging is self-contained).
+- [ ] LocalThenFlush: checkpoint, compact, checkpoint, flush. Second staging log has post-compaction assignments.
+- [ ] Compaction after flush (no pending staging): works as before
+
+### f. Cache eviction under memory pressure with pending staging
+
+**Problem:** Pending pages are protected from eviction, but only tested with unlimited cache. With `max_cache_bytes` set low and heavy read load between checkpoint and flush, does the protection hold?
+
+**Tests:**
+- [ ] `max_cache_bytes=1MB`, write 5MB, checkpoint (LocalThenFlush), read different data (triggers eviction), flush. Pending pages survive eviction, flush succeeds.
+- [ ] Same but with `clear_cache()` call between checkpoint and flush. Pending pages survive.
+
+### g. Multiple databases on same VFS with LocalThenFlush
+
+**Problem:** Two db files sharing the same VFS + staging_dir. Staging logs use a shared `staging_seq` counter. Do logs stay isolated? Does flush upload the right data for each db?
+
+**Tests:**
+- [ ] Two databases on same VFS: each checkpoints with LocalThenFlush, each flushes independently, cold readers see correct data for each db
+- [ ] Staging log filenames don't collide (different seq numbers)
+
+### h. Tokio runtime contention under parallel tests
+
+**Problem:** 90 parallel integration tests each create their own tokio runtime + S3 client + prefetch pool. Under heavy parallel load, 3 tests fail intermittently (cache_truncation_after_vacuum, dictionary_roundtrip, custom_pages_per_group).
+
+**Tests/fix:**
+- [ ] Investigate: are failures from S3 rate limiting, tokio thread exhaustion, or file descriptor limits?
+- [ ] If tokio contention: consider shared runtime across VFS instances in test harness
+- [ ] If S3 rate limiting: add retry/backoff to test assertions, or reduce parallelism for S3-heavy tests
+
+---
+
 ## Stalingrad (remaining): Query Cost Estimation
 > After: Austerlitz (CHANGELOG) · Before: Jena
 
