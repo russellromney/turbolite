@@ -15,6 +15,7 @@ pub struct TieredSharedState {
     // Shared state for flush_to_s3()
     pub(super) shared_manifest: Arc<RwLock<Manifest>>,
     pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     pub(super) flush_lock: Arc<Mutex<()>>,
     pub(super) compression_level: i32,
     #[cfg(feature = "zstd")]
@@ -197,6 +198,7 @@ impl TieredSharedState {
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
+            &self.pending_flushes,
             self.compression_level,
             #[cfg(feature = "zstd")]
             self.dictionary.as_deref(),
@@ -207,9 +209,10 @@ impl TieredSharedState {
         )
     }
 
-    /// Returns true if there are dirty groups pending S3 upload.
+    /// Returns true if there are dirty groups or staging logs pending S3 upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
+            || !self.pending_flushes.lock().unwrap().is_empty()
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
