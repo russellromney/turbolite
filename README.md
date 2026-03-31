@@ -159,7 +159,7 @@ If encryption is enabled, turbolite encrypts everything: S3 objects, local cache
 ### Current limitations
 
 - **Single writer only.** Two machines writing to the same prefix will corrupt the manifest.
-- **No WAL shipping.** Writes between checkpoints live only in the local WAL. See [Durability](#durability).
+- **WAL shipping is experimental.** Requires the `wal` feature flag + walrust. See [Durability](#durability).
 
 SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mode, VACUUM, autovacuum.
 
@@ -171,8 +171,7 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 |-----------|-----------------|---------|
 | `prefetch_threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
 | `pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
-| `grouping_strategy` | How pages are packed into groups at import | BTreeAware |
-| `gc_enabled` | Delete old page group versions after checkpoint | false |
+| `gc_enabled` | Delete old page group versions after checkpoint | true |
 | `sync_mode` | Checkpoint durability: `Durable` (S3 upload in checkpoint) or `LocalThenFlush` (defer upload) | Durable |
 
 ### Prefetch schedules
@@ -270,11 +269,31 @@ turbolite supports two checkpoint modes via `sync_mode` in `TieredConfig`:
 
 **`SyncMode::LocalThenFlush`**. The checkpoint writes to local disk cache only (~1ms lock hold), then releases the lock. The caller uploads to S3 separately via `flush_to_s3()`, during which reads and writes continue normally. This is useful for write-heavy workloads where blocking readers for the duration of an S3 upload is unacceptable.
 
-Between checkpoint and flush, data exists only in the local disk cache. A process crash is fine (data is on local disk). Machine loss before flush means those writes are gone. Cache eviction is safe: turbolite protects pending pages from eviction automatically.
+Between checkpoint and flush, data exists only in the local disk cache. A process crash is fine (data is on local disk, and staging logs capture the exact page contents for upload). Machine loss before flush means those writes are gone. Cache eviction is safe: turbolite protects pending pages from eviction automatically.
 
-### WAL shipping
+**Crash recovery**: If the process crashes between checkpoint and flush, staging logs survive on disk. On the next `TieredVfs::new()`, they are automatically recovered and queued for the next `flush_to_s3()` call. Reads are served immediately from the local cache without waiting for the flush.
 
-WAL shipping (not yet implemented): the VFS already intercepts every WAL write, so it could ship WAL frames to S3 in the background, closing the durability gap between writes and checkpoints. This is on the roadmap. WAL shipping is complementary to SyncMode: SyncMode controls how checkpoints reach S3, WAL shipping would make individual writes durable before checkpoint.
+### WAL shipping (experimental)
+
+With the `wal` feature flag enabled, turbolite ships WAL frames to S3 via [walrust](https://github.com/russellromney/walrust), closing the durability gap between individual writes and checkpoints.
+
+```toml
+# Cargo.toml
+turbolite = { version = "0.2", features = ["tiered", "zstd", "wal"] }
+```
+
+```rust
+let config = TieredConfig {
+    wal_replication: true,  // enable WAL shipping
+    ..Default::default()
+};
+```
+
+Both turbolite and walrust use SQLite's file change counter as their version, so they stay synchronized without coordination. On cold start, walrust replays WAL segments with txid > manifest.version to recover writes that occurred after the last checkpoint.
+
+**Durability model with WAL shipping**: every committed transaction is shipped to S3 as a WAL segment within the sync interval (default 100ms). If the machine dies, at most one sync interval of writes is lost. After checkpoint, WAL segments with txid <= manifest.version are garbage collected automatically.
+
+WAL shipping is complementary to SyncMode: SyncMode controls how checkpoints reach S3, WAL shipping makes individual writes durable before checkpoint.
 
 ### Consistency model
 
