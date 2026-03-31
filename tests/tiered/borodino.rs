@@ -182,6 +182,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
     let cache_dir = TempDir::new().unwrap();
     let mut config = ltf_config("enc_wrong", cache_dir.path());
     config.encryption_key = Some([0xAB; 32]);
+    let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
     let vfs = TieredVfs::new(config).unwrap();
     let shared = vfs.shared_state();
@@ -197,10 +198,10 @@ fn borodino_encryption_staging_wrong_key_fails() {
     // Cold reader with WRONG key should fail
     let cold_dir = TempDir::new().unwrap();
     let cold_config = TieredConfig {
-        bucket: config.bucket.clone(),
-        prefix: config.prefix.clone(),
+        bucket,
+        prefix,
         cache_dir: cold_dir.into_path(),
-        endpoint_url: config.endpoint_url.clone(),
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
         encryption_key: Some([0xCD; 32]), // wrong key
