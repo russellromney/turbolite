@@ -2,6 +2,90 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Somme: WAL Durability via walrust Integration
+
+Close the durability gap between checkpoints. walrust ships WAL frames to S3; turbolite page groups serve as the snapshot. The two layers compose through SQLite's file change counter (page 0, offset 24): both use it as their version/txid, staying synchronized with no coordination protocol.
+
+### a-b. SnapshotSource + Unified version counter
+- `SnapshotSource` trait in walrust-core, `restore_with_snapshot_source()` for WAL replay from external snapshot
+- `materialize_to_file()` on TieredSharedState: hydrate full DB from S3 page groups into local file
+- `manifest.version` = SQLite file change counter (panics if missing, no fallback)
+- walrust `current_txid` = same change counter from WAL page 0 / DB file
+- 12 turbolite + 8 walrust unit + 3 walrust S3 integration tests
+
+### c. walrust as optional dependency
+- `wal` feature flag: walrust-core + hadb-io + async-trait as optional deps
+- Config fields `wal_replication` and `wal_sync_interval_ms` gated behind `#[cfg(feature = "wal")]`
+- `TURBOLITE_WAL_REPLICATION=true`, `TURBOLITE_WAL_SYNC_INTERVAL=1000` env vars
+- Compiles clean with and without wal feature
+
+### d. Runtime WAL shipping + cold start recovery
+- `WalReplicationState`: starts walrust's `run_wal_replication()` background loop on first MainDb open
+- Lazy start (WAL file path not known until open). Uses snapshot-less WAL-only replication (turbolite page groups ARE the snapshot)
+- Cancel signal on Drop for graceful shutdown with final WAL sync
+- Cold start: checks S3 for WAL segments > manifest.version, materializes page groups to temp file, applies LTX incrementals via walrust, loads recovered pages into VFS cache
+- Stops on checksum chain break (stale lineage detection)
+
+### e. WAL segment GC after checkpoint
+- After checkpoint uploads manifest version=N, async list + delete WAL segments (.ltx) with max_txid <= N
+- `list_all_keys_with_prefix()` on S3Client for WAL segment discovery
+- GC only runs when wal feature enabled and gc_enabled=true
+
+### f. End-to-end integration tests (7 tests)
+- Version agreement, crash recovery, checkpoint+WAL recovery, no-WAL no-op, GC after checkpoint, large data (1000 rows + multiple checkpoints)
+- Feature-gated behind `#[cfg(feature = "wal")]`
+
+---
+
+## Austerlitz: Per-Query Adaptive Prefetch Schedules
+
+### a. Range-GET budget per tree (added then removed)
+- Implemented per-tree range-GET budget with `max_range_gets_per_tree` config
+- Removed after benchmarking showed 3x regression from HashMap overhead
+- Replaced by query-plan-aware prefetch: SCAN queries bulk-prefetch all tree groups upfront
+
+### b. Independent search/lookup prefetch schedules
+- Refactored prefetch to push independent `prefetch_search` and `prefetch_lookup` schedules per query
+- Per-query CLI flags and env vars (e.g. `BENCH_PROFILE_PREFETCH`, `BENCH_PROFILE_LOOKUP`)
+- 16-pair matrix sweep on Tigris to find optimal schedules (Tigris 25ms round trips need warmer lookups than S3 Express)
+- Tuned hop schedule to `[0.1, 0.3, 0.6]` for balanced SEARCH/SCAN performance
+- `turbolite_config_set` SQL function for runtime schedule adjustment
+
+---
+
+## Kursk: Staging Log for Two-Phase Checkpoint
+
+Correctness fix for `SyncMode::LocalThenFlush`. Without staging, a second checkpoint could overwrite disk cache pages before `flush_to_s3()` reads them, uploading a state that never existed as a committed transaction.
+
+### Staging log (WAL-inspired)
+- `StagingWriter`: append-only log in `cache_dir/staging/{seq}.log`, fixed-size records `[page_num: u64 LE][page_data]`
+- `write_all_at()` in LocalThenFlush mode appends to staging log alongside normal cache write
+- `sync()` fsyncs + closes staging writer, pushes `PendingFlush` to shared state (zero added I/O)
+- `flush_to_s3()` reads from staging logs (not live cache), priority: staging > cache > S3 merge
+- Staging files deleted after successful upload
+
+### Bug fixes (review)
+- Staging version collision: monotonic AtomicU64 counter (`staging_seq`) instead of manifest.version+1
+- Flush error recovery: on S3 failure, staging logs and dirty groups pushed back to shared state for retry
+- Staging dir mismatch: handle and VFS both use `cache_dir/staging/` (was `cache_dir/locks/staging/` on handle)
+
+### Crash recovery
+- `recover_staging_logs()` scans for leftover `.log` files on VFS open
+- Validates file size (must be multiple of record size), skips empty/corrupt files
+- Recovered logs queued for next `flush_to_s3()` call
+
+### SyncMode config
+- `SyncMode::Durable` (default): S3 upload during checkpoint, EXCLUSIVE lock held
+- `SyncMode::LocalThenFlush`: local-only checkpoint (~1ms lock), user calls `flush_to_s3()`
+- Per-VFS config in `TieredConfig`, documented in README Durability section
+
+### Tests
+- 7 unit tests: roundtrip, duplicate pages, empty log, multi-log recovery, error cases
+- 5 S3 integration tests: two-checkpoints-before-flush, crash recovery, durable no-staging, overwrite, no-op flush
+- 312 unit + 5 integration tests passing
+
+---
+
 ## Midway-g: B-tree Page Group Compaction
 
 - `analyze_dead_space()`: re-walk B-trees, compare against manifest, report dead-page ratio per tree
@@ -200,23 +284,11 @@ The VFS knows which B-trees a query will access BEFORE the first page read. A tr
 
 ---
 
-## Verdun (Prediction): Predictive Cross-Tree Prefetch
+## Verdun (Prediction): Removed Experiment
 
-Learn which B-trees appear together in transactions and prefetch the full set when a partial match is detected. Pattern boundary = lock lifecycle (NONE -> SHARED/EXCLUSIVE -> NONE). K=2 trigger: after 2 distinct trees are touched, predict the rest.
+Predictive cross-tree prefetch was implemented as an experiment: learn which B-trees appear together in transactions and prefetch the full set when a partial match is detected. The system tracked lock session B-tree touches, maintained a PredictionTable with confidence scoring (observe/reinforce/decay), and fired predictions on the 2nd distinct B-tree touch.
 
-### Lock session tracking (a-f)
-- `LockSession` tracks B-tree touches per connection, `PredictionTable` with pair index and confidence math
-- Confidence: initial 0.3, reinforce +0.25, time decay *0.95, write decay *0.7, threshold 0.5
-- `AccessHistory` tracks B-tree frequency across sessions with exponential decay
-- Prediction firing: on 2nd tree touch, predict remaining trees, submit groups to prefetch pool
-- Write decay applied per dirty B-tree on lock release; reinforcement on correct prediction
-- 25 unit tests
-
-### Name-based prediction keys (i1-i2)
-- Refactored from u64 root page IDs to String table/index names (survives VACUUM)
-- `page_to_tree_name` and `tree_name_to_groups` reverse indexes in manifest
-- All prediction types (LockSession, PredictionTable, AccessHistory) use String keys
-- 28 tests including VACUUM resilience, table rename, drop/create same name
+**Removed** because the existing hop schedule + query-plan-aware prefetch (Phase Marne) already achieve very fast results. The prediction system added significant complexity (LockSession tracking, PredictionTable with pair index, AccessHistory with exponential decay, write decay, reinforcement, manifest persistence of patterns) for marginal gains on workloads where plan-aware prefetch already knows which trees to fetch. The complexity was not justified by the performance delta.
 
 ---
 

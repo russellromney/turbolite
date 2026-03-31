@@ -54,16 +54,6 @@ pub struct TieredHandle {
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
 
-    // --- Phase Verdun: predictive prefetch ---
-    /// Per-connection lock session tracker (B-tree touches within a lock lifecycle).
-    lock_session: prediction::LockSession,
-    /// Shared prediction table (lives on TieredVfs, shared across connections).
-    prediction: Option<prediction::SharedPrediction>,
-    /// Shared access history (lives on TieredVfs, shared across connections).
-    access_history: Option<prediction::SharedAccessHistory>,
-    /// B-tree names that had dirty pages this session (for write decay, applied once per flush).
-    dirty_btrees: HashSet<String>,
-
     // --- Phase Midway: VACUUM detection ---
     /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
     /// and VACUUM. Used to detect VACUUM and trigger B-tree re-walk at checkpoint.
@@ -128,8 +118,6 @@ impl TieredHandle {
         eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
-        prediction: Option<prediction::SharedPrediction>,
-        access_history: Option<prediction::SharedAccessHistory>,
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
@@ -306,10 +294,6 @@ impl TieredHandle {
             #[cfg(feature = "zstd")]
             decoder_dict,
             query_plan_prefetch,
-            lock_session: prediction::LockSession::new(),
-            prediction,
-            access_history,
-            dirty_btrees: HashSet::new(),
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
@@ -351,10 +335,6 @@ impl TieredHandle {
             #[cfg(feature = "zstd")]
             decoder_dict: None,
             query_plan_prefetch: false,
-            lock_session: prediction::LockSession::new(),
-            prediction: None,
-            access_history: None,
-            dirty_btrees: HashSet::new(),
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
             cache_limit: None,
@@ -726,49 +706,6 @@ impl TieredHandle {
         ))
     }
 
-    /// Phase Verdun: flush the current lock session.
-    /// Records the B-tree pattern in the prediction table and applies write decay.
-    fn flush_lock_session(&mut self) {
-        let prediction = match &self.prediction {
-            Some(p) => Arc::clone(p),
-            None => {
-                self.lock_session.flush();
-                self.dirty_btrees.clear();
-                return;
-            }
-        };
-
-        if !self.lock_session.btrees.is_empty() {
-            // Phase Verdun (b): record B-tree access frequency
-            if let Some(ref ah) = self.access_history {
-                ah.write().record(&self.lock_session.btrees);
-            }
-
-            let mut table = prediction.write();
-
-            // Apply write decay for dirty B-trees (once per tree name, not per page)
-            for name in &self.dirty_btrees {
-                table.write_decay(name);
-            }
-
-            // Reinforcement: if a prediction fired, check if all predicted names
-            // were actually touched. Uses fired_pattern (set by subphase d).
-            if let Some(ref fired) = self.lock_session.fired_pattern {
-                if fired.iter().all(|r| self.lock_session.btrees.contains(r.as_str())) {
-                    table.reinforce(fired);
-                }
-            }
-
-            // Observe the pattern from this session (needs >= 2 trees)
-            if let Some(pattern) = self.lock_session.flush() {
-                table.observe(&pattern);
-            }
-        } else {
-            self.lock_session.flush();
-        }
-
-        self.dirty_btrees.clear();
-    }
 }
 
 impl DatabaseHandle for TieredHandle {
@@ -832,73 +769,12 @@ impl DatabaseHandle for TieredHandle {
         let loc = manifest_ref.page_location(page_num)
             .expect("page within manifest bounds must have group assignment");
 
-        // 3b. Phase Verdun-i: track B-tree name touch for predictive prefetch
-        let mut predicted_groups: Vec<u64> = Vec::new();
-        if self.prediction.is_some() && self.lock_session.active {
-            if let Some(tree_name) = manifest_ref.page_to_tree_name.get(&page_num) {
-                let is_new = self.lock_session.touch(tree_name);
-                // Fire prediction on 2nd+ B-tree touch (new name, not re-touch)
-                if is_new && !self.lock_session.prediction_fired && self.lock_session.tree_count() >= 2 {
-                    if let Some(ref pred) = self.prediction {
-                        let table = pred.read();
-                        if let Some(extras) = table.predict(&self.lock_session.btrees) {
-                            // Collect group IDs for predicted B-tree names
-                            for predicted_name in &extras {
-                                if let Some(group_ids) = manifest_ref.tree_name_to_groups.get(predicted_name) {
-                                    predicted_groups.extend_from_slice(group_ids);
-                                }
-                            }
-                            // Record the full predicted pattern for reinforcement on flush
-                            let mut full_pattern: std::collections::BTreeSet<String> =
-                                self.lock_session.btrees.iter().cloned().collect();
-                            for r in &extras {
-                                full_pattern.insert(r.clone());
-                            }
-                            self.lock_session.fired_pattern = Some(full_pattern);
-                            self.lock_session.prediction_fired = true;
-                        }
-                    }
-                }
-            }
-        }
-
         let gid = loc.group_id;
         let current_tree_name = manifest_ref.group_to_tree_name.get(&gid).cloned();
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
-        // 3c. Phase Verdun (d): submit predicted groups to prefetch pool
-        if !predicted_groups.is_empty() {
-            if let Some(pool) = &self.prefetch_pool {
-                let manifest_snap = self.manifest.read();
-                let sub_ppf = manifest_snap.sub_pages_per_frame;
-                for &pred_gid in &predicted_groups {
-                    let cache_ref = self.cache.as_ref().expect("disk cache required");
-                    if cache_ref.group_state(pred_gid) == GroupState::None
-                        && cache_ref.try_claim_group(pred_gid)
-                    {
-                        if let Some(key) = manifest_snap.page_group_keys.get(pred_gid as usize) {
-                            if !key.is_empty() {
-                                let ft = manifest_snap.frame_tables
-                                    .get(pred_gid as usize)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let gp = manifest_snap.group_page_nums(pred_gid).into_owned();
-                                if !pool.submit(pred_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp) {
-                                    cache_ref.unclaim_group(pred_gid);
-                                }
-                            } else {
-                                cache_ref.unclaim_group(pred_gid);
-                            }
-                        } else {
-                            cache_ref.unclaim_group(pred_gid);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3d. Phase Stalingrad: between-query eviction trigger.
+        // 3c. Phase Stalingrad: between-query eviction trigger.
         //
         // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
         // fires on statement completion and sets the end-query signal). If so,
@@ -1346,6 +1222,19 @@ impl DatabaseHandle for TieredHandle {
             cache.touch_group(gid);
             return Ok(());
         }
+
+        // Phase Kursk: fallback read from cache file even if bitmap says absent.
+        // After crash recovery, the cache file may have valid pages from a previous
+        // VFS instance that were never uploaded to S3. The bitmap is in-memory and
+        // was reset on VFS restart, so it doesn't know these pages exist.
+        if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
+            cache.bitmap.lock().mark_present(page_num);
+            cache.mark_group_present(gid);
+            self.detect_interior_page(buf, page_num, cache);
+            cache.touch_group(gid);
+            return Ok(());
+        }
+
         buf.fill(0);
         Ok(())
     }
@@ -1402,13 +1291,6 @@ impl DatabaseHandle for TieredHandle {
                 if cookie != 0 {
                     self.last_schema_cookie = Some(cookie);
                 }
-            }
-        }
-
-        // Phase Verdun-i: track dirty B-tree name for write decay (once per tree per session)
-        if self.prediction.is_some() && self.lock_session.active {
-            if let Some(tree_name) = self.manifest.read().page_to_tree_name.get(&page_num) {
-                self.dirty_btrees.insert(tree_name.clone());
             }
         }
 
@@ -2147,17 +2029,6 @@ impl DatabaseHandle for TieredHandle {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            // Phase Verdun (c): serialize access history + prediction patterns
-            btree_access_freq: self.access_history.as_ref().map(|ah| {
-                let mut h = ah.write();
-                h.decay_and_prune();
-                h.freq.clone()
-            }).unwrap_or_else(|| old_manifest.btree_access_freq.clone()),
-            prediction_patterns: self.prediction.as_ref().map(|p| {
-                let mut t = p.write();
-                t.prune();
-                t.to_persisted()
-            }).unwrap_or_else(|| old_manifest.prediction_patterns.clone()),
         };
         new_manifest.build_page_index();
         s3.put_manifest(&new_manifest)?;
@@ -2470,20 +2341,6 @@ impl DatabaseHandle for TieredHandle {
                     }
                     Err(e) => return Err(e),
                 }
-            }
-        }
-
-        // Phase Verdun: lock session tracking
-        if self.prediction.is_some() {
-            let was_none = current == LockKind::None;
-            let now_none = lock == LockKind::None;
-
-            if was_none && !now_none {
-                // Acquiring lock: start a new session
-                self.lock_session.start();
-            } else if !was_none && now_none {
-                // Releasing lock: flush the session
-                self.flush_lock_session();
             }
         }
 
