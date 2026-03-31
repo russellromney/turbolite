@@ -2,7 +2,7 @@
 
 turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency. 
 
-It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rests, which can be used separately from S3.
+It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest, which can be used separately from S3.
 
 > turbolite is **experimental**. It is new and contains bugs. It may corrupt your data. Please be careful.
 
