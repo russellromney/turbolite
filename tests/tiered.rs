@@ -25,4 +25,6 @@ mod tiered {
     mod manifest_persistence;
     mod materialize;
     mod prediction;
+    #[cfg(feature = "wal")]
+    mod wal_integration;
 }
