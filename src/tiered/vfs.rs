@@ -35,13 +35,22 @@ pub struct TieredVfs {
     /// read by flush_to_s3() for non-blocking S3 upload.
     shared_manifest: Arc<RwLock<Manifest>>,
     /// Shared pending S3 groups. Accumulated by TieredHandle during local-only
-    /// checkpoints, drained by flush_to_s3().
+    /// checkpoints, drained by flush_to_s3(). Legacy path for global
+    /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    /// Phase Kursk: pending staging log flushes. Populated by sync() in
+    /// LocalThenFlush mode, drained by flush_to_s3().
+    pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     /// Serializes flush_to_s3() calls. Prevents two concurrent flushes from
     /// racing on version numbers and S3 keys. Also prevents a durable-mode
     /// checkpoint (which drains s3_dirty_groups in sync()) from interleaving
     /// with a flush in progress.
     flush_lock: Arc<Mutex<()>>,
+    /// Phase Somme: WAL replication state (started lazily on first MainDb open).
+    #[cfg(feature = "wal")]
+    wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
+    /// Tokio runtime handle for spawning WAL replication background task.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl TieredVfs {
@@ -151,6 +160,17 @@ impl TieredVfs {
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
 
+        // Phase Kursk: recover staging logs from interrupted flushes
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
+        if !recovered_staging.is_empty() {
+            eprintln!(
+                "[tiered] recovered {} staging logs from interrupted flush",
+                recovered_staging.len(),
+            );
+        }
+        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
+
         Ok(Self {
             s3,
             cache,
@@ -162,7 +182,11 @@ impl TieredVfs {
             access_history,
             shared_manifest,
             shared_dirty_groups,
+            pending_flushes,
             flush_lock,
+            #[cfg(feature = "wal")]
+            wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
+            runtime_handle,
         })
     }
 
@@ -216,6 +240,7 @@ impl TieredVfs {
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             shared_manifest: Arc::clone(&self.shared_manifest),
             shared_dirty_groups: Arc::clone(&self.shared_dirty_groups),
+            pending_flushes: Arc::clone(&self.pending_flushes),
             flush_lock: Arc::clone(&self.flush_lock),
             compression_level: self.config.compression_level,
             #[cfg(feature = "zstd")]
@@ -322,6 +347,7 @@ impl TieredVfs {
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
+            &self.pending_flushes,
             self.config.compression_level,
             #[cfg(feature = "zstd")]
             self.config.dictionary.as_deref(),
@@ -332,9 +358,10 @@ impl TieredVfs {
         )
     }
 
-    /// Returns true if there are dirty groups pending S3 upload.
+    /// Returns true if there are dirty groups or staging logs pending S3 upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
+            || !self.pending_flushes.lock().unwrap().is_empty()
     }
 
     /// Get page numbers for all groups pending S3 upload.
@@ -537,11 +564,35 @@ impl Vfs for TieredVfs {
                     .open(&wal_path);
             }
 
+            // Phase Somme: start WAL replication on first MainDb open
+            #[cfg(feature = "wal")]
+            if self.config.wal_replication {
+                let mut wal = self.wal_state.lock().unwrap();
+                if !wal.is_started() {
+                    let db_path = self.config.cache_dir.join(db);
+                    let wal_prefix = format!("{}/wal/", self.config.prefix);
+                    let manifest_version = self.shared_manifest.read().version;
+                    if let Err(e) = wal.start(
+                        db_path,
+                        wal_prefix,
+                        manifest_version,
+                        self.config.wal_sync_interval_ms,
+                        self.config.bucket.clone(),
+                        self.config.endpoint_url.clone(),
+                        self.config.region.clone(),
+                        self.runtime_handle.clone(),
+                    ) {
+                        eprintln!("[tiered] WARNING: failed to start WAL replication: {}", e);
+                    }
+                }
+            }
+
             Ok(TieredHandle::new_tiered(
                 Arc::clone(&self.s3),
                 Arc::clone(&self.cache),
                 Arc::clone(&self.shared_manifest),
                 Arc::clone(&self.shared_dirty_groups),
+                Arc::clone(&self.pending_flushes),
                 lock_path,
                 ppg,
                 self.config.compression_level,

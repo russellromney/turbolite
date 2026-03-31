@@ -1,7 +1,47 @@
 # turbolite Roadmap
 
+## Kursk: Staging Log for Two-Phase Checkpoint
+> After: Stalingrad (CHANGELOG) · Before: Midway (remaining)
+
+Correctness fix for `SyncMode::LocalThenFlush`. Without staging, a second checkpoint can overwrite disk cache pages before `flush_to_s3()` reads them, uploading a state that never existed.
+
+**Fix: append-only staging log (WAL-inspired).** During checkpoint, dirty pages are written to a sequential staging file alongside the normal cache write. `flush_to_s3()` reads from staging, not from disk cache. sync() adds zero I/O.
+
+### a. Staging log write path
+- [ ] `StagingLog` struct: append-only file at `cache_dir/staging/{version}.log`
+- [ ] Format: `[page_num: u64 LE][page_data: [u8; page_size]]` per entry. No framing needed (fixed-size records).
+- [ ] In `write_all_at()`: when `sync_mode == LocalThenFlush`, append page to open staging log
+- [ ] Staging file handle stored on `TieredHandle` (opened lazily on first dirty write)
+- [ ] Sequential append only, no seeks. Same I/O pattern as SQLite WAL.
+
+### b. sync() metadata-only
+- [ ] `sync()` in LocalThenFlush: fsync + close staging file handle, record `PendingFlush { version, staging_path, dirty_groups }` in shared state
+- [ ] No page reads, no encoding, no copies. Zero added I/O beyond the fsync.
+- [ ] Clear `dirty_pages` map as before (frees memory)
+
+### c. flush_to_s3() reads from staging
+- [ ] `flush_to_s3()` drains `Vec<PendingFlush>` (supports multiple pending flushes)
+- [ ] For each pending flush: read pages from staging log, group by page group, encode, upload
+- [ ] Delete staging file after successful upload
+- [ ] Update manifest version to max flushed version
+
+### d. Crash recovery
+- [ ] On `TieredVfs::open()`: scan `cache_dir/staging/` for leftover `.log` files
+- [ ] Parse each log, populate `pending_flushes` in shared state
+- [ ] Next `flush_to_s3()` call uploads them (same as Gallipoli dirty_groups recovery)
+- [ ] Log warning: "recovering N staging logs from interrupted flush"
+
+### e. Tests
+- [ ] Unit: staging log write + read roundtrip, multiple pages, page_size variations
+- [ ] Correctness: two checkpoints before one flush, flush uploads correct versions from each
+- [ ] Crash recovery: write staging log, kill before flush, reopen, flush recovers correct data
+- [ ] Integration: write-heavy workload with LocalThenFlush, verify cold reader sees consistent state
+- [ ] Edge: flush with no staging logs (no-op), empty checkpoint (no dirty pages, no staging file created)
+
+---
+
 ## Midway (remaining): VACUUM Checkpoint Re-walk + Tests
-> After: Thermopylae · Before: Somme
+> After: Kursk · Before: Somme
 
 ### Bug: VACUUM corrupts B-tree-aware page groups
 
@@ -81,20 +121,28 @@ Add walrust-core as an optional dep behind a feature flag. This step is pure plu
 
 When `wal_replication=true`, turbolite starts a background walrust replication loop alongside the VFS. WAL frames are shipped to S3 on a timer. This provides transaction-level durability.
 
-**d1. Start walrust replication on VFS creation**
-- [ ] In `TieredVfs::new()` when `wal_replication=true`:
-  1. Create `S3Backend::from_env()` for walrust (same bucket/endpoint as turbolite, from env vars)
-  2. Determine WAL file path: `{cache_dir}/{db_name}.db-wal` (same file the VFS passthrough writes to)
-  3. Create `SyncState::new()` for the DB
-  4. Initialize: read current manifest.version, set `state.current_txid = manifest.version`
-  5. Take initial snapshot via `take_snapshot()` (walrust requires this before incrementals)
-  6. Spawn background task: `tokio::spawn(run_replication(storage, prefix, db_path, config, cancel_rx))`
-  7. Store `cancel_tx` on `TieredVfs` so `Drop` can signal shutdown
-- [ ] WAL segments stored under `{turbolite_prefix}/wal/{db_name}/0000/` (incrementals)
+**d1. Start walrust replication on first DB open**
+
+The WAL file path isn't known until SQLite calls `open()` on a MainDb. So replication starts lazily on the first `TieredHandle` open, not in `TieredVfs::new()`.
+
+- [ ] Add to `TieredVfs`:
+  - `wal_cancel_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>` (None until first open)
+  - `wal_started: AtomicBool` (prevents double-start across concurrent opens)
+- [ ] In `TieredVfs::open()` for MainDb, when `wal_replication=true` and `!wal_started`:
+  1. Create `S3Backend::from_env()` for walrust (same bucket/endpoint from TieredConfig)
+  2. WAL file path = the passthrough WAL file path (already computed by open())
+  3. DB file path = `{cache_dir}/{db_name}.db` (for walrust to read page 0)
+  4. `SyncState::new(db_path)`, set `state.current_txid = manifest.version`
+  5. `run_replication()` does NOT take initial snapshot (turbolite page groups ARE the snapshot)
+     - Need a variant `run_replication_no_snapshot()` or set `state.last_snapshot = Some(now)` to skip
+  6. Spawn background: `tokio::spawn(run_replication(storage, wal_prefix, db_path, config, cancel_rx))`
+  7. Store `cancel_tx` on VFS, set `wal_started = true`
+- [ ] In `TieredVfs::Drop`: send cancel signal, walrust does final sync
+- [ ] WAL segments stored under `{turbolite_prefix}/wal/{db_name}/0000/`
 - [ ] Tests:
-  - VFS creates + walrust replication starts without error
-  - WAL frames appear in S3 after writes
-  - Shutdown triggers final sync (cancel signal)
+  - VFS open + write + verify WAL frames appear in S3
+  - Shutdown triggers final sync
+  - Second open() doesn't start duplicate replication
 
 **d2. WAL recovery on VFS open (cold start)**
 - [ ] In `TieredVfs::new()` when `wal_replication=true` AND manifest exists:
