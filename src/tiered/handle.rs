@@ -78,6 +78,15 @@ pub struct TieredHandle {
     /// Evict data tier after successful checkpoint S3 upload.
     evict_on_checkpoint: bool,
 
+    // --- Phase Kursk: staging log for two-phase checkpoint ---
+    /// Append-only staging log writer (open during LocalThenFlush checkpoint).
+    /// Lazily opened on first dirty write; closed+fsynced in sync().
+    staging_writer: Option<staging::StagingWriter>,
+    /// Shared pending flushes. Populated by sync(), drained by flush_to_s3().
+    pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    /// Staging directory path (cache_dir/staging).
+    staging_dir: PathBuf,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -103,6 +112,7 @@ impl TieredHandle {
         cache: Arc<DiskCache>,
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+        pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
         db_path: PathBuf,
         pages_per_group: u32,
         compression_level: i32,
@@ -268,6 +278,8 @@ impl TieredHandle {
         // Drop the snapshot; handle uses the shared Arc from now on
         drop(manifest);
 
+        let staging_dir = cache.cache_dir.join("staging");
+
         Self {
             s3: Some(s3),
             cache: Some(cache),
@@ -299,6 +311,9 @@ impl TieredHandle {
             vacuum_replaced_keys: None,
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
             evict_on_checkpoint,
+            staging_writer: None,
+            pending_flushes,
+            staging_dir,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -340,6 +355,9 @@ impl TieredHandle {
             vacuum_replaced_keys: None,
             cache_limit: None,
             evict_on_checkpoint: false,
+            staging_writer: None,
+            pending_flushes: Arc::new(Mutex::new(Vec::new())),
+            staging_dir: PathBuf::new(),
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -1395,6 +1413,22 @@ impl DatabaseHandle for TieredHandle {
         }
         self.dirty_page_nums.write().insert(page_num);
 
+        // Phase Kursk: append to staging log for LocalThenFlush mode.
+        // Captures exact page contents at write time, immune to overwrite
+        // by subsequent checkpoints.
+        if self.sync_mode == SyncMode::LocalThenFlush {
+            let ps = *self.page_size.read();
+            if self.staging_writer.is_none() && ps > 0 {
+                let version = self.manifest.read().version + 1;
+                self.staging_writer = Some(
+                    staging::StagingWriter::open(&self.staging_dir, version, ps)?
+                );
+            }
+            if let Some(ref mut writer) = self.staging_writer {
+                writer.append(page_num, buf)?;
+            }
+        }
+
         // Update manifest page_count if this page extends the database
         {
             let mut manifest = self.manifest.write();
@@ -1449,7 +1483,8 @@ impl DatabaseHandle for TieredHandle {
         // free in-memory dirty map, but skip S3 upload entirely.
         // Pages are already in disk cache from write_all_at().
         if self.sync_mode == SyncMode::LocalThenFlush || LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
-            let cache = self.disk_cache();
+            let cache_arc = self.cache.as_ref().expect("cache required for tiered handle").clone();
+            let cache = &*cache_arc;
             let mut manifest = self.manifest.write();
             let mut pending = self.s3_dirty_groups.lock().unwrap();
             let mut interior_found = 0usize;
@@ -1461,8 +1496,8 @@ impl DatabaseHandle for TieredHandle {
             if !unassigned.is_empty() {
                 Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
             }
-            let page_size = *self.page_size.read() as usize;
-            let mut type_buf = vec![0u8; page_size];
+            let page_size = *self.page_size.read();
+            let mut type_buf = vec![0u8; page_size as usize];
             for &page_num in &dirty_snapshot {
                 let loc = manifest.page_location(page_num)
                     .expect("page must have group assignment after new-page assignment");
@@ -1489,14 +1524,33 @@ impl DatabaseHandle for TieredHandle {
             let total_interior = cache.interior_pages.lock().len();
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending.len());
+            let cache_dir = cache.cache_dir.clone();
+            let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
+            drop(pending);
+            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending_groups_snapshot.len());
+
+            // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
+            // The staging log captured exact page contents during write_all_at(),
+            // immune to overwrite by subsequent checkpoints.
+            if let Some(writer) = self.staging_writer.take() {
+                let version = self.manifest.read().version + 1;
+                let (staging_path, pages_written) = writer.finalize()?;
+                eprintln!(
+                    "[sync] staging log finalized: {} pages, version {}, path {}",
+                    pages_written, version, staging_path.display(),
+                );
+                self.pending_flushes.lock().unwrap().push(staging::PendingFlush {
+                    staging_path,
+                    version,
+                    page_size,
+                });
+            }
 
             // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery
             {
                 let m = self.manifest.read().clone();
-                let dirty_groups: Vec<u64> = pending.iter().copied().collect();
-                let local = manifest::LocalManifest { manifest: m, dirty_groups };
-                if let Err(e) = local.persist(&cache.cache_dir) {
+                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot };
+                if let Err(e) = local.persist(&cache_dir) {
                     eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
                 }
             }
@@ -2145,6 +2199,42 @@ impl DatabaseHandle for TieredHandle {
             eprintln!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
             runtime.spawn(async move {
                 gc_s3.delete_objects_async_owned(replaced_keys).await;
+            });
+        }
+
+        // Phase Somme-e: GC old WAL segments after checkpoint.
+        // WAL segments with txid <= new manifest version are redundant.
+        #[cfg(feature = "wal")]
+        if self.gc_enabled {
+            let gc_s3 = self.s3.as_ref().expect("s3 required").clone();
+            let wal_prefix = format!("{}/wal/", gc_s3.prefix);
+            let version = next_version;
+            let runtime = gc_s3.runtime.clone();
+            runtime.spawn(async move {
+                // List all WAL segment keys under the wal prefix
+                let keys = match gc_s3.list_all_keys_with_prefix(&wal_prefix).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("[wal-gc] ERROR listing WAL segments: {}", e);
+                        return;
+                    }
+                };
+                // Filter to .ltx files with max_txid <= version
+                let to_delete: Vec<String> = keys.into_iter()
+                    .filter(|k| {
+                        k.ends_with(".ltx")
+                            && k.rsplit('/').next()
+                                .and_then(|f| f.strip_suffix(".ltx"))
+                                .and_then(|f| f.split('-').last())
+                                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                                .map(|max_txid| max_txid <= version)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                if !to_delete.is_empty() {
+                    eprintln!("[wal-gc] deleting {} WAL segments with txid <= {}", to_delete.len(), version);
+                    gc_s3.delete_objects_async_owned(to_delete).await;
+                }
             });
         }
 
