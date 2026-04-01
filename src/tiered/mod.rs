@@ -65,6 +65,7 @@ mod flush;
 mod handle;
 mod import;
 mod interior_map;
+mod record_parser;
 mod manifest;
 mod prediction;
 mod prefetch;
