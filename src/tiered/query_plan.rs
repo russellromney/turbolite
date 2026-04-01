@@ -332,6 +332,11 @@ pub unsafe extern "C" fn turbolite_trace_push_plan(
 /// `db` must be a valid sqlite3 handle.
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_discover_schema(db: *mut std::ffi::c_void) {
+    // Skip if schema already cached (avoid redundant sqlite_master queries)
+    if super::schema::peek_schema().is_some() {
+        return;
+    }
+
     let sql = "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE type IN ('table', 'index')";
     let c_sql = match std::ffi::CString::new(sql) {
         Ok(s) => s,
@@ -390,10 +395,12 @@ pub unsafe extern "C" fn turbolite_discover_schema(db: *mut std::ffi::c_void) {
 
     if !rows.is_empty() {
         let info = super::schema::build_schema_info(&rows);
-        eprintln!(
-            "[jena] schema discovered: {} tables, {} indexes",
-            info.table_columns.len(), info.index_columns.len(),
-        );
+        if std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "[jena] schema discovered: {} tables, {} indexes",
+                info.table_columns.len(), info.index_columns.len(),
+            );
+        }
         super::schema::push_schema(info);
     }
 }

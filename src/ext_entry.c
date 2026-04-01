@@ -377,12 +377,11 @@ static int turbolite_trace_callback(
 
         turbolite_trace_reentrant = 1;
 
-        /* Phase Jena-d: discover schema once per connection for leaf chasing. */
-        static int schema_discovered = 0;
-        if (!schema_discovered) {
-            turbolite_discover_schema(db);
-            schema_discovered = 1;
-        }
+        /* Phase Jena-d: discover schema for leaf chasing.
+         * Re-discovers on every connection (no static flag) because different
+         * connections may open different databases. The VFS side deduplicates
+         * via schema_info.is_none() check. */
+        turbolite_discover_schema(db);
 
         turbolite_trace_push_plan(db, sql);
         turbolite_trace_reentrant = 0;
@@ -560,6 +559,7 @@ int sqlite3_uri_boolean(const char *zFilename, const char *zParam, int bDflt) {
 #undef sqlite3_prepare_v2
 #undef sqlite3_step
 #undef sqlite3_column_text
+#undef sqlite3_column_int64
 #undef sqlite3_finalize
 
 int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
@@ -573,6 +573,10 @@ int sqlite3_step(sqlite3_stmt *stmt) {
 
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int iCol) {
     return sqlite3_api->column_text(stmt, iCol);
+}
+
+sqlite3_int64 sqlite3_column_int64(sqlite3_stmt *stmt, int iCol) {
+    return sqlite3_api->column_int64(stmt, iCol);
 }
 
 int sqlite3_finalize(sqlite3_stmt *stmt) {

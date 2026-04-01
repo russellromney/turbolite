@@ -323,6 +323,8 @@ fn compare_keys(a: &[SqliteValue], b: &[SqliteValue]) -> std::cmp::Ordering {
 
 /// Extract child page numbers from an interior page buffer.
 /// Returns 1-based page numbers (SQLite convention).
+/// Used only in tests; production uses parse_interior_cell for key extraction.
+#[cfg(test)]
 fn extract_children(buf: &[u8], hdr_off: usize) -> Vec<u32> {
     if buf.len() < hdr_off + 12 {
         return Vec::new();

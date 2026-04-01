@@ -274,14 +274,9 @@ pub(crate) fn cell_offsets(page: &[u8], hdr_off: usize) -> Vec<usize> {
         return Vec::new();
     }
     let cell_count = u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
-    let ptr_start = if hdr_off == 100 {
-        // Page 0: cell pointers after 100-byte DB header + 12-byte page header
-        112
-    } else if page[hdr_off] == 0x05 || page[hdr_off] == 0x02 {
-        hdr_off + 12 // interior pages have 12-byte header
-    } else {
-        hdr_off + 8  // leaf pages have 8-byte header
-    };
+    let is_interior = page[hdr_off] == 0x05 || page[hdr_off] == 0x02;
+    let page_header_size = if is_interior { 12 } else { 8 };
+    let ptr_start = hdr_off + page_header_size;
 
     let mut offsets = Vec::with_capacity(cell_count);
     for i in 0..cell_count {

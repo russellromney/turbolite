@@ -91,6 +91,8 @@ pub struct TieredHandle {
     chase_rules: Vec<leaf_chaser::ChaseRule>,
     /// Schema info (table/index column names). Populated from global cache on first query.
     schema_info: Option<schema::SchemaInfo>,
+    /// Cached BENCH_VERBOSE env var check (avoid repeated env lookups on hot path).
+    bench_verbose: bool,
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
@@ -334,6 +336,7 @@ impl TieredHandle {
             interior_writes_since_rebuild: 0,
             chase_rules: Vec::new(),
             schema_info: None,
+            bench_verbose: std::env::var("BENCH_VERBOSE").is_ok(),
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -379,6 +382,7 @@ impl TieredHandle {
             interior_writes_since_rebuild: 0,
             chase_rules: Vec::new(),
             schema_info: None,
+            bench_verbose: false,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -659,19 +663,17 @@ impl TieredHandle {
         let tree_name = manifest.group_to_tree_name
             .get(&manifest.page_location(page_num).map(|l| l.group_id).unwrap_or(u64::MAX))
             .cloned();
-        drop(manifest);
 
         let tree_name = match tree_name {
             Some(n) => n,
-            None => return,
+            None => { drop(manifest); return; },
         };
 
         // Check all chase rules for this source tree
         let pool = match &self.prefetch_pool {
             Some(p) => Arc::clone(p),
-            None => return,
+            None => { drop(manifest); return; },
         };
-        let manifest = self.manifest.read().clone();
         let ps = manifest.page_size;
         let sub_ppf = manifest.sub_pages_per_frame;
 
@@ -719,13 +721,14 @@ impl TieredHandle {
                 }
             }
 
-            if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+            if submitted > 0 && self.bench_verbose {
                 eprintln!(
                     "  [jena-chase] {} -> {}: {} keys, {} groups predicted, {} submitted",
                     rule.source_tree, rule.target_tree, keys.len(), groups.len(), submitted,
                 );
             }
         }
+        drop(manifest);
     }
 
     /// Phase Jena-f: on interior page read, prefetch sibling interior page groups.
@@ -776,7 +779,7 @@ impl TieredHandle {
             }
         }
 
-        if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+        if submitted > 0 && self.bench_verbose {
             eprintln!(
                 "  [jena-lookahead] interior page={} prefetched {} sibling interior groups",
                 page_num, submitted,
@@ -824,7 +827,7 @@ impl TieredHandle {
             }
         }
 
-        if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+        if submitted > 0 && self.bench_verbose {
             eprintln!(
                 "  [jena-overflow] page={} detected {} overflow pages, submitted {} groups",
                 page_num, overflow_pages.len(), submitted,
@@ -1161,17 +1164,21 @@ impl DatabaseHandle for TieredHandle {
 
                 // Phase Jena-d: build chase rules from plan + schema.
                 // Take schema info from global cache (pushed by extension trace callback).
+                // Re-take if schema was invalidated (DDL/VACUUM changes schema cookie).
                 if self.schema_info.is_none() {
                     self.schema_info = schema::take_schema();
+                }
+                // Check for fresh schema (DDL may have pushed a new one)
+                if let Some(fresh) = schema::take_schema() {
+                    self.schema_info = Some(fresh);
                 }
                 if let Some(ref schema) = self.schema_info {
                     self.chase_rules = leaf_chaser::build_chase_rules(
                         &planned,
                         &schema.tree_roots,
-                        &schema.index_columns,
                         &schema.table_columns,
                     );
-                    if !self.chase_rules.is_empty() && std::env::var("BENCH_VERBOSE").is_ok() {
+                    if !self.chase_rules.is_empty() && self.bench_verbose {
                         eprintln!(
                             "  [jena-chase] built {} chase rules from {} planned accesses",
                             self.chase_rules.len(), planned.len(),
@@ -1250,9 +1257,11 @@ impl DatabaseHandle for TieredHandle {
         if cache.is_present(page_num) {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
+            self.try_leaf_chase(buf, page_num, &cache_arc);
+            self.try_overflow_prefetch(buf, page_num, &cache_arc);
+            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
-            // Convert miss to hit (prefetch completed between check and fetch)
             cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
@@ -1362,6 +1371,9 @@ impl DatabaseHandle for TieredHandle {
                         }
 
                         self.detect_interior_page(buf, page_num, cache);
+                        self.try_leaf_chase(buf, page_num, &cache_arc);
+                        self.try_overflow_prefetch(buf, page_num, &cache_arc);
+                        self.try_interior_lookahead(buf, page_num, &cache_arc);
                         cache.touch_group(gid);
                         self.reset_misses(current_tree_name.as_ref());
 
@@ -1511,18 +1523,21 @@ impl DatabaseHandle for TieredHandle {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
+            self.try_leaf_chase(buf, page_num, &cache_arc);
+            self.try_overflow_prefetch(buf, page_num, &cache_arc);
+            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             return Ok(());
         }
 
         // Phase Kursk: fallback read from cache file even if bitmap says absent.
-        // After crash recovery, the cache file may have valid pages from a previous
-        // VFS instance that were never uploaded to S3. The bitmap is in-memory and
-        // was reset on VFS restart, so it doesn't know these pages exist.
         if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
             cache.bitmap.lock().mark_present(page_num);
             cache.mark_group_present(gid);
             self.detect_interior_page(buf, page_num, cache);
+            self.try_leaf_chase(buf, page_num, &cache_arc);
+            self.try_overflow_prefetch(buf, page_num, &cache_arc);
+            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             return Ok(());
         }

@@ -44,7 +44,6 @@ pub(crate) struct ChaseRule {
 pub(crate) fn build_chase_rules(
     plan: &[PlannedAccess],
     tree_roots: &HashMap<String, u64>,
-    index_columns: &HashMap<String, Vec<String>>,
     table_columns: &HashMap<String, Vec<String>>,
 ) -> Vec<ChaseRule> {
     let mut rules = Vec::new();
@@ -93,7 +92,20 @@ pub(crate) fn build_chase_rules(
         // For different names (a.user_id = b.id), we'd need the actual SQL
         // parse tree, which the VFS doesn't have. In that case, we skip.
         for target_col in &target.constraint_columns {
-            // Try exact match in source table columns
+            // FK heuristic first (more specific): source "user_id" matches
+            // target "id" on table "users".
+            if let Some(found_idx) = source_cols.iter().position(|c| {
+                fk_column_matches(c, target_col, target.table_name.as_deref())
+            }) {
+                rules.push(ChaseRule {
+                    source_tree: source.tree_name.clone(),
+                    col_index: found_idx,
+                    target_root_page: target_root,
+                    target_tree: target_tree.clone(),
+                });
+                break;
+            }
+            // Fallback: exact column name match (self-joins, same-name FKs)
             if let Some(col_idx) = source_cols.iter().position(|c| c == target_col) {
                 rules.push(ChaseRule {
                     source_tree: source.tree_name.clone(),
@@ -101,15 +113,53 @@ pub(crate) fn build_chase_rules(
                     target_root_page: target_root,
                     target_tree: target_tree.clone(),
                 });
-                break; // one rule per target access
+                break;
             }
-            // Try matching the target constraint against source table columns
-            // with common FK patterns: "user_id" matches column "user_id"
-            // This is already covered by exact match above.
         }
     }
 
     rules
+}
+
+/// FK column matching heuristic.
+///
+/// Checks if `source_col` (e.g., "user_id") could be a foreign key pointing
+/// to `target_col` (e.g., "id") on `target_table` (e.g., "users").
+///
+/// Patterns matched:
+/// - "user_id" -> strip "_id" -> "user" matches table "users" (singular/plural)
+/// - "author_fk" -> strip "_fk" -> "author" matches table "authors"
+/// - "parent_id" -> strip "_id" -> "parent" (if target_col is "id")
+fn fk_column_matches(source_col: &str, target_col: &str, target_table: Option<&str>) -> bool {
+    let source_lower = source_col.to_lowercase();
+    let target_col_lower = target_col.to_lowercase();
+
+    // Strip common FK suffixes
+    let prefix = if let Some(p) = source_lower.strip_suffix("_id") {
+        p
+    } else if let Some(p) = source_lower.strip_suffix("_fk") {
+        p
+    } else {
+        return false;
+    };
+
+    // If target constraint is "id" or "rowid", the FK prefix should match
+    // the target table name (with basic singular/plural handling)
+    if target_col_lower == "id" || target_col_lower == "rowid" {
+        if let Some(table) = target_table {
+            let table_lower = table.to_lowercase();
+            // "user" matches "users", "users" matches "users", "user" matches "user"
+            return table_lower == prefix
+                || table_lower == format!("{}s", prefix)
+                || table_lower.strip_suffix('s') == Some(prefix);
+        }
+        // No table info, can't match
+        return false;
+    }
+
+    // If target constraint matches the prefix (e.g., source "category_id", target "category")
+    prefix == target_col_lower
+
 }
 
 /// Extract chase keys from a leaf page buffer.
@@ -184,38 +234,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_chase_rules_basic_join() {
+    fn test_build_chase_rules_self_join_exact_match() {
+        // Self-join: employees.manager_id = employees.id (same table, exact column name)
         let plan = vec![
             PlannedAccess {
-                tree_name: "posts".into(),
+                tree_name: "employees".into(),
                 access_type: AccessType::Scan,
-                table_name: Some("posts".into()),
+                table_name: Some("employees".into()),
                 constraint_columns: vec![],
             },
             PlannedAccess {
-                tree_name: "idx_users_id".into(),
+                tree_name: "idx_emp_name".into(),
                 access_type: AccessType::Search,
-                table_name: Some("users".into()),
-                constraint_columns: vec!["id".into()],
+                table_name: Some("employees".into()),
+                constraint_columns: vec!["name".into()],
             },
         ];
 
         let mut tree_roots = HashMap::new();
-        tree_roots.insert("idx_users_id".into(), 5);
+        tree_roots.insert("idx_emp_name".into(), 5);
 
         let mut table_columns = HashMap::new();
-        // posts table has columns: id, user_id, content
-        // The join is ON posts.id = users.id -- but "id" appears in posts
-        table_columns.insert("posts".into(), vec!["id".into(), "user_id".into(), "content".into()]);
+        table_columns.insert("employees".into(), vec!["id".into(), "name".into(), "manager_id".into()]);
 
-        let index_columns = HashMap::new();
-
-        let rules = build_chase_rules(&plan, &tree_roots, &index_columns, &table_columns);
+        let rules = build_chase_rules(&plan, &tree_roots, &table_columns);
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].source_tree, "posts");
-        assert_eq!(rules[0].col_index, 0); // "id" is column 0 in posts
-        assert_eq!(rules[0].target_root_page, 5);
-        assert_eq!(rules[0].target_tree, "idx_users_id");
+        assert_eq!(rules[0].col_index, 1); // "name" is column 1 (exact match)
     }
 
     #[test]
@@ -242,8 +286,57 @@ mod tests {
         let mut table_columns = HashMap::new();
         table_columns.insert("orders".into(), vec!["id".into(), "product_id".into()]);
 
-        let rules = build_chase_rules(&plan, &tree_roots, &HashMap::new(), &table_columns);
+        let rules = build_chase_rules(&plan, &tree_roots, &table_columns);
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_fk_column_matching() {
+        // user_id -> id on users table
+        assert!(fk_column_matches("user_id", "id", Some("users")));
+        // author_id -> id on authors table
+        assert!(fk_column_matches("author_id", "id", Some("authors")));
+        // author_fk -> id on authors table
+        assert!(fk_column_matches("author_fk", "id", Some("authors")));
+        // user_id -> id on user table (singular)
+        assert!(fk_column_matches("user_id", "id", Some("user")));
+        // no match: post_id -> id on users table
+        assert!(!fk_column_matches("post_id", "id", Some("users")));
+        // no match: name -> id
+        assert!(!fk_column_matches("name", "id", Some("users")));
+        // category_id -> category (non-id target)
+        assert!(fk_column_matches("category_id", "category", None));
+    }
+
+    #[test]
+    fn test_build_chase_rules_fk_heuristic() {
+        // posts.user_id = users.id (different column names)
+        let plan = vec![
+            PlannedAccess {
+                tree_name: "posts".into(),
+                access_type: AccessType::Scan,
+                table_name: Some("posts".into()),
+                constraint_columns: vec![],
+            },
+            PlannedAccess {
+                tree_name: "idx_users_id".into(),
+                access_type: AccessType::Search,
+                table_name: Some("users".into()),
+                constraint_columns: vec!["id".into()],
+            },
+        ];
+
+        let mut tree_roots = HashMap::new();
+        tree_roots.insert("idx_users_id".into(), 5);
+
+        let mut table_columns = HashMap::new();
+        table_columns.insert("posts".into(), vec!["id".into(), "user_id".into(), "content".into()]);
+
+        let rules = build_chase_rules(&plan, &tree_roots, &table_columns);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].source_tree, "posts");
+        assert_eq!(rules[0].col_index, 1); // "user_id" is column 1 in posts
+        assert_eq!(rules[0].target_tree, "idx_users_id");
     }
 
     #[test]
