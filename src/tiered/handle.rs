@@ -79,6 +79,14 @@ pub struct TieredHandle {
     /// Staging directory path (cache_dir/staging).
     staging_dir: PathBuf,
 
+    // --- Phase Jena: interior map for precise prefetch ---
+    /// B-tree child pointer map built from cached interior pages.
+    /// Used by sibling prefetch to replace hop-schedule guessing.
+    /// Rebuilt when interior pages are written (page splits/merges).
+    interior_map: interior_map::InteriorMap,
+    /// Counter for interior page writes since last map rebuild.
+    interior_writes_since_rebuild: u32,
+
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -271,6 +279,21 @@ impl TieredHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
+        // Phase Jena: build interior map from cached interior pages.
+        // Interior pages are pinned (eagerly loaded on open), so this is
+        // a pure local-cache operation. Cost: ~100us for 15 pages.
+        let interior_map = {
+            let m = shared_manifest.read();
+            interior_map::InteriorMap::build(&cache, &m)
+        };
+        if !interior_map.is_empty() {
+            eprintln!(
+                "[tiered] Jena: built interior map ({} interior pages, {} children)",
+                interior_map.interior_count(),
+                interior_map.child_count(),
+            );
+        }
+
         Self {
             s3: Some(s3),
             cache: Some(cache),
@@ -302,6 +325,8 @@ impl TieredHandle {
             pending_flushes,
             staging_seq,
             staging_dir,
+            interior_map,
+            interior_writes_since_rebuild: 0,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -343,6 +368,8 @@ impl TieredHandle {
             pending_flushes: Arc::new(Mutex::new(Vec::new())),
             staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
+            interior_map: interior_map::InteriorMap::default(),
+            interior_writes_since_rebuild: 0,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -598,11 +625,26 @@ impl TieredHandle {
         );
     }
 
-    /// Fraction-based prefetch. Strategy dispatches neighbor selection:
-    /// BTreeAware: sibling groups from the same B-tree.
-    /// Positional: radial fan-out (gid+1, gid-1, gid+2, gid-2, ...).
+    /// Ensure interior map is up to date before making prefetch decisions.
+    /// Rebuilds if interior pages were written since last rebuild.
+    fn ensure_interior_map_fresh(&mut self) {
+        if self.interior_writes_since_rebuild > 0 {
+            if let Some(cache) = &self.cache {
+                let manifest = self.manifest.read();
+                self.interior_map = interior_map::InteriorMap::build(cache, &manifest);
+                self.interior_writes_since_rebuild = 0;
+            }
+        }
+    }
+
+    /// Phase Jena: precise prefetch using interior map.
+    ///
+    /// On cache miss, uses the B-tree child pointer map to identify exact
+    /// sibling groups instead of guessing with hop-schedule fractions.
+    /// Falls back to manifest-based sibling prefetch if interior map is empty.
     pub(crate) fn trigger_prefetch(
-        &self,
+        &mut self,
+        page_num: u64,
         current_gid: u64,
         manifest: &Manifest,
         cache: &Arc<DiskCache>,
@@ -617,7 +659,6 @@ impl TieredHandle {
         let sub_ppf = manifest.sub_pages_per_frame;
 
         // Helper: try to claim and submit a group for prefetch.
-        // Returns true if submitted, false otherwise.
         let try_submit = |gid: u64, submitted: &mut usize| -> bool {
             if cache.group_state(gid) != GroupState::None {
                 return false;
@@ -635,12 +676,54 @@ impl TieredHandle {
                     }
                 }
             }
-            // Failed to submit: reset state
             cache.unclaim_group(gid);
             false
         };
 
-        // BTreeAware: prefetch sibling groups from the same B-tree.
+        // Phase Jena: use interior map for precise sibling selection.
+        // The map knows exact B-tree structure from parsed interior pages.
+        if !self.interior_map.is_empty() {
+            let tree_name = manifest.group_to_tree_name.get(&current_gid);
+            let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
+
+            // For SEARCH: prefetch exact siblings from interior map
+            // For SCAN: handled by plan-aware bulk prefetch (not here)
+            // For lookup: conservative, prefetch 0-1 siblings
+            let sibling_groups = self.interior_map.sibling_groups(page_num);
+
+            if sibling_groups.is_empty() {
+                return;
+            }
+
+            let max_submit = if is_search {
+                sibling_groups.len() // SEARCH: prefetch all siblings
+            } else {
+                // Lookup: conservative, use hop schedule fraction
+                let hops = &self.prefetch_lookup;
+                let miss_count = self.miss_count(tree_name);
+                let hop_idx = miss_count.saturating_sub(1) as usize;
+                let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+                if fraction <= 0.0 { return; }
+                ((sibling_groups.len() as f32) * fraction).ceil() as usize
+            };
+
+            let mut submitted = 0usize;
+            for &gid in &sibling_groups {
+                if submitted >= max_submit { break; }
+                try_submit(gid, &mut submitted);
+            }
+
+            if std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!(
+                    "  [jena-prefetch] page={} gid={} siblings={} submitted={} mode={}",
+                    page_num, current_gid, sibling_groups.len(), submitted,
+                    if is_search { "search" } else { "lookup" },
+                );
+            }
+            return;
+        }
+
+        // Fallback: manifest-based sibling prefetch (legacy hop schedule)
         let siblings = manifest.prefetch_siblings(current_gid);
         let eligible: Vec<u64> = siblings.iter()
             .copied()
@@ -650,43 +733,20 @@ impl TieredHandle {
             return;
         }
 
-        // Pick schedule: SEARCH trees get aggressive warmup, lookups are conservative.
         let tree_name = manifest.group_to_tree_name.get(&current_gid);
         let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
         let hops = if is_search { &self.prefetch_search } else { &self.prefetch_lookup };
 
         let miss_count = self.miss_count(tree_name);
         let hop_idx = miss_count.saturating_sub(1) as usize;
-        let fraction = if hop_idx < hops.len() {
-            hops[hop_idx]
-        } else {
-            1.0
-        };
-        if fraction <= 0.0 {
-            if std::env::var("BENCH_VERBOSE").is_ok() {
-                eprintln!(
-                    "  [prefetch] gid={} misses={} SKIP ({}hop fraction=0)",
-                    current_gid, miss_count,
-                    if is_search { "search " } else { "" },
-                );
-            }
-            return;
-        }
+        let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+        if fraction <= 0.0 { return; }
+
         let max_submit = ((eligible.len() as f32) * fraction).ceil() as usize;
         let mut submitted = 0usize;
-
         for &gid in &eligible {
             if submitted >= max_submit { break; }
             try_submit(gid, &mut submitted);
-        }
-
-        if std::env::var("BENCH_VERBOSE").is_ok() {
-            eprintln!(
-                "  [prefetch] gid={} misses={} fraction={:.0}% eligible={} submitted={} schedule={}",
-                current_gid, miss_count, fraction * 100.0,
-                eligible.len(), submitted,
-                if is_search { "search" } else { "default" },
-            );
         }
     }
 
@@ -1005,7 +1065,8 @@ impl DatabaseHandle for TieredHandle {
                         }
                     }
                 }
-                self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
+                self.ensure_interior_map_fresh();
+                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
 
                 let s3_start = Instant::now();
                 match s3_arc.range_get(key, entry.offset, entry.len) {
@@ -1112,7 +1173,8 @@ impl DatabaseHandle for TieredHandle {
         } else if state != GroupState::Present {
             if cache.try_claim_group(gid) {
                 self.increment_misses(current_tree_name.as_ref());
-                self.trigger_prefetch(gid, &manifest, &cache_arc, &s3_arc);
+                self.ensure_interior_map_fresh();
+                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
                         let s3_start = Instant::now();
@@ -1299,6 +1361,16 @@ impl DatabaseHandle for TieredHandle {
             cache.write_page(page_num, buf)?;
         }
         self.dirty_page_nums.write().insert(page_num);
+
+        // Phase Jena: detect interior page writes for map rebuild.
+        // Only check the type byte (no manifest lookup needed).
+        {
+            let hdr_off = if page_num == 0 { 100 } else { 0 };
+            let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
+            if type_byte == 0x05 || type_byte == 0x02 {
+                self.interior_writes_since_rebuild += 1;
+            }
+        }
 
         // Phase Kursk: append to staging log for LocalThenFlush mode.
         // Captures exact page contents at write time, immune to overwrite
