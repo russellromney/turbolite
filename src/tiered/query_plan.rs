@@ -31,6 +31,11 @@ pub struct PlannedAccess {
     pub tree_name: String,
     /// SCAN or SEARCH.
     pub access_type: AccessType,
+    /// Table name this access belongs to (for join chasing).
+    pub table_name: Option<String>,
+    /// Column constraint from EQP, e.g., "id=?" from "USING INDEX idx (id=?)".
+    /// Used by leaf chasing to know which column links tables in a join.
+    pub constraint_columns: Vec<String>,
 }
 
 /// Global queue of planned accesses. The trace callback pushes, VFS drains.
@@ -131,12 +136,17 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
             first
         };
 
+        // Extract constraint columns from (col=? AND col2>?) if present
+        let constraint_columns = extract_constraint_columns(rest);
+
         // For SCAN: always emit the table (we need all data groups)
         if access_type == AccessType::Scan {
             if seen.insert((table_name.to_string(), AccessType::Scan)) {
                 accesses.push(PlannedAccess {
                     tree_name: table_name.to_string(),
                     access_type: AccessType::Scan,
+                    table_name: Some(table_name.to_string()),
+                    constraint_columns: constraint_columns.clone(),
                 });
             }
         }
@@ -154,15 +164,15 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
                 .and_then(|s| s.split_whitespace().next())
             {
                 let idx_access = match access_type {
-                    // SEARCH via index: emit the index as Search
                     AccessType::Search => AccessType::Search,
-                    // SCAN via index: emit the index as Scan (full index scan)
                     AccessType::Scan => AccessType::Scan,
                 };
                 if seen.insert((idx_name.to_string(), idx_access)) {
                     accesses.push(PlannedAccess {
                         tree_name: idx_name.to_string(),
                         access_type: idx_access,
+                        table_name: Some(table_name.to_string()),
+                        constraint_columns: constraint_columns.clone(),
                     });
                 }
             }
@@ -172,6 +182,38 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
     }
 
     accesses
+}
+
+/// Extract column names from EQP constraint expression like "(id=? AND name>?)".
+/// Returns ["id", "name"]. Handles =, <, >, <=, >=, IS operators.
+fn extract_constraint_columns(eqp_rest: &str) -> Vec<String> {
+    // Look for (...) at end of line
+    let paren_start = match eqp_rest.rfind('(') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let paren_end = match eqp_rest[paren_start..].find(')') {
+        Some(p) => paren_start + p,
+        None => return Vec::new(),
+    };
+    let inside = &eqp_rest[paren_start + 1..paren_end];
+
+    // Split by " AND " and extract column names (left of operator)
+    let mut columns = Vec::new();
+    for part in inside.split(" AND ") {
+        let part = part.trim();
+        // Find the operator: =, <, >, <=, >=, IS
+        for op in &["<=", ">=", "=", "<", ">", " IS "] {
+            if let Some(pos) = part.find(op) {
+                let col = part[..pos].trim();
+                if !col.is_empty() {
+                    columns.push(col.to_string());
+                }
+                break;
+            }
+        }
+    }
+    columns
 }
 
 /// Run EXPLAIN QUERY PLAN on a SQL string and return planned accesses.
