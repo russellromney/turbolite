@@ -160,7 +160,7 @@ pub(crate) fn recover_wal_from_shared_state(
         use walrust_core::StorageBackend;
         let db_name = wal_prefix.trim_end_matches('/').rsplit('/').next().unwrap_or("db");
         let incr_prefix = format!("{}{}/0000/", wal_prefix, db_name);
-        let start_key = format!("{}{:016x}-{:016x}.ltx", incr_prefix, manifest_version, manifest_version);
+        let start_key = format!("{}{:016x}-{:016x}.hadbp", incr_prefix, manifest_version, manifest_version);
 
         storage.list_objects_after(&incr_prefix, &start_key).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("list WAL: {}", e)))
@@ -184,11 +184,13 @@ pub(crate) fn recover_wal_from_shared_state(
 
         use walrust_core::StorageBackend;
         let mut count = 0u64;
+        let mut prev_checksum = 0u64; // Start of chain; first changeset validates from 0
         for key in &incr_keys {
             let data = storage.download_bytes(key).await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e)))?;
-            match walrust_core::ltx::apply_ltx_to_db(std::io::Cursor::new(data), &recovery_path) {
-                Ok(_) => {
+            match walrust_core::ltx::apply_changeset_to_db(&data, &recovery_path, prev_checksum) {
+                Ok(result) => {
+                    prev_checksum = result.checksum;
                     count += 1;
                     eprintln!("[wal-recovery] applied {}", key);
                 }

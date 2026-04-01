@@ -2419,12 +2419,12 @@ impl DatabaseHandle for TieredHandle {
                         return;
                     }
                 };
-                // Filter to .ltx files with max_txid <= version
+                // Filter to .hadbp files with max_txid <= version
                 let to_delete: Vec<String> = keys.into_iter()
                     .filter(|k| {
-                        k.ends_with(".ltx")
+                        k.ends_with(".hadbp")
                             && k.rsplit('/').next()
-                                .and_then(|f| f.strip_suffix(".ltx"))
+                                .and_then(|f| f.strip_suffix(".hadbp"))
                                 .and_then(|f| f.split('-').last())
                                 .and_then(|hex| u64::from_str_radix(hex, 16).ok())
                                 .map(|max_txid| max_txid <= version)
