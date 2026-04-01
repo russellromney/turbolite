@@ -104,8 +104,17 @@ impl Database {
             tiered_register(&vfs_name, vfs)
                 .map_err(|e| Error::from_reason(format!("register tiered VFS: {e}")))?;
 
-            Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
-                .map_err(|e| Error::from_reason(format!("open: {e}")))?
+            let conn = Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
+                .map_err(|e| Error::from_reason(format!("open: {e}")))?;
+
+            // S3 mode: 64KB pages for fewer S3 round trips, WAL mode for
+            // concurrent reads during checkpoint.
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;"
+            ).map_err(|e| Error::from_reason(format!("set S3 pragmas: {e}")))?;
+
+            conn
         } else {
             let compression = options.as_ref().and_then(|o| o.compression);
             let vfs = match compression {
