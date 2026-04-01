@@ -247,7 +247,7 @@ pub unsafe extern "C" fn turbolite_warm(
     };
     match BENCH_HANDLE.get() {
         Some(h) => {
-            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            let accesses = crate::tiered::run_eqp_and_parse(db, sql_str);
             let json = h.warm_from_plan(&accesses);
             match std::ffi::CString::new(json) {
                 Ok(c) => {
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn turbolite_evict_query(
     };
     match BENCH_HANDLE.get() {
         Some(h) => {
-            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            let accesses = crate::tiered::run_eqp_and_parse(db, sql_str);
             h.evict_query(&accesses) as i32
         }
         None => -1,

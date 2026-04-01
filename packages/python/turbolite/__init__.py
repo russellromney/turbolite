@@ -45,7 +45,8 @@ def _find_ext() -> str:
     )
 
 
-_loaded = False
+_loaded_local = False
+_loaded_s3 = False
 
 
 def load(conn: sqlite3.Connection) -> None:
@@ -59,11 +60,13 @@ def load(conn: sqlite3.Connection) -> None:
     Args:
         conn: Any open sqlite3.Connection (can be :memory:).
     """
-    global _loaded
+    global _loaded_local, _loaded_s3
     ext_path = _find_ext()
     conn.enable_load_extension(True)
     conn.load_extension(ext_path)
-    _loaded = True
+    _loaded_local = True
+    if os.environ.get("TURBOLITE_BUCKET"):
+        _loaded_s3 = True
 
 
 def connect(
@@ -105,8 +108,9 @@ def connect(
         raise ValueError(f"mode must be 'local' or 's3', got {mode!r}")
 
     if mode == "s3":
-        # Set env vars for the extension before loading.
-        # Fail fast if bucket is missing.
+        # Set env vars BEFORE loading the extension. The C init function
+        # checks TURBOLITE_BUCKET to decide whether to register turbolite-s3.
+        # Once loaded, the VFS is registered for the process lifetime.
         effective_bucket = bucket or os.environ.get("TURBOLITE_BUCKET")
         if not effective_bucket:
             raise ValueError(
@@ -129,11 +133,29 @@ def connect(
     if prefetch_threads is not None:
         os.environ["TURBOLITE_PREFETCH_THREADS"] = str(prefetch_threads)
 
-    global _loaded
-    if not _loaded:
+    # Load extension. S3 env vars must be set BEFORE first load because the
+    # C init function only runs once per process. If local mode was loaded
+    # first without TURBOLITE_BUCKET, the S3 VFS won't be registered and
+    # there's no way to add it later.
+    needs_load = not _loaded_local or (mode == "s3" and not _loaded_s3)
+    if needs_load:
+        if _loaded_local and mode == "s3" and not _loaded_s3:
+            raise RuntimeError(
+                "Cannot switch to S3 mode after local mode was already loaded. "
+                "The SQLite extension init only runs once per process. "
+                "Use mode='s3' on the first turbolite.connect() call, or set "
+                "TURBOLITE_BUCKET in the environment before importing turbolite."
+            )
         bootstrap = sqlite3.connect(":memory:")
         load(bootstrap)
         bootstrap.close()
 
     vfs = "turbolite-s3" if mode == "s3" else "turbolite"
-    return sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+    conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+
+    if mode == "s3":
+        # 64KB pages for fewer S3 round trips, WAL mode for concurrent reads
+        conn.execute("PRAGMA page_size=65536")
+        conn.execute("PRAGMA journal_mode=WAL")
+
+    return conn

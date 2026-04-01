@@ -2,11 +2,31 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::{register, CompressedVfs};
+use turbolite::tiered::{register as tiered_register, TieredConfig, TieredVfs};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A SQLite database connection with transparent compression.
+/// Options for opening a Database.
+#[napi(object)]
+pub struct DatabaseOptions {
+    /// Storage mode: "local" (default) or "s3".
+    pub mode: Option<String>,
+    /// Zstd compression level 1-22 (local mode, default 3). Pass null for no compression.
+    pub compression: Option<i32>,
+    /// S3 bucket name (required when mode = "s3").
+    pub bucket: Option<String>,
+    /// S3 endpoint URL, e.g. for Tigris or MinIO (mode = "s3").
+    pub endpoint: Option<String>,
+    /// S3 key prefix (mode = "s3", default "turbolite").
+    pub prefix: Option<String>,
+    /// Local cache directory (mode = "s3", defaults to db file's parent directory).
+    pub cache_dir: Option<String>,
+    /// AWS region (mode = "s3").
+    pub region: Option<String>,
+}
+
+/// A SQLite database connection with transparent compression or S3 tiered storage.
 #[napi]
 pub struct Database {
     conn: Option<Connection>,
@@ -14,12 +34,14 @@ pub struct Database {
 
 #[napi]
 impl Database {
-    /// Open a database with transparent zstd compression.
+    /// Open a database.
     ///
     /// @param path - Path to the database file.
-    /// @param compression - zstd compression level 1-22 (default 3). Pass null for no compression.
+    /// @param options - Options object. Omit for local compressed mode.
+    ///   Local mode: `{ compression: 3 }` (zstd level 1-22; omit for no compression).
+    ///   S3 mode:    `{ mode: "s3", bucket: "my-bucket", endpoint: "..." }`.
     #[napi(constructor)]
-    pub fn new(path: String, compression: Option<i32>) -> Result<Self> {
+    pub fn new(path: String, options: Option<DatabaseOptions>) -> Result<Self> {
         let path = std::path::Path::new(&path);
         let abs_path = if path.is_absolute() {
             path.to_path_buf()
@@ -30,24 +52,81 @@ impl Database {
         };
         let base_dir = abs_path
             .parent()
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
 
         let vfs_name = format!(
             "turbolite-node-{}",
             VFS_COUNTER.fetch_add(1, Ordering::SeqCst)
         );
 
-        let vfs = match compression {
-            Some(level) => CompressedVfs::new(base_dir, level),
-            None => CompressedVfs::passthrough(base_dir),
-        };
-
-        register(&vfs_name, vfs)
-            .map_err(|e| Error::from_reason(format!("register VFS: {e}")))?;
+        let mode = options
+            .as_ref()
+            .and_then(|o| o.mode.as_deref())
+            .unwrap_or("local");
 
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
-        let conn = Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
-            .map_err(|e| Error::from_reason(format!("open: {e}")))?;
+
+        let conn = if mode == "s3" {
+            let bucket = options
+                .as_ref()
+                .and_then(|o| o.bucket.clone())
+                .ok_or_else(|| Error::from_reason("bucket is required for s3 mode"))?;
+            let endpoint_url = options
+                .as_ref()
+                .and_then(|o| o.endpoint.clone())
+                .filter(|s| !s.is_empty());
+            let prefix = options
+                .as_ref()
+                .and_then(|o| o.prefix.clone())
+                .unwrap_or_else(|| "turbolite".to_string());
+            let cache_dir = options
+                .as_ref()
+                .and_then(|o| o.cache_dir.as_ref().map(|s| std::path::PathBuf::from(s)))
+                .unwrap_or_else(|| base_dir.clone());
+            let region = options
+                .as_ref()
+                .and_then(|o| o.region.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("TURBOLITE_REGION").ok().filter(|s| !s.is_empty()));
+
+            let config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir,
+                endpoint_url,
+                region,
+                ..Default::default()
+            };
+
+            let vfs = TieredVfs::new(config)
+                .map_err(|e| Error::from_reason(format!("create tiered VFS: {e}")))?;
+            tiered_register(&vfs_name, vfs)
+                .map_err(|e| Error::from_reason(format!("register tiered VFS: {e}")))?;
+
+            let conn = Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
+                .map_err(|e| Error::from_reason(format!("open: {e}")))?;
+
+            // S3 mode: 64KB pages for fewer S3 round trips, WAL mode for
+            // concurrent reads during checkpoint.
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;"
+            ).map_err(|e| Error::from_reason(format!("set S3 pragmas: {e}")))?;
+
+            conn
+        } else {
+            let compression = options.as_ref().and_then(|o| o.compression);
+            let vfs = match compression {
+                Some(level) => CompressedVfs::new(base_dir, level),
+                None => CompressedVfs::passthrough(base_dir),
+            };
+            register(&vfs_name, vfs)
+                .map_err(|e| Error::from_reason(format!("register VFS: {e}")))?;
+
+            Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
+                .map_err(|e| Error::from_reason(format!("open: {e}")))?
+        };
 
         Ok(Database { conn: Some(conn) })
     }
