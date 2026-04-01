@@ -136,4 +136,11 @@ def connect(
         bootstrap.close()
 
     vfs = "turbolite-s3" if mode == "s3" else "turbolite"
-    return sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+    conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+
+    if mode == "s3":
+        # 64KB pages for fewer S3 round trips, WAL mode for concurrent reads
+        conn.execute("PRAGMA page_size=65536")
+        conn.execute("PRAGMA journal_mode=WAL")
+
+    return conn
