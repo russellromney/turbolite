@@ -22,6 +22,7 @@ gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
 parallel = ["dep:rayon"]
 tiered = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:tokio", "dep:crc32fast", "dep:libc"]
+wal = ["tiered", "dep:walrust-core", "dep:hadb-io", "dep:async-trait"]
 lambda = ["dep:lambda_runtime", "tiered", "zstd"]
 
 [dependencies]
@@ -64,6 +65,12 @@ libsqlite3-sys = { version = "0.33", features = ["bundled"], optional = true }
 tempfile = "3"
 ureq = "2"
 lambda_runtime = { version = "0.13", optional = true }
+
+# WAL replication via walrust (optional)
+walrust-core = { path = "../walrust/crates/walrust-core", optional = true, package = "walrust" }
+hadb-io = { path = "../../hadb/hadb-io", optional = true }
+async-trait = { version = "0.1", optional = true }
+
 rmp-serde = "1.3.1"
 
 [build-dependencies]

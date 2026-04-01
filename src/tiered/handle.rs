@@ -54,21 +54,30 @@ pub struct TieredHandle {
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
 
-    // --- Phase Verdun: predictive prefetch ---
-    /// Per-connection lock session tracker (B-tree touches within a lock lifecycle).
-    lock_session: prediction::LockSession,
-    /// Shared prediction table (lives on TieredVfs, shared across connections).
-    prediction: Option<prediction::SharedPrediction>,
-    /// Shared access history (lives on TieredVfs, shared across connections).
-    access_history: Option<prediction::SharedAccessHistory>,
-    /// B-tree names that had dirty pages this session (for write decay, applied once per flush).
-    dirty_btrees: HashSet<String>,
+    // --- Phase Midway: VACUUM detection ---
+    /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
+    /// and VACUUM. Used to detect VACUUM and trigger B-tree re-walk at checkpoint.
+    last_schema_cookie: Option<u32>,
+    /// Old S3 keys to GC after VACUUM re-walk. Populated during VACUUM detection,
+    /// consumed during the upload phase.
+    vacuum_replaced_keys: Option<Vec<String>>,
 
     // --- Phase Stalingrad: cache eviction ---
     /// Maximum cache size in bytes. None = unlimited.
     cache_limit: Option<u64>,
     /// Evict data tier after successful checkpoint S3 upload.
     evict_on_checkpoint: bool,
+
+    // --- Phase Kursk: staging log for two-phase checkpoint ---
+    /// Append-only staging log writer (open during LocalThenFlush checkpoint).
+    /// Lazily opened on first dirty write; closed+fsynced in sync().
+    staging_writer: Option<staging::StagingWriter>,
+    /// Shared pending flushes. Populated by sync(), drained by flush_to_s3().
+    pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    /// Monotonic counter for staging log filenames (avoids version collisions).
+    staging_seq: Arc<AtomicU64>,
+    /// Staging directory path (cache_dir/staging).
+    staging_dir: PathBuf,
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
@@ -95,6 +104,8 @@ impl TieredHandle {
         cache: Arc<DiskCache>,
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+        pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+        staging_seq: Arc<AtomicU64>,
         db_path: PathBuf,
         pages_per_group: u32,
         compression_level: i32,
@@ -107,8 +118,6 @@ impl TieredHandle {
         eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
-        prediction: Option<prediction::SharedPrediction>,
-        access_history: Option<prediction::SharedAccessHistory>,
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
@@ -260,6 +269,8 @@ impl TieredHandle {
         // Drop the snapshot; handle uses the shared Arc from now on
         drop(manifest);
 
+        let staging_dir = cache.cache_dir.join("staging");
+
         Self {
             s3: Some(s3),
             cache: Some(cache),
@@ -283,12 +294,14 @@ impl TieredHandle {
             #[cfg(feature = "zstd")]
             decoder_dict,
             query_plan_prefetch,
-            lock_session: prediction::LockSession::new(),
-            prediction,
-            access_history,
-            dirty_btrees: HashSet::new(),
+            last_schema_cookie: None,
+            vacuum_replaced_keys: None,
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
             evict_on_checkpoint,
+            staging_writer: None,
+            pending_flushes,
+            staging_seq,
+            staging_dir,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -322,12 +335,14 @@ impl TieredHandle {
             #[cfg(feature = "zstd")]
             decoder_dict: None,
             query_plan_prefetch: false,
-            lock_session: prediction::LockSession::new(),
-            prediction: None,
-            access_history: None,
-            dirty_btrees: HashSet::new(),
+            last_schema_cookie: None,
+            vacuum_replaced_keys: None,
             cache_limit: None,
             evict_on_checkpoint: false,
+            staging_writer: None,
+            pending_flushes: Arc::new(Mutex::new(Vec::new())),
+            staging_seq: Arc::new(AtomicU64::new(0)),
+            staging_dir: PathBuf::new(),
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -691,49 +706,6 @@ impl TieredHandle {
         ))
     }
 
-    /// Phase Verdun: flush the current lock session.
-    /// Records the B-tree pattern in the prediction table and applies write decay.
-    fn flush_lock_session(&mut self) {
-        let prediction = match &self.prediction {
-            Some(p) => Arc::clone(p),
-            None => {
-                self.lock_session.flush();
-                self.dirty_btrees.clear();
-                return;
-            }
-        };
-
-        if !self.lock_session.btrees.is_empty() {
-            // Phase Verdun (b): record B-tree access frequency
-            if let Some(ref ah) = self.access_history {
-                ah.write().record(&self.lock_session.btrees);
-            }
-
-            let mut table = prediction.write();
-
-            // Apply write decay for dirty B-trees (once per tree name, not per page)
-            for name in &self.dirty_btrees {
-                table.write_decay(name);
-            }
-
-            // Reinforcement: if a prediction fired, check if all predicted names
-            // were actually touched. Uses fired_pattern (set by subphase d).
-            if let Some(ref fired) = self.lock_session.fired_pattern {
-                if fired.iter().all(|r| self.lock_session.btrees.contains(r.as_str())) {
-                    table.reinforce(fired);
-                }
-            }
-
-            // Observe the pattern from this session (needs >= 2 trees)
-            if let Some(pattern) = self.lock_session.flush() {
-                table.observe(&pattern);
-            }
-        } else {
-            self.lock_session.flush();
-        }
-
-        self.dirty_btrees.clear();
-    }
 }
 
 impl DatabaseHandle for TieredHandle {
@@ -797,73 +769,12 @@ impl DatabaseHandle for TieredHandle {
         let loc = manifest_ref.page_location(page_num)
             .expect("page within manifest bounds must have group assignment");
 
-        // 3b. Phase Verdun-i: track B-tree name touch for predictive prefetch
-        let mut predicted_groups: Vec<u64> = Vec::new();
-        if self.prediction.is_some() && self.lock_session.active {
-            if let Some(tree_name) = manifest_ref.page_to_tree_name.get(&page_num) {
-                let is_new = self.lock_session.touch(tree_name);
-                // Fire prediction on 2nd+ B-tree touch (new name, not re-touch)
-                if is_new && !self.lock_session.prediction_fired && self.lock_session.tree_count() >= 2 {
-                    if let Some(ref pred) = self.prediction {
-                        let table = pred.read();
-                        if let Some(extras) = table.predict(&self.lock_session.btrees) {
-                            // Collect group IDs for predicted B-tree names
-                            for predicted_name in &extras {
-                                if let Some(group_ids) = manifest_ref.tree_name_to_groups.get(predicted_name) {
-                                    predicted_groups.extend_from_slice(group_ids);
-                                }
-                            }
-                            // Record the full predicted pattern for reinforcement on flush
-                            let mut full_pattern: std::collections::BTreeSet<String> =
-                                self.lock_session.btrees.iter().cloned().collect();
-                            for r in &extras {
-                                full_pattern.insert(r.clone());
-                            }
-                            self.lock_session.fired_pattern = Some(full_pattern);
-                            self.lock_session.prediction_fired = true;
-                        }
-                    }
-                }
-            }
-        }
-
         let gid = loc.group_id;
         let current_tree_name = manifest_ref.group_to_tree_name.get(&gid).cloned();
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
-        // 3c. Phase Verdun (d): submit predicted groups to prefetch pool
-        if !predicted_groups.is_empty() {
-            if let Some(pool) = &self.prefetch_pool {
-                let manifest_snap = self.manifest.read();
-                let sub_ppf = manifest_snap.sub_pages_per_frame;
-                for &pred_gid in &predicted_groups {
-                    let cache_ref = self.cache.as_ref().expect("disk cache required");
-                    if cache_ref.group_state(pred_gid) == GroupState::None
-                        && cache_ref.try_claim_group(pred_gid)
-                    {
-                        if let Some(key) = manifest_snap.page_group_keys.get(pred_gid as usize) {
-                            if !key.is_empty() {
-                                let ft = manifest_snap.frame_tables
-                                    .get(pred_gid as usize)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let gp = manifest_snap.group_page_nums(pred_gid).into_owned();
-                                if !pool.submit(pred_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp) {
-                                    cache_ref.unclaim_group(pred_gid);
-                                }
-                            } else {
-                                cache_ref.unclaim_group(pred_gid);
-                            }
-                        } else {
-                            cache_ref.unclaim_group(pred_gid);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3d. Phase Stalingrad: between-query eviction trigger.
+        // 3c. Phase Stalingrad: between-query eviction trigger.
         //
         // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
         // fires on statement completion and sets the end-query signal). If so,
@@ -1311,6 +1222,19 @@ impl DatabaseHandle for TieredHandle {
             cache.touch_group(gid);
             return Ok(());
         }
+
+        // Phase Kursk: fallback read from cache file even if bitmap says absent.
+        // After crash recovery, the cache file may have valid pages from a previous
+        // VFS instance that were never uploaded to S3. The bitmap is in-memory and
+        // was reset on VFS restart, so it doesn't know these pages exist.
+        if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
+            cache.bitmap.lock().mark_present(page_num);
+            cache.mark_group_present(gid);
+            self.detect_interior_page(buf, page_num, cache);
+            cache.touch_group(gid);
+            return Ok(());
+        }
+
         buf.fill(0);
         Ok(())
     }
@@ -1349,10 +1273,24 @@ impl DatabaseHandle for TieredHandle {
         let page_size = *self.page_size.read() as u64;
         let page_num = offset / page_size;
 
-        // Phase Verdun-i: track dirty B-tree name for write decay (once per tree per session)
-        if self.prediction.is_some() && self.lock_session.active {
-            if let Some(tree_name) = self.manifest.read().page_to_tree_name.get(&page_num) {
-                self.dirty_btrees.insert(tree_name.clone());
+        // Phase Midway: capture schema cookie from page 0 for VACUUM detection.
+        // Read the EXISTING cookie before this write overwrites it.
+        if page_num == 0 && self.last_schema_cookie.is_none() {
+            if let Some(cache) = &self.cache {
+                let mut old_page0 = vec![0u8; page_size as usize];
+                if cache.read_page(0, &mut old_page0).is_ok() && old_page0.len() >= 28 {
+                    let cookie = u32::from_be_bytes([old_page0[24], old_page0[25], old_page0[26], old_page0[27]]);
+                    if cookie != 0 {
+                        self.last_schema_cookie = Some(cookie);
+                    }
+                }
+            }
+            // If cache didn't have page 0 yet, read from the incoming write
+            if self.last_schema_cookie.is_none() && buf.len() >= 28 {
+                let cookie = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+                if cookie != 0 {
+                    self.last_schema_cookie = Some(cookie);
+                }
             }
         }
 
@@ -1361,6 +1299,22 @@ impl DatabaseHandle for TieredHandle {
             cache.write_page(page_num, buf)?;
         }
         self.dirty_page_nums.write().insert(page_num);
+
+        // Phase Kursk: append to staging log for LocalThenFlush mode.
+        // Captures exact page contents at write time, immune to overwrite
+        // by subsequent checkpoints.
+        if self.sync_mode == SyncMode::LocalThenFlush {
+            let ps = *self.page_size.read();
+            if self.staging_writer.is_none() && ps > 0 {
+                let seq = self.staging_seq.fetch_add(1, Ordering::Relaxed);
+                self.staging_writer = Some(
+                    staging::StagingWriter::open(&self.staging_dir, seq, ps)?
+                );
+            }
+            if let Some(ref mut writer) = self.staging_writer {
+                writer.append(page_num, buf)?;
+            }
+        }
 
         // Update manifest page_count if this page extends the database
         {
@@ -1416,7 +1370,8 @@ impl DatabaseHandle for TieredHandle {
         // free in-memory dirty map, but skip S3 upload entirely.
         // Pages are already in disk cache from write_all_at().
         if self.sync_mode == SyncMode::LocalThenFlush || LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
-            let cache = self.disk_cache();
+            let cache_arc = self.cache.as_ref().expect("cache required for tiered handle").clone();
+            let cache = &*cache_arc;
             let mut manifest = self.manifest.write();
             let mut pending = self.s3_dirty_groups.lock().unwrap();
             let mut interior_found = 0usize;
@@ -1428,8 +1383,8 @@ impl DatabaseHandle for TieredHandle {
             if !unassigned.is_empty() {
                 Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
             }
-            let page_size = *self.page_size.read() as usize;
-            let mut type_buf = vec![0u8; page_size];
+            let page_size = *self.page_size.read();
+            let mut type_buf = vec![0u8; page_size as usize];
             for &page_num in &dirty_snapshot {
                 let loc = manifest.page_location(page_num)
                     .expect("page must have group assignment after new-page assignment");
@@ -1456,12 +1411,171 @@ impl DatabaseHandle for TieredHandle {
             let total_interior = cache.interior_pages.lock().len();
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending.len());
+            let cache_dir = cache.cache_dir.clone();
+            let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
+            drop(pending);
+            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending_groups_snapshot.len());
+
+            // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
+            // The staging log captured exact page contents during write_all_at(),
+            // immune to overwrite by subsequent checkpoints.
+            if let Some(writer) = self.staging_writer.take() {
+                let (staging_path, pages_written) = writer.finalize()?;
+                // Version from filename (seq counter assigned at open time)
+                let version = staging_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[sync] staging log finalized: {} pages, version {}, path {}",
+                    pages_written, version, staging_path.display(),
+                );
+                self.pending_flushes.lock().unwrap().push(staging::PendingFlush {
+                    staging_path,
+                    version,
+                    page_size,
+                });
+            }
+
+            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery
+            {
+                let m = self.manifest.read().clone();
+                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot };
+                if let Err(e) = local.persist(&cache_dir) {
+                    eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
+                }
+            }
+
             return Ok(());
         }
 
-        let s3 = self.s3();
-        let cache = self.disk_cache();
+        let page_size = *self.page_size.read();
+
+        // Phase Midway: detect VACUUM by checking schema cookie change.
+        // VACUUM rewrites the entire database with new page numbers.
+        // When detected, re-walk B-trees and rebuild group_pages from scratch.
+        // Done before borrowing cache/s3 to avoid borrow conflicts with self mutation.
+        {
+            let cache_arc = self.cache.as_ref().expect("cache required").clone();
+            let cache_ref = &*cache_arc;
+            if dirty_snapshot.contains(&0) && self.manifest.read().strategy == GroupingStrategy::BTreeAware {
+                let mut page0 = vec![0u8; page_size as usize];
+                if cache_ref.read_page(0, &mut page0).is_ok() && page0.len() >= 28 {
+                    let cookie = u32::from_be_bytes([page0[24], page0[25], page0[26], page0[27]]);
+                    let mut do_rewalk = false;
+                    if let Some(prev) = self.last_schema_cookie {
+                        if cookie != prev {
+                            let manifest = self.manifest.read();
+                            let dirty_ratio = dirty_snapshot.len() as f64 / manifest.page_count.max(1) as f64;
+                            if dirty_ratio > 0.5 {
+                                eprintln!(
+                                    "[sync] VACUUM detected: schema cookie {} -> {}, {:.0}% pages dirty, re-walking B-trees",
+                                    prev, cookie, dirty_ratio * 100.0,
+                                );
+                                do_rewalk = true;
+                            }
+                        }
+                    }
+                    self.last_schema_cookie = Some(cookie);
+
+                    if do_rewalk {
+                        let mut manifest = self.manifest.write();
+                        let page_count = manifest.page_count;
+
+                        let walk = crate::btree_walker::walk_all_btrees(page_count, page_size, &|pnum| {
+                            let mut buf = vec![0u8; page_size as usize];
+                            cache_ref.read_page(pnum, &mut buf).ok()?;
+                            Some(buf)
+                        });
+
+                        eprintln!(
+                            "[sync] VACUUM re-walk: {} B-trees, {} unowned pages",
+                            walk.btrees.len(), walk.unowned_pages.len(),
+                        );
+
+                        // Rebuild group_pages using import's packing logic
+                        let mut new_group_pages: Vec<Vec<u64>> = Vec::new();
+                        let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
+                            walk.btrees.iter().collect();
+                        btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+
+                        let threshold = std::cmp::max(ppg as usize / 4, 1);
+                        let mut small_pages: Vec<u64> = Vec::new();
+
+                        for (_, entry) in &btree_list {
+                            let mut sorted_pages = entry.pages.clone();
+                            sorted_pages.sort_unstable();
+                            if sorted_pages.len() >= threshold {
+                                for chunk in sorted_pages.chunks(ppg as usize) {
+                                    new_group_pages.push(chunk.to_vec());
+                                }
+                            } else {
+                                small_pages.extend_from_slice(&sorted_pages);
+                            }
+                        }
+
+                        let mut sorted_unowned = walk.unowned_pages.clone();
+                        sorted_unowned.sort_unstable();
+                        small_pages.extend_from_slice(&sorted_unowned);
+
+                        for chunk in small_pages.chunks(ppg as usize) {
+                            new_group_pages.push(chunk.to_vec());
+                        }
+
+                        // Rebuild btrees manifest entries
+                        let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
+                        for (gid, pages) in new_group_pages.iter().enumerate() {
+                            for &p in pages {
+                                page_to_gid.insert(p, gid as u64);
+                            }
+                        }
+
+                        let mut new_btrees: HashMap<u64, BTreeManifestEntry> = HashMap::new();
+                        for (&root_page, entry) in &walk.btrees {
+                            let mut gid_set: HashSet<u64> = HashSet::new();
+                            for &p in &entry.pages {
+                                if let Some(&gid) = page_to_gid.get(&p) {
+                                    gid_set.insert(gid);
+                                }
+                            }
+                            let mut gids: Vec<u64> = gid_set.into_iter().collect();
+                            gids.sort_unstable();
+                            new_btrees.insert(root_page, BTreeManifestEntry {
+                                name: entry.name.clone(),
+                                obj_type: entry.obj_type.clone(),
+                                group_ids: gids,
+                            });
+                        }
+
+                        eprintln!(
+                            "[sync] VACUUM: repacked {} pages into {} groups (was {} groups)",
+                            page_count, new_group_pages.len(), manifest.group_pages.len(),
+                        );
+
+                        // Collect old keys for GC
+                        let mut vacuum_keys: Vec<String> = manifest.page_group_keys.iter()
+                            .filter(|k| !k.is_empty()).cloned().collect();
+                        vacuum_keys.extend(manifest.interior_chunk_keys.values().cloned());
+                        vacuum_keys.extend(manifest.index_chunk_keys.values().cloned());
+
+                        // Replace manifest group state
+                        manifest.group_pages = new_group_pages;
+                        manifest.btrees = new_btrees;
+                        manifest.page_group_keys = Vec::new();
+                        manifest.interior_chunk_keys.clear();
+                        manifest.index_chunk_keys.clear();
+                        manifest.frame_tables.clear();
+                        manifest.build_page_index();
+
+                        self.vacuum_replaced_keys = Some(vacuum_keys);
+                    }
+                }
+            }
+        }
+
+        // Clone Arcs to avoid borrow conflicts with self.vacuum_replaced_keys
+        let s3 = self.s3.as_ref().expect("s3 required").clone();
+        let cache = self.cache.as_ref().expect("cache required").clone();
 
         // Assign new pages (not in page_index) to new groups before grouping
         {
@@ -1495,13 +1609,20 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
+        // Dual counter (Phase Borodino):
+        // - version: monotonic +1, for S3 key uniqueness
+        // - change_counter: SQLite file change counter, for walrust WAL replay
         let next_version = self.manifest.read().version + 1;
+        let change_counter = read_change_counter_from_cache(&cache, page_size);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut new_keys = self.manifest.read().page_group_keys.clone();
         // Track old keys being replaced (for post-checkpoint GC)
         let mut replaced_keys: Vec<String> = Vec::new();
 
-        let page_size = *self.page_size.read();
+        // Consume VACUUM old keys (populated during VACUUM detection above)
+        if let Some(vacuum_keys) = self.vacuum_replaced_keys.take() {
+            replaced_keys.extend(vacuum_keys);
+        }
 
         // Carry forward seekable encoding from the manifest.
         // If the manifest was imported with seekable format, sync re-encodes dirty
@@ -1890,6 +2011,7 @@ impl DatabaseHandle for TieredHandle {
         let old_manifest = self.manifest.read().clone();
         let mut new_manifest = Manifest {
             version: next_version,
+            change_counter,
             page_count: old_manifest.page_count,
             page_size: old_manifest.page_size,
             pages_per_group: ppg,
@@ -1909,17 +2031,6 @@ impl DatabaseHandle for TieredHandle {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            // Phase Verdun (c): serialize access history + prediction patterns
-            btree_access_freq: self.access_history.as_ref().map(|ah| {
-                let mut h = ah.write();
-                h.decay_and_prune();
-                h.freq.clone()
-            }).unwrap_or_else(|| old_manifest.btree_access_freq.clone()),
-            prediction_patterns: self.prediction.as_ref().map(|p| {
-                let mut t = p.write();
-                t.prune();
-                t.to_persisted()
-            }).unwrap_or_else(|| old_manifest.prediction_patterns.clone()),
         };
         new_manifest.build_page_index();
         s3.put_manifest(&new_manifest)?;
@@ -1973,6 +2084,43 @@ impl DatabaseHandle for TieredHandle {
             });
         }
 
+        // Phase Somme-e: GC old WAL segments after checkpoint.
+        // WAL segments with txid <= change_counter are in the page groups (redundant).
+        // Uses change_counter (not version) because walrust txids are file change counters.
+        #[cfg(feature = "wal")]
+        if self.gc_enabled {
+            let gc_s3 = self.s3.as_ref().expect("s3 required").clone();
+            let wal_prefix = format!("{}/wal/", gc_s3.prefix);
+            let version = change_counter;
+            let runtime = gc_s3.runtime.clone();
+            runtime.spawn(async move {
+                // List all WAL segment keys under the wal prefix
+                let keys = match gc_s3.list_all_keys_with_prefix(&wal_prefix).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("[wal-gc] ERROR listing WAL segments: {}", e);
+                        return;
+                    }
+                };
+                // Filter to .ltx files with max_txid <= version
+                let to_delete: Vec<String> = keys.into_iter()
+                    .filter(|k| {
+                        k.ends_with(".ltx")
+                            && k.rsplit('/').next()
+                                .and_then(|f| f.strip_suffix(".ltx"))
+                                .and_then(|f| f.split('-').last())
+                                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                                .map(|max_txid| max_txid <= version)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+                if !to_delete.is_empty() {
+                    eprintln!("[wal-gc] deleting {} WAL segments with txid <= {}", to_delete.len(), version);
+                    gc_s3.delete_objects_async_owned(to_delete).await;
+                }
+            });
+        }
+
         // Phase Stalingrad-e: evict data tier after successful checkpoint upload.
         if self.evict_on_checkpoint {
             if let Some(cache) = &self.cache {
@@ -1997,6 +2145,15 @@ impl DatabaseHandle for TieredHandle {
                 cache.stat_evictions.fetch_add(count as u64, Ordering::Relaxed);
                 cache.stat_bytes_evicted.fetch_add(count as u64 * scbs, Ordering::Relaxed);
                 eprintln!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
+            }
+        }
+
+        // Phase Gallipoli: persist local manifest (no dirty groups in Durable mode)
+        if let Some(cache) = &self.cache {
+            let m = self.manifest.read().clone();
+            let local = manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
+            if let Err(e) = local.persist(&cache.cache_dir) {
+                eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
             }
         }
 
@@ -2187,20 +2344,6 @@ impl DatabaseHandle for TieredHandle {
                     }
                     Err(e) => return Err(e),
                 }
-            }
-        }
-
-        // Phase Verdun: lock session tracking
-        if self.prediction.is_some() {
-            let was_none = current == LockKind::None;
-            let now_none = lock == LockKind::None;
-
-            if was_none && !now_none {
-                // Acquiring lock: start a new session
-                self.lock_session.start();
-            } else if !was_none && now_none {
-                // Releasing lock: flush the session
-                self.flush_lock_session();
             }
         }
 

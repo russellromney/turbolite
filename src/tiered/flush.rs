@@ -1,49 +1,111 @@
-//! Non-blocking S3 flush for two-phase checkpoint.
+//! Non-blocking S3 flush for two-phase checkpoint (Phase Kursk).
 //!
-//! After a local-only checkpoint (SyncMode::LocalThenFlush, or the global
-//! LOCAL_CHECKPOINT_ONLY flag for benchmarks), dirty pages are in the local
-//! disk cache but not yet on S3. This module uploads them without holding any
-//! SQLite lock, so reads and writes can continue concurrently.
+//! After a local-only checkpoint (SyncMode::LocalThenFlush), dirty pages are
+//! captured in staging log files on disk. This module reads from staging logs
+//! (not the live disk cache), encodes page groups, and uploads to S3 without
+//! holding any SQLite lock.
+//!
+//! Staging logs guarantee correctness: even if a subsequent checkpoint overwrites
+//! pages in the disk cache, the staging log has the exact contents from the
+//! original checkpoint.
 
 use super::*;
 
 /// Upload locally-checkpointed dirty page groups to S3.
 ///
-/// Reads pages from the disk cache, encodes them, uploads to S3, and updates
-/// the manifest. Called outside any SQLite lock.
+/// Reads dirty pages from staging logs (Phase Kursk), non-dirty pages from
+/// cache or S3. Called outside any SQLite lock.
 ///
 /// # Safety contract
-/// - Must NOT be called concurrently with a SQLite checkpoint on the same VFS.
-/// - Pages for all dirty groups must be present in the disk cache.
+/// - Must NOT be called concurrently with itself (caller holds flush_lock).
+/// - Staging log files must exist for all pending flushes.
 pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
     shared_manifest: &RwLock<Manifest>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
+    pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
     gc_enabled: bool,
-    access_history: Option<&prediction::SharedAccessHistory>,
-    prediction: Option<&prediction::SharedPrediction>,
 ) -> io::Result<()> {
-    // 1. Drain pending dirty groups atomically
-    let dirty_groups: HashSet<u64> = {
+    // 1. Drain pending flushes (staging logs) + legacy dirty groups
+    let flushes: Vec<staging::PendingFlush> = {
+        let mut pf = pending_flushes.lock().unwrap();
+        std::mem::take(&mut *pf)
+    };
+    let legacy_dirty_groups: HashSet<u64> = {
         let mut pending = shared_dirty_groups.lock().unwrap();
         std::mem::take(&mut *pending)
     };
 
-    if dirty_groups.is_empty() {
+    let has_staging = !flushes.is_empty();
+    let has_legacy = !legacy_dirty_groups.is_empty();
+
+    if !has_staging && !has_legacy {
         eprintln!("[flush] no pending groups to upload");
         return Ok(());
     }
 
-    eprintln!(
-        "[flush] uploading {} dirty groups to S3...",
-        dirty_groups.len()
+    // Run the actual flush, restoring drained state on error so nothing is lost.
+    let result = flush_inner(
+        s3, cache, shared_manifest, compression_level,
+        #[cfg(feature = "zstd")] dictionary,
+        encryption_key, gc_enabled,
+        &flushes, &legacy_dirty_groups,
     );
 
-    // 2. Snapshot manifest (avoid holding lock during S3 I/O)
+    if let Err(ref e) = result {
+        eprintln!("[flush] ERROR: flush failed, restoring pending state: {}", e);
+        // Push staging logs back so next flush_to_s3() retries them
+        if !flushes.is_empty() {
+            pending_flushes.lock().unwrap().extend(flushes);
+        }
+        // Push legacy dirty groups back
+        if !legacy_dirty_groups.is_empty() {
+            shared_dirty_groups.lock().unwrap().extend(legacy_dirty_groups);
+        }
+    }
+
+    result
+}
+
+/// Inner flush logic. Separated so the outer function can restore state on error.
+fn flush_inner(
+    s3: &S3Client,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+    gc_enabled: bool,
+    flushes: &[staging::PendingFlush],
+    legacy_dirty_groups: &HashSet<u64>,
+) -> io::Result<()> {
+    // 2. Read all staging logs and merge into a single page map.
+    // Later staging logs overwrite earlier ones (correct: later checkpoint wins).
+    let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
+    for flush_entry in flushes {
+        let pages = staging::read_staging_log(
+            &flush_entry.staging_path,
+            flush_entry.page_size,
+        )?;
+        eprintln!(
+            "[flush] read staging log v{}: {} pages from {}",
+            flush_entry.version, pages.len(), flush_entry.staging_path.display(),
+        );
+        staging_paths.push(flush_entry.staging_path.clone());
+        staged_pages.extend(pages);
+    }
+
+    eprintln!(
+        "[flush] {} staged pages from {} logs, {} legacy dirty groups",
+        staged_pages.len(), flushes.len(), legacy_dirty_groups.len(),
+    );
+
+    // 3. Snapshot manifest
     let manifest_snap = shared_manifest.read().clone();
     let page_count = manifest_snap.page_count;
     let page_size = manifest_snap.page_size;
@@ -56,7 +118,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
         ));
     }
 
-    // 3. Build encoder/decoder dictionaries
+    // 4. Build encoder/decoder dictionaries
     #[cfg(feature = "zstd")]
     let encoder_dict = dictionary
         .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
@@ -64,7 +126,30 @@ pub(crate) fn flush_dirty_groups_to_s3(
     let decoder_dict = dictionary
         .map(zstd::dict::DecoderDictionary::copy);
 
+    // 5. Determine all dirty groups: from staged pages + legacy dirty groups
+    let mut dirty_groups: HashSet<u64> = legacy_dirty_groups.clone();
+    for &pnum in staged_pages.keys() {
+        if let Some(loc) = manifest_snap.page_location(pnum) {
+            dirty_groups.insert(loc.group_id);
+        }
+    }
+
+    if dirty_groups.is_empty() {
+        eprintln!("[flush] no dirty groups after manifest lookup");
+        // Clean up staging logs even if no groups (edge case: empty checkpoint)
+        for path in &staging_paths {
+            staging::remove_staging_log(path);
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "[flush] uploading {} dirty groups to S3...",
+        dirty_groups.len(),
+    );
+
     let next_version = manifest_snap.version + 1;
+    let change_counter = read_change_counter_from_cache(cache, manifest_snap.page_size);
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();
@@ -77,7 +162,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
     // Track page numbers from dirty groups (for interior/index chunk dirtiness)
     let mut dirty_page_nums: HashSet<u64> = HashSet::new();
 
-    // 4. For each dirty group: read pages from cache, encode, prepare upload
+    // 6. For each dirty group: read pages from staging/cache/S3, encode, prepare upload
     for &gid in &dirty_groups {
         let pages_in_group = manifest_snap.group_page_nums(gid);
         let group_size = pages_in_group.len();
@@ -89,7 +174,11 @@ pub(crate) fn flush_dirty_groups_to_s3(
                 break;
             }
             dirty_page_nums.insert(pnum);
-            if cache.is_present(pnum) {
+
+            // Priority: staging log > cache > S3 merge
+            if let Some(staged_data) = staged_pages.get(&pnum) {
+                pages[i] = Some(staged_data.clone());
+            } else if cache.is_present(pnum) {
                 let mut page_buf = vec![0u8; page_size as usize];
                 if cache.read_page(pnum, &mut page_buf).is_ok() {
                     pages[i] = Some(page_buf);
@@ -101,7 +190,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
             }
         }
 
-        // If some pages aren't in cache, fetch existing group from S3 and merge
+        // If some pages aren't in staging or cache, fetch existing group from S3 and merge
         if need_s3_merge {
             if let Some(existing_key) = new_keys.get(gid as usize) {
                 if !existing_key.is_empty() {
@@ -194,12 +283,12 @@ pub(crate) fn flush_dirty_groups_to_s3(
         new_keys[gid as usize] = key;
     }
 
-    // 5. Upload all dirty page groups
+    // 7. Upload all dirty page groups
     eprintln!("[flush] uploading {} page groups...", uploads.len());
     s3.put_page_groups(&uploads)?;
     eprintln!("[flush] page groups uploaded");
 
-    // 6. Interior chunks: collect from cache, re-upload dirty chunks
+    // 8. Interior chunks: collect from staging + cache, re-upload dirty chunks
     eprintln!("[flush] building interior chunks...");
     let chunk_range = bundle_chunk_range(page_size);
     let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -209,15 +298,20 @@ pub(crate) fn flush_dirty_groups_to_s3(
             if pnum >= page_count {
                 continue;
             }
-            let mut buf = vec![0u8; page_size as usize];
-            if cache.read_page(pnum, &mut buf).is_ok() {
-                all_interior.insert(pnum, buf);
+            // Staging wins over cache for interior pages too
+            if let Some(staged_data) = staged_pages.get(&pnum) {
+                all_interior.insert(pnum, staged_data.clone());
             } else {
-                eprintln!("[flush] WARN: cache.read_page({}) failed for interior page", pnum);
+                let mut buf = vec![0u8; page_size as usize];
+                if cache.read_page(pnum, &mut buf).is_ok() {
+                    all_interior.insert(pnum, buf);
+                } else {
+                    eprintln!("[flush] WARN: cache.read_page({}) failed for interior page", pnum);
+                }
             }
         }
         eprintln!(
-            "[flush] interior collection: {} pages from cache",
+            "[flush] interior collection: {} pages",
             all_interior.len(),
         );
     }
@@ -282,17 +376,13 @@ pub(crate) fn flush_dirty_groups_to_s3(
         eprintln!("[flush] interior chunks uploaded");
     }
 
-    // 7. Index leaf bundles (same pattern as interior)
-    // Two sources: (a) dirty group pages that are index leaves (newly written),
+    // 9. Index leaf bundles (same pattern as interior)
+    // Two sources: (a) staged/cache dirty group pages that are index leaves,
     // (b) previously-fetched index pages from the tracker's Index tier.
     eprintln!("[flush] building index leaf bundles...");
     let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
     {
         // (a) Scan dirty group pages for index leaves (type 0x0A + valid header).
-        // These are pages written since last checkpoint; the tracker doesn't know
-        // they're index pages because they were never fetched from S3.
-        // Uses manifest_snap (not shared_manifest) to avoid re-acquiring the lock
-        // and seeing a potentially newer manifest version mid-flush.
         let mut dirty_index_count = 0usize;
         for &gid in &dirty_groups {
             let pages_in_group = manifest_snap.group_page_nums(gid);
@@ -300,15 +390,21 @@ pub(crate) fn flush_dirty_groups_to_s3(
                 if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
                     continue;
                 }
-                if cache.is_present(pnum) {
-                    let mut buf = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut buf).is_ok() {
-                        let hdr_off = if pnum == 0 { 100 } else { 0 };
-                        let tb = buf.get(hdr_off).copied();
-                        if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
-                            all_index_leaves.insert(pnum, buf);
-                            dirty_index_count += 1;
-                        }
+                // Try staging first, then cache
+                let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
+                    Some(staged_data.clone())
+                } else if cache.is_present(pnum) {
+                    let mut b = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut b).is_ok() { Some(b) } else { None }
+                } else {
+                    None
+                };
+                if let Some(buf) = buf {
+                    let hdr_off = if pnum == 0 { 100 } else { 0 };
+                    let tb = buf.get(hdr_off).copied();
+                    if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
+                        all_index_leaves.insert(pnum, buf);
+                        dirty_index_count += 1;
                     }
                 }
             }
@@ -333,8 +429,14 @@ pub(crate) fn flush_dirty_groups_to_s3(
                 if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
                     continue;
                 }
-                let mut buf = vec![0u8; page_size as usize];
-                if cache.read_page(pnum, &mut buf).is_ok() {
+                // Staging wins for tracker pages too
+                let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
+                    Some(staged_data.clone())
+                } else {
+                    let mut b = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut b).is_ok() { Some(b) } else { None }
+                };
+                if let Some(buf) = buf {
                     let hdr_off = if pnum == 0 { 100 } else { 0 };
                     let tb = buf.get(hdr_off).copied();
                     if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
@@ -410,11 +512,12 @@ pub(crate) fn flush_dirty_groups_to_s3(
         eprintln!("[flush] index chunks uploaded");
     }
 
-    // 8. Update manifest atomically
+    // 10. Update manifest atomically
     let new_manifest = {
         let old_manifest = manifest_snap;
         let mut m = Manifest {
             version: next_version,
+            change_counter,
             page_count: old_manifest.page_count,
             page_size: old_manifest.page_size,
             pages_per_group: ppg,
@@ -431,20 +534,6 @@ pub(crate) fn flush_dirty_groups_to_s3(
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            btree_access_freq: access_history
-                .map(|ah| {
-                    let mut h = ah.write();
-                    h.decay_and_prune();
-                    h.freq.clone()
-                })
-                .unwrap_or_else(|| old_manifest.btree_access_freq.clone()),
-            prediction_patterns: prediction
-                .map(|p| {
-                    let mut t = p.write();
-                    t.prune();
-                    t.to_persisted()
-                })
-                .unwrap_or_else(|| old_manifest.prediction_patterns.clone()),
         };
         m.build_page_index();
         m
@@ -455,7 +544,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
         new_manifest.version, new_manifest.page_count, new_manifest.page_group_keys.len(),
     );
 
-    // 9. Commit to shared manifest
+    // 11. Commit to shared manifest
     {
         let mut m = shared_manifest.write();
         cache.set_group_pages(new_manifest.group_pages.clone());
@@ -465,14 +554,27 @@ pub(crate) fn flush_dirty_groups_to_s3(
     // Persist bitmap
     let _ = cache.persist_bitmap();
 
-    // 10. Post-flush GC: delete old page group/interior chunk versions.
-    // Sync here (flush_to_s3 is user-initiated, blocking is acceptable).
+    // 12. Post-flush GC: delete old page group/interior chunk versions.
     if gc_enabled && !replaced_keys.is_empty() {
         eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
         if let Err(e) = s3.delete_objects(&replaced_keys) {
             eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
         } else {
             eprintln!("[gc] deleted {} old versions", replaced_keys.len());
+        }
+    }
+
+    // 13. Clean up staging logs (all successfully uploaded)
+    for path in &staging_paths {
+        staging::remove_staging_log(path);
+    }
+
+    // Phase Gallipoli: persist local manifest with empty dirty_groups (flush complete)
+    {
+        let m = shared_manifest.read().clone();
+        let local = super::manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
+        if let Err(e) = local.persist(&cache.cache_dir) {
+            eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
         }
     }
 

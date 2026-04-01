@@ -43,6 +43,9 @@ extern long long turbolite_bench_s3_bytes(void);
 /* Rust function -- full GC scan. Defined in src/ext.rs. */
 extern int turbolite_gc(void);
 
+/* Rust function -- compact B-tree groups. Defined in src/ext.rs. */
+extern const char *turbolite_compact(void);
+
 /* Rust function -- runtime config (prefetch tuning).
  * Defined in src/tiered/settings.rs. */
 extern int turbolite_config_set(const char *key, const char *value);
@@ -294,6 +297,26 @@ static void turbolite_gc_func(
     sqlite3_result_int(ctx, deleted);
 }
 
+/*
+ * turbolite_compact()
+ * Compact B-tree page groups: re-walk B-trees, repack groups with >30% dead space.
+ * Returns JSON report with compaction results.
+ */
+static void turbolite_compact_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    const char *json = turbolite_compact();
+    if (!json) {
+        sqlite3_result_error(ctx, "turbolite_compact: no tiered VFS registered or compaction error", -1);
+        return;
+    }
+    sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
 /* ── Trace callback: frontrun prefetch + between-query eviction ─── */
 
 /*
@@ -454,6 +477,10 @@ int sqlite3_turbolite_init(
     sqlite3_create_function_v2(
         db, "turbolite_gc", 0,
         SQLITE_UTF8, 0, turbolite_gc_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_compact", 0,
+        SQLITE_UTF8, 0, turbolite_compact_func, 0, 0, 0
     );
     return SQLITE_OK;
 }

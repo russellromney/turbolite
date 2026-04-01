@@ -27,21 +27,30 @@ pub struct TieredVfs {
     config: TieredConfig,
     /// Owned runtime (if we created one ourselves)
     _runtime: Option<tokio::runtime::Runtime>,
-    /// Phase Verdun: shared prediction table (None when prediction_enabled=false).
-    prediction: Option<prediction::SharedPrediction>,
-    /// Phase Verdun: shared access history (None when prediction_enabled=false).
-    access_history: Option<prediction::SharedAccessHistory>,
     /// Shared manifest state. Written by TieredHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
     shared_manifest: Arc<RwLock<Manifest>>,
     /// Shared pending S3 groups. Accumulated by TieredHandle during local-only
-    /// checkpoints, drained by flush_to_s3().
+    /// checkpoints, drained by flush_to_s3(). Legacy path for global
+    /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    /// Phase Kursk: pending staging log flushes. Populated by sync() in
+    /// LocalThenFlush mode, drained by flush_to_s3().
+    pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    /// Phase Kursk: monotonic counter for staging log filenames.
+    /// Avoids version collisions when manifest version is updated by flush
+    /// between two checkpoints.
+    staging_seq: Arc<AtomicU64>,
     /// Serializes flush_to_s3() calls. Prevents two concurrent flushes from
     /// racing on version numbers and S3 keys. Also prevents a durable-mode
     /// checkpoint (which drains s3_dirty_groups in sync()) from interleaving
     /// with a flush in progress.
     flush_lock: Arc<Mutex<()>>,
+    /// Phase Somme: WAL replication state (started lazily on first MainDb open).
+    #[cfg(feature = "wal")]
+    wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
+    /// Tokio runtime handle for spawning WAL replication background task.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl TieredVfs {
@@ -67,10 +76,25 @@ impl TieredVfs {
         let s3 = S3Client::new_blocking(&config, &runtime_handle)?;
         eprintln!("[tiered] S3 client created, fetching manifest...");
 
-        // Fetch manifest to get page_size for cache initialization
-        let mut manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        // Phase Gallipoli: try local manifest first for cache initialization.
+        // This is critical for crash recovery: if the process died after a local
+        // checkpoint but before flush_to_s3, the S3 manifest is stale/empty but
+        // the local manifest has the correct page_count and group layout.
+        let (mut manifest, recovered_dirty_groups) = match manifest::LocalManifest::load(&config.cache_dir) {
+            Ok(Some(local)) => {
+                eprintln!(
+                    "[tiered] loaded local manifest for cache init (v{}, {} pages, {} dirty groups)",
+                    local.manifest.version, local.manifest.page_count, local.dirty_groups.len(),
+                );
+                (local.manifest, local.dirty_groups)
+            }
+            _ => {
+                eprintln!("[tiered] no local manifest, fetching from S3 for cache init...");
+                (s3.get_manifest()?.unwrap_or_else(Manifest::empty), Vec::new())
+            }
+        };
         manifest.detect_and_normalize_strategy();
-        eprintln!("[tiered] manifest fetched (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
+        eprintln!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
         let page_size = if manifest.page_size > 0 {
             manifest.page_size
         } else {
@@ -113,37 +137,117 @@ impl TieredVfs {
             config.encryption_key,
         ));
 
-        // Phase Verdun: initialize prediction table + access history from manifest (if enabled)
-        let (prediction, access_history) = if config.prediction_enabled {
-            let table = prediction::PredictionTable::from_persisted(&manifest.prediction_patterns);
-            let mut history = prediction::AccessHistory::new();
-            history.freq = manifest.btree_access_freq.clone();
-            (
-                Some(Arc::new(RwLock::new(table))),
-                Some(Arc::new(RwLock::new(history))),
-            )
-        } else {
-            (None, None)
-        };
-
         // Shared state for two-phase checkpoint (flush_to_s3)
         let shared_manifest = Arc::new(RwLock::new(manifest));
-        let shared_dirty_groups = Arc::new(Mutex::new(HashSet::new()));
+        // Phase Gallipoli: recover dirty groups from local manifest
+        let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
+        if !initial_dirty.is_empty() {
+            eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
+        }
+        let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
 
-        Ok(Self {
+        // Phase Kursk: recover staging logs from interrupted flushes
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
+        if !recovered_staging.is_empty() {
+            eprintln!(
+                "[tiered] recovered {} staging logs from interrupted flush",
+                recovered_staging.len(),
+            );
+        }
+        // Staging seq starts above any recovered log version to avoid filename collisions
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
+        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
+
+        let vfs = Self {
             s3,
             cache,
             prefetch_pool,
             page_count,
             config,
             _runtime: owned_runtime,
-            prediction,
-            access_history,
             shared_manifest,
             shared_dirty_groups,
+            pending_flushes,
+            staging_seq,
             flush_lock,
-        })
+            #[cfg(feature = "wal")]
+            wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
+            runtime_handle,
+        };
+
+        // Phase Somme: WAL recovery on cold start
+        #[cfg(feature = "wal")]
+        if vfs.config.wal_replication {
+            // Phase Borodino: use change_counter (not version) for WAL replay cutoff.
+            // change_counter = SQLite file change counter at checkpoint time.
+            // WAL segments with txid > change_counter are not yet in the page groups.
+            let manifest_cc = vfs.shared_manifest.read().change_counter;
+            if manifest_cc > 0 {
+                let wal_prefix = format!("{}/wal/", vfs.config.prefix);
+                let shared = vfs.shared_state();
+                match wal_replication::recover_wal_from_shared_state(
+                    &shared,
+                    &vfs.cache,
+                    manifest_cc,
+                    vfs.shared_manifest.read().page_size,
+                    &wal_prefix,
+                    &vfs.config.bucket,
+                    vfs.config.endpoint_url.as_deref(),
+                    &vfs.runtime_handle,
+                    &vfs.config.cache_dir,
+                ) {
+                    Ok(0) => eprintln!("[tiered] WAL recovery: no WAL segments to replay"),
+                    Ok(n) => eprintln!("[tiered] WAL recovery: loaded {} pages from WAL", n),
+                    Err(e) => eprintln!("[tiered] WARNING: WAL recovery failed: {}", e),
+                }
+            }
+        }
+
+        Ok(vfs)
+    }
+
+    /// Load manifest based on ManifestSource config.
+    /// Returns (manifest, recovered_dirty_groups).
+    fn load_manifest(&self) -> io::Result<(Manifest, Vec<u64>)> {
+        let existing = self.shared_manifest.read();
+        let has_loaded = existing.page_count > 0 || existing.version > 0;
+        drop(existing);
+
+        match self.config.manifest_source {
+            ManifestSource::Auto => {
+                // If VFS already has a manifest (warm reconnect), use it
+                if has_loaded {
+                    let m = self.shared_manifest.read().clone();
+                    eprintln!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
+                    return Ok((m, Vec::new()));
+                }
+                // Try local manifest first
+                if let Some(local) = manifest::LocalManifest::load(&self.config.cache_dir)? {
+                    let dirty = local.dirty_groups.clone();
+                    eprintln!(
+                        "[tiered] loaded local manifest (v{}, {} pages, {} dirty groups)",
+                        local.manifest.version, local.manifest.page_count, dirty.len(),
+                    );
+                    let mut m = local.manifest;
+                    m.build_page_index();
+                    return Ok((m, dirty));
+                }
+                // Fall back to S3
+                eprintln!("[tiered] no local manifest, fetching from S3...");
+                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] manifest fetched from S3 (v{}, {} pages)", m.version, m.page_count);
+                Ok((m, Vec::new()))
+            }
+            ManifestSource::S3 => {
+                eprintln!("[tiered] fetching manifest from S3 (manifest_source=S3)...");
+                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
+                Ok((m, Vec::new()))
+            }
+        }
     }
 
     /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
@@ -155,14 +259,13 @@ impl TieredVfs {
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             shared_manifest: Arc::clone(&self.shared_manifest),
             shared_dirty_groups: Arc::clone(&self.shared_dirty_groups),
+            pending_flushes: Arc::clone(&self.pending_flushes),
             flush_lock: Arc::clone(&self.flush_lock),
             compression_level: self.config.compression_level,
             #[cfg(feature = "zstd")]
             dictionary: self.config.dictionary.clone(),
             encryption_key: self.config.encryption_key,
             gc_enabled: self.config.gc_enabled,
-            prediction: self.prediction.clone(),
-            access_history: self.access_history.clone(),
         }
     }
 
@@ -261,19 +364,19 @@ impl TieredVfs {
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
+            &self.pending_flushes,
             self.config.compression_level,
             #[cfg(feature = "zstd")]
             self.config.dictionary.as_deref(),
             self.config.encryption_key,
             self.config.gc_enabled,
-            self.access_history.as_ref(),
-            self.prediction.as_ref(),
         )
     }
 
-    /// Returns true if there are dirty groups pending S3 upload.
+    /// Returns true if there are dirty groups or staging logs pending S3 upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
+            || !self.pending_flushes.lock().unwrap().is_empty()
     }
 
     /// Get page numbers for all groups pending S3 upload.
@@ -428,7 +531,8 @@ impl Vfs for TieredVfs {
         let path = self.config.cache_dir.join(db);
 
         if matches!(opts.kind, OpenKind::MainDb) {
-            let mut manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+            // Phase Gallipoli: load manifest from local disk or S3 based on config.
+            let (mut manifest, recovered_dirty_groups) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
 
             let ppg = if manifest.pages_per_group > 0 {
@@ -443,8 +547,16 @@ impl Vfs for TieredVfs {
                 self.cache.ensure_group_capacity(manifest.group_pages.len());
             }
 
-            // Update shared manifest with latest from S3
+            // Update shared manifest
             *self.shared_manifest.write() = manifest;
+
+            // Recover dirty groups from local manifest (LocalThenFlush crash recovery)
+            if !recovered_dirty_groups.is_empty() {
+                let mut pending = self.shared_dirty_groups.lock().unwrap();
+                let count = recovered_dirty_groups.len();
+                pending.extend(recovered_dirty_groups);
+                eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", count);
+            }
 
             let lock_dir = self.config.cache_dir.join("locks");
             fs::create_dir_all(&lock_dir)?;
@@ -467,11 +579,36 @@ impl Vfs for TieredVfs {
                     .open(&wal_path);
             }
 
+            // Phase Somme: start WAL replication on first MainDb open
+            #[cfg(feature = "wal")]
+            if self.config.wal_replication {
+                let mut wal = self.wal_state.lock().unwrap();
+                if !wal.is_started() {
+                    let db_path = self.config.cache_dir.join(db);
+                    let wal_prefix = format!("{}/wal/", self.config.prefix);
+                    let manifest_cc = self.shared_manifest.read().change_counter;
+                    if let Err(e) = wal.start(
+                        db_path,
+                        wal_prefix,
+                        manifest_cc,
+                        self.config.wal_sync_interval_ms,
+                        self.config.bucket.clone(),
+                        self.config.endpoint_url.clone(),
+                        self.config.region.clone(),
+                        self.runtime_handle.clone(),
+                    ) {
+                        eprintln!("[tiered] WARNING: failed to start WAL replication: {}", e);
+                    }
+                }
+            }
+
             Ok(TieredHandle::new_tiered(
                 Arc::clone(&self.s3),
                 Arc::clone(&self.cache),
                 Arc::clone(&self.shared_manifest),
                 Arc::clone(&self.shared_dirty_groups),
+                Arc::clone(&self.pending_flushes),
+                Arc::clone(&self.staging_seq),
                 lock_path,
                 ppg,
                 self.config.compression_level,
@@ -485,8 +622,6 @@ impl Vfs for TieredVfs {
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
                 self.config.encryption_key,
-                self.prediction.clone(),
-                self.access_history.clone(),
                 self.config.query_plan_prefetch,
                 self.config.max_cache_bytes,
                 self.config.evict_on_checkpoint,

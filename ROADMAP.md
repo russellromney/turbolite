@@ -1,245 +1,119 @@
 # turbolite Roadmap
 
-## Thermopylae: GC + Msgpack Manifest + Autovacuum
-> After: Kursk · Before: Marathon
+## Borodino: Version Counter + Cross-Cutting Correctness
+> After: Kursk (CHANGELOG) · Before: Stalingrad (remaining)
 
-### b. `turbolite_gc()` SQL function
-- [ ] `turbolite_gc()`: full orphan scan (list all S3 keys, diff against manifest, delete orphans), returns deleted count
-- [ ] FFI + ext_entry.c registration, same pattern as turbolite_cache_info
-- [ ] Tests: orphans cleaned up, live keys preserved, returns correct count, no-op when no orphans
+Blocking bugs and untested interactions discovered during Kursk stress testing. Each subsection is a specific issue with a failing test that must pass before shipping.
 
----
+### a. Dual counter: manifest.version (S3 keys) + manifest.change_counter (walrust)
 
-## Midway (remaining): Remove Positional + Compaction + Tests
-> After: Thermopylae · Before: Gallipoli
+**Problem:** In WAL mode, SQLite's file change counter (page 0, offset 24) may not increment on every checkpoint. Using it as the S3 key version causes duplicate keys (`pg/0_v2` written twice), and GC deletes "old" versions that are actually current.
 
-Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
+**Root cause:** turbolite and walrust need different things from the version number:
+- turbolite needs a unique-per-checkpoint number for S3 key deduplication. `version + 1` is perfect.
+- walrust needs to know which transactions are already in the page groups, so it can replay only WAL segments after that point. The file change counter answers this.
 
-### Compaction (g)
-- [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
-- [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
-- [ ] GC old groups after manifest swap
-- [ ] VACUUM triggers full repack (all page numbers change)
+These are independent concerns. One number can't serve both.
 
-### Remaining tests (h)
-- [ ] Re-walk B-trees at checkpoint to update mapping for new/moved pages
-- [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
-- [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
-- [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
-- [ ] Compaction: dead space reclaimed, B-tree groups repacked optimally
-- [ ] VACUUM: full repack produces correct mapping
+**Fix: dual counter.**
+- `manifest.version`: monotonic `version + 1`. Used for S3 keys (`pg/0_v{version}`). Never reused.
+- `manifest.change_counter`: SQLite file change counter from page 0 at checkpoint time. Used by walrust to determine WAL replay window (`replay segments with txid > change_counter`).
 
----
+**Safety:** WAL replay is always safe to over-replay (idempotent), never under-replay. If `change_counter` is stale (same value for two checkpoints), walrust replays extra segments (wasted work, not data loss). `change_counter` can never jump ahead of what's in the page groups because it's read from the same page 0 in the checkpoint.
 
-## Gallipoli: Local Manifest Persistence
-> After: Midway (remaining) · Before: Somme
+**Implementation:**
+- [ ] Add `change_counter: u64` to `Manifest` struct (serde, default 0 for backward compat)
+- [ ] In `sync()` durable path: `next_version = manifest.version + 1`, read change counter from cache, store both
+- [ ] In `flush_to_s3()`: `next_version = manifest_snap.version + 1` (not change counter)
+- [ ] In `sync()` LocalThenFlush path: no change (version assigned at flush time)
+- [ ] `page_group_key(gid, next_version)` uses `manifest.version` (already correct)
+- [ ] Backward compat: old manifests with `change_counter = 0` work fine (walrust replays everything)
 
-The manifest only lives in S3 and in-memory on the VFS. No local persistence. This causes two problems:
-1. **Performance:** Every `open()` hits S3 to fetch the manifest, even when the VFS has a fresh copy.
-2. **Durability bug (LocalThenFlush):** If the process dies between a local checkpoint and `flush_to_s3()`, dirty pages are on disk in the cache file but the S3 manifest doesn't reference them. On restart, the stale S3 manifest is fetched, and unflushed work is silently lost.
+**Failing tests (must pass after fix):**
+- [ ] `borodino_version_increments_per_checkpoint`: v1 != v2 after two checkpoints
+- [ ] `borodino_gc_does_not_delete_current_version`: GC deletes v(N-1) keys, not v(N)
+- [ ] `test_manifest_version_increments`: existing test, same fix
+- [ ] `test_gc_disabled_preserves_old_versions`: existing test, same fix
+- [ ] `test_materialize_after_multiple_checkpoints`: correct S3 key after fix
+- [ ] `test_materialize_after_vfs_writes`: same
 
-### a. Persist manifest locally
+### b. Walrust uses manifest.change_counter for WAL replay
 
-Write `manifest.msgpack` to `cache_dir/` alongside the cache file. This is the same manifest that goes to S3, plus a `dirty_groups` field for unflushed pages.
+**Problem:** Somme's `materialize_to_file` and `restore_with_snapshot_source` use `manifest.version` as the snapshot version for WAL replay. After the dual counter fix, walrust must use `manifest.change_counter` instead.
 
-- [ ] On every checkpoint (both Durable and LocalThenFlush): write manifest to `cache_dir/manifest.msgpack`
-- [ ] Include `dirty_groups: Vec<u64>` in local manifest (not in S3 manifest) for unflushed page tracking
-- [ ] On flush_to_s3(): clear dirty_groups from local manifest after successful upload
-- [ ] Test: local checkpoint writes manifest to disk, manifest contains dirty_groups
-- [ ] Test: process restart after local checkpoint, dirty_groups survive, flush_to_s3 works
+**Cold start flow:**
+1. Fetch manifest. `change_counter = N`.
+2. `materialize_to_file()` from page groups. DB at state N.
+3. walrust `restore_with_snapshot_source()` replays WAL segments with `txid > N`.
+4. Checkpoint (turbolite uploads dirty pages, walrust GCs old segments).
 
-### b. Manifest source config
+**Implementation:**
+- [ ] `materialize_to_file()` returns `manifest.change_counter` (not `manifest.version`)
+- [ ] WAL recovery in `TieredVfs::new()` uses `manifest.change_counter` for replay cutoff
+- [ ] WAL segment GC after checkpoint uses `manifest.change_counter`
 
-- [ ] `manifest_source: Auto | S3` on TieredConfig
-  - `Auto` (default): load local manifest if present, fall back to S3. Correct for single-writer.
-  - `S3`: always fetch from S3 on open. For HA followers and multi-reader setups.
-- [ ] `TURBOLITE_MANIFEST_SOURCE` env var
-- [ ] `turbolite_config_set('manifest_source', 'auto')` runtime toggle
-- [ ] Test: Auto mode uses local on warm reconnect (zero S3 GETs on second open)
-- [ ] Test: S3 mode always fetches (S3 GET count increments on every open)
+**Tests (require `wal` feature):**
+- [ ] `change_counter` survives manifest roundtrip (serialize/deserialize)
+- [ ] After checkpoint, `manifest.change_counter` matches file change counter from page 0
+- [ ] Cold start with WAL segments: replays correct segments based on `change_counter`
+- [ ] WAL segment GC deletes segments with txid <= `change_counter`
 
-### c. Dirty group recovery
+### c. Encryption + staging log interaction
 
-- [ ] On open with Auto mode: if local manifest has dirty_groups, log warning and populate s3_dirty_groups
-- [ ] `flush_to_s3()` picks up recovered dirty groups and uploads them
-- [ ] Test: crash simulation (kill after local checkpoint, restart, verify flush recovers all data)
-- [ ] Test: no dirty_groups on clean shutdown (Durable mode never has dirty_groups in local manifest)
+**Problem:** `write_all_at()` receives plaintext from SQLite, writes encrypted to cache (if encryption enabled), and appends to staging log. If the staging log captures encrypted data, `flush_to_s3()` would double-encrypt during encoding. If it captures plaintext, the staging file on disk is unencrypted (data at rest exposure).
 
-### d. Packaging cleanup
-- [ ] Test: missing .so in Python package produces clear error message
-- [ ] pkg-config `.pc` file for system install discovery
+**Tests:**
+- [ ] Staging log with encryption enabled: flush produces correct S3 data, cold reader decrypts successfully
+- [ ] Staging log bytes are encrypted on disk (not plaintext)
+- [ ] Wrong encryption key on recovery VFS: staging log read fails cleanly (not silent corruption)
 
----
+### d. VACUUM + LocalThenFlush interaction
 
-## Somme: Built-in WAL Shipping
-> After: Gallipoli · Before: Verdun (remaining)
+**Problem:** VACUUM detection + B-tree re-walk runs in the durable sync path. In LocalThenFlush mode, the staging log captures pages during `write_all_at()` (before sync). If VACUUM fires, sync() re-walks B-trees and rebuilds `group_pages`. But the staging log has page data under the old group assignments. `flush_to_s3()` would use the re-walked manifest but the staging pages map to old groups.
 
-Close the durability gap between checkpoints. Ship WAL frames to S3 in the background so writes are durable before checkpoint.
+**Tests:**
+- [ ] LocalThenFlush: INSERT, checkpoint, VACUUM, checkpoint, flush, cold reader sees correct data
+- [ ] Staging log pages are assigned to correct groups after VACUUM re-walk
+- [ ] VACUUM detection fires in LocalThenFlush mode (not skipped)
 
-### a. WAL frame capture + upload
-- [ ] Intercept WAL `write_all_at()` -- buffer frame bytes
-- [ ] Batch frames into segments (every 100 frames or N ms) to amortize PUT cost
-- [ ] Upload segments to `{prefix}/wal/{sequence_number}` via existing S3 client
+### e. Compaction between checkpoint and flush
 
-### b. Recovery
-- [ ] On open: after manifest download, list `{prefix}/wal/` objects newer than manifest version
-- [ ] Replay WAL frames into local cache before serving queries
-- [ ] Test: write data, kill before checkpoint, recover from S3 WAL segments
+**Problem:** `turbolite_compact()` repacks page groups with new group IDs. If called between a LocalThenFlush checkpoint and flush, the staging log references group assignments that compaction just invalidated.
 
-### c. Cleanup
-- [ ] After checkpoint, WAL segments older than manifest version are garbage
-- [ ] Integrate with existing GC
+**Tests:**
+- [ ] LocalThenFlush: checkpoint, compact, flush. Flush uses pre-compaction group assignments (staging is self-contained).
+- [ ] LocalThenFlush: checkpoint, compact, checkpoint, flush. Second staging log has post-compaction assignments.
+- [ ] Compaction after flush (no pending staging): works as before
 
-### d. WAL write callback (future)
-- [ ] `TieredConfig::on_wal_write(fn(&[u8]))` -- optional hook for external tools
+### f. Cache eviction under memory pressure with pending staging
 
----
+**Problem:** Pending pages are protected from eviction, but only tested with unlimited cache. With `max_cache_bytes` set low and heavy read load between checkpoint and flush, does the protection hold?
 
-## Verdun (remaining): Integration Tests + Trie + Frame Correlation
-> After: Somme · Before: Marne (Query Plan remaining)
+**Tests:**
+- [ ] `max_cache_bytes=1MB`, write 5MB, checkpoint (LocalThenFlush), read different data (triggers eviction), flush. Pending pages survive eviction, flush succeeds.
+- [ ] Same but with `clear_cache()` call between checkpoint and flush. Pending pages survive.
 
-Remaining items from Predictive Cross-Tree Prefetch (completed work in CHANGELOG).
+### g. Multiple databases on same VFS with LocalThenFlush
 
-### Integration tests (g2)
+**Problem:** Two db files sharing the same VFS + staging_dir. Staging logs use a shared `staging_seq` counter. Do logs stay isolated? Does flush upload the right data for each db?
 
-**Checkpoint roundtrip:**
-- [ ] Prediction patterns survive checkpoint -> S3 manifest -> reopen
-- [ ] Access history frequencies survive checkpoint -> reopen
-- [ ] Checkpoint with no patterns produces empty prediction_patterns
-- [ ] Checkpoint with prediction_enabled=false preserves existing patterns
+**Tests:**
+- [ ] Two databases on same VFS: each checkpoints with LocalThenFlush, each flushes independently, cold readers see correct data for each db
+- [ ] Staging log filenames don't collide (different seq numbers)
 
-**Real query prediction firing:**
-- [ ] 3-table join: pattern learned after 2 lock sessions, fires on 3rd
-- [ ] Prediction submits correct group IDs (verify via S3 fetch counters)
-- [ ] Reinforcement fires when predicted groups are subsequently read
+### h. Tokio runtime contention under parallel tests
 
-**Decay + write behavior:**
-- [ ] Pattern decays below threshold after ~10 sessions without reinforcement
-- [ ] Write decay: bulk INSERT drops confidence within 3 dirty sessions
-- [ ] Read-only workload: patterns stabilize around 0.85-0.95
-- [ ] Mixed workload: read patterns survive, write-heavy patterns fade
+**Problem:** 90 parallel integration tests each create their own tokio runtime + S3 client + prefetch pool. Under heavy parallel load, 3 tests fail intermittently (cache_truncation_after_vacuum, dictionary_roundtrip, custom_pages_per_group).
 
-**Strategy edge cases:**
-- [ ] Positional strategy: prediction fields exist but page_to_btree empty, no panics
-- [ ] BTreeAware with single-table DB: no predictions fire, no overhead
-
-**Negative tests:**
-- [ ] Single-tree query never fires predictions
-- [ ] Prediction with unknown B-tree root silently skipped
-- [ ] max_patterns cap enforced
-
-**Manifest bloat:**
-- [ ] 100 unique patterns: manifest under 10KB
-- [ ] 1000 patterns: prune reduces to max_patterns
-
-**VACUUM / schema change:**
-- [ ] After VACUUM: old patterns become no-ops, no crash
-- [ ] After DROP TABLE + CREATE TABLE: handles missing roots
-- [ ] After ADD INDEX: new B-tree learned in subsequent sessions
-
-**Concurrency:**
-- [ ] 4 concurrent readers: no deadlocks, all patterns recorded
-- [ ] 2 readers + 1 writer: write decay only for writer's patterns
-
-### Prediction benchmark (h)
-- [ ] Add `--predicted` flag to tiered-bench
-- [ ] Learning phase: run query suite N times, checkpoint
-- [ ] A/B test with prediction on/off at each cache level
-- [ ] Report prediction stats (patterns, fire rate, hit rate)
-- [ ] Benchmark serial vs parallel tree fetch latency for multi-join queries
-
-### Trie storage (i3)
-- [ ] `PredictionTrie` struct: sorted trie keyed by tree name
-- [ ] Trie insert, lookup (K=2), observe, reinforce, prune
-- [ ] Pair index elimination (trie IS the index)
-- [ ] Serialization: `to_persisted()` / `from_persisted()`
-- [ ] Replace `PredictionTable` throughout handle.rs and vfs.rs
-- [ ] Tests: identical predictions, memory savings, prune, serde roundtrip
-
-### Cleanup (i4)
-- [ ] Remove `PredictionTable` (replaced by trie)
-- [ ] Remove `pair_index`
-- [ ] Update all doc comments to reference tree names
-- [ ] Verify all tests pass with trie backend
-
-### Frame-level correlation (j)
-
-Extend tree-level prediction with frame granularity. Instead of "fetch all of tree B", predict "fetch frame 7 of tree B's group 3". Reduces prefetch bandwidth 10-1000x for large tables.
-
-#### j1. Frame-level access tracking
-- [ ] Derive frame index: `frame_idx = index_in_group / sub_pages_per_frame`
-- [ ] `LockSession`: add `frame_touches: Vec<(String, u64, u32)>`
-- [ ] `read_exact_at`: record `(name, gid, frame_idx)` in `frame_touches`
-
-#### j2. Frame correlation table
-- [ ] `FrameCorrelation` struct with per-pair frame mappings
-- [ ] Cross-correlate frame touches on session flush
-- [ ] `max_correlations_per_pair` config (default 200)
-
-#### j3. Precision prefetch firing
-- [ ] On prediction fire: use frame correlations to narrow to specific frames
-- [ ] S3 range GET for single frame (~256KB) instead of full group (~8MB)
-- [ ] Fallback to full-group when no frame correlations exist
-
-#### j4. Manifest persistence
-- [ ] `frame_correlations` manifest field, serialize in sync()
-- [ ] Prune on checkpoint, enforce max per pair
-
-#### j5. Staleness handling
-- [ ] Clear frame correlations on VACUUM (relearned within 2-3 sessions)
-- [ ] Time decay handles gradual drift
-
-#### j6. Frame-level benchmark
-- [ ] Compare S3 bytes fetched: tree-level vs frame-level prediction
-- [ ] Expected: point query 1M rows: ~400MB tree-level vs ~256KB frame-level
+**Tests/fix:**
+- [ ] Investigate: are failures from S3 rate limiting, tokio thread exhaustion, or file descriptor limits?
+- [ ] If tokio contention: consider shared runtime across VFS instances in test harness
+- [ ] If S3 rate limiting: add retry/backoff to test assertions, or reduce parallelism for S3-heavy tests
 
 ---
 
-## Marne (Query Plan remaining): Benchmark
-> After: Verdun (remaining) · Before: Stalingrad
-
-- [x] `--plan-aware` flag in tiered-bench
-- [x] Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate trace callback
-- [x] Compare plan-aware vs hop-schedule on all query types, cache levels none/interior/index
-- [x] `--matrix` mode: sweep 10 schedule pairs x 6 queries at cold level
-- [x] `tiered-tune` binary: connect to existing database, sweep schedules against user queries
-- [x] Storage backend comparison: S3 Express vs Tigris results documented
-
----
-
-## Stalingrad: Cache Eviction Policies
-> After: Marne (Query Plan remaining) · Before: Austerlitz
-
-Production cache management: size limits, observability, manual control, and smart eviction. Without this, a machine serving many tenant databases will grow the cache unbounded.
-
-### a. Size-based eviction
-
-Cache grows unbounded today. Add a global byte budget enforced between queries. The cache limit is "what you keep between queries," not "what you're allowed to use." Active queries and writes get whatever they need; eviction runs after.
-
-**Semantics:**
-- Eviction NEVER fires during `read_exact_at()` or active query execution
-- Eviction fires between queries (on next trace callback), on checkpoint, and on explicit `turbolite_evict()` calls
-- Cache can temporarily exceed the limit during a query; trimmed back after
-- Never evict sub-chunks containing dirty pages (any journal mode) or pending flush pages (LocalThenFlush)
-- Minimum floor: `max(all_interior_groups_size, prefetch_threads * sub_frame_size)`. Reject config below this.
-
-Between-query eviction hook is wired (step 3d in VFS read path, end-query signal via SQLITE_TRACE_PROFILE). Remaining work is the eviction logic itself:
-
-- [ ] `max_cache_bytes: Option<u64>` in TieredConfig
-- [ ] `TURBOLITE_CACHE_LIMIT` env var (e.g., `512MB`, `2GB`), parsed at VFS registration
-- [ ] `turbolite_config_set('cache_limit', '512MB')` for runtime adjustment
-- [ ] `current_cache_bytes: AtomicU64` on DiskCache, updated on write/evict
-- [ ] `is_evictable(sub_chunk)`: false if dirty, pending flush, or Pinned
-- [ ] `evict_to_budget()`: loop `evict_one()` over evictable sub-chunks until under limit
-- [ ] Wire `evict_to_budget()` into the existing between-query hook (handle.rs step 3d TODO)
-- [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
-- [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
-
-### b-g. Completed (see CHANGELOG)
-
-All Stalingrad items implemented: weighted eviction (b), observability with churn detection and peak tracking (c), tier eviction + evict_query (d), checkpoint eviction (e), speculative warm (f), TieredSharedState rename (g).
-
-### Future: query cost estimation (c2) + query analysis (c3)
+## Stalingrad (remaining): Query Cost Estimation
+> After: Austerlitz (CHANGELOG) · Before: Jena
 
 Diagnostic tools, not blocking production use. Build when needed.
 
@@ -248,44 +122,8 @@ Diagnostic tools, not blocking production use. Build when needed.
 
 ---
 
-## Austerlitz: Per-Query Adaptive Prefetch Schedules
-> After: Stalingrad · Before: Jena
-
-The VFS already selects search vs lookup schedule based on EQP output. Extend this to automatically tune schedules per query pattern over time, based on observed access patterns.
-
-### a. Range-GET budget per tree
-- [ ] `max_range_gets_per_tree: u8` config field (default 2)
-- [ ] `tree_range_get_count: HashMap<String, u8>` on TieredHandle
-- [ ] When count >= max for a tree: skip inline range GET, submit ALL of that tree's groups to prefetch pool, wait
-- [ ] Point queries (1 GET per tree in a join) stay fast; scans (2+ GETs to same tree) switch to bulk prefetch after 2 range GETs
-- [ ] `group_to_tree_name: HashMap<u64, String>` on Manifest (built on load from btrees)
-- [ ] Graceful degradation for Positional strategy (no tree info = budget never triggers)
-- [ ] `--max-range-gets` CLI flag in tiered-bench
-- [ ] Tests: budget increment, independent per-tree counts, exhaustion triggers wait, max=0 always waits, max=255 unlimited, all tree groups submitted on exhaustion
-
-### b. Extended-zero lookup schedules
-- [ ] Test lookup schedules with 3-4 leading zeros: `[0,0,0,0.1,0.2]`, `[0,0,0,0,0.2]`
-- [ ] Hypothesis: more leading zeros improve point queries further (sub-70ms on S3 Express)
-- [ ] Matrix benchmark with extended-zero grid
-- [ ] Update defaults if results justify it
-
-### c. Per-query schedule learning
-- [ ] Track (query_hash, tree_name, miss_count) over time
-- [ ] After N executions of the same query pattern, adjust schedule based on observed miss distribution
-- [ ] Queries that consistently miss 1-2 times get conservative schedule; queries with 10+ misses get aggressive
-- [ ] Persist learned schedules in manifest (per query hash)
-- [ ] `turbolite_config_set('prefetch_auto', 'true')` to enable
-
-### d. Backend-adaptive defaults
-- [ ] Measure GET latency on first S3 request (or during interior page load)
-- [ ] If latency > 15ms (standard S3/Tigris): shift search schedule more aggressive, keep lookup conservative
-- [ ] If latency < 8ms (S3 Express): use current defaults
-- [ ] Log detected backend class on connection open
-
----
-
 ## Jena: Interior Page Introspection for Precise Prefetch
-> After: Austerlitz · Before: Rosetta
+> After: Stalingrad · Before: Rosetta
 
 The B-tree structure is fully known from interior pages (cached/pinned). By extracting child pointers at checkpoint and persisting them in the manifest, we can predict exact leaf pages for any query without guessing. Replaces the hop schedule heuristic with direct structural knowledge.
 

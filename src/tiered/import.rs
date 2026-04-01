@@ -61,7 +61,9 @@ pub fn import_sqlite_file(
     let compression_level = config.compression_level;
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
-    let version = 1u64;
+    // Phase Somme: use SQLite's file change counter as manifest version.
+    let version = read_file_change_counter(&header);
+    assert!(version > 0, "file change counter must be > 0 for import (is this a valid SQLite DB with committed data?)");
     eprintln!(
         "[import] encoding: {} (sub_ppf={})",
         if use_seekable { "seekable multi-frame" } else { "legacy single-frame" },
@@ -331,6 +333,7 @@ pub fn import_sqlite_file(
     // Build and upload manifest (Phase Midway: explicit B-tree-aware groups)
     let mut manifest = Manifest {
         version,
+        change_counter: version, // import uses the same value; walrust not relevant for import
         page_count,
         page_size,
         pages_per_group: ppg,
@@ -347,8 +350,6 @@ pub fn import_sqlite_file(
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
-        btree_access_freq: HashMap::new(),
-        prediction_patterns: Vec::new(),
     };
     manifest.build_page_index();
     s3.put_manifest(&manifest)?;

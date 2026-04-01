@@ -5,8 +5,14 @@ use super::*;
 /// S3 manifest — updated atomically after all page group uploads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Monotonically increasing version (bumped on each checkpoint)
+    /// Monotonically increasing version (bumped +1 on each checkpoint).
+    /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
     pub version: u64,
+    /// SQLite file change counter (page 0, offset 24) at checkpoint time.
+    /// Used by walrust for WAL segment replay: replay segments with txid > change_counter.
+    /// Default 0 for backward compat (walrust replays everything).
+    #[serde(default)]
+    pub change_counter: u64,
     /// Number of pages in the database
     pub page_count: u64,
     /// Page size in bytes
@@ -73,15 +79,6 @@ pub struct Manifest {
     /// Used by per-query prefetch schedule selection (SEARCH vs default hops).
     #[serde(skip)]
     pub group_to_tree_name: HashMap<u64, String>,
-
-    /// Phase Verdun: B-tree access frequency for prediction confidence and decay.
-    /// Keyed by tree name (survives VACUUM).
-    #[serde(default)]
-    pub btree_access_freq: HashMap<String, f32>,
-
-    /// Phase Verdun-i: persisted prediction patterns (name set, confidence).
-    #[serde(default)]
-    pub prediction_patterns: Vec<(std::collections::BTreeSet<String>, f32)>,
 }
 
 fn default_strategy() -> GroupingStrategy {
@@ -103,10 +100,54 @@ pub(crate) fn default_pages_per_group() -> u32 {
     DEFAULT_PAGES_PER_GROUP
 }
 
+// ── Phase Gallipoli: local manifest persistence ──
+
+/// Wrapper for local manifest persistence. Contains the full manifest
+/// plus dirty_groups that haven't been flushed to S3 yet.
+/// Persisted to cache_dir/manifest.msgpack on every checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalManifest {
+    /// The full manifest (same data as S3, or ahead of S3 if dirty_groups exist).
+    pub manifest: Manifest,
+    /// Group IDs with dirty pages not yet uploaded to S3.
+    /// Non-empty only in LocalThenFlush mode between checkpoint and flush.
+    #[serde(default)]
+    pub dirty_groups: Vec<u64>,
+}
+
+impl LocalManifest {
+    /// Persist to cache_dir/manifest.msgpack (atomic write via tmp + rename).
+    pub fn persist(&self, cache_dir: &Path) -> io::Result<()> {
+        let path = cache_dir.join("manifest.msgpack");
+        let tmp = cache_dir.join("manifest.msgpack.tmp");
+        let data = rmp_serde::to_vec(self).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("serialize local manifest: {}", e))
+        })?;
+        fs::write(&tmp, &data)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Load from cache_dir/manifest.msgpack. Returns None if file doesn't exist.
+    pub fn load(cache_dir: &Path) -> io::Result<Option<Self>> {
+        let path = cache_dir.join("manifest.msgpack");
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let local: LocalManifest = rmp_serde::from_slice(&data).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("deserialize local manifest: {}", e))
+        })?;
+        Ok(Some(local))
+    }
+}
+
 impl Manifest {
     pub(crate) fn empty() -> Self {
         Self {
             version: 0,
+            change_counter: 0,
             page_count: 0,
             page_size: 0,
             pages_per_group: 0,
@@ -123,8 +164,6 @@ impl Manifest {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            btree_access_freq: HashMap::new(),
-            prediction_patterns: Vec::new(),
         }
     }
 

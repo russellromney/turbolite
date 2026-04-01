@@ -352,6 +352,32 @@ pub extern "C" fn turbolite_gc() -> i32 {
     }
 }
 
+/// Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
+/// Returns JSON report string (caller must free), or null on error.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
+    match BENCH_HANDLE.get() {
+        Some(h) => match h.compact(0.3) {
+            Ok(json) => {
+                let c_str = std::ffi::CString::new(json).unwrap();
+                c_str.into_raw()
+            }
+            Err(e) => {
+                eprintln!("[compact] ERROR: {}", e);
+                std::ptr::null()
+            }
+        },
+        None => std::ptr::null(),
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
+    std::ptr::null()
+}
+
 #[cfg(not(feature = "tiered"))]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
