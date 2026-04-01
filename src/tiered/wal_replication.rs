@@ -19,6 +19,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
+/// block_on that works from inside or outside a tokio runtime.
+/// Same pattern as S3Client::block_on.
+fn safe_block_on<F: std::future::Future<Output = T>, T>(
+    handle: &tokio::runtime::Handle,
+    fut: F,
+) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => handle.block_on(fut),
+    }
+}
+
 /// State for the WAL replication background task.
 pub(crate) struct WalReplicationState {
     /// Cancel signal sender. Send `true` to stop the background loop.
@@ -141,7 +153,7 @@ pub(crate) fn recover_wal_from_shared_state(
     }
 
     // Step 1: check for WAL segments before doing expensive materialization
-    let incr_keys = runtime_handle.block_on(async {
+    let incr_keys = safe_block_on(runtime_handle, async {
         let storage = walrust_core::S3Backend::from_env(bucket.to_string(), endpoint).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
@@ -166,7 +178,7 @@ pub(crate) fn recover_wal_from_shared_state(
     shared_state.materialize_to_file(&recovery_path)?;
 
     // Step 3: download and apply WAL segments
-    let applied = runtime_handle.block_on(async {
+    let applied = safe_block_on(runtime_handle, async {
         let storage = walrust_core::S3Backend::from_env(bucket.to_string(), endpoint).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
