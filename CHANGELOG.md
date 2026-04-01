@@ -6,11 +6,11 @@
 
 Close the durability gap between checkpoints. walrust ships WAL frames to S3; turbolite page groups serve as the snapshot. The two layers compose through SQLite's file change counter (page 0, offset 24): both use it as their version/txid, staying synchronized with no coordination protocol.
 
-### a-b. SnapshotSource + Unified version counter
+### a-b. SnapshotSource + Dual version counter
 - `SnapshotSource` trait in walrust-core, `restore_with_snapshot_source()` for WAL replay from external snapshot
 - `materialize_to_file()` on TieredSharedState: hydrate full DB from S3 page groups into local file
-- `manifest.version` = SQLite file change counter (panics if missing, no fallback)
-- walrust `current_txid` = same change counter from WAL page 0 / DB file
+- Dual counter (Phase Borodino): `manifest.version` = monotonic +1 for S3 keys, `manifest.change_counter` = SQLite file change counter for walrust WAL replay
+- walrust `current_txid` = file change counter from WAL page 0 / DB file
 - 12 turbolite + 8 walrust unit + 3 walrust S3 integration tests
 
 ### c. walrust as optional dependency
@@ -23,11 +23,11 @@ Close the durability gap between checkpoints. walrust ships WAL frames to S3; tu
 - `WalReplicationState`: starts walrust's `run_wal_replication()` background loop on first MainDb open
 - Lazy start (WAL file path not known until open). Uses snapshot-less WAL-only replication (turbolite page groups ARE the snapshot)
 - Cancel signal on Drop for graceful shutdown with final WAL sync
-- Cold start: checks S3 for WAL segments > manifest.version, materializes page groups to temp file, applies LTX incrementals via walrust, loads recovered pages into VFS cache
+- Cold start: checks S3 for WAL segments > manifest.change_counter, materializes page groups to temp file, applies LTX incrementals via walrust, loads recovered pages into VFS cache
 - Stops on checksum chain break (stale lineage detection)
 
 ### e. WAL segment GC after checkpoint
-- After checkpoint uploads manifest version=N, async list + delete WAL segments (.ltx) with max_txid <= N
+- After checkpoint uploads manifest with change_counter=N, async list + delete WAL segments (.ltx) with max_txid <= N
 - `list_all_keys_with_prefix()` on S3Client for WAL segment discovery
 - GC only runs when wal feature enabled and gc_enabled=true
 
