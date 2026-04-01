@@ -57,6 +57,7 @@ use crate::FileWalIndex;
 // --- Extracted submodules (Phase Tannenberg) ---
 mod bench;
 mod cache_tracking;
+mod compact;
 mod config;
 mod disk_cache;
 mod encoding;
@@ -70,11 +71,14 @@ mod query_plan;
 mod rotation;
 mod s3_client;
 mod settings;
+mod staging;
 mod vfs;
+#[cfg(feature = "wal")]
+mod wal_replication;
 
 // Public API (visible outside the crate)
 pub use bench::TieredSharedState;
-pub use config::{GroupState, GroupingStrategy, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
+pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
@@ -146,6 +150,34 @@ pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> 
     };
     let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
     s3.get_manifest()
+}
+
+// ===== SQLite file change counter =====
+
+/// Read SQLite's file change counter from page 0 data.
+/// Offset 24 in the database header, 4 bytes big-endian.
+/// Returns 0 if page data is too short.
+///
+/// This counter increments on every transaction commit. Used as the unified
+/// version number for both turbolite manifests and walrust WAL txids (Phase Somme).
+pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
+    if page0.len() < 28 {
+        return 0;
+    }
+    u32::from_be_bytes([page0[24], page0[25], page0[26], page0[27]]) as u64
+}
+
+/// Read the file change counter from page 0 in the disk cache.
+/// Panics if page 0 is not cached or counter is 0. A wrong version
+/// number would corrupt data on recovery (walrust would replay WAL
+/// segments over the wrong page state).
+pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32) -> u64 {
+    let mut page0 = vec![0u8; page_size as usize];
+    cache.read_page(0, &mut page0)
+        .expect("page 0 must be in cache at checkpoint time");
+    let counter = read_file_change_counter(&page0);
+    assert!(counter > 0, "file change counter must be > 0 at checkpoint time");
+    counter
 }
 
 // ===== Page group coordinate math =====

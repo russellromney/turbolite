@@ -710,9 +710,13 @@ fn test_rotate_key_gc_cleans_old_objects() {
         "manifest must still exist after rotation"
     );
 
-    // New versioned objects exist
-    let has_v2 = keys_after.iter().any(|k| k.contains("_v2"));
-    assert!(has_v2, "new v2 objects must exist after rotation");
+    // New versioned objects exist (version > any pre-rotation version)
+    // After rotation, manifest.version is one higher than the checkpoint version.
+    // Check that keys_after has objects NOT present in keys_before (rotation created new versions).
+    let new_keys: Vec<&String> = keys_after.iter()
+        .filter(|k| !keys_before.contains(k) && k.contains("/pg/"))
+        .collect();
+    assert!(!new_keys.is_empty(), "rotation must create new versioned page group objects, got keys_after={:?}", keys_after);
 
     // Cleanup with new key
     {

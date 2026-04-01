@@ -15,14 +15,13 @@ pub struct TieredSharedState {
     // Shared state for flush_to_s3()
     pub(super) shared_manifest: Arc<RwLock<Manifest>>,
     pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     pub(super) flush_lock: Arc<Mutex<()>>,
     pub(super) compression_level: i32,
     #[cfg(feature = "zstd")]
     pub(super) dictionary: Option<Vec<u8>>,
     pub(super) encryption_key: Option<[u8; 32]>,
     pub(super) gc_enabled: bool,
-    pub(super) prediction: Option<prediction::SharedPrediction>,
-    pub(super) access_history: Option<prediction::SharedAccessHistory>,
 }
 
 impl TieredSharedState {
@@ -197,19 +196,19 @@ impl TieredSharedState {
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
+            &self.pending_flushes,
             self.compression_level,
             #[cfg(feature = "zstd")]
             self.dictionary.as_deref(),
             self.encryption_key,
             self.gc_enabled,
-            self.access_history.as_ref(),
-            self.prediction.as_ref(),
         )
     }
 
-    /// Returns true if there are dirty groups pending S3 upload.
+    /// Returns true if there are dirty groups or staging logs pending S3 upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
+            || !self.pending_flushes.lock().unwrap().is_empty()
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
@@ -431,6 +430,324 @@ impl TieredSharedState {
             result.insert(gid, pages);
         }
         result
+    }
+
+    /// Compact B-tree groups: re-walk B-trees, identify dead pages, repack.
+    /// `threshold` is the dead-page ratio (0.0-1.0) above which a B-tree is repacked.
+    /// All pages must be in the local cache before calling (run a query or warm first).
+    /// Returns JSON report with compaction results.
+    pub fn compact(&self, threshold: f64) -> io::Result<String> {
+        let manifest = self.shared_manifest.read().clone();
+        let page_size = manifest.page_size;
+        let ppg = manifest.pages_per_group;
+
+        // Analyze dead space (reads pages from local cache only)
+        let report = compact::analyze_dead_space(
+            &manifest,
+            page_size,
+            &|pnum| {
+                let mut buf = vec![0u8; page_size as usize];
+                self.cache.read_page(pnum, &mut buf).ok()?;
+                Some(buf)
+            },
+            threshold,
+        );
+
+        if report.candidates.is_empty() {
+            return Ok(format!(
+                "{{\"compacted\":0,\"total_dead\":{},\"total_live\":{},\"message\":\"no B-trees exceed {:.0}% dead space threshold\"}}",
+                report.total_dead, report.total_live, threshold * 100.0,
+            ));
+        }
+
+        // Compact each candidate B-tree
+        let mut compacted = 0u32;
+        let mut total_freed = 0usize;
+        let mut replaced_keys: Vec<String> = Vec::new();
+        let mut manifest = self.shared_manifest.write();
+        // Phase Somme: use file change counter from cache for version
+        let next_version = read_change_counter_from_cache(&self.cache, page_size);
+
+        for btree_info in &report.btrees {
+            if !report.candidates.contains(&btree_info.name) {
+                continue;
+            }
+
+            let root = btree_info.root_page;
+            let compact_result = match compact::compact_btree(
+                &manifest,
+                root,
+                ppg,
+                page_size,
+                &|pnum| {
+                    let mut buf = vec![0u8; page_size as usize];
+                    if self.cache.read_page(pnum, &mut buf).is_ok() {
+                        Some(buf)
+                    } else {
+                        None
+                    }
+                },
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[compact] ERROR compacting B-tree {}: {}", btree_info.name, e);
+                    continue;
+                }
+            };
+
+            eprintln!(
+                "[compact] {} : {} pages -> {} pages ({} freed), {} groups -> {} groups",
+                compact_result.btree_name,
+                compact_result.pages_before,
+                compact_result.pages_after,
+                compact_result.pages_freed(),
+                compact_result.old_group_ids.len(),
+                compact_result.new_groups.len(),
+            );
+
+            // Allocate new group IDs, encode and upload
+            let mut new_group_ids: Vec<u64> = Vec::new();
+            let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut new_frame_tables_patch: Vec<(usize, Vec<FrameEntry>)> = Vec::new();
+
+            for new_pages in &compact_result.new_groups {
+                // Reuse an old group ID if available, otherwise allocate new
+                let gid = if new_group_ids.len() < compact_result.old_group_ids.len() {
+                    compact_result.old_group_ids[new_group_ids.len()]
+                } else {
+                    manifest.group_pages.len() as u64 + new_group_ids.len() as u64
+                        - compact_result.old_group_ids.len() as u64
+                };
+                new_group_ids.push(gid);
+
+                // Read pages from cache
+                let mut pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(new_pages.len());
+                for &pnum in new_pages {
+                    let mut buf = vec![0u8; page_size as usize];
+                    if self.cache.read_page(pnum, &mut buf).is_ok() {
+                        pages.push(Some(buf));
+                    } else {
+                        pages.push(None);
+                    }
+                }
+
+                let key = self.s3.page_group_key(gid, next_version);
+                let use_seekable = manifest.sub_pages_per_frame > 0;
+
+                if use_seekable {
+                    let (encoded, ft) = encode_page_group_seekable(
+                        &pages,
+                        page_size,
+                        manifest.sub_pages_per_frame,
+                        self.compression_level,
+                        #[cfg(feature = "zstd")]
+                        None, // dictionaries not used in compaction (same as import)
+                        self.encryption_key.as_ref(),
+                    )?;
+                    uploads.push((key.clone(), encoded));
+                    new_frame_tables_patch.push((gid as usize, ft));
+                } else {
+                    let encoded = encode_page_group(
+                        &pages,
+                        page_size,
+                        self.compression_level,
+                        #[cfg(feature = "zstd")]
+                        None,
+                        self.encryption_key.as_ref(),
+                    )?;
+                    uploads.push((key.clone(), encoded));
+                }
+
+                // Update manifest
+                while manifest.page_group_keys.len() <= gid as usize {
+                    manifest.page_group_keys.push(String::new());
+                }
+                while manifest.group_pages.len() <= gid as usize {
+                    manifest.group_pages.push(Vec::new());
+                }
+                // Track old key for GC
+                let old_key = manifest.page_group_keys.get(gid as usize).cloned().unwrap_or_default();
+                if !old_key.is_empty() {
+                    replaced_keys.push(old_key);
+                }
+                manifest.page_group_keys[gid as usize] = key;
+                manifest.group_pages[gid as usize] = new_pages.clone();
+            }
+
+            // Clear old group IDs that are no longer used
+            for &old_gid in &compact_result.old_group_ids {
+                if !new_group_ids.contains(&old_gid) {
+                    if let Some(old_key) = manifest.page_group_keys.get(old_gid as usize) {
+                        if !old_key.is_empty() {
+                            replaced_keys.push(old_key.clone());
+                        }
+                    }
+                    if let Some(k) = manifest.page_group_keys.get_mut(old_gid as usize) {
+                        *k = String::new();
+                    }
+                    if let Some(p) = manifest.group_pages.get_mut(old_gid as usize) {
+                        p.clear();
+                    }
+                }
+            }
+
+            // Update B-tree manifest entry with new group IDs
+            if let Some(entry) = manifest.btrees.get_mut(&root) {
+                entry.group_ids = new_group_ids;
+            }
+
+            // Upload new groups
+            if !uploads.is_empty() {
+                self.s3.put_page_groups(&uploads)?;
+            }
+
+            // Patch frame tables
+            for (gid_idx, ft) in new_frame_tables_patch {
+                while manifest.frame_tables.len() <= gid_idx {
+                    manifest.frame_tables.push(Vec::new());
+                }
+                manifest.frame_tables[gid_idx] = ft;
+            }
+
+            total_freed += compact_result.pages_freed();
+            compacted += 1;
+        }
+
+        // Update manifest version and rebuild indexes
+        manifest.version = next_version;
+        manifest.build_page_index();
+
+        // Upload new manifest
+        self.s3.put_manifest(&manifest)?;
+
+        // GC old groups
+        if !replaced_keys.is_empty() && self.gc_enabled {
+            let keys = replaced_keys.clone();
+            let s3 = self.s3.clone();
+            eprintln!("[compact] GC: deleting {} replaced S3 objects", keys.len());
+            std::thread::spawn(move || {
+                if let Err(e) = s3.delete_objects(&keys) {
+                    eprintln!("[compact] GC ERROR: {}", e);
+                }
+            });
+        }
+
+        Ok(format!(
+            "{{\"compacted\":{},\"pages_freed\":{},\"replaced_keys\":{},\"total_dead\":{},\"total_live\":{}}}",
+            compacted, total_freed, replaced_keys.len(), report.total_dead, report.total_live,
+        ))
+    }
+
+    /// Materialize the full database from S3 page groups into a local SQLite file.
+    ///
+    /// Downloads ALL page groups, decodes them, and writes pages in order to produce
+    /// a standard SQLite database file. Returns the manifest version (checkpoint version).
+    ///
+    /// This is the "snapshot source" for walrust integration: turbolite page groups
+    /// serve as the snapshot, walrust applies WAL increments on top.
+    pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
+        use std::os::unix::fs::FileExt;
+
+        let manifest = self.shared_manifest.read().clone();
+        let page_size = manifest.page_size;
+        let page_count = manifest.page_count;
+
+        if page_count == 0 || page_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "empty manifest, no data to materialize"));
+        }
+
+        eprintln!(
+            "[materialize] page_count={}, page_size={}, groups={}, version={}",
+            page_count, page_size, manifest.page_group_keys.len(), manifest.version,
+        );
+
+        // Create output file
+        let file = std::fs::File::create(output)?;
+        // Pre-allocate the file to the correct size
+        let total_size = page_count * page_size as u64;
+        file.set_len(total_size)?;
+
+        // Collect non-empty page group keys
+        let keys_with_gids: Vec<(u64, String)> = manifest.page_group_keys.iter()
+            .enumerate()
+            .filter(|(_, k)| !k.is_empty())
+            .map(|(gid, k)| (gid as u64, k.clone()))
+            .collect();
+
+        // Download in batches of 50 (parallel within each batch)
+        let batch_size = 50;
+        let total = keys_with_gids.len();
+        let use_seekable = manifest.sub_pages_per_frame > 0;
+
+        for (batch_idx, batch) in keys_with_gids.chunks(batch_size).enumerate() {
+            let keys: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
+            let data_map = self.s3.get_page_groups_by_key(&keys)?;
+
+            for &(gid, ref key) in batch {
+                let pg_data = match data_map.get(key) {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("[materialize] WARNING: missing S3 object for group {} key {}", gid, key);
+                        continue;
+                    }
+                };
+
+                let page_nums = manifest.group_page_nums(gid);
+
+                // Decode the page group
+                let ft = manifest.frame_tables.get(gid as usize);
+                let has_ft = use_seekable && ft.map(|f| !f.is_empty()).unwrap_or(false);
+
+                let decoded_pages: Vec<u8> = if has_ft {
+                    let ft = ft.unwrap();
+                    let (_pc, _ps, bulk) = decode_page_group_seekable_full(
+                        pg_data,
+                        ft,
+                        page_size,
+                        page_nums.len() as u32,
+                        page_count,
+                        0,
+                        #[cfg(feature = "zstd")]
+                        None,
+                        self.encryption_key.as_ref(),
+                    )?;
+                    bulk
+                } else {
+                    let (_pc, _ps, pages) = decode_page_group(
+                        pg_data,
+                        #[cfg(feature = "zstd")]
+                        None,
+                        self.encryption_key.as_ref(),
+                    )?;
+                    pages.into_iter().flatten().collect()
+                };
+
+                // Write each page to the correct offset in the output file
+                let ps = page_size as usize;
+                for (i, &pnum) in page_nums.iter().enumerate() {
+                    if pnum >= page_count { break; }
+                    let start = i * ps;
+                    let end = start + ps;
+                    if end <= decoded_pages.len() {
+                        file.write_all_at(&decoded_pages[start..end], pnum * page_size as u64)?;
+                    }
+                }
+            }
+
+            let done = std::cmp::min((batch_idx + 1) * batch_size, total);
+            eprintln!("[materialize] downloaded {}/{} page groups", done, total);
+        }
+
+        eprintln!(
+            "[materialize] wrote {:.1}MB to {} (version {}, change_counter {})",
+            total_size as f64 / (1024.0 * 1024.0),
+            output.display(),
+            manifest.version,
+            manifest.change_counter,
+        );
+
+        // Return change_counter for walrust WAL replay (txid > change_counter)
+        Ok(manifest.change_counter)
     }
 
     /// Full GC: list all S3 objects, diff against manifest, delete orphans.

@@ -13,10 +13,19 @@
 mod tiered {
     pub mod helpers;
     mod basic;
+    mod btree_grouping;
+    mod compact;
     mod data_ops;
     mod indexes;
     mod gc;
     #[cfg(feature = "encryption")]
     mod encryption;
     mod advanced;
+    mod eviction;
+    mod manifest_persistence;
+    mod materialize;
+    mod staging;
+    mod borodino;
+    #[cfg(feature = "wal")]
+    mod wal_integration;
 }

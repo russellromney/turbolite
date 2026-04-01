@@ -518,6 +518,35 @@ impl S3Client {
         }
         Ok(all_keys)
     }
+
+    /// List all S3 keys under an arbitrary prefix (not limited to self.prefix).
+    pub(crate) async fn list_all_keys_with_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let mut all_keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut req = self.client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = req.send().await.map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("S3 list (prefix={}) failed: {}", prefix, e))
+            })?;
+            for obj in resp.contents() {
+                if let Some(key) = obj.key() {
+                    all_keys.push(key.to_string());
+                }
+            }
+            if resp.is_truncated() == Some(true) {
+                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+        Ok(all_keys)
+    }
 }
 
 /// Check if an S3 error is a 404 / NoSuchKey.

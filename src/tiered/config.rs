@@ -1,5 +1,24 @@
 use super::*;
 
+// ===== Manifest source =====
+
+/// Where to load the manifest on connection open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestSource {
+    /// Use local manifest if present, fall back to S3. Correct for single-writer.
+    /// Checkpoints keep the local manifest fresh. No S3 fetch on warm reconnect.
+    Auto,
+    /// Always fetch from S3 on open. For HA followers and multi-reader setups
+    /// where another process may have checkpointed.
+    S3,
+}
+
+impl Default for ManifestSource {
+    fn default() -> Self {
+        ManifestSource::Auto
+    }
+}
+
 // ===== Sync mode =====
 
 /// Controls whether checkpoint uploads to S3 synchronously (blocking) or defers to flush_to_s3().
@@ -148,6 +167,20 @@ pub struct TieredConfig {
     /// Only evicts Data tier (interior + index remain for next query's fast path).
     /// Default: false. Also settable via turbolite_config_set('evict_on_checkpoint', 'true').
     pub evict_on_checkpoint: bool,
+    /// Phase Gallipoli: where to load manifest on connection open.
+    /// Auto (default): use local manifest if present, fall back to S3.
+    /// S3: always fetch from S3 (for HA followers, multi-reader).
+    pub manifest_source: ManifestSource,
+    /// Phase Somme: enable WAL replication via walrust.
+    /// Ships WAL frames to S3 for transaction-level durability between checkpoints.
+    /// Requires the `wal` feature flag.
+    /// Default: false. `TURBOLITE_WAL_REPLICATION=true` to enable.
+    #[cfg(feature = "wal")]
+    pub wal_replication: bool,
+    /// Phase Somme: WAL sync interval (how often walrust ships WAL frames to S3).
+    /// Default: 1 second.
+    #[cfg(feature = "wal")]
+    pub wal_sync_interval_ms: u64,
 }
 
 impl Default for TieredConfig {
@@ -190,6 +223,22 @@ impl Default for TieredConfig {
             evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),
+            manifest_source: std::env::var("TURBOLITE_MANIFEST_SOURCE")
+                .ok()
+                .map(|v| match v.to_lowercase().as_str() {
+                    "s3" => ManifestSource::S3,
+                    _ => ManifestSource::Auto,
+                })
+                .unwrap_or_default(),
+            #[cfg(feature = "wal")]
+            wal_replication: std::env::var("TURBOLITE_WAL_REPLICATION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            #[cfg(feature = "wal")]
+            wal_sync_interval_ms: std::env::var("TURBOLITE_WAL_SYNC_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
         }
     }
 }
