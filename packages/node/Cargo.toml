@@ -11,7 +11,7 @@ napi = { version = "2", features = ["serde-json"] }
 napi-derive = "2"
 rusqlite = "0.35"
 serde_json = "1"
-turbolite = { path = "../..", default-features = false, features = ["zstd", "bundled-sqlite"] }
+turbolite = { path = "../..", default-features = false, features = ["zstd", "bundled-sqlite", "tiered"] }
 
 [build-dependencies]
 napi-build = "2"
