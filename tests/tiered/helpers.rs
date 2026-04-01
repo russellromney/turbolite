@@ -2,6 +2,24 @@
 
 use turbolite::tiered::{Manifest, TieredConfig};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+
+/// Shared tokio runtime for all integration tests.
+/// Prevents 100+ runtime creation when tests run in parallel.
+static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+pub fn shared_runtime_handle() -> tokio::runtime::Handle {
+    SHARED_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(16) // enough for parallel tests doing concurrent block_in_place
+                .enable_all()
+                .build()
+                .expect("shared test runtime")
+        })
+        .handle()
+        .clone()
+}
 
 /// Deserialize manifest from msgpack bytes into serde_json::Value for test assertions.
 pub fn manifest_from_msgpack(bytes: &[u8]) -> serde_json::Value {
@@ -46,6 +64,23 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
         compression_level: 3,
         endpoint_url: Some(endpoint_url()),
         region: Some("auto".to_string()),
+        runtime_handle: Some(shared_runtime_handle()),
+        gc_enabled: false, // Async GC races with cold readers under parallel tests
+        ..Default::default()
+    }
+}
+
+/// Create a read-only TieredConfig for cold reader tests.
+/// Uses the shared runtime to prevent tokio contention.
+pub fn cold_reader_config(bucket: &str, prefix: &str, endpoint: &Option<String>, cache_dir: &std::path::Path) -> TieredConfig {
+    TieredConfig {
+        bucket: bucket.to_string(),
+        prefix: prefix.to_string(),
+        cache_dir: cache_dir.to_path_buf(),
+        endpoint_url: endpoint.clone(),
+        region: Some("auto".to_string()),
+        read_only: true,
+        runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     }
 }
@@ -59,7 +94,7 @@ pub fn verify_s3_manifest(
     expected_page_count_min: u64,
     expected_page_size: u64,
 ) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = shared_runtime_handle();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
             .region(aws_sdk_s3::config::Region::new("auto"))
@@ -116,7 +151,7 @@ pub fn verify_s3_has_page_groups(
     prefix: &str,
     endpoint: &Option<String>,
 ) -> usize {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
             .region(aws_sdk_s3::config::Region::new("auto"))
@@ -144,7 +179,7 @@ pub fn verify_s3_has_page_groups(
 
 /// Helper: count all S3 objects under a prefix (pg/ + ibc/ + manifest).
 pub fn count_s3_objects(bucket: &str, prefix: &str, endpoint: &Option<String>) -> usize {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
             .region(aws_sdk_s3::config::Region::new("auto"))

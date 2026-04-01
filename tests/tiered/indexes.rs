@@ -95,7 +95,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         read_only: true,
         region: region.clone(),
         eager_index_load: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -131,7 +131,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -191,7 +191,7 @@ fn test_index_bundles_eager_load_disabled() {
         read_only: true,
         region: region.clone(),
         eager_index_load: false,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -219,7 +219,7 @@ fn test_index_bundles_eager_load_disabled() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -322,7 +322,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         read_only: true,
         region: region.clone(),
         eager_index_load: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("warm_prof_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -401,7 +401,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -430,7 +430,7 @@ fn test_small_ppg_index_integrity() {
         endpoint_url: endpoint.clone(),
         region: region.clone(),
         pages_per_group: 8,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
 
     let vfs_name = unique_vfs_name("small_ppg_write");
@@ -481,7 +481,7 @@ fn test_small_ppg_index_integrity() {
         read_only: true,
         region: region.clone(),
         pages_per_group: 8,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
 
     let reader_vfs_name = unique_vfs_name("small_ppg_reader");
@@ -539,7 +539,7 @@ fn test_small_ppg_index_integrity() {
             endpoint_url: endpoint,
             region,
             pages_per_group: 8,
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();

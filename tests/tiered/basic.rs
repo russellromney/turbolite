@@ -218,7 +218,7 @@ fn test_reader_from_s3() {
         endpoint_url: reader_endpoint,
         read_only: true,
         region: reader_region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_reader");
     let reader_vfs =
@@ -377,7 +377,7 @@ fn test_large_cold_scan() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_coldscan_reader");
     let reader_vfs =
@@ -540,7 +540,7 @@ fn test_read_only_rejects_writes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let ro_vfs_name = unique_vfs_name("tiered_ro_reader");
     let ro_vfs = TieredVfs::new(ro_config).unwrap();
@@ -617,7 +617,7 @@ fn test_cache_clear_survival() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let fresh_vfs_name = unique_vfs_name("tiered_cacheclr2");
     let fresh_vfs = TieredVfs::new(fresh_config).unwrap();
@@ -707,7 +707,7 @@ fn test_page_group_cache_populates() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_pgcache_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -806,7 +806,7 @@ fn test_destroy_s3() {
         cache_dir: cache_dir.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let destroy_vfs = TieredVfs::new(destroy_config).unwrap();
     destroy_vfs.destroy_s3().unwrap();
@@ -887,7 +887,7 @@ fn test_1k_rows_checkpoint_cold_read() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_1k_reader");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -1095,7 +1095,7 @@ fn test_default_4096_page_size() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_4k_reader");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();

@@ -63,7 +63,7 @@ fn test_ttl_eviction() {
         endpoint_url: endpoint.clone(),
         read_only: true,
         region: region.clone(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ttl_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -157,7 +157,7 @@ fn test_dictionary_mismatch_errors() {
         read_only: true,
         region,
         // dictionary: None (default) — intentional mismatch
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_dict_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -251,7 +251,7 @@ fn test_dictionary_roundtrip() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     reader_config.dictionary = Some(dict_bytes);
     let reader_vfs_name = unique_vfs_name("tiered_drt_r");
@@ -372,7 +372,7 @@ fn test_custom_pages_per_group() {
         read_only: true,
         pages_per_group: 8,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppg8_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -449,7 +449,7 @@ fn test_ppg_mismatch_uses_manifest() {
         read_only: true,
         pages_per_group: 64, // DIFFERENT from writer's 2048
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppgmm_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -562,7 +562,7 @@ fn test_evict_tree_by_name() {
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -632,7 +632,7 @@ fn test_cache_info_returns_valid_json() {
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -740,7 +740,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -829,7 +829,7 @@ fn test_autovacuum_with_gc() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let gc_vfs = TieredVfs::new(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
@@ -946,7 +946,7 @@ fn test_cache_truncation_after_vacuum() {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }

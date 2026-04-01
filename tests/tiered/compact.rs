@@ -78,7 +78,7 @@ fn test_compact_reclaims_dead_space() {
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true,
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("compact_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();

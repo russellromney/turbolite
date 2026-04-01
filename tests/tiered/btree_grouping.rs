@@ -78,7 +78,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
             bucket, prefix, endpoint_url: endpoint,
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
-            read_only: true, ..Default::default()
+            read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_cp_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -187,7 +187,7 @@ fn test_vacuum_produces_correct_mapping() {
     let mut manifest = turbolite::tiered::get_manifest(&TieredConfig {
         bucket: bucket.clone(), prefix: prefix.clone(),
         endpoint_url: endpoint.clone(), region: Some("auto".to_string()),
-        cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
+        cache_dir: cache_dir.path().to_path_buf(), runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     }).unwrap().unwrap();
     manifest.detect_and_normalize_strategy();
 
@@ -203,7 +203,7 @@ fn test_vacuum_produces_correct_mapping() {
             bucket, prefix, endpoint_url: endpoint,
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
-            read_only: true, ..Default::default()
+            read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_vac_reader");
         let reader_vfs = TieredVfs::new(reader_config).unwrap();

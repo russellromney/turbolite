@@ -61,7 +61,7 @@ fn jena_interior_map_built_on_open() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_imap_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -118,7 +118,7 @@ fn jena_point_lookup_large_table() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_point_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -186,7 +186,7 @@ fn jena_index_scan() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_idx_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -252,7 +252,7 @@ fn jena_join_posts_users() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_join_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -322,7 +322,7 @@ fn jena_overflow_large_text() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_ovfl_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -383,7 +383,7 @@ fn jena_full_scan() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_scan_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
