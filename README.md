@@ -122,10 +122,6 @@ You can tune the prefetch schedule for *each query* via `SELECT turbolite_config
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
-### Experimental Features
-
-turbolite has an experimental **semantic predictive prefetching** feature that tracks **cross-table access patterns** using a lightweight prediction engine held as a [trie](https://ds.cs.rutgers.edu/assignment-trie/) in the manifest. When queries consistently touch the same set of tables together (e.g. `users` then `posts` then `likes`), future queries that touch any subset trigger background prefetch of the rest. See [Predictive Prefetching](#predictive-prefetching-experimental) for details.
-
 ### Encryption & Compression
 
 #### Compression
@@ -289,9 +285,9 @@ let config = TieredConfig {
 };
 ```
 
-Both turbolite and walrust use SQLite's file change counter as their version, so they stay synchronized without coordination. On cold start, walrust replays WAL segments with txid > manifest.version to recover writes that occurred after the last checkpoint.
+turbolite and walrust stay synchronized via SQLite's file change counter, stored as `manifest.change_counter`. On cold start, turbolite materializes the database from page groups, then walrust replays WAL segments with txid > `change_counter` to recover writes that occurred after the last checkpoint.
 
-**Durability model with WAL shipping**: every committed transaction is shipped to S3 as a WAL segment within the sync interval (default 100ms). If the machine dies, at most one sync interval of writes is lost. After checkpoint, WAL segments with txid <= manifest.version are garbage collected automatically.
+**Durability model with WAL shipping**: every committed transaction is shipped to S3 as a WAL segment within the sync interval (default 100ms). If the machine dies, at most one sync interval of writes is lost. After checkpoint, WAL segments with txid <= `change_counter` are garbage collected automatically.
 
 WAL shipping is complementary to SyncMode: SyncMode controls how checkpoints reach S3, WAL shipping makes individual writes durable before checkpoint.
 
@@ -308,32 +304,6 @@ Compression: zstd (default), lz4, snappy, gzip. With zstd, you can train and emb
 Encryption: AES-256-GCM per page.
 
 Page-level operation means most SQLite features still work: FTS, R-tree, JSON, WAL mode. Most other SQLite compression/encryption extensions operate at the file level or require custom builds.
-
-## Predictive Prefetching (Experimental)
-
-turbolite includes an experimental **predictive prefetch engine** that learns cross-table access patterns and prefetches data before SQLite asks for it. This is inspired by [semantic caching for LLMs](https://redis.io/blog/what-is-semantic-caching/). 
-
-This has not been tested very much yet. 
-
-The engine tracks which tables and indexes are accessed together. Repeated co-access builds confidence in a pattern; confidence decays over time so stale patterns (dropped/renamed tables) prune themselves. On a cache miss, if the current session's touched tables match a known pattern, the predicted tables' page groups are prefetched immediately. Patterns that match reality are reinforced; wrong predictions decay faster.
-
-Patterns are keyed by **table/index name**, not page number, so they survive VACUUMk, autovacuum, and local data eviction without re-learning.
-
-**Example.** An e-commerce dashboard query:
-
-```sql
--- "order detail" page: 4 tables, 6 indexes touched
-SELECT o.*, c.name, c.email FROM orders o
-  JOIN customers c ON c.id = o.customer_id WHERE o.id = ?;
-SELECT li.*, p.name, p.sku FROM line_items li
-  JOIN products p ON p.id = li.product_id WHERE li.order_id = ?;
-```
-
-This touches `{orders, customers, line_items, products, idx_orders_id, idx_customers_id, idx_line_items_order_id, idx_products_id, idx_line_items_product_id, idx_orders_customer_id}`. After a few repetitions, a cache miss on `orders` prefetches all ten trees' page groups in the background. By the time SQLite reaches `line_items`, data is already cached. Without prediction, each table/index hit is a separate cold miss, potentially 10+ sequential S3 round trips.
-
-On connection open, the engine also prompts turbolite to prefetche the **top-N most frequently accessed trees** by historical frequency.Combined with eager interior page loading, the first query on a warm workload often hits zero S3 requests.
-
-**Planned: frame-level correlation.** Currently the ngine prediction prefetches entire tables. Future work will narrow this to specific sub-chunks: "if you read frame 7 of table A, you'll need frame 12 of table B, then frame 17 of table C." This aims to reduce prefetch bandwidth by orders of magnitude for large tables.
 
 ## Installation
 
