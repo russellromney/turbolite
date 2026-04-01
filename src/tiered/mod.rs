@@ -64,6 +64,7 @@ mod encoding;
 mod flush;
 mod handle;
 mod import;
+mod interior_map;
 mod manifest;
 mod prediction;
 mod prefetch;
