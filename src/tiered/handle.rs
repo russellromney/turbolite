@@ -79,19 +79,12 @@ pub struct TieredHandle {
     /// Staging directory path (cache_dir/staging).
     staging_dir: PathBuf,
 
-    // --- Phase Jena: interior map for precise prefetch ---
-    /// B-tree child pointer map built from cached interior pages.
-    /// Used by sibling prefetch to replace hop-schedule guessing.
-    /// Rebuilt when interior pages are written (page splits/merges).
+    // --- Phase Jena: interior map for precise prefetch (experimental, off by default) ---
+    jena_enabled: bool,
     interior_map: interior_map::InteriorMap,
-    /// Counter for interior page writes since last map rebuild.
     interior_writes_since_rebuild: u32,
-    /// Phase Jena-d: chase rules for cross-tree leaf prefetch.
-    /// Built from schema info + query plan on first query.
     chase_rules: Vec<leaf_chaser::ChaseRule>,
-    /// Schema info (table/index column names). Populated from global cache on first query.
     schema_info: Option<schema::SchemaInfo>,
-    /// Cached BENCH_VERBOSE env var check (avoid repeated env lookups on hot path).
     bench_verbose: bool,
 
     // --- Passthrough mode (WAL/journal) ---
@@ -136,6 +129,7 @@ impl TieredHandle {
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
+        jena_enabled: bool,
     ) -> Self {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
@@ -286,20 +280,21 @@ impl TieredHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
-        // Phase Jena: build interior map from cached interior pages.
-        // Interior pages are pinned (eagerly loaded on open), so this is
-        // a pure local-cache operation. Cost: ~100us for 15 pages.
-        let interior_map = {
+        // Phase Jena: build interior map from cached interior pages (if enabled).
+        let interior_map = if jena_enabled {
             let m = shared_manifest.read();
-            interior_map::InteriorMap::build(&cache, &m)
+            let map = interior_map::InteriorMap::build(&cache, &m);
+            if !map.is_empty() {
+                eprintln!(
+                    "[tiered] Jena: built interior map ({} interior pages, {} children)",
+                    map.interior_count(),
+                    map.child_count(),
+                );
+            }
+            map
+        } else {
+            interior_map::InteriorMap::default()
         };
-        if !interior_map.is_empty() {
-            eprintln!(
-                "[tiered] Jena: built interior map ({} interior pages, {} children)",
-                interior_map.interior_count(),
-                interior_map.child_count(),
-            );
-        }
 
         Self {
             s3: Some(s3),
@@ -332,6 +327,7 @@ impl TieredHandle {
             pending_flushes,
             staging_seq,
             staging_dir,
+            jena_enabled,
             interior_map,
             interior_writes_since_rebuild: 0,
             chase_rules: Vec::new(),
@@ -378,6 +374,7 @@ impl TieredHandle {
             pending_flushes: Arc::new(Mutex::new(Vec::new())),
             staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
+            jena_enabled: false,
             interior_map: interior_map::InteriorMap::default(),
             interior_writes_since_rebuild: 0,
             chase_rules: Vec::new(),
@@ -644,7 +641,7 @@ impl TieredHandle {
     /// extract join column values, predict target leaf groups, and submit
     /// them for prefetch.
     fn try_leaf_chase(&mut self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
-        if self.chase_rules.is_empty() {
+        if !self.jena_enabled || self.chase_rules.is_empty() {
             return;
         }
 
@@ -738,6 +735,7 @@ impl TieredHandle {
     /// interior page. Only fires for pages that ARE interior pages and
     /// whose siblings are in different groups.
     fn try_interior_lookahead(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
+        if !self.jena_enabled { return; }
         let hdr_off = if page_num == 0 { 100 } else { 0 };
         let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
         if type_byte != 0x05 && type_byte != 0x02 {
@@ -789,6 +787,7 @@ impl TieredHandle {
 
     /// Phase Jena-e: detect overflow in a leaf page and prefetch overflow page groups.
     fn try_overflow_prefetch(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
+        if !self.jena_enabled { return; }
         let page_size = *self.page_size.read();
         if page_size == 0 { return; }
 
@@ -890,9 +889,8 @@ impl TieredHandle {
             false
         };
 
-        // Phase Jena: use interior map for precise sibling selection.
-        // The map knows exact B-tree structure from parsed interior pages.
-        if !self.interior_map.is_empty() {
+        // Phase Jena: use interior map for precise sibling selection (if enabled).
+        if self.jena_enabled && !self.interior_map.is_empty() {
             let tree_name = manifest.group_to_tree_name.get(&current_gid);
             let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
 
@@ -1607,9 +1605,8 @@ impl DatabaseHandle for TieredHandle {
         }
         self.dirty_page_nums.write().insert(page_num);
 
-        // Phase Jena: detect interior page writes for map rebuild.
-        // Only check the type byte (no manifest lookup needed).
-        {
+        // Phase Jena: detect interior page writes for map rebuild (if enabled).
+        if self.jena_enabled {
             let hdr_off = if page_num == 0 { 100 } else { 0 };
             let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
             if type_byte == 0x05 || type_byte == 0x02 {

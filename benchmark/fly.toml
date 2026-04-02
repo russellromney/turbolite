@@ -25,7 +25,7 @@ primary_region = "iad"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --grouping btree --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0,0 --plan-aware"
+  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0,0 --plan-aware"
 
 [[vm]]
   size = "performance-8x"
