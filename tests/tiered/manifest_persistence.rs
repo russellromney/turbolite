@@ -47,7 +47,7 @@ fn test_local_manifest_persisted_on_checkpoint() {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -109,7 +109,7 @@ fn test_warm_reconnect_skips_s3() {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -202,7 +202,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         bucket, prefix, endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
@@ -245,7 +245,7 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }

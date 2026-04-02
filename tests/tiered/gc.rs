@@ -203,7 +203,7 @@ fn test_gc_full_scan() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let gc_vfs = TieredVfs::new(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
@@ -274,7 +274,7 @@ fn test_gc_no_orphans() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: Some(endpoint_url()),
         region: Some("auto".to_string()),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let gc_vfs = TieredVfs::new(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();

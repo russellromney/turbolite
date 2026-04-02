@@ -59,7 +59,7 @@ fn cold_reader(
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("cold");
     let cold_vfs = TieredVfs::new(cold_config).expect("cold VFS");
@@ -161,7 +161,7 @@ fn borodino_encryption_staging_roundtrip() {
         region: Some("auto".to_string()),
         read_only: true,
         encryption_key: Some([0xAB; 32]),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("enc_staging_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
@@ -205,7 +205,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
         region: Some("auto".to_string()),
         read_only: true,
         encryption_key: Some([0xCD; 32]), // wrong key
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("enc_wrong_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();

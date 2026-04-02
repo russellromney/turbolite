@@ -29,6 +29,10 @@ extern int turbolite_ext_register_vfs(void);
  * Defined in src/tiered/query_plan.rs (Phase Marne). */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
 
+/* Rust function -- discovers schema from sqlite_master for leaf chasing.
+ * Defined in src/tiered/query_plan.rs (Phase Jena-d). */
+extern void turbolite_discover_schema(sqlite3 *db);
+
 /* Rust function -- signals query completion for between-query eviction.
  * Defined in src/tiered/query_plan.rs (Phase Stalingrad). */
 extern void turbolite_trace_end_query(void);
@@ -372,6 +376,13 @@ static int turbolite_trace_callback(
         sqlite3 *db = sqlite3_db_handle(stmt);
 
         turbolite_trace_reentrant = 1;
+
+        /* Phase Jena-d: discover schema for leaf chasing.
+         * Re-discovers on every connection (no static flag) because different
+         * connections may open different databases. The VFS side deduplicates
+         * via schema_info.is_none() check. */
+        turbolite_discover_schema(db);
+
         turbolite_trace_push_plan(db, sql);
         turbolite_trace_reentrant = 0;
     }
@@ -548,6 +559,7 @@ int sqlite3_uri_boolean(const char *zFilename, const char *zParam, int bDflt) {
 #undef sqlite3_prepare_v2
 #undef sqlite3_step
 #undef sqlite3_column_text
+#undef sqlite3_column_int64
 #undef sqlite3_finalize
 
 int sqlite3_prepare_v2(sqlite3 *db, const char *zSql, int nByte,
@@ -561,6 +573,10 @@ int sqlite3_step(sqlite3_stmt *stmt) {
 
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int iCol) {
     return sqlite3_api->column_text(stmt, iCol);
+}
+
+sqlite3_int64 sqlite3_column_int64(sqlite3_stmt *stmt, int iCol) {
+    return sqlite3_api->column_int64(stmt, iCol);
 }
 
 int sqlite3_finalize(sqlite3_stmt *stmt) {

@@ -59,7 +59,7 @@ fn cold_reader(
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("cold");
     let cold_vfs = TieredVfs::new(cold_config).expect("cold VFS");
@@ -121,7 +121,7 @@ fn config_with_same_s3(
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         sync_mode,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     }
 }
 
@@ -617,7 +617,7 @@ fn staging_follower_sees_data_after_flush() {
         region: Some("auto".to_string()),
         manifest_source: ManifestSource::S3,
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name = unique_vfs_name("follower_r1");
     let follower_vfs = TieredVfs::new(follower_config).unwrap();
@@ -649,7 +649,7 @@ fn staging_follower_sees_data_after_flush() {
         region: Some("auto".to_string()),
         manifest_source: ManifestSource::S3,
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name2 = unique_vfs_name("follower_r2");
     let follower_vfs2 = TieredVfs::new(follower_config2).unwrap();
@@ -691,7 +691,7 @@ fn staging_follower_no_staging_files() {
         region: Some("auto".to_string()),
         read_only: true,
         sync_mode: SyncMode::LocalThenFlush,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name = unique_vfs_name("follower_nolog_r");
     let follower_vfs = TieredVfs::new(follower_config).unwrap();

@@ -625,6 +625,7 @@ impl Vfs for TieredVfs {
                 self.config.query_plan_prefetch,
                 self.config.max_cache_bytes,
                 self.config.evict_on_checkpoint,
+                self.config.jena_enabled,
             ))
         } else {
             if let Some(parent) = path.parent() {

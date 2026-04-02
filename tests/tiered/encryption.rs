@@ -84,7 +84,7 @@ fn test_encrypted_write_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(test_encryption_key()),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_read");
         let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
@@ -123,7 +123,7 @@ fn test_encrypted_write_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -174,7 +174,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(wrong_key),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_wrong");
         let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
@@ -207,7 +207,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -268,7 +268,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(test_encryption_key()),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_arctic_r");
         let vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
@@ -318,7 +318,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -390,7 +390,7 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
 
         rotate_encryption_key(&rotate_config, Some(key_b))
@@ -408,7 +408,7 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_rd");
         let vfs = TieredVfs::new(reader_config).unwrap();
@@ -459,7 +459,7 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -515,7 +515,7 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -531,7 +531,7 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_old_rd");
         let vfs = TieredVfs::new(reader_config).unwrap();
@@ -564,7 +564,7 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -660,7 +660,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -729,7 +729,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -803,7 +803,7 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -819,7 +819,7 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_int_rd");
         let vfs = TieredVfs::new(reader_config).unwrap();
@@ -863,7 +863,7 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -931,7 +931,7 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
 
         rotate_encryption_key(&rotate_config, None)
@@ -949,7 +949,7 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no key needed
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rmenc_rd");
         let vfs = TieredVfs::new(reader_config).unwrap();
@@ -984,7 +984,7 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: None,
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -1052,7 +1052,7 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no old key
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
 
         rotate_encryption_key(&rotate_config, Some(key_b))
@@ -1070,7 +1070,7 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_addenc_rd");
         let vfs = TieredVfs::new(reader_config).unwrap();
@@ -1105,7 +1105,7 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no key, but data is now encrypted
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let fail_vfs_name = unique_vfs_name("tiered_addenc_fail");
         let vfs = TieredVfs::new(fail_config).unwrap();
@@ -1138,7 +1138,7 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();

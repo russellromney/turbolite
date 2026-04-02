@@ -66,7 +66,7 @@ fn cold_reader(
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         read_only: true,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     config_fn(&mut config);
     let vfs_name = unique_vfs_name("evict_cold");
@@ -92,7 +92,7 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let _ = TieredVfs::new(config).unwrap().destroy_s3();
 }

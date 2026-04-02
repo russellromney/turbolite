@@ -26,6 +26,7 @@ mod tiered {
     mod materialize;
     mod staging;
     mod borodino;
+    mod jena;
     #[cfg(feature = "wal")]
     mod wal_integration;
 }

@@ -198,7 +198,7 @@ fn test_large_representative_db() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_large_reader");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -403,7 +403,7 @@ fn test_oltp_with_indexes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_oltp_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -539,7 +539,7 @@ fn test_update_delete_operations() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_upddel_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -663,7 +663,7 @@ fn test_multiple_tables() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_multitbl_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -757,7 +757,7 @@ fn test_large_overflow_blobs() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_overflow_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -896,7 +896,7 @@ fn test_vacuum_reorganizes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_vacuum_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -995,7 +995,7 @@ fn test_delete_preserves_s3() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_del_s3_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();
@@ -1079,7 +1079,7 @@ fn test_delete_journal_mode() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_jdel_r");
     let reader_vfs = TieredVfs::new(reader_config).unwrap();

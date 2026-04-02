@@ -31,6 +31,11 @@ pub struct PlannedAccess {
     pub tree_name: String,
     /// SCAN or SEARCH.
     pub access_type: AccessType,
+    /// Table name this access belongs to (for join chasing).
+    pub table_name: Option<String>,
+    /// Column constraint from EQP, e.g., "id=?" from "USING INDEX idx (id=?)".
+    /// Used by leaf chasing to know which column links tables in a join.
+    pub constraint_columns: Vec<String>,
 }
 
 /// Global queue of planned accesses. The trace callback pushes, VFS drains.
@@ -131,12 +136,17 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
             first
         };
 
+        // Extract constraint columns from (col=? AND col2>?) if present
+        let constraint_columns = extract_constraint_columns(rest);
+
         // For SCAN: always emit the table (we need all data groups)
         if access_type == AccessType::Scan {
             if seen.insert((table_name.to_string(), AccessType::Scan)) {
                 accesses.push(PlannedAccess {
                     tree_name: table_name.to_string(),
                     access_type: AccessType::Scan,
+                    table_name: Some(table_name.to_string()),
+                    constraint_columns: constraint_columns.clone(),
                 });
             }
         }
@@ -154,15 +164,15 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
                 .and_then(|s| s.split_whitespace().next())
             {
                 let idx_access = match access_type {
-                    // SEARCH via index: emit the index as Search
                     AccessType::Search => AccessType::Search,
-                    // SCAN via index: emit the index as Scan (full index scan)
                     AccessType::Scan => AccessType::Scan,
                 };
                 if seen.insert((idx_name.to_string(), idx_access)) {
                     accesses.push(PlannedAccess {
                         tree_name: idx_name.to_string(),
                         access_type: idx_access,
+                        table_name: Some(table_name.to_string()),
+                        constraint_columns: constraint_columns.clone(),
                     });
                 }
             }
@@ -172,6 +182,38 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
     }
 
     accesses
+}
+
+/// Extract column names from EQP constraint expression like "(id=? AND name>?)".
+/// Returns ["id", "name"]. Handles =, <, >, <=, >=, IS operators.
+fn extract_constraint_columns(eqp_rest: &str) -> Vec<String> {
+    // Look for (...) at end of line
+    let paren_start = match eqp_rest.rfind('(') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let paren_end = match eqp_rest[paren_start..].find(')') {
+        Some(p) => paren_start + p,
+        None => return Vec::new(),
+    };
+    let inside = &eqp_rest[paren_start + 1..paren_end];
+
+    // Split by " AND " and extract column names (left of operator)
+    let mut columns = Vec::new();
+    for part in inside.split(" AND ") {
+        let part = part.trim();
+        // Find the operator: =, <, >, <=, >=, IS
+        for op in &["<=", ">=", "=", "<", ">", " IS "] {
+            if let Some(pos) = part.find(op) {
+                let col = part[..pos].trim();
+                if !col.is_empty() {
+                    columns.push(col.to_string());
+                }
+                break;
+            }
+        }
+    }
+    columns
 }
 
 /// Run EXPLAIN QUERY PLAN on a SQL string and return planned accesses.
@@ -258,6 +300,7 @@ extern "C" {
     fn sqlite3_column_text(stmt: *mut std::ffi::c_void, col: i32) -> *const std::ffi::c_char;
 
     fn sqlite3_finalize(stmt: *mut std::ffi::c_void) -> i32;
+    fn sqlite3_column_int64(stmt: *mut std::ffi::c_void, col: i32) -> i64;
 }
 
 /// FFI entry point called from C trace callback.
@@ -280,6 +323,86 @@ pub unsafe extern "C" fn turbolite_trace_push_plan(
 
     let accesses = run_eqp_and_parse(db, sql_str);
     push_planned_accesses(accesses);
+}
+
+/// Phase Jena-d2: discover schema from sqlite_master and push to global cache.
+/// Called once per db connection from the trace callback.
+///
+/// # Safety
+/// `db` must be a valid sqlite3 handle.
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_discover_schema(db: *mut std::ffi::c_void) {
+    // Skip if schema already cached (avoid redundant sqlite_master queries)
+    if super::schema::peek_schema().is_some() {
+        return;
+    }
+
+    let sql = "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE type IN ('table', 'index')";
+    let c_sql = match std::ffi::CString::new(sql) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let mut stmt: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut tail: *const std::ffi::c_char = std::ptr::null();
+
+    let rc = sqlite3_prepare_v2(
+        db,
+        c_sql.as_ptr(),
+        -1,
+        &mut stmt as *mut *mut std::ffi::c_void as *mut *mut _,
+        &mut tail as *mut *const std::ffi::c_char as *mut *const _,
+    );
+    if rc != 0 || stmt.is_null() {
+        return;
+    }
+
+    let mut rows: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
+
+    loop {
+        let step_rc = sqlite3_step(stmt);
+        if step_rc == 100 {
+            // SQLITE_ROW
+            let get_text = |col: i32| -> String {
+                let ptr = sqlite3_column_text(stmt, col);
+                if ptr.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(ptr as *const _).to_str().unwrap_or("").to_string()
+                }
+            };
+
+            let obj_type = get_text(0);
+            let name = get_text(1);
+            let tbl_name = get_text(2);
+            let rootpage = sqlite3_column_int64(stmt, 3);
+            let sql_text = {
+                let ptr = sqlite3_column_text(stmt, 4);
+                if ptr.is_null() {
+                    None
+                } else {
+                    std::ffi::CStr::from_ptr(ptr as *const _).to_str().ok().map(|s| s.to_string())
+                }
+            };
+
+            rows.push((obj_type, name, tbl_name, rootpage, sql_text));
+        } else {
+            break;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+
+    if !rows.is_empty() {
+        let info = super::schema::build_schema_info(&rows);
+        if std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "[jena] schema discovered: {} tables, {} indexes",
+                info.table_columns.len(), info.index_columns.len(),
+            );
+        }
+        super::schema::push_schema(info);
+    }
 }
 
 /// FFI entry point called from C trace profile callback.
