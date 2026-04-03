@@ -1,7 +1,114 @@
 # turbolite Roadmap
 
+## Unification: TurboliteVfs (merge CompressedVfs + TieredVfs)
+> After: Kursk (CHANGELOG) · Before: Borodino
+
+Merge CompressedVfs (local-only) and TieredVfs (S3-backed) into a single TurboliteVfs. Works locally by default. Cloud (S3) is an optional add-on controlled by `cloud` feature flag. No tokio, no AWS deps in local-only mode. On-disk format is manifest + page groups regardless of mode. Existing CompressedVfs databases get a one-time migration tool.
+
+### a. StorageClient abstraction + StorageBackend config
+
+The linchpin. One enum, two variants, abstracts all I/O for page groups and manifests.
+
+```rust
+pub enum StorageBackend {
+    Local,
+    #[cfg(feature = "cloud")]
+    S3 { bucket: String, prefix: String, endpoint_url: Option<String>, region: Option<String> },
+}
+```
+
+- [ ] Add `StorageBackend` enum to config.rs
+- [ ] Add `StorageClient` enum: `Local { base_dir: PathBuf }` / `S3(S3Client)`
+- [ ] Implement on `StorageClient`: `get_page_group(key)`, `put_page_group(key, data)`, `delete_page_groups(keys)`, `get_manifest()`, `put_manifest(data)`, `exists()`
+- [ ] Local variant: page groups stored at `{base_dir}/pg/{key}`, manifest at `{base_dir}/manifest.msgpack`
+- [ ] S3 variant: delegates to existing `S3Client` methods
+- [ ] Move `bucket`/`prefix` from top-level TieredConfig fields into `StorageBackend::S3`
+- [ ] Default: `StorageBackend::Local`
+- [ ] Tests: Local StorageClient roundtrips page groups + manifest; file-not-found returns None
+
+### b. Make VFS constructable without S3/tokio
+
+Remove hard dependency on S3Client and tokio runtime from construction path.
+
+- [ ] `s3` field on VFS struct: replace `Arc<S3Client>` with `StorageClient` enum
+- [ ] `prefetch_pool`: `Option<Arc<PrefetchPool>>` (None in local mode, no S3 to prefetch from)
+- [ ] `runtime_handle`: gate behind `#[cfg(feature = "cloud")]`
+- [ ] `TieredVfs::new()`: branch on `StorageBackend`:
+  - `Local`: no S3Client, no tokio, load manifest from local `{cache_dir}/manifest.msgpack` only, no PrefetchPool, data served directly from local page groups + cache
+  - `S3`: current behavior
+- [ ] `load_manifest()` for Local: read local manifest, no S3 fallback
+- [ ] `exists()` for Local: check local manifest file
+- [ ] Handle missing manifest on first open (new database): create empty manifest locally
+- [ ] Tests: construct VFS with StorageBackend::Local, no S3 creds, no tokio. Open database, create table, insert, read back. Checkpoint writes manifest locally.
+
+### c. Local page group storage + local flush
+
+Checkpoint in local mode writes compressed page groups to local disk.
+
+- [ ] `flush_local_groups()` in flush.rs: reads staging logs / dirty pages, encodes page groups (reuse `encode_page_group_seekable`), writes to `{cache_dir}/pg/{gid}_v{version}` via atomic tmp+rename
+- [ ] Updates local manifest with new page_group_keys pointing to local paths
+- [ ] `sync()` in local mode: always LocalThenFlush path, then immediately flush locally (no deferred S3)
+- [ ] OR: keep two-phase (local checkpoint + explicit `flush_local()`) for consistency
+- [ ] Local GC: delete old page group files after manifest update
+- [ ] `read_exact_at()` for local mode cache miss: read page group from local `pg/` directory, decode, populate cache
+- [ ] Tests: write data, checkpoint, verify page group files exist in `pg/` dir. Cold open from local manifest + page groups. Delete cache file, reopen, data recovered from local page groups.
+
+### d. Gate cloud deps behind `#[cfg(feature = "cloud")]`
+
+- [ ] Rename feature flag `tiered` -> `cloud` in Cargo.toml
+- [ ] `cloud` feature: aws-sdk-s3, aws-config, aws-smithy-runtime, tokio
+- [ ] Gate `S3Client`, `PrefetchPool`, tokio runtime, WAL replication behind `#[cfg(feature = "cloud")]`
+- [ ] VFS struct + Handle compiles and works without `cloud` feature
+- [ ] Update `wal` and `lambda` features to depend on `cloud` instead of `tiered`
+- [ ] CI: test `--features cloud,zstd` AND `--features zstd` (no cloud)
+- [ ] Tests: full test suite passes with and without `cloud` feature
+
+### e. Rename TieredVfs -> TurboliteVfs
+
+Mechanical rename across codebase.
+
+- [ ] `TieredVfs` -> `TurboliteVfs`
+- [ ] `TieredHandle` -> `TurboliteHandle`
+- [ ] `TieredConfig` -> `TurboliteConfig`
+- [ ] `TieredSharedState` -> `TurboliteSharedState`
+- [ ] Add backward-compat type aliases: `pub type TieredVfs = TurboliteVfs;` etc.
+- [ ] `tiered::register()` -> `register()` (keep `tiered::register()` as deprecated alias)
+- [ ] Update all doc comments, module-level docs, README
+- [ ] `pub use` at crate root: `pub use tiered::TurboliteVfs;`
+
+### f. Update FFI bindings
+
+- [ ] Add `turbolite_register_local(cache_dir, ...)` -- creates TurboliteVfs with Local backend
+- [ ] Rename `turbolite_register_tiered()` -> `turbolite_register_cloud()` (keep old name as alias)
+- [ ] `turbolite_register_cloud()` creates TurboliteVfs with S3 backend (behind `#[cfg(feature = "cloud")]`)
+- [ ] Add `turbolite_register()` unified entry point taking config JSON
+- [ ] `turbolite_register_compressed()` delegates to local TurboliteVfs (or stays for CompressedVfs compat)
+- [ ] Update ext.rs loadable extension entry point
+- [ ] Update cbindgen header generation
+- [ ] Tests: FFI roundtrip in local mode
+
+### g. Migration tool for CompressedVfs databases
+
+- [ ] `turbolite migrate <source.db> <dest_dir>` CLI command
+- [ ] Read CompressedVfs format (SQLCEvfS header, scan page records)
+- [ ] Write as TurboliteVfs local format (manifest + page groups in `pg/`)
+- [ ] Handle dictionary embedding (extract from CompressedVfs header, store in config)
+- [ ] Handle encryption (re-encrypt from password-derived key to raw key format)
+- [ ] `CompressedVfs::migrate_to_turbolite()` programmatic API
+- [ ] Tests: migrate a CompressedVfs database, open with TurboliteVfs, verify all data intact
+
+### h. Deprecate and remove CompressedVfs
+
+- [ ] Mark `CompressedVfs`, `CompressedHandle`, old `register()` as `#[deprecated]`
+- [ ] Migrate all integration tests from CompressedVfs to TurboliteVfs local mode
+- [ ] Remove CompressedVfs code from src/lib.rs (~700 lines)
+- [ ] Remove `CompressedHandle` page index, shared write state, append-only format code
+- [ ] Keep `compress.rs` and `dict.rs` (shared utilities)
+
+---
+
 ## Borodino: Version Counter + Cross-Cutting Correctness
-> After: Kursk (CHANGELOG) · Before: Stalingrad (remaining)
+> After: Unification · Before: Stalingrad (remaining)
 
 Blocking bugs and untested interactions discovered during Kursk stress testing. Each subsection is a specific issue with a failing test that must pass before shipping.
 

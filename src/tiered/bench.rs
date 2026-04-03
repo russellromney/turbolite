@@ -80,6 +80,23 @@ impl TieredSharedState {
             let _ = bitmap.persist();
         }
 
+        // Prune compressed cache index
+        {
+            let mut keep = pinned_pages.clone();
+            keep.extend(&index_pages);
+            for pages in pending_groups.values() {
+                keep.extend(pages);
+            }
+            let gp = self.cache.group_pages.read();
+            if let Some(g0_pages) = gp.first() {
+                keep.extend(g0_pages);
+            } else {
+                let ppg = self.cache.pages_per_group as u64;
+                for p in 0..ppg { keep.insert(p); }
+            }
+            self.cache.prune_cache_index(&keep);
+        }
+
         // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
         {
             let mut tracker = self.cache.tracker.lock();
@@ -139,6 +156,22 @@ impl TieredSharedState {
             let _ = bitmap.persist();
         }
 
+        // Prune compressed cache index
+        {
+            let mut keep = pinned_pages.clone();
+            for pages in pending_groups.values() {
+                keep.extend(pages);
+            }
+            let gp = self.cache.group_pages.read();
+            if let Some(g0_pages) = gp.first() {
+                keep.extend(g0_pages);
+            } else {
+                let ppg = self.cache.pages_per_group as u64;
+                for p in 0..ppg { keep.insert(p); }
+            }
+            self.cache.prune_cache_index(&keep);
+        }
+
         // Clear sub-chunk tracker: evict Index + Data tiers, keep Pinned only
         {
             let mut tracker = self.cache.tracker.lock();
@@ -179,6 +212,9 @@ impl TieredSharedState {
             bitmap.bits.fill(0);
             let _ = bitmap.persist();
         }
+
+        // Clear compressed cache index entirely
+        self.cache.clear_cache_index();
 
         // Clear ALL sub-chunk tracker entries including Pinned and Index
         {

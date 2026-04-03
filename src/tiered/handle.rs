@@ -108,7 +108,7 @@ const SHARED_SIZE: u64 = 510;
 impl TieredHandle {
     /// Create a tiered handle backed by S3 + local page cache.
     pub(crate) fn new_tiered(
-        s3: Arc<S3Client>,
+        s3: Option<Arc<S3Client>>,
         cache: Arc<DiskCache>,
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
@@ -138,9 +138,9 @@ impl TieredHandle {
         // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
         if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
             if let Some(key) = manifest.page_group_keys.first() {
-                if !key.is_empty() {
+                if !key.is_empty() && s3.is_some() {
                     if cache.try_claim_group(0) {
-                        if let Ok(Some(pg_data)) = s3.get_page_group(key) {
+                        if let Ok(Some(pg_data)) = s3.as_ref().expect("checked above").get_page_group(key) {
                             let ft = manifest.frame_tables.first().map(|v| v.as_slice());
                             let gp0 = manifest.group_page_nums(0);
                             let _ = Self::decode_and_cache_group_static(
@@ -172,11 +172,11 @@ impl TieredHandle {
                 "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
                 cache.interior_pages.lock().len(),
             );
-        } else if !manifest.interior_chunk_keys.is_empty() {
+        } else if !manifest.interior_chunk_keys.is_empty() && s3.is_some() {
             // Parallel fetch all interior chunks
             let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
             eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
-            match s3.get_page_groups_by_key(&chunk_keys) {
+            match s3.as_ref().expect("checked above").get_page_groups_by_key(&chunk_keys) {
                 Ok(results) => {
                     #[cfg(feature = "zstd")]
                     let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
@@ -217,9 +217,9 @@ impl TieredHandle {
         // index pages from data page groups via inline range GET (~100KB), while
         // the background thread populates the full index cache.
         let index_already_cached = !cache.index_pages.lock().is_empty();
-        if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
+        if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached && s3.is_some() {
             let cache_bg = Arc::clone(&cache);
-            let s3_bg = Arc::clone(&s3);
+            let s3_bg = Arc::clone(s3.as_ref().expect("checked above"));
             let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
             #[cfg(feature = "zstd")]
             let dict_bg = dictionary.map(|d| d.to_vec());
@@ -297,7 +297,7 @@ impl TieredHandle {
         };
 
         Self {
-            s3: Some(s3),
+            s3,
             cache: Some(cache),
             manifest: shared_manifest,
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -1029,7 +1029,8 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // 3. Look up page location (Phase Midway). Safe to .expect() here because:
+        // 3. Look up page location (Phase Midway).
+        // Safe to .expect() here because:
         //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
         //    - Pages beyond page_count are zero-filled (returned above)
         //    - sync() assigns new pages to groups before clearing dirty_page_nums
@@ -1245,9 +1246,20 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // 5. Cache miss - fetch from S3.
+        // 5. Cache miss - fetch from storage (S3 or local page groups).
         cache.stat_misses.fetch_add(1, Ordering::Relaxed);
-        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
+        let s3_arc = match self.s3.as_ref() {
+            Some(s3) => Arc::clone(s3),
+            None => {
+                // Local-only mode: no S3 to fetch from. Page should be in cache.
+                // If we get here, the cache file was deleted or corrupted.
+                // Phase Unification-c will add local page group fetch here.
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("page {} not in local cache (no storage backend to fetch from)", page_num),
+                ));
+            }
+        };
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
 
@@ -1751,14 +1763,16 @@ impl DatabaseHandle for TieredHandle {
                 });
             }
 
-            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery
+            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery.
+            // Errors MUST propagate: if persist fails, SQLite must not discard the WAL.
             {
                 let m = self.manifest.read().clone();
                 let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot };
-                if let Err(e) = local.persist(&cache_dir) {
-                    eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
-                }
+                local.persist(&cache_dir)?;
             }
+
+            // Persist bitmap so cached pages survive process restart
+            cache.persist_bitmap()?;
 
             return Ok(());
         }

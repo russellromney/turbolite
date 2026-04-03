@@ -77,13 +77,14 @@ mod rotation;
 mod s3_client;
 mod settings;
 mod staging;
+mod storage_client;
 mod vfs;
 #[cfg(feature = "wal")]
 mod wal_replication;
 
 // Public API (visible outside the crate)
 pub use bench::TieredSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
+pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
@@ -100,6 +101,7 @@ pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
 pub(crate) use query_plan::*;
 pub(crate) use s3_client::*;
+pub(crate) use storage_client::*;
 
 
 // ===== Constants =====

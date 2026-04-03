@@ -68,7 +68,7 @@ lambda_runtime = { version = "0.13", optional = true }
 
 # WAL replication via walrust (optional)
 walrust-core = { path = "../walrust/crates/walrust-core", optional = true, package = "walrust" }
-hadb-io = { path = "../../hadb/hadb-io", optional = true }
+hadb-io = { path = "../hadb/hadb-io", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 rmp-serde = "1.3.1"

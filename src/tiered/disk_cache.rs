@@ -1,5 +1,120 @@
 use super::*;
 
+// ===== CacheIndex (compressed cache page offset tracking) =====
+
+/// Entry in the compressed cache index: where a page lives in the cache file.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct CacheIndexEntry {
+    /// Byte offset in the compressed cache file.
+    pub(crate) offset: u64,
+    /// Compressed (and optionally encrypted) length in bytes.
+    pub(crate) compressed_len: u32,
+}
+
+/// Maps page numbers to their location in the compressed cache file.
+/// When cache_compression is enabled, pages are zstd-compressed (then optionally
+/// CTR-encrypted) and appended sequentially. The index tracks each page's offset
+/// and compressed length so reads can pread the exact byte range.
+///
+/// Persisted as JSON alongside the bitmap for crash recovery.
+pub(crate) struct CacheIndex {
+    /// page_num -> (offset, compressed_len)
+    pub(crate) entries: HashMap<u64, CacheIndexEntry>,
+    /// Next append offset in the compressed cache file.
+    pub(crate) next_offset: u64,
+    /// Path for persistence.
+    pub(crate) path: PathBuf,
+}
+
+impl CacheIndex {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        match Self::load_from_disk(&path) {
+            Some(idx) => idx,
+            None => Self {
+                entries: HashMap::new(),
+                next_offset: 0,
+                path,
+            },
+        }
+    }
+
+    /// Look up a page's location in the compressed cache.
+    pub(crate) fn get(&self, page_num: u64) -> Option<&CacheIndexEntry> {
+        self.entries.get(&page_num)
+    }
+
+    /// Record a page written at the current append offset.
+    /// Returns the offset where the page was written.
+    pub(crate) fn insert(&mut self, page_num: u64, compressed_len: u32) -> u64 {
+        let offset = self.next_offset;
+        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        self.next_offset = offset + compressed_len as u64;
+        offset
+    }
+
+    /// Record a page at a specific offset (for bulk writes where offset is pre-computed).
+    pub(crate) fn insert_at(&mut self, page_num: u64, offset: u64, compressed_len: u32) {
+        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        let end = offset + compressed_len as u64;
+        if end > self.next_offset {
+            self.next_offset = end;
+        }
+    }
+
+    /// Check if a page is in the index.
+    pub(crate) fn contains(&self, page_num: u64) -> bool {
+        self.entries.contains_key(&page_num)
+    }
+
+    /// Remove a page from the index.
+    pub(crate) fn remove(&mut self, page_num: u64) {
+        self.entries.remove(&page_num);
+    }
+
+    /// Remove all pages from the index and reset append offset.
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.next_offset = 0;
+    }
+
+    /// Persist index to disk (atomic tmp+rename).
+    pub(crate) fn persist(&self) -> io::Result<()> {
+        let data = serde_json::to_vec(&PersistableCacheIndex {
+            entries: &self.entries,
+            next_offset: self.next_offset,
+        }).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("serialize cache index: {}", e))
+        })?;
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, &data)?;
+        fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Load index from disk. Returns None if missing or corrupt.
+    fn load_from_disk(path: &Path) -> Option<Self> {
+        let data = fs::read(path).ok()?;
+        let parsed: LoadableCacheIndex = serde_json::from_slice(&data).ok()?;
+        Some(Self {
+            entries: parsed.entries,
+            next_offset: parsed.next_offset,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct PersistableCacheIndex<'a> {
+    entries: &'a HashMap<u64, CacheIndexEntry>,
+    next_offset: u64,
+}
+
+#[derive(Deserialize)]
+struct LoadableCacheIndex {
+    entries: HashMap<u64, CacheIndexEntry>,
+    next_offset: u64,
+}
+
 // ===== DiskCache (sub-chunk-level cache with tiered eviction) =====
 
 /// Local NVMe page cache with sub-chunk-level tracking and tiered eviction.
@@ -44,6 +159,19 @@ pub(crate) struct DiskCache {
     /// Used by evict_group and clear_cache to clear the correct bitmap bits.
     /// Updated when the manifest changes (via set_group_pages).
     pub(crate) group_pages: parking_lot::RwLock<Vec<Vec<u64>>>,
+    /// When true, pages are zstd-compressed (and optionally CTR-encrypted) in the cache file.
+    /// The CacheIndex tracks each page's offset and compressed length.
+    pub(crate) cache_compression: bool,
+    /// Zstd compression level for cache pages (only used when cache_compression is true).
+    pub(crate) cache_compression_level: i32,
+    /// Index mapping page_num -> (offset, compressed_len) in the compressed cache file.
+    /// Only populated when cache_compression is true.
+    pub(crate) cache_index: parking_lot::Mutex<CacheIndex>,
+    /// Raw zstd dictionary bytes for cache compression/decompression.
+    /// Shared via Arc so DiskCache (which is Arc<DiskCache>) can be used from multiple threads.
+    /// EncoderDictionary/DecoderDictionary are created on each use (cheap, same pattern as PrefetchPool).
+    #[cfg(feature = "zstd")]
+    pub(crate) dictionary: Option<Arc<Vec<u8>>>,
 
     // ── Phase Stalingrad-c: cache stats counters ──
     /// Cache hits (page was in bitmap/cache, served from local disk).
@@ -66,6 +194,21 @@ pub(crate) static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DiskCache {
     pub(crate) fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>) -> io::Result<Self> {
+        Self::new_with_compression(
+            cache_dir, ttl_secs, pages_per_group, sub_pages_per_frame,
+            page_size, page_count, encryption_key, group_pages,
+            false, 3,
+            #[cfg(feature = "zstd")]
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_compression(
+        cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32,
+        page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>,
+        cache_compression: bool, cache_compression_level: i32,
+        #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
         let cache_file_path = cache_dir.join("data.cache");
@@ -75,12 +218,32 @@ impl DiskCache {
             .create(true)
             .open(&cache_file_path)?;
 
-        // Extend to full size (sparse file)
-        if page_count > 0 && page_size > 0 {
+        // For uncompressed mode: extend to full size (sparse file).
+        // For compressed mode: the file grows via append, no pre-allocation needed.
+        if !cache_compression && page_count > 0 && page_size > 0 {
             let target_size = page_count * page_size as u64;
             let meta = cache_file.metadata()?;
             if meta.len() < target_size {
                 cache_file.set_len(target_size)?;
+            }
+        }
+
+        // Load or create compressed cache index
+        let index_path = cache_dir.join("cache_index.json");
+        let mut cache_index = CacheIndex::new(index_path);
+
+        // If compression mode changed (index exists but compression off, or vice versa),
+        // or if index is present but cache file is empty/missing, reset both.
+        if cache_compression {
+            let file_len = cache_file.metadata()?.len();
+            if file_len == 0 && !cache_index.entries.is_empty() {
+                // Cache file was cleared but index survived, reset index
+                cache_index.clear();
+            }
+        } else {
+            // Not using compression, clear any stale index
+            if !cache_index.entries.is_empty() {
+                cache_index.clear();
             }
         }
 
@@ -161,6 +324,11 @@ impl DiskCache {
             page_size: std::sync::atomic::AtomicU32::new(page_size),
             encryption_key,
             group_pages: parking_lot::RwLock::new(group_pages),
+            cache_compression,
+            cache_compression_level,
+            cache_index: parking_lot::Mutex::new(cache_index),
+            #[cfg(feature = "zstd")]
+            dictionary: dictionary.map(|d| Arc::new(d)),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
             stat_evictions: AtomicU64::new(0),
@@ -170,9 +338,32 @@ impl DiskCache {
         })
     }
 
-    /// Read a single page from the cache file (pread, decrypt with CTR if encrypted).
+    /// Create a zstd encoder dictionary from raw bytes (if dictionary is set).
+    #[cfg(feature = "zstd")]
+    fn encoder_dict(&self) -> Option<zstd::dict::EncoderDictionary<'static>> {
+        self.dictionary.as_ref().map(|d| {
+            zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level)
+        })
+    }
+
+    /// Create a zstd decoder dictionary from raw bytes (if dictionary is set).
+    #[cfg(feature = "zstd")]
+    fn decoder_dict(&self) -> Option<zstd::dict::DecoderDictionary<'static>> {
+        self.dictionary.as_ref().map(|d| {
+            zstd::dict::DecoderDictionary::copy(d)
+        })
+    }
+
+    /// Read a single page from the cache file.
+    /// Uncompressed mode: pread at fixed offset, decrypt with CTR if encrypted.
+    /// Compressed mode: look up offset+len in index, pread, decrypt CTR, zstd decompress.
     pub(crate) fn read_page(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        if self.cache_compression {
+            return self.read_page_compressed(page_num, buf);
+        }
+
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
         let file = self.cache_file.read();
         file.read_exact_at(buf, offset)?;
@@ -184,9 +375,72 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Write a single uncompressed page to the cache file (encrypt with CTR if key set).
+    /// Read a page from the compressed cache: index lookup -> pread -> decrypt -> decompress.
+    fn read_page_compressed(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let entry = {
+            let index = self.cache_index.lock();
+            match index.get(page_num) {
+                Some(e) => *e,
+                None => return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("page {} not in compressed cache index", page_num),
+                )),
+            }
+        };
+
+        // Read the compressed (and optionally encrypted) blob
+        let mut compressed = vec![0u8; entry.compressed_len as usize];
+        let file = self.cache_file.read();
+        file.read_exact_at(&mut compressed, entry.offset)?;
+
+        // Decrypt if encrypted (CTR, same size)
+        #[cfg(feature = "encryption")]
+        if let Some(ref key) = self.encryption_key {
+            let decrypted = compress::decrypt_ctr(&compressed, page_num, key)?;
+            compressed = decrypted;
+        }
+
+        // Decompress (with dictionary if available)
+        {
+            #[cfg(feature = "zstd")]
+            let dd = self.decoder_dict();
+            let decompressed = compress::decompress(
+                &compressed,
+                #[cfg(feature = "zstd")]
+                dd.as_ref(),
+                #[cfg(not(feature = "zstd"))]
+                None,
+            )?;
+            // SQLite may request partial reads (e.g., 16-byte header read).
+            // Decompressed data is always a full page. Copy the requested portion.
+            if buf.len() <= decompressed.len() {
+                buf.copy_from_slice(&decompressed[..buf.len()]);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "decompressed page {} too small: need {} bytes, got {}",
+                        page_num, buf.len(), decompressed.len()
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write a single page to the cache file.
+    /// Uncompressed mode: encrypt with CTR if key set, pwrite at fixed offset.
+    /// Compressed mode: zstd compress, CTR encrypt, append at index offset.
     pub(crate) fn write_page(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        if self.cache_compression {
+            return self.write_page_compressed(page_num, data);
+        }
+
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
 
         // CTR encryption: same size, no overhead
@@ -223,12 +477,64 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Write a single page in compressed mode: compress -> encrypt -> append -> update index.
+    fn write_page_compressed(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        // Compress (with dictionary if available)
+        #[cfg(feature = "zstd")]
+        let ed = self.encoder_dict();
+        let mut blob = compress::compress(
+            data, self.cache_compression_level,
+            #[cfg(feature = "zstd")]
+            ed.as_ref(),
+            #[cfg(not(feature = "zstd"))]
+            None,
+        )?;
+
+        // Encrypt compressed blob
+        #[cfg(feature = "encryption")]
+        if let Some(ref key) = self.encryption_key {
+            blob = compress::encrypt_ctr(&blob, page_num, key)?;
+        }
+
+        let blob_len = blob.len() as u32;
+
+        // Reserve offset in index and write
+        let offset = {
+            let mut index = self.cache_index.lock();
+            index.insert(page_num, blob_len)
+        };
+
+        let needed = offset + blob_len as u64;
+        {
+            let file = self.cache_file.read();
+            if file.metadata()?.len() < needed {
+                drop(file);
+                let file = self.cache_file.write();
+                if file.metadata()?.len() < needed {
+                    file.set_len(needed)?;
+                }
+                file.write_all_at(&blob, offset)?;
+            } else {
+                file.write_all_at(&blob, offset)?;
+            }
+        }
+
+        self.bitmap.lock().mark_present(page_num);
+        Ok(())
+    }
+
     /// Write a contiguous range of pages to the cache file in a single I/O operation.
     /// `start_page` is the first page number, `data` is the raw concatenated page data.
     /// Uses RwLock: read lock for pwrite (concurrent), write lock only if file needs extending.
     pub(crate) fn write_pages_bulk(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
+
+        if self.cache_compression {
+            return self.write_pages_bulk_compressed(start_page, data, num_pages);
+        }
 
         // CTR encryption: encrypt each page in-place (same size, no overhead)
         #[cfg(feature = "encryption")]
@@ -285,6 +591,89 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Compressed bulk write: compress each page individually, concatenate, single pwrite.
+    fn write_pages_bulk_compressed(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let page_sz = self.page_size.load(Ordering::Acquire) as usize;
+
+        // Create encoder dictionary once for all pages in this batch
+        #[cfg(feature = "zstd")]
+        let ed = self.encoder_dict();
+
+        // Compress each page, build a single contiguous blob and record offsets
+        let mut blob = Vec::new();
+        let mut page_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(num_pages as usize); // (page_num, offset_in_blob, compressed_len)
+
+        for i in 0..num_pages {
+            let start = i as usize * page_sz;
+            let end = (start + page_sz).min(data.len());
+            let page_data = &data[start..end];
+
+            let mut compressed = compress::compress(
+                page_data, self.cache_compression_level,
+                #[cfg(feature = "zstd")]
+                ed.as_ref(),
+                #[cfg(not(feature = "zstd"))]
+                None,
+            )?;
+
+            #[cfg(feature = "encryption")]
+            if let Some(ref key) = self.encryption_key {
+                compressed = compress::encrypt_ctr(&compressed, start_page + i, key)?;
+            }
+
+            let blob_offset = blob.len() as u64;
+            let compressed_len = compressed.len() as u32;
+            blob.extend_from_slice(&compressed);
+            page_entries.push((start_page + i, blob_offset, compressed_len));
+        }
+
+        // Reserve contiguous range in the index and write blob
+        let base_offset = {
+            let mut index = self.cache_index.lock();
+            let base = index.next_offset;
+            for &(page_num, offset_in_blob, compressed_len) in &page_entries {
+                index.insert_at(page_num, base + offset_in_blob, compressed_len);
+            }
+            base
+        };
+
+        let needed = base_offset + blob.len() as u64;
+        {
+            let file = self.cache_file.read();
+            if file.metadata()?.len() < needed {
+                drop(file);
+                let file = self.cache_file.write();
+                if file.metadata()?.len() < needed {
+                    file.set_len(needed)?;
+                }
+                file.write_all_at(&blob, base_offset)?;
+            } else {
+                file.write_all_at(&blob, base_offset)?;
+            }
+        }
+
+        // Mark all pages present in legacy bitmap
+        let mut bitmap = self.bitmap.lock();
+        for i in 0..num_pages {
+            bitmap.mark_present(start_page + i);
+        }
+        drop(bitmap);
+
+        // Mark sub-chunks present in tracker
+        {
+            let mut tracker = self.tracker.lock();
+            let mut seen = HashSet::new();
+            for i in 0..num_pages {
+                let id = tracker.sub_chunk_for_page(start_page + i);
+                if seen.insert(id) {
+                    tracker.mark_present(id, SubChunkTier::Data);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Write pages to the cache at non-consecutive positions (Phase Midway: B-tree-packed groups).
     /// `page_nums` maps position in `data` to actual page number.
     pub(crate) fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
@@ -301,6 +690,10 @@ impl DiskCache {
         let written_pages = &page_nums[..writable_count];
         if written_pages.is_empty() {
             return Ok(());
+        }
+
+        if self.cache_compression {
+            return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
         }
 
         // Find max page to size the cache file
@@ -367,6 +760,90 @@ impl DiskCache {
         Ok(())
     }
 
+    /// Compressed scattered write: compress each page, append as contiguous blob.
+    fn write_pages_scattered_compressed(
+        &self,
+        written_pages: &[u64],
+        data: &[u8],
+        page_sz: usize,
+        gid: u64,
+        start_index_in_group: u32,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        // Create encoder dictionary once for all pages in this batch
+        #[cfg(feature = "zstd")]
+        let ed = self.encoder_dict();
+
+        let mut blob = Vec::new();
+        let mut page_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(written_pages.len());
+
+        for (i, &pnum) in written_pages.iter().enumerate() {
+            let src_start = i * page_sz;
+            let page_data = &data[src_start..src_start + page_sz];
+
+            let mut compressed = compress::compress(
+                page_data, self.cache_compression_level,
+                #[cfg(feature = "zstd")]
+                ed.as_ref(),
+                #[cfg(not(feature = "zstd"))]
+                None,
+            )?;
+
+            #[cfg(feature = "encryption")]
+            if let Some(ref key) = self.encryption_key {
+                compressed = compress::encrypt_ctr(&compressed, pnum, key)?;
+            }
+
+            let blob_offset = blob.len() as u64;
+            let compressed_len = compressed.len() as u32;
+            blob.extend_from_slice(&compressed);
+            page_entries.push((pnum, blob_offset, compressed_len));
+        }
+
+        let base_offset = {
+            let mut index = self.cache_index.lock();
+            let base = index.next_offset;
+            for &(page_num, offset_in_blob, compressed_len) in &page_entries {
+                index.insert_at(page_num, base + offset_in_blob, compressed_len);
+            }
+            base
+        };
+
+        let needed = base_offset + blob.len() as u64;
+        {
+            let file = self.cache_file.read();
+            if file.metadata()?.len() < needed {
+                drop(file);
+                let file = self.cache_file.write();
+                if file.metadata()?.len() < needed {
+                    file.set_len(needed)?;
+                }
+                file.write_all_at(&blob, base_offset)?;
+            } else {
+                file.write_all_at(&blob, base_offset)?;
+            }
+        }
+
+        // Mark bitmap for per-page presence
+        let mut bitmap = self.bitmap.lock();
+        for &pnum in written_pages {
+            bitmap.mark_present(pnum);
+        }
+        drop(bitmap);
+
+        // Mark tracker sub-chunks as Data tier (manifest-aware, not positional)
+        let mut tracker = self.tracker.lock();
+        for (i, _) in written_pages.iter().enumerate() {
+            let idx = start_index_in_group + i as u32;
+            let id = tracker.sub_chunk_id_for(gid, idx);
+            tracker.mark_present(id, SubChunkTier::Data);
+        }
+        drop(tracker);
+
+        Ok(())
+    }
+
     /// Update the page size (needed when writer VFS learns page size from first write).
     pub(crate) fn set_page_size(&self, new_page_size: u32) {
         self.page_size.store(new_page_size, Ordering::Release);
@@ -378,8 +855,14 @@ impl DiskCache {
     /// Check if a page is present in the local cache.
     /// Uses bitmap (per-page accurate). SubChunkTracker is not consulted here
     /// because it uses positional mapping which is wrong for B-tree-aware groups.
+    /// In compressed mode, also verifies the page is in the cache index.
     pub(crate) fn is_present(&self, page_num: u64) -> bool {
-        self.bitmap.lock().is_present(page_num)
+        let in_bitmap = self.bitmap.lock().is_present(page_num);
+        if self.cache_compression && in_bitmap {
+            // Double-check: bitmap says present, but index must also have it
+            return self.cache_index.lock().contains(page_num);
+        }
+        in_bitmap
     }
 
     /// Get the state of a page group.
@@ -596,7 +1079,7 @@ impl DiskCache {
         }
     }
 
-    /// Clear bitmap bits and hole-punch pages on Linux.
+    /// Clear bitmap bits, remove from cache index, and hole-punch pages on Linux.
     pub(crate) fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
             let mut bitmap = self.bitmap.lock();
@@ -604,8 +1087,16 @@ impl DiskCache {
                 bitmap.clear(pnum);
             }
         }
+        // Remove from compressed cache index
+        if self.cache_compression {
+            let mut index = self.cache_index.lock();
+            for &pnum in page_nums {
+                index.remove(pnum);
+            }
+        }
+        // Hole-punching only applies to uncompressed mode (fixed offsets)
         #[cfg(target_os = "linux")]
-        {
+        if !self.cache_compression {
             use std::os::unix::io::AsRawFd;
             let file = self.cache_file.write();
             let ps = self.page_size.load(Ordering::Acquire) as u64;
@@ -711,10 +1202,42 @@ impl DiskCache {
         evicted
     }
 
-    /// Persist the page bitmap and sub-chunk tracker to disk.
+    /// Prune the compressed cache index: remove all entries NOT in `keep_pages`.
+    /// No-op if cache_compression is false. Persists the index afterward.
+    pub(crate) fn prune_cache_index(&self, keep_pages: &HashSet<u64>) {
+        if !self.cache_compression {
+            return;
+        }
+        let mut index = self.cache_index.lock();
+        let to_remove: Vec<u64> = index.entries.keys()
+            .copied()
+            .filter(|p| !keep_pages.contains(p))
+            .collect();
+        for p in to_remove {
+            index.remove(p);
+        }
+        let _ = index.persist();
+    }
+
+    /// Clear the compressed cache index entirely (for full cache reset).
+    /// No-op if cache_compression is false.
+    pub(crate) fn clear_cache_index(&self) {
+        if !self.cache_compression {
+            return;
+        }
+        let mut index = self.cache_index.lock();
+        index.clear();
+        let _ = index.persist();
+    }
+
+    /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
         self.bitmap.lock().persist()?;
-        self.tracker.lock().persist()
+        self.tracker.lock().persist()?;
+        if self.cache_compression {
+            self.cache_index.lock().persist()?;
+        }
+        Ok(())
     }
 }
 

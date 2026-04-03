@@ -1334,3 +1334,625 @@ fn test_evict_to_budget_already_under() {
     let evicted = cache.evict_to_budget(999999, &skip);
     assert_eq!(evicted, 0);
 }
+
+// =========================================================================
+// Compressed cache tests
+// =========================================================================
+
+/// Helper: create a DiskCache with compression enabled.
+fn compressed_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
+    DiskCache::new_with_compression(
+        dir, 3600, 4, 2, page_size, page_count, None, Vec::new(),
+        true, 3,
+        #[cfg(feature = "zstd")]
+        None,
+    ).expect("compressed cache creation failed")
+}
+
+#[test]
+fn test_compressed_write_read_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write a page with known content
+    let page_data = vec![0xABu8; 64];
+    cache.write_page(0, &page_data).unwrap();
+
+    assert!(cache.is_present(0));
+    assert!(!cache.is_present(1));
+
+    // Read it back
+    let mut buf = vec![0u8; 64];
+    cache.read_page(0, &mut buf).unwrap();
+    assert_eq!(buf, page_data);
+}
+
+#[test]
+fn test_compressed_multiple_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write multiple pages with different content
+    for p in 0..8u64 {
+        let data: Vec<u8> = (0..64).map(|i| (p as u8).wrapping_add(i)).collect();
+        cache.write_page(p, &data).unwrap();
+    }
+
+    // Read each back and verify
+    for p in 0..8u64 {
+        let expected: Vec<u8> = (0..64).map(|i| (p as u8).wrapping_add(i)).collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(p, &mut buf).unwrap();
+        assert_eq!(buf, expected, "page {} mismatch", p);
+    }
+}
+
+#[test]
+fn test_compressed_bulk_write_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Build 4 pages of data
+    let mut data = Vec::with_capacity(4 * 64);
+    for p in 0..4u64 {
+        let page: Vec<u8> = (0..64).map(|i| (p as u8 * 10).wrapping_add(i)).collect();
+        data.extend_from_slice(&page);
+    }
+
+    cache.write_pages_bulk(2, &data, 4).unwrap();
+
+    // All 4 pages should be present
+    for p in 2..6 {
+        assert!(cache.is_present(p), "page {} should be present", p);
+    }
+    assert!(!cache.is_present(0));
+    assert!(!cache.is_present(6));
+
+    // Read each back
+    for p in 0..4u64 {
+        let expected: Vec<u8> = (0..64).map(|i| (p as u8 * 10).wrapping_add(i)).collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(p + 2, &mut buf).unwrap();
+        assert_eq!(buf, expected, "page {} mismatch", p + 2);
+    }
+}
+
+#[test]
+fn test_compressed_scattered_write_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write 3 pages at non-contiguous positions
+    let page_nums = vec![1u64, 5, 10];
+    let mut data = Vec::new();
+    for &pn in &page_nums {
+        let page: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i)).collect();
+        data.extend_from_slice(&page);
+    }
+
+    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+    for &pn in &page_nums {
+        assert!(cache.is_present(pn), "page {} should be present", pn);
+    }
+    assert!(!cache.is_present(0));
+    assert!(!cache.is_present(2));
+
+    // Read each back
+    for &pn in &page_nums {
+        let expected: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i)).collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(pn, &mut buf).unwrap();
+        assert_eq!(buf, expected, "page {} mismatch", pn);
+    }
+}
+
+#[test]
+fn test_compressed_read_missing_page() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    let mut buf = vec![0u8; 64];
+    let result = cache.read_page(42, &mut buf);
+    assert!(result.is_err(), "reading missing page should fail");
+}
+
+#[test]
+fn test_compressed_space_savings() {
+    let dir = TempDir::new().unwrap();
+    let page_size = 4096u32;
+    let num_pages = 16u64;
+    let cache = compressed_cache(dir.path(), page_size, num_pages);
+
+    // Write pages with highly compressible data (all zeros)
+    for p in 0..num_pages {
+        let data = vec![0u8; page_size as usize];
+        cache.write_page(p, &data).unwrap();
+    }
+
+    // Check actual file size vs uncompressed size
+    let cache_file_path = dir.path().join("data.cache");
+    let file_size = std::fs::metadata(&cache_file_path).unwrap().len();
+    let uncompressed_size = num_pages * page_size as u64;
+
+    assert!(
+        file_size < uncompressed_size,
+        "compressed cache ({} bytes) should be smaller than uncompressed ({} bytes)",
+        file_size, uncompressed_size,
+    );
+    // Zeros compress extremely well, expect >90% savings
+    assert!(
+        file_size < uncompressed_size / 10,
+        "all-zero pages should compress >90%: got {} vs {}",
+        file_size, uncompressed_size,
+    );
+}
+
+#[test]
+fn test_compressed_overwrite_page() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write page 0 with one content
+    let data1 = vec![0xAAu8; 64];
+    cache.write_page(0, &data1).unwrap();
+
+    // Overwrite with different content
+    let data2 = vec![0xBBu8; 64];
+    cache.write_page(0, &data2).unwrap();
+
+    // Should read back the second write
+    let mut buf = vec![0u8; 64];
+    cache.read_page(0, &mut buf).unwrap();
+    assert_eq!(buf, data2);
+}
+
+#[test]
+fn test_compressed_clear_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    let data = vec![0xCCu8; 64];
+    cache.write_page(5, &data).unwrap();
+    assert!(cache.is_present(5));
+
+    cache.clear_pages_from_disk(&[5]);
+    assert!(!cache.is_present(5));
+}
+
+#[test]
+fn test_compressed_evict_group() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write all 4 pages in group 0
+    assert!(cache.try_claim_group(0));
+    let data = vec![0xDDu8; 4 * 64];
+    cache.write_pages_bulk(0, &data, 4).unwrap();
+    cache.mark_group_present(0);
+
+    for p in 0..4 {
+        assert!(cache.is_present(p), "page {} should be present before evict", p);
+    }
+
+    cache.evict_group(0);
+
+    for p in 0..4 {
+        assert!(!cache.is_present(p), "page {} should be absent after evict", p);
+    }
+}
+
+#[test]
+fn test_compressed_index_persistence() {
+    let dir = TempDir::new().unwrap();
+
+    // Write some pages
+    {
+        let cache = compressed_cache(dir.path(), 64, 16);
+        for p in 0..4u64 {
+            let data: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            cache.write_page(p, &data).unwrap();
+        }
+        cache.persist_bitmap().unwrap();
+    }
+
+    // Re-open and verify pages are still readable
+    {
+        let cache = compressed_cache(dir.path(), 64, 16);
+        for p in 0..4u64 {
+            assert!(cache.is_present(p), "page {} should be present after reopen", p);
+            let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            let mut buf = vec![0u8; 64];
+            cache.read_page(p, &mut buf).unwrap();
+            assert_eq!(buf, expected, "page {} content mismatch after reopen", p);
+        }
+    }
+}
+
+#[test]
+fn test_compressed_corrupt_index_resets() {
+    let dir = TempDir::new().unwrap();
+
+    // Write some pages and persist
+    {
+        let cache = compressed_cache(dir.path(), 64, 16);
+        let data = vec![0xEEu8; 64];
+        cache.write_page(0, &data).unwrap();
+        cache.persist_bitmap().unwrap();
+    }
+
+    // Corrupt the index file
+    let index_path = dir.path().join("cache_index.json");
+    std::fs::write(&index_path, b"this is not valid json").unwrap();
+
+    // Re-open: should start with empty index (graceful rebuild)
+    let cache = compressed_cache(dir.path(), 64, 16);
+    // Page 0 is in bitmap but NOT in cache index, so is_present returns false
+    assert!(!cache.is_present(0), "corrupt index should make page absent");
+}
+
+#[test]
+fn test_compressed_cache_file_cleared_but_index_survives() {
+    let dir = TempDir::new().unwrap();
+
+    // Write and persist
+    {
+        let cache = compressed_cache(dir.path(), 64, 16);
+        let data = vec![0xFFu8; 64];
+        cache.write_page(0, &data).unwrap();
+        cache.persist_bitmap().unwrap();
+    }
+
+    // Clear cache file but leave index
+    let cache_file_path = dir.path().join("data.cache");
+    std::fs::write(&cache_file_path, b"").unwrap();
+
+    // Re-open: constructor detects empty file + non-empty index, resets index
+    let cache = compressed_cache(dir.path(), 64, 16);
+    assert!(!cache.is_present(0), "should detect stale index from empty cache file");
+}
+
+#[test]
+fn test_uncompressed_default_unchanged() {
+    // Verify the default DiskCache::new still works as uncompressed
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    assert!(!cache.cache_compression);
+
+    let data = vec![0xAAu8; 64];
+    cache.write_page(3, &data).unwrap();
+    assert!(cache.is_present(3));
+
+    let mut buf = vec![0u8; 64];
+    cache.read_page(3, &mut buf).unwrap();
+    assert_eq!(buf, data);
+}
+
+// =========================================================================
+// CacheIndex unit tests
+// =========================================================================
+
+#[test]
+fn test_cache_index_insert_and_get() {
+    let dir = TempDir::new().unwrap();
+    let mut idx = CacheIndex::new(dir.path().join("idx.json"));
+
+    assert!(!idx.contains(0));
+    let offset = idx.insert(0, 100);
+    assert_eq!(offset, 0);
+    assert!(idx.contains(0));
+
+    let entry = idx.get(0).unwrap();
+    assert_eq!(entry.offset, 0);
+    assert_eq!(entry.compressed_len, 100);
+
+    let offset2 = idx.insert(1, 200);
+    assert_eq!(offset2, 100);
+    assert_eq!(idx.next_offset, 300);
+}
+
+#[test]
+fn test_cache_index_insert_at() {
+    let dir = TempDir::new().unwrap();
+    let mut idx = CacheIndex::new(dir.path().join("idx.json"));
+
+    idx.insert_at(5, 1000, 50);
+    let entry = idx.get(5).unwrap();
+    assert_eq!(entry.offset, 1000);
+    assert_eq!(entry.compressed_len, 50);
+    assert_eq!(idx.next_offset, 1050);
+}
+
+#[test]
+fn test_cache_index_remove_and_clear() {
+    let dir = TempDir::new().unwrap();
+    let mut idx = CacheIndex::new(dir.path().join("idx.json"));
+
+    idx.insert(0, 100);
+    idx.insert(1, 200);
+    assert!(idx.contains(0));
+
+    idx.remove(0);
+    assert!(!idx.contains(0));
+    assert!(idx.contains(1));
+
+    idx.clear();
+    assert!(!idx.contains(1));
+    assert_eq!(idx.next_offset, 0);
+}
+
+#[test]
+fn test_cache_index_persist_reload() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("idx.json");
+
+    {
+        let mut idx = CacheIndex::new(path.clone());
+        idx.insert(10, 500);
+        idx.insert(20, 300);
+        idx.persist().unwrap();
+    }
+
+    let idx2 = CacheIndex::new(path);
+    assert!(idx2.contains(10));
+    assert!(idx2.contains(20));
+    let e10 = idx2.get(10).unwrap();
+    assert_eq!(e10.offset, 0);
+    assert_eq!(e10.compressed_len, 500);
+    let e20 = idx2.get(20).unwrap();
+    assert_eq!(e20.offset, 500);
+    assert_eq!(e20.compressed_len, 300);
+    assert_eq!(idx2.next_offset, 800);
+}
+
+#[test]
+fn test_cache_index_corrupt_load() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("idx.json");
+
+    std::fs::write(&path, b"not json").unwrap();
+    let idx = CacheIndex::new(path);
+    assert_eq!(idx.entries.len(), 0);
+    assert_eq!(idx.next_offset, 0);
+}
+
+#[test]
+fn test_cache_index_missing_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("nonexistent.json");
+    let idx = CacheIndex::new(path);
+    assert_eq!(idx.entries.len(), 0);
+}
+
+// =========================================================================
+// Compressed + Encrypted cache tests
+// =========================================================================
+
+#[cfg(feature = "encryption")]
+fn test_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    key
+}
+
+#[cfg(feature = "encryption")]
+fn wrong_key() -> [u8; 32] {
+    [0xFFu8; 32]
+}
+
+#[cfg(feature = "encryption")]
+fn compressed_encrypted_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
+    DiskCache::new_with_compression(
+        dir, 3600, 4, 2, page_size, page_count,
+        Some(test_key()), Vec::new(),
+        true, 3,
+        #[cfg(feature = "zstd")]
+        None,
+    ).expect("compressed+encrypted cache creation failed")
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_encrypted_cache(dir.path(), 64, 16);
+
+    let page_data = vec![0xABu8; 64];
+    cache.write_page(0, &page_data).unwrap();
+    assert!(cache.is_present(0));
+
+    let mut buf = vec![0u8; 64];
+    cache.read_page(0, &mut buf).unwrap();
+    assert_eq!(buf, page_data);
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_bulk_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_encrypted_cache(dir.path(), 64, 16);
+
+    let mut data = Vec::new();
+    for p in 0..4u64 {
+        let page: Vec<u8> = (0..64).map(|i| (p as u8 * 10).wrapping_add(i)).collect();
+        data.extend_from_slice(&page);
+    }
+
+    cache.write_pages_bulk(0, &data, 4).unwrap();
+
+    for p in 0..4u64 {
+        let expected: Vec<u8> = (0..64).map(|i| (p as u8 * 10).wrapping_add(i)).collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(p, &mut buf).unwrap();
+        assert_eq!(buf, expected, "page {} mismatch", p);
+    }
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_scattered_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_encrypted_cache(dir.path(), 64, 16);
+
+    let page_nums = vec![2u64, 7, 13];
+    let mut data = Vec::new();
+    for &pn in &page_nums {
+        let page: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i)).collect();
+        data.extend_from_slice(&page);
+    }
+
+    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+
+    for &pn in &page_nums {
+        let expected: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i)).collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(pn, &mut buf).unwrap();
+        assert_eq!(buf, expected, "page {} mismatch", pn);
+    }
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_data_not_plaintext() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_encrypted_cache(dir.path(), 64, 16);
+
+    let page_data = vec![0xABu8; 64];
+    cache.write_page(0, &page_data).unwrap();
+
+    // Read raw bytes from disk: should NOT match plaintext or compressed plaintext
+    let entry = cache.cache_index.lock().get(0).copied().unwrap();
+    let mut raw = vec![0u8; entry.compressed_len as usize];
+    let file = cache.cache_file.read();
+    file.read_exact_at(&mut raw, entry.offset).unwrap();
+
+    // Raw disk bytes must differ from plaintext
+    assert_ne!(raw, page_data, "encrypted+compressed data must not match plaintext");
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_wrong_key_fails() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_encrypted_cache(dir.path(), 64, 16);
+
+    let page_data = vec![0xAAu8; 64];
+    cache.write_page(0, &page_data).unwrap();
+
+    // Create a new cache with wrong key, same index
+    let bad_cache = DiskCache::new_with_compression(
+        dir.path(), 3600, 4, 2, 64, 16,
+        Some(wrong_key()), Vec::new(),
+        true, 3,
+        #[cfg(feature = "zstd")]
+        None,
+    ).unwrap();
+
+    let mut buf = vec![0u8; 64];
+    // With wrong key, either read fails or returns garbage (CTR mode returns garbage, not error)
+    let result = bad_cache.read_page(0, &mut buf);
+    if result.is_ok() {
+        assert_ne!(buf, page_data, "wrong key must not produce correct plaintext");
+    }
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_compressed_encrypted_persistence_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let key = test_key();
+
+    // Write and persist
+    {
+        let cache = DiskCache::new_with_compression(
+            dir.path(), 3600, 4, 2, 64, 16,
+            Some(key), Vec::new(),
+            true, 3,
+            #[cfg(feature = "zstd")]
+            None,
+        ).unwrap();
+        for p in 0..4u64 {
+            let data: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            cache.write_page(p, &data).unwrap();
+        }
+        cache.persist_bitmap().unwrap();
+    }
+
+    // Reopen with same key and verify
+    {
+        let cache = DiskCache::new_with_compression(
+            dir.path(), 3600, 4, 2, 64, 16,
+            Some(key), Vec::new(),
+            true, 3,
+            #[cfg(feature = "zstd")]
+            None,
+        ).unwrap();
+        for p in 0..4u64 {
+            assert!(cache.is_present(p), "page {} should be present after reopen", p);
+            let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            let mut buf = vec![0u8; 64];
+            cache.read_page(p, &mut buf).unwrap();
+            assert_eq!(buf, expected, "page {} content mismatch after reopen", p);
+        }
+    }
+}
+
+// =========================================================================
+// Prune/clear cache index tests
+// =========================================================================
+
+#[test]
+fn test_prune_cache_index_keeps_specified_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    // Write 4 pages
+    for p in 0..4u64 {
+        let data = vec![p as u8; 64];
+        cache.write_page(p, &data).unwrap();
+    }
+
+    // Prune: keep pages 1 and 3
+    let mut keep = HashSet::new();
+    keep.insert(1u64);
+    keep.insert(3u64);
+    cache.prune_cache_index(&keep);
+
+    assert!(!cache.cache_index.lock().contains(0));
+    assert!(cache.cache_index.lock().contains(1));
+    assert!(!cache.cache_index.lock().contains(2));
+    assert!(cache.cache_index.lock().contains(3));
+}
+
+#[test]
+fn test_clear_cache_index_removes_all() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    for p in 0..4u64 {
+        let data = vec![p as u8; 64];
+        cache.write_page(p, &data).unwrap();
+    }
+
+    cache.clear_cache_index();
+
+    for p in 0..4u64 {
+        assert!(!cache.cache_index.lock().contains(p));
+    }
+    assert_eq!(cache.cache_index.lock().next_offset, 0);
+}
+
+#[test]
+fn test_prune_noop_when_uncompressed() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+
+    // Should not panic or error on uncompressed cache
+    let keep = HashSet::new();
+    cache.prune_cache_index(&keep);
+    cache.clear_cache_index();
+}

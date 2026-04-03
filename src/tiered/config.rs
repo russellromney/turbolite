@@ -1,5 +1,36 @@
 use super::*;
 
+// ===== Storage backend =====
+
+/// Where page groups and manifests are stored.
+/// Local: everything on local disk. No S3, no tokio, no async deps.
+/// S3: cloud-backed with local NVMe cache (requires `cloud` feature).
+#[derive(Debug, Clone)]
+pub enum StorageBackend {
+    /// Local-only mode. Page groups stored at `{cache_dir}/pg/`, manifest at
+    /// `{cache_dir}/manifest.msgpack`. No cloud dependencies.
+    Local,
+    /// S3-backed mode. Local disk is a cache; S3 is the source of truth.
+    /// Requires the `cloud` feature for AWS SDK + tokio.
+    #[cfg(feature = "tiered")]
+    S3 {
+        /// S3 bucket name
+        bucket: String,
+        /// S3 key prefix (e.g., "databases/tenant-123")
+        prefix: String,
+        /// Custom S3 endpoint URL (for MinIO/Tigris)
+        endpoint_url: Option<String>,
+        /// AWS region (default "us-east-1")
+        region: Option<String>,
+    },
+}
+
+impl Default for StorageBackend {
+    fn default() -> Self {
+        StorageBackend::Local
+    }
+}
+
 // ===== Manifest source =====
 
 /// Where to load the manifest on connection open.
@@ -76,13 +107,24 @@ pub enum GroupState {
 
 // ===== Configuration =====
 
-/// Configuration for tiered S3-backed storage.
+/// Configuration for turbolite storage.
+///
+/// Use `storage_backend` to choose Local (default) or S3 mode:
+/// - `StorageBackend::Local`: page groups on local disk, no cloud deps
+/// - `StorageBackend::S3 { .. }`: S3-backed with local cache (requires `cloud` feature)
+///
+/// When `storage_backend` is `S3`, `bucket`/`prefix` are read from the variant.
+/// The top-level `bucket`/`prefix` fields are kept for backward compatibility;
+/// if `storage_backend` is Local and `bucket` is non-empty, the VFS will
+/// auto-upgrade to S3 mode.
 pub struct TieredConfig {
-    /// S3 bucket name
+    /// Storage backend: Local (default) or S3.
+    pub storage_backend: StorageBackend,
+    /// S3 bucket name (legacy; prefer StorageBackend::S3)
     pub bucket: String,
-    /// S3 key prefix (e.g. "databases/tenant-123")
+    /// S3 key prefix (legacy; prefer StorageBackend::S3)
     pub prefix: String,
-    /// Local cache directory
+    /// Local cache/data directory
     pub cache_dir: PathBuf,
     /// Zstd compression level (1-22, default 3)
     pub compression_level: i32,
@@ -172,6 +214,15 @@ pub struct TieredConfig {
     /// hop-schedule guessing. Currently adds overhead without proven latency improvement.
     /// Default: false. Set `TURBOLITE_JENA=true` to enable.
     pub jena_enabled: bool,
+    /// Compress pages in the local disk cache using zstd before writing.
+    /// Saves disk space at the cost of CPU on cache hits (compress on write, decompress on read).
+    /// When combined with encryption_key, order is: compress then encrypt on write,
+    /// decrypt then decompress on read.
+    /// Requires the `zstd` feature. Default: false (uncompressed, zero-CPU cache hits).
+    pub cache_compression: bool,
+    /// Zstd compression level for local cache pages (1-22, default 3).
+    /// Only used when cache_compression is true. Lower = faster, higher = smaller.
+    pub cache_compression_level: i32,
     /// Phase Gallipoli: where to load manifest on connection open.
     /// Auto (default): use local manifest if present, fall back to S3.
     /// S3: always fetch from S3 (for HA followers, multi-reader).
@@ -191,6 +242,7 @@ pub struct TieredConfig {
 impl Default for TieredConfig {
     fn default() -> Self {
         Self {
+            storage_backend: StorageBackend::default(),
             bucket: String::new(),
             prefix: String::new(),
             cache_dir: PathBuf::from("/tmp/sqlces-cache"),
@@ -231,6 +283,13 @@ impl Default for TieredConfig {
             jena_enabled: std::env::var("TURBOLITE_JENA")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),
+            cache_compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            cache_compression_level: std::env::var("TURBOLITE_CACHE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
             manifest_source: std::env::var("TURBOLITE_MANIFEST_SOURCE")
                 .ok()
                 .map(|v| match v.to_lowercase().as_str() {
@@ -248,6 +307,35 @@ impl Default for TieredConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000),
         }
+    }
+}
+
+impl TieredConfig {
+    /// Resolve the effective storage backend.
+    /// If `storage_backend` is explicitly S3, use it.
+    /// If Local but `bucket` is non-empty, auto-upgrade to S3 (backward compat).
+    pub fn effective_backend(&self) -> StorageBackend {
+        match &self.storage_backend {
+            #[cfg(feature = "tiered")]
+            StorageBackend::S3 { .. } => self.storage_backend.clone(),
+            StorageBackend::Local => {
+                #[cfg(feature = "tiered")]
+                if !self.bucket.is_empty() {
+                    return StorageBackend::S3 {
+                        bucket: self.bucket.clone(),
+                        prefix: self.prefix.clone(),
+                        endpoint_url: self.endpoint_url.clone(),
+                        region: self.region.clone(),
+                    };
+                }
+                StorageBackend::Local
+            }
+        }
+    }
+
+    /// Whether the effective backend is local-only (no S3).
+    pub fn is_local(&self) -> bool {
+        matches!(self.effective_backend(), StorageBackend::Local)
     }
 }
 

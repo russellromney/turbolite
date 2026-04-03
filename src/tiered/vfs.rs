@@ -18,9 +18,13 @@ use super::*;
 /// turbolite::tiered::register("tiered", vfs).unwrap();
 /// ```
 pub struct TieredVfs {
-    s3: Arc<S3Client>,
+    /// Unified storage client: Local (filesystem) or S3.
+    pub(crate) storage: StorageClient,
+    /// S3 client (only set in cloud mode). Kept separate because PrefetchPool
+    /// and flush_to_s3 need Arc<S3Client> directly.
+    s3: Option<Arc<S3Client>>,
     cache: Arc<DiskCache>,
-    prefetch_pool: Arc<PrefetchPool>,
+    prefetch_pool: Option<Arc<PrefetchPool>>,
     /// Shared page_count for prefetch workers (kept alive by PrefetchPool workers).
     #[allow(dead_code)]
     page_count: Arc<AtomicU64>,
@@ -50,12 +54,91 @@ pub struct TieredVfs {
     #[cfg(feature = "wal")]
     wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
     /// Tokio runtime handle for spawning WAL replication background task.
-    runtime_handle: tokio::runtime::Handle,
+    /// None in local-only mode (no tokio dependency).
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl TieredVfs {
-    /// Create a new tiered VFS.
+    /// Create a new VFS. Dispatches to local or cloud construction based on config.
     pub fn new(config: TieredConfig) -> io::Result<Self> {
+        match config.effective_backend() {
+            StorageBackend::Local => Self::new_local(config),
+            #[cfg(feature = "tiered")]
+            StorageBackend::S3 { .. } => Self::new_cloud(config),
+        }
+    }
+
+    /// Construct a local-only VFS. No S3, no tokio, no async.
+    /// Page groups and manifest stored at `{cache_dir}/`.
+    fn new_local(mut config: TieredConfig) -> io::Result<Self> {
+        // Local mode always uses LocalThenFlush (no S3 to upload to)
+        config.sync_mode = SyncMode::LocalThenFlush;
+        let storage = StorageClient::local(config.cache_dir.clone())?;
+
+        // Load manifest from local disk (or empty for new database)
+        let (mut manifest, recovered_dirty_groups) = match storage.get_manifest()? {
+            Some(m) => {
+                eprintln!(
+                    "[local] loaded manifest (v{}, {} pages)",
+                    m.version, m.page_count,
+                );
+                (m, Vec::new())
+            }
+            None => {
+                eprintln!("[local] no manifest found, starting empty database");
+                (Manifest::empty(), Vec::new())
+            }
+        };
+        manifest.detect_and_normalize_strategy();
+
+        let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let ppg = if manifest.pages_per_group > 0 { manifest.pages_per_group } else { config.pages_per_group };
+
+        let cache = DiskCache::new_with_compression(
+            &config.cache_dir, config.cache_ttl_secs, ppg, config.sub_pages_per_frame,
+            page_size, manifest.page_count, config.encryption_key,
+            manifest.group_pages.clone(),
+            config.cache_compression, config.cache_compression_level,
+            #[cfg(feature = "zstd")]
+            config.dictionary.clone(),
+        )?;
+        let manifest_groups = manifest.total_groups() as usize;
+        cache.ensure_group_capacity(manifest_groups);
+        let cache = Arc::new(cache);
+        let page_count = Arc::new(AtomicU64::new(manifest.page_count));
+
+        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
+        let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
+
+        // Phase Kursk: recover staging logs
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
+        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
+
+        Ok(Self {
+            storage,
+            s3: None,
+            cache,
+            prefetch_pool: None,
+            page_count,
+            config,
+            _runtime: None,
+            shared_manifest,
+            shared_dirty_groups,
+            pending_flushes,
+            staging_seq,
+            flush_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "wal")]
+            wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
+            runtime_handle: None,
+        })
+    }
+
+    /// Construct a cloud (S3-backed) VFS. Requires tokio runtime.
+    fn new_cloud(config: TieredConfig) -> io::Result<Self> {
         let (runtime_handle, owned_runtime) =
             if let Some(ref handle) = config.runtime_handle {
                 (handle.clone(), None)
@@ -77,9 +160,6 @@ impl TieredVfs {
         eprintln!("[tiered] S3 client created, fetching manifest...");
 
         // Phase Gallipoli: try local manifest first for cache initialization.
-        // This is critical for crash recovery: if the process died after a local
-        // checkpoint but before flush_to_s3, the S3 manifest is stale/empty but
-        // the local manifest has the correct page_count and group layout.
         let (mut manifest, recovered_dirty_groups) = match manifest::LocalManifest::load(&config.cache_dir) {
             Ok(Some(local)) => {
                 eprintln!(
@@ -95,34 +175,22 @@ impl TieredVfs {
         };
         manifest.detect_and_normalize_strategy();
         eprintln!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
-        let page_size = if manifest.page_size > 0 {
-            manifest.page_size
-        } else {
-            4096 // default for new databases
-        };
-        let ppg = if manifest.pages_per_group > 0 {
-            manifest.pages_per_group
-        } else {
-            config.pages_per_group
-        };
+        let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let ppg = if manifest.pages_per_group > 0 { manifest.pages_per_group } else { config.pages_per_group };
 
-        let cache = DiskCache::new(
-            &config.cache_dir,
-            config.cache_ttl_secs,
-            ppg,
-            config.sub_pages_per_frame,
-            page_size,
-            manifest.page_count,
-            config.encryption_key,
+        let cache = DiskCache::new_with_compression(
+            &config.cache_dir, config.cache_ttl_secs, ppg, config.sub_pages_per_frame,
+            page_size, manifest.page_count, config.encryption_key,
             manifest.group_pages.clone(),
+            config.cache_compression, config.cache_compression_level,
+            #[cfg(feature = "zstd")]
+            config.dictionary.clone(),
         )?;
-
-        // B-tree-aware groups may exceed the positional group count formula.
-        // Ensure group_states can track all manifest groups.
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
 
         let s3 = Arc::new(s3);
+        let storage = StorageClient::s3(Arc::clone(&s3));
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
@@ -137,9 +205,7 @@ impl TieredVfs {
             config.encryption_key,
         ));
 
-        // Shared state for two-phase checkpoint (flush_to_s3)
         let shared_manifest = Arc::new(RwLock::new(manifest));
-        // Phase Gallipoli: recover dirty groups from local manifest
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         if !initial_dirty.is_empty() {
             eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
@@ -147,24 +213,21 @@ impl TieredVfs {
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
 
-        // Phase Kursk: recover staging logs from interrupted flushes
+        // Phase Kursk: recover staging logs
         let staging_dir = config.cache_dir.join("staging");
         let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
         if !recovered_staging.is_empty() {
-            eprintln!(
-                "[tiered] recovered {} staging logs from interrupted flush",
-                recovered_staging.len(),
-            );
+            eprintln!("[tiered] recovered {} staging logs from interrupted flush", recovered_staging.len());
         }
-        // Staging seq starts above any recovered log version to avoid filename collisions
         let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
         let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
         let pending_flushes = Arc::new(Mutex::new(recovered_staging));
 
         let vfs = Self {
-            s3,
+            storage,
+            s3: Some(s3),
             cache,
-            prefetch_pool,
+            prefetch_pool: Some(prefetch_pool),
             page_count,
             config,
             _runtime: owned_runtime,
@@ -175,33 +238,32 @@ impl TieredVfs {
             flush_lock,
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
-            runtime_handle,
+            runtime_handle: Some(runtime_handle),
         };
 
         // Phase Somme: WAL recovery on cold start
         #[cfg(feature = "wal")]
         if vfs.config.wal_replication {
-            // Phase Borodino: use change_counter (not version) for WAL replay cutoff.
-            // change_counter = SQLite file change counter at checkpoint time.
-            // WAL segments with txid > change_counter are not yet in the page groups.
             let manifest_cc = vfs.shared_manifest.read().change_counter;
             if manifest_cc > 0 {
-                let wal_prefix = format!("{}/wal/", vfs.config.prefix);
-                let shared = vfs.shared_state();
-                match wal_replication::recover_wal_from_shared_state(
-                    &shared,
-                    &vfs.cache,
-                    manifest_cc,
-                    vfs.shared_manifest.read().page_size,
-                    &wal_prefix,
-                    &vfs.config.bucket,
-                    vfs.config.endpoint_url.as_deref(),
-                    &vfs.runtime_handle,
-                    &vfs.config.cache_dir,
-                ) {
-                    Ok(0) => eprintln!("[tiered] WAL recovery: no WAL segments to replay"),
-                    Ok(n) => eprintln!("[tiered] WAL recovery: loaded {} pages from WAL", n),
-                    Err(e) => eprintln!("[tiered] WARNING: WAL recovery failed: {}", e),
+                if let Some(ref rt) = vfs.runtime_handle {
+                    let wal_prefix = format!("{}/wal/", vfs.config.prefix);
+                    let shared = vfs.shared_state();
+                    match wal_replication::recover_wal_from_shared_state(
+                        &shared,
+                        &vfs.cache,
+                        manifest_cc,
+                        vfs.shared_manifest.read().page_size,
+                        &wal_prefix,
+                        &vfs.config.bucket,
+                        vfs.config.endpoint_url.as_deref(),
+                        rt,
+                        &vfs.config.cache_dir,
+                    ) {
+                        Ok(0) => eprintln!("[tiered] WAL recovery: no WAL segments to replay"),
+                        Ok(n) => eprintln!("[tiered] WAL recovery: loaded {} pages from WAL", n),
+                        Err(e) => eprintln!("[tiered] WARNING: WAL recovery failed: {}", e),
+                    }
                 }
             }
         }
@@ -235,15 +297,15 @@ impl TieredVfs {
                     m.build_page_index();
                     return Ok((m, dirty));
                 }
-                // Fall back to S3
-                eprintln!("[tiered] no local manifest, fetching from S3...");
-                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
-                eprintln!("[tiered] manifest fetched from S3 (v{}, {} pages)", m.version, m.page_count);
+                // Fall back to storage (S3 or local)
+                eprintln!("[tiered] no local manifest, fetching from storage...");
+                let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
                 Ok((m, Vec::new()))
             }
             ManifestSource::S3 => {
-                eprintln!("[tiered] fetching manifest from S3 (manifest_source=S3)...");
-                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] fetching manifest from storage (manifest_source=S3)...");
+                let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
                 eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
                 Ok((m, Vec::new()))
             }
@@ -252,11 +314,12 @@ impl TieredVfs {
 
     /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
+    /// Panics if called in local-only mode (no S3 client).
     pub fn shared_state(&self) -> TieredSharedState {
         TieredSharedState {
-            s3: Arc::clone(&self.s3),
+            s3: self.s3.as_ref().expect("shared_state requires S3 backend").clone(),
             cache: Arc::clone(&self.cache),
-            prefetch_pool: Arc::clone(&self.prefetch_pool),
+            prefetch_pool: self.prefetch_pool.as_ref().expect("shared_state requires prefetch pool").clone(),
             shared_manifest: Arc::clone(&self.shared_manifest),
             shared_dirty_groups: Arc::clone(&self.shared_dirty_groups),
             pending_flushes: Arc::clone(&self.pending_flushes),
@@ -276,7 +339,9 @@ impl TieredVfs {
     /// Safe to call with pending flush: groups awaiting S3 upload are protected
     /// (their pages remain in the disk cache bitmap).
     pub fn clear_cache(&self) {
-        self.prefetch_pool.wait_idle();
+        if let Some(ref pool) = self.prefetch_pool {
+            pool.wait_idle();
+        }
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
         let pending_groups = self.pending_group_pages();
@@ -301,31 +366,43 @@ impl TieredVfs {
             let gp = self.cache.group_pages.read();
             let mut bitmap = self.cache.bitmap.lock();
             bitmap.bits.fill(0);
+
+            // Collect pages to keep
+            let mut keep_pages: HashSet<u64> = HashSet::new();
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
+                keep_pages.insert(page);
             }
             for &page in &index_pages {
                 bitmap.mark_present(page);
+                keep_pages.insert(page);
             }
             // Protect pending flush pages
             for pages in pending_groups.values() {
                 for &p in pages {
                     bitmap.mark_present(p);
+                    keep_pages.insert(p);
                 }
             }
             if let Some(g0_pages) = gp.first() {
                 // BTreeAware: explicit page list
                 for &p in g0_pages {
                     bitmap.mark_present(p);
+                    keep_pages.insert(p);
                 }
             } else {
                 // Positional: group 0 = pages 0..ppg
                 let ppg = self.cache.pages_per_group as u64;
                 for p in 0..ppg {
                     bitmap.mark_present(p);
+                    keep_pages.insert(p);
                 }
             }
             let _ = bitmap.persist();
+
+            // Prune compressed cache index: remove entries for evicted pages
+            drop(bitmap);
+            self.cache.prune_cache_index(&keep_pages);
         }
 
         // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
@@ -358,9 +435,12 @@ impl TieredVfs {
     ///
     /// After flush_to_s3() completes, data is durable on S3.
     pub fn flush_to_s3(&self) -> io::Result<()> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "flush_to_s3 requires S3 backend")
+        })?;
         let _guard = self.flush_lock.lock().unwrap();
         flush::flush_dirty_groups_to_s3(
-            &self.s3,
+            s3,
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
@@ -396,18 +476,28 @@ impl TieredVfs {
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
+    /// Returns (0, 0) in local-only mode.
     pub fn reset_s3_counters(&self) -> (u64, u64) {
-        let count = self.s3.fetch_count.swap(0, Ordering::Relaxed);
-        let bytes = self.s3.fetch_bytes.swap(0, Ordering::Relaxed);
-        (count, bytes)
+        match &self.s3 {
+            Some(s3) => {
+                let count = s3.fetch_count.swap(0, Ordering::Relaxed);
+                let bytes = s3.fetch_bytes.swap(0, Ordering::Relaxed);
+                (count, bytes)
+            }
+            None => (0, 0),
+        }
     }
 
     /// Read current S3 I/O counters without resetting.
+    /// Returns (0, 0) in local-only mode.
     pub fn s3_counters(&self) -> (u64, u64) {
-        (
-            self.s3.fetch_count.load(Ordering::Relaxed),
-            self.s3.fetch_bytes.load(Ordering::Relaxed),
-        )
+        match &self.s3 {
+            Some(s3) => (
+                s3.fetch_count.load(Ordering::Relaxed),
+                s3.fetch_bytes.load(Ordering::Relaxed),
+            ),
+            None => (0, 0),
+        }
     }
 
     /// Garbage collect orphaned S3 objects not referenced by the current manifest.
@@ -415,14 +505,17 @@ impl TieredVfs {
     /// deletes unreferenced page groups and interior chunks.
     /// Returns the number of objects deleted.
     pub fn gc(&self) -> io::Result<usize> {
-        let manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
-        let all_keys = self.s3.list_all_keys()?;
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "gc requires S3 backend")
+        })?;
+        let manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        let all_keys = s3.list_all_keys()?;
 
         // Build set of live keys from manifest
         let mut live_keys: HashSet<String> = HashSet::new();
         // Phase Thermopylae: msgpack manifest is the live one.
         // Old manifest.json is an orphan and will be GC'd.
-        live_keys.insert(self.s3.manifest_key_msgpack());
+        live_keys.insert(s3.manifest_key_msgpack());
         for key in &manifest.page_group_keys {
             if !key.is_empty() {
                 live_keys.insert(key.clone());
@@ -444,7 +537,7 @@ impl TieredVfs {
         let count = orphans.len();
         if count > 0 {
             eprintln!("[gc] deleting {} orphaned S3 objects...", count);
-            self.s3.delete_objects(&orphans)?;
+            s3.delete_objects(&orphans)?;
             eprintln!("[gc] deleted {} orphaned objects", count);
         }
         Ok(count)
@@ -452,7 +545,9 @@ impl TieredVfs {
 
     /// Helper to destroy all S3 data for a prefix.
     pub fn destroy_s3(&self) -> io::Result<()> {
-        let s3 = &self.s3;
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "destroy_s3 requires S3 backend")
+        })?;
         S3Client::block_on(&s3.runtime, async {
             let mut continuation_token: Option<String> = None;
             loop {
@@ -603,7 +698,7 @@ impl Vfs for TieredVfs {
             }
 
             Ok(TieredHandle::new_tiered(
-                Arc::clone(&self.s3),
+                self.s3.clone(),
                 Arc::clone(&self.cache),
                 Arc::clone(&self.shared_manifest),
                 Arc::clone(&self.shared_dirty_groups),
@@ -616,7 +711,7 @@ impl Vfs for TieredVfs {
                 self.config.sync_mode,
                 self.config.prefetch_search.clone(),
                 self.config.prefetch_lookup.clone(),
-                Some(Arc::clone(&self.prefetch_pool)),
+                self.prefetch_pool.as_ref().map(Arc::clone),
                 self.config.gc_enabled,
                 self.config.eager_index_load,
                 #[cfg(feature = "zstd")]
@@ -660,7 +755,7 @@ impl Vfs for TieredVfs {
             return Ok(false);
         }
 
-        Ok(self.s3.get_manifest()?.is_some())
+        Ok(self.storage.exists()?)
     }
 
     fn temporary_name(&self) -> String {
@@ -684,3 +779,7 @@ impl Vfs for TieredVfs {
         duration
     }
 }
+
+#[cfg(test)]
+#[path = "test_local_vfs.rs"]
+mod local_vfs_tests;

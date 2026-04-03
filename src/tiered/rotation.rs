@@ -27,6 +27,12 @@ pub fn rotate_encryption_key(
     config: &TieredConfig,
     new_key: Option<[u8; 32]>,
 ) -> io::Result<()> {
+    if config.is_local() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "key rotation requires S3 backend (re-encrypts S3 objects in place)",
+        ));
+    }
     let old_key = config.encryption_key;
 
     if old_key.is_none() && new_key.is_none() {
@@ -315,6 +321,7 @@ pub fn rotate_encryption_key(
     let _ = std::fs::remove_file(config.cache_dir.join("data.cache"));
     let _ = std::fs::remove_file(config.cache_dir.join("sub_chunk_tracker"));
     let _ = std::fs::remove_file(config.cache_dir.join("page_bitmap"));
+    let _ = std::fs::remove_file(config.cache_dir.join("cache_index.json"));
     eprintln!("[rotate] cleared local cache");
 
     eprintln!("[rotate] {} complete", mode);
