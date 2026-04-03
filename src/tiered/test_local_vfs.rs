@@ -149,6 +149,7 @@ fn test_local_vfs_schema_changes() {
 }
 
 /// Local VFS gc() and flush_to_s3() return appropriate errors.
+#[cfg(feature = "cloud")]
 #[test]
 fn test_local_vfs_cloud_methods_error() {
     let dir = TempDir::new().unwrap();

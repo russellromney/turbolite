@@ -1,38 +1,48 @@
-//! S3-backed page-group tiered storage VFS.
+//! Turbolite VFS: compressed + encrypted SQLite storage.
 //!
-//! Architecture:
-//! - S3/Tigris is the source of truth for all pages
-//! - Local NVMe disk is a page-level cache (uncompressed, direct pread)
-//! - Writes go through WAL (local, fast), checkpoint flushes dirty pages to S3 as page groups
-//! - Any instance with the VFS + S3 credentials can read the database
+//! Two storage modes, same on-disk format:
+//!
+//! - **Local** (default): page groups stored at `{cache_dir}/pg/`, manifest at
+//!   `{cache_dir}/manifest.msgpack`. No S3, no tokio, no async deps.
+//!   Enable with `StorageBackend::Local` (the default).
+//!
+//! - **Cloud** (S3-backed): S3 is the source of truth, local NVMe disk is a
+//!   page-level cache. Requires the `cloud` feature for AWS SDK + tokio.
+//!   Enable with `StorageBackend::S3 { bucket, prefix, .. }`.
+//!
+//! # Quick start (local mode)
+//!
+//! ```ignore
+//! use turbolite::tiered::{TieredVfs, TieredConfig, StorageBackend};
+//!
+//! let config = TieredConfig {
+//!     storage_backend: StorageBackend::Local,
+//!     cache_dir: "/data/mydb".into(),
+//!     ..Default::default()
+//! };
+//! let vfs = TieredVfs::new(config)?;
+//! turbolite::tiered::register("mydb", vfs)?;
+//! // Now open with rusqlite: "file:test.db?vfs=mydb"
+//! ```
+//!
+//! # Architecture
+//!
+//! Both modes use the same format: a manifest tracks page-to-group assignments,
+//! and page groups are compressed blobs containing multiple pages. Switching from
+//! local to cloud is a config change (same files, same manifest).
+//!
 //! - Default: 64KB pages, 256 pages per group (16MB uncompressed, ~8MB compressed)
-//! - Sub-chunk caching: the unit of S3 cost is the sub-chunk (4 pages = 256KB), not the page.
-//!   Cache tracking, eviction, and fetch all operate at sub-chunk granularity.
+//! - Optional zstd compression with dictionary support (2-5x smaller on structured data)
+//! - Optional AES-256 encryption (CTR for cache, GCM for cloud page groups)
+//! - Optional compressed local cache (saves disk space, costs CPU on read)
 //!
-//! S3 layout:
-//! ```text
-//! s3://{bucket}/{prefix}/
-//! ├── manifest.json       # version, page_count, page_size, pages_per_group, page_group_keys
-//! └── pg/
-//!     ├── 0_v1            # Page group 0, manifest version 1 (pages 0-255)
-//!     ├── 1_v1            # Page group 1 (pages 256-511)
-//!     └── 0_v2            # Page group 0 updated at version 2
-//! ```
+//! Cloud mode adds:
+//! - Prefetch thread pool for parallel S3 range GETs
+//! - Sub-chunk caching (fetch 256KB instead of full 16MB group for point lookups)
+//! - Interior/index bundle eager loading on connection open
+//! - Two-phase checkpoint (local-then-flush) for low-latency writes
 //!
-//! Local cache (single file, uncompressed):
-//! ```text
-//! [page 0 @ offset 0] [page 1 @ offset 65536] ... [page N @ offset N*65536]
-//! ```
-//! Cache hits are a single pread() with zero CPU overhead (no decompression).
-//!
-//! Sub-chunk tracker (in-memory, per sub-chunk):
-//! Tracks which sub-chunks are present in the local cache file.
-//! Eviction operates on sub-chunks with tiered priority:
-//!   Tier 0 (pinned): interior page sub-chunks — never evicted
-//!   Tier 1 (high):   index leaf sub-chunks — evicted last
-//!   Tier 2 (normal): data sub-chunks — standard LRU
-//!
-//! Interior B-tree pages (type bytes 0x05, 0x02) are pinned permanently — never evicted.
+//! Interior B-tree pages (type bytes 0x05, 0x02) are pinned permanently -- never evicted.
 //! They represent <1% of the database but are hit on every query.
 
 use std::collections::{HashMap, HashSet};
@@ -40,6 +50,7 @@ use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "cloud")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +58,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
+#[cfg(feature = "cloud")]
 use tokio::runtime::Handle as TokioHandle;
 
 use crate::compress;
@@ -54,7 +66,8 @@ use crate::compress;
 // Re-use the FileWalIndex from the main lib
 use crate::FileWalIndex;
 
-// --- Extracted submodules (Phase Tannenberg) ---
+// --- Extracted submodules ---
+#[cfg(feature = "cloud")]
 mod bench;
 mod cache_tracking;
 mod compact;
@@ -63,6 +76,7 @@ mod disk_cache;
 mod encoding;
 mod flush;
 mod handle;
+#[cfg(feature = "cloud")]
 mod import;
 mod interior_map;
 mod leaf_chaser;
@@ -83,9 +97,11 @@ mod vfs;
 mod wal_replication;
 
 // Public API (visible outside the crate)
+#[cfg(feature = "cloud")]
 pub use bench::TieredSharedState;
 pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
+#[cfg(feature = "cloud")]
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
 pub use vfs::TieredVfs;
@@ -143,6 +159,8 @@ pub fn is_local_checkpoint_only() -> bool {
 
 /// Check if a manifest exists at the given S3 prefix. Returns the manifest if found.
 /// Useful for checking whether data has already been imported before re-importing.
+/// Requires the `cloud` feature (creates S3Client + tokio runtime).
+#[cfg(feature = "cloud")]
 pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -155,7 +173,7 @@ pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> 
         runtime_handle: Some(handle.clone()),
         ..Default::default()
     };
-    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
+    let s3 = s3_client::S3Client::block_on(&handle, s3_client::S3Client::new_async(&s3_cfg))?;
     s3.get_manifest()
 }
 

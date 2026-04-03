@@ -198,7 +198,7 @@ pub extern "C" fn turbolite_register_encrypted(
 ///
 /// # Returns
 /// 0 on success, -1 on error.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_register_tiered(
     name: *const c_char,

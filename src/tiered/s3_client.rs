@@ -1,7 +1,16 @@
+// When cloud feature is disabled, S3Client is a zero-size type that can never
+// be constructed. The type exists so Option<Arc<S3Client>> compiles everywhere.
+#[cfg(not(feature = "cloud"))]
+pub(crate) struct S3Client {
+    _private: (),  // prevent construction
+}
+
+#[cfg(feature = "cloud")]
 use super::*;
 
 // ===== S3Client (sync wrapper around async SDK) =====
 
+#[cfg(feature = "cloud")]
 /// Synchronous S3 client wrapping the async AWS SDK.
 pub(crate) struct S3Client {
     pub(crate) client: aws_sdk_s3::Client,
@@ -18,6 +27,7 @@ pub(crate) struct S3Client {
     pub(crate) put_bytes: AtomicU64,
 }
 
+#[cfg(feature = "cloud")]
 impl S3Client {
     /// Create a new S3 client.
     pub(crate) async fn new_async(config: &TieredConfig) -> io::Result<Self> {
@@ -549,6 +559,7 @@ impl S3Client {
     }
 }
 
+#[cfg(feature = "cloud")]
 /// Check if an S3 error is a 404 / NoSuchKey.
 pub(crate) fn is_not_found<E: std::fmt::Display + std::fmt::Debug>(
     err: &aws_sdk_s3::error::SdkError<E>,

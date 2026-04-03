@@ -19,6 +19,7 @@ use super::*;
 /// # Safety contract
 /// - Must NOT be called concurrently with itself (caller holds flush_lock).
 /// - Staging log files must exist for all pending flushes.
+#[cfg(feature = "cloud")]
 pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
@@ -72,6 +73,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 }
 
 /// Inner flush logic. Separated so the outer function can restore state on error.
+#[cfg(feature = "cloud")]
 fn flush_inner(
     s3: &S3Client,
     cache: &DiskCache,

@@ -219,6 +219,242 @@ These are independent concerns. One number can't serve both.
 
 ---
 
+## Phase Drift: Subframe Overrides (Write Amplification Reduction)
+> After: Borodino . Before: Stalingrad
+
+Instead of rewriting an entire page group (~16MB) when a few pages change, upload only the dirty frame (~256KB) as an independent S3 object. The manifest tracks which frames are overridden per group. Readers fetch override frames from their own keys, all other frames from the base group via range GET. Background compaction merges overrides back into a fresh base group.
+
+### Why
+
+Today, a single dirty page triggers a full page group rewrite: fetch the group (or merge from cache + S3), re-encode all frames, upload ~16MB. For the Shared mode use case (ephemeral compute, small infrequent writes), this is the dominant cost. A 4KB page change causes 16MB of write amplification.
+
+Subframe overrides reduce checkpoint cost from O(group_size) to O(frame_size). A typical write touching one frame is a ~256KB upload instead of ~16MB. That's a ~64x write amplification reduction.
+
+### Manifest changes
+
+Add per-group override map to the manifest:
+
+```rust
+// Existing manifest fields per group:
+//   page_group_keys: Vec<String>       // S3 keys for base groups
+//   frame_tables: Vec<Vec<FrameEntry>> // seek offsets per frame
+
+// New field:
+pub subframe_overrides: Vec<HashMap<usize, SubframeOverride>>,
+// subframe_overrides[group_id][frame_index] -> override info
+
+pub struct SubframeOverride {
+    pub key: String,          // S3 key: "pg/{gid}_f{frame_idx}_v{version}"
+    pub entry: FrameEntry,    // offset=0, length=full object (single frame)
+}
+```
+
+When `subframe_overrides[gid]` is empty, all frames come from the base group (current behavior). When a frame index has an override, readers fetch that frame from the override key instead of range GETing the base group.
+
+### Write path (checkpoint with overrides)
+
+During `flush_to_s3()` (or durable `sync()`), for each dirty group:
+
+1. Identify dirty frames (from dirty page set + frame table mapping)
+2. For each dirty frame:
+   a. Encode the frame (compress ~256KB, optionally encrypt)
+   b. Upload as `pg/{gid}_f{frame_idx}_v{version}` (~256KB PUT)
+3. Add override entries to manifest
+4. Publish manifest (base group key unchanged, overrides added)
+5. Base group is NOT re-uploaded
+
+**Decision: override vs rewrite.** If more than N frames in a group are dirty (e.g., > 25% of frames), rewrite the full group instead. The crossover point is when N individual frame uploads cost more than one group upload. With ~64 frames per group, the threshold is roughly 16 dirty frames.
+
+### Read path
+
+In `read_exact_at()`, when resolving a page to a frame:
+
+1. Look up group_id and frame_index for the page (existing logic)
+2. Check `subframe_overrides[group_id]` for frame_index
+3. If override exists: fetch from override key (full object GET, ~256KB)
+4. If no override: range GET from base group (existing logic)
+
+Prefetch pool handles overrides the same way: when prefetching a group, check for overrides per frame, fetch from the right source.
+
+### Compaction
+
+Overrides accumulate. When a group has too many overrides, compact: merge all overrides into a fresh base group.
+
+```
+Manifest v42: group_3 has 1 override  (1 extra S3 object)
+Manifest v53: group_3 has 12 overrides (12 extra S3 objects)
+Manifest v54: group_3 compacted
+  -> fresh base group uploaded as pg/3_v54
+  -> all 12 override objects deleted (GC)
+  -> subframe_overrides[3] cleared
+```
+
+**Compaction trigger:** `overrides.len() > frames_per_group / 4` or total override size > half the base group size. Compaction runs during checkpoint when the threshold is exceeded, or via explicit `turbolite_compact()`.
+
+**Compaction is not on the critical write path.** A write that triggers compaction can defer it: upload the override now, compact on the next checkpoint or in a background task. For Shared mode (ephemeral compute), the node doing the next write can compact opportunistically.
+
+### GC
+
+Override objects are deleted when:
+- Compaction merges them into a new base group
+- The base group is rewritten (normal full-group checkpoint)
+- The group is deleted (database shrink / VACUUM)
+
+Old override keys are collected alongside old base group keys in the existing GC pass.
+
+### Phases
+
+**Drift-a: Manifest + override tracking**
+- Add `subframe_overrides` field to `Manifest` (serde, default empty vecs for backward compat)
+- Add `SubframeOverride` struct
+- `dirty_frames_for_group(dirty_pages, frame_table) -> Vec<usize>`: map dirty pages to frame indices
+- Tests: manifest round-trip with overrides, empty overrides == current behavior, dirty frame mapping correct
+
+**Drift-b: Override write path**
+- In `flush_to_s3()`: detect when a group has few dirty frames (below threshold)
+- Upload individual frames as override objects instead of rewriting the group
+- Update manifest with override entries
+- Threshold config: `override_threshold` (default: frames_per_group / 4)
+- Tests: single dirty page -> one override uploaded (not full group), many dirty pages -> full group rewrite, override S3 key format correct, manifest has override entry after flush
+
+**Drift-c: Override read path**
+- In `read_exact_at()`: check override map before range GET
+- Prefetch pool: fetch overrides from correct keys
+- Disk cache: pages from overrides cached the same as pages from base groups
+- Tests: write + checkpoint with override, cold read fetches from override key, warm read serves from cache, prefetch handles mixed override + base frames
+
+**Drift-d: Compaction**
+- Detect when override count exceeds threshold
+- Merge: fetch base group + all override frames, re-encode as single group, upload, clear overrides
+- GC old override objects after compaction
+- `turbolite_compact()` forces compaction of all groups with overrides
+- Tests: accumulate overrides past threshold, compaction produces correct merged group, override objects deleted after compaction, cold read after compaction works, compaction during Shared mode write
+
+**Drift-e: Integration with Shared mode (haqlite Phase Crest)**
+- Shared mode checkpoint defaults to override mode (optimize for small writes)
+- Compaction runs opportunistically when a Shared mode node acquires the lease and has time
+- Tests: two Shared mode writers, each produces overrides, both readable by the other after manifest poll
+
+---
+
+## Phase Zenith: S3-Primary Mode (Local as Cache Only)
+> After: Drift . Before: Stalingrad
+> Depends on: Phase Drift (subframe overrides)
+
+The endgame. S3 is the database. Local disk is a disposable read cache. Every committed transaction is immediately durable in S3 via subframe override uploads + manifest publish. No WAL, no journal, no checkpoint-as-replication-step. The manifest publish IS the atomic commit.
+
+### Why
+
+Today, turbolite treats local disk as the source of truth and S3 as a replication target. Checkpoint copies local state to S3. This works for persistent processes but breaks the model for ephemeral compute: if the process dies between writes and checkpoint, uncommitted-to-S3 data is lost with the local disk.
+
+In S3-primary mode, every committed transaction is immediately in S3. Local disk is warm cache that accelerates reads but holds no unique state. Process dies? Manifest + S3 has everything. Next process opens from manifest, lazy-fetches pages, continues.
+
+Combined with Phase Drift (subframe overrides), the per-transaction S3 cost is small: upload ~256KB per dirty frame, publish ~few KB manifest. For the Shared mode use case (Lambda, scale-to-zero), this gives true durability without persistent infrastructure.
+
+### How it works
+
+**New SyncMode:**
+
+```rust
+pub enum SyncMode {
+    Durable,          // existing: S3 upload during checkpoint lock
+    LocalThenFlush,   // existing: staging log, deferred S3 upload
+    S3Primary,        // new: every sync uploads dirty frames + publishes manifest
+}
+```
+
+**Write path (S3Primary):**
+
+1. `write_all_at(offset, data)`: write to local cache, mark page dirty. Same as today. No S3 call.
+2. SQLite executes the full transaction locally (multiple write_all_at calls). Pages accumulate in the dirty set.
+3. `xSync()` (SQLite transaction commit): triggers S3 upload.
+   a. Collect dirty pages, map to dirty frames
+   b. Encode each dirty frame (~256KB compressed)
+   c. Upload as subframe overrides (parallel PUTs)
+   d. Publish manifest with new overrides (CAS on version)
+   e. Clear dirty set
+   f. Persist local manifest copy (for cache validation on next open)
+
+**Read path:** Unchanged. `read_exact_at()` reads from local cache, falls back to S3 on miss. Override-aware (Phase Drift).
+
+**Journal mode:** `journal_mode=OFF` or `journal_mode=MEMORY`. No rollback journal, no WAL. SQLite writes directly to pages. Transaction atomicity is provided by the manifest: either the manifest is published (committed) or it's not (aborted/crashed). The local file may have partial writes from a crashed transaction, but it's disposable cache.
+
+**Why journal_mode=OFF is safe:** If a transaction fails (constraint violation, disk error), the dirty pages in local cache are invalid. But they were never uploaded to S3 and the manifest was never published. On next open, local manifest version doesn't match S3 (or is the same pre-transaction version), so the cache is valid minus the dirty pages (which get evicted or overwritten by lazy-fetch from S3 on next read).
+
+If the process crashes mid-transaction (after some write_all_at calls, before xSync): same situation. Dirty pages in cache are garbage, but S3+manifest is clean. Next open invalidates stale cache entries.
+
+### Cache validation on open
+
+1. Fetch manifest from ManifestStore (or S3)
+2. Compare with locally persisted manifest version
+3. Match: cache is warm and valid. Proceed.
+4. S3 newer: other writers committed since last open. Invalidate cache entries for changed groups (diff page_group_keys + subframe_overrides between local and S3 manifest). Lazy-fetch on demand.
+5. Local "newer" (crash during write, manifest never published): discard local manifest, use S3 manifest, invalidate entire cache. Lazy-fetch everything.
+
+Optimization: rather than invalidating the entire cache on version mismatch, diff the manifests to find which groups/frames changed and only invalidate those cache pages. Most of the cache is still warm.
+
+### Interaction with WAL mode
+
+S3Primary mode is incompatible with WAL mode. WAL mode has SQLite maintaining a separate WAL file with its own lifecycle (readers, checkpoints, WAL index). S3Primary's model (every xSync goes to S3, no local journaling) conflicts with WAL's assumptions.
+
+Require `journal_mode=OFF` (or MEMORY) when S3Primary is configured. Error on open if the database is in WAL mode: "S3Primary mode requires journal_mode=OFF. Run PRAGMA journal_mode=OFF before enabling."
+
+For databases migrating from Durable/LocalThenFlush (WAL mode) to S3Primary: one-time migration that checkpoints the WAL, switches journal mode, then enables S3Primary.
+
+### Latency characteristics
+
+Per-transaction commit overhead:
+- Encode dirty frames: ~1-5ms (CPU, zstd compression)
+- Upload overrides: ~20-50ms (S3, parallel PUTs for multiple frames)
+- Publish manifest: ~2-5ms (NATS) / ~20-50ms (S3)
+- **Total per commit: ~25-60ms (NATS manifest) / ~40-100ms (S3 manifest)**
+
+This is the cost of S3 durability per transaction. Acceptable for the Shared mode / ephemeral compute use case (writes every few seconds). Not suitable for high-throughput OLTP (use Durable or LocalThenFlush for that).
+
+Read latency: unchanged. Cache hit = ~1us. Cache miss = ~20-100ms (S3 range GET for one frame).
+
+### Phases
+
+**Zenith-a: S3Primary SyncMode + xSync override upload**
+- Add `SyncMode::S3Primary` variant
+- In `xSync()` (handle.rs sync path): if S3Primary, collect dirty frames, encode, upload as overrides, publish manifest
+- Enforce `journal_mode=OFF` on connection open when S3Primary
+- Error if database is in WAL mode
+- Clear dirty set after successful S3 upload + manifest publish
+- Tests: single write transaction, xSync uploads overrides, manifest published, cold open from S3 sees data
+
+**Zenith-b: Cache validation on open**
+- On open: fetch S3 manifest, compare with local
+- Version match: cache warm, proceed
+- Version mismatch: diff manifests, invalidate changed pages/groups
+- Crash recovery (local ahead of S3): discard local manifest, full cache invalidation
+- Persist local manifest copy after each successful publish
+- Tests: open after external write (another node), cache partially invalidated, correct data read. Open after crash (local dirty, S3 clean), cache invalidated, correct data from S3.
+
+**Zenith-c: Transaction failure / rollback handling**
+- Transaction fails (constraint violation, etc.): dirty pages in cache are stale
+- No S3 upload happened, no manifest published: S3 state is clean
+- Mark dirty pages as "unvalidated" in cache, evict or lazy-re-fetch on next read
+- OR: simpler approach: invalidate all dirty pages on transaction failure
+- Tests: INSERT violates UNIQUE constraint, transaction aborted, subsequent read returns correct pre-transaction data from cache (re-fetched from S3 if needed)
+
+**Zenith-d: Migration path from WAL mode**
+- `turbolite_migrate_to_s3_primary()`: checkpoint WAL, switch to journal_mode=OFF, enable S3Primary
+- One-time operation, non-reversible (can switch back to Durable by re-enabling WAL)
+- Tests: database in WAL mode with pending WAL data, migrate, verify all data in S3, open in S3Primary mode, read + write works
+
+**Zenith-e: Integration with Shared mode (haqlite Phase Crest)**
+- Shared mode + S3Primary: the full stack
+  - Acquire lease
+  - Catch up from manifest (cache validation)
+  - Execute writes (journal_mode=OFF, local cache)
+  - Commit: upload overrides + publish manifest (xSync)
+  - Release lease
+- No checkpoint, no flush, no staging log in this path
+- Tests: two Shared mode nodes alternating writes with S3Primary, each sees the other's data after manifest poll. Lambda simulation: open, write, close, destroy cache, open fresh, read back data from S3.
+
+---
+
 ## Stalingrad (remaining): Query Cost Estimation
 > After: Austerlitz (CHANGELOG) · Before: Jena
 

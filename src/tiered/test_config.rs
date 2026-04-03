@@ -10,6 +10,7 @@ fn test_tiered_config_default() {
     assert_eq!(c.compression_level, 1);
     assert_eq!(c.endpoint_url, None);
     assert!(!c.read_only);
+    #[cfg(feature = "cloud")]
     assert!(c.runtime_handle.is_none());
     assert_eq!(c.pages_per_group, DEFAULT_PAGES_PER_GROUP);
     assert_eq!(c.region, None);

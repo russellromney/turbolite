@@ -138,102 +138,53 @@ impl TieredHandle {
         let manifest = shared_manifest.read().clone();
         let page_size = manifest.page_size;
 
-        // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
-        if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
-            if let Some(key) = manifest.page_group_keys.first() {
-                if !key.is_empty() && s3.is_some() {
-                    if cache.try_claim_group(0) {
-                        if let Ok(Some(pg_data)) = s3.as_ref().expect("checked above").get_page_group(key) {
-                            let ft = manifest.frame_tables.first().map(|v| v.as_slice());
-                            let gp0 = manifest.group_page_nums(0);
-                            let _ = Self::decode_and_cache_group_static(
-                                &cache,
-                                &pg_data,
-                                &gp0,
-                                0, // gid
-                                manifest.page_size,
-                                manifest.page_count,
-                                ft,
-                                #[cfg(feature = "zstd")]
-                                dictionary,
-                                encryption_key.as_ref(),
-                            );
-                            cache.mark_group_present(0);
-                            cache.touch_group(0);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
-        // Fetched in parallel — after this, every B-tree traversal is a cache hit.
-        // Skip if interior pages are already cached (survived clear_cache pinning).
-        let interior_already_cached = !cache.interior_pages.lock().is_empty();
-        if interior_already_cached {
-            eprintln!(
-                "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
-                cache.interior_pages.lock().len(),
-            );
-        } else if !manifest.interior_chunk_keys.is_empty() && s3.is_some() {
-            // Parallel fetch all interior chunks
-            let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
-            eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
-            match s3.as_ref().expect("checked above").get_page_groups_by_key(&chunk_keys) {
-                Ok(results) => {
-                    #[cfg(feature = "zstd")]
-                    let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                    let mut total_pages = 0usize;
-                    let mut total_bytes = 0usize;
-                    for (key, data) in &results {
-                        total_bytes += data.len();
-                        match decode_interior_bundle(
-                            data,
-                            #[cfg(feature = "zstd")]
-                            ib_decoder.as_ref(),
-                            encryption_key.as_ref(),
-                        ) {
-                            Ok(pages) => {
-                                total_pages += pages.len();
-                                for (pnum, pdata) in &pages {
-                                    let _ = cache.write_page(*pnum, pdata);
-                                    let loc = manifest.page_location(*pnum)
-                                        .expect("interior page must have group assignment");
-                                    cache.mark_interior_group(loc.group_id, *pnum, loc.index);
-                                }
+        // Eagerly fetch page group 0 and interior/index chunks from S3.
+        // In local mode (s3=None), these are not fetched eagerly; they're fetched
+        // on demand from local page groups when first accessed.
+        #[cfg(feature = "cloud")]
+        if let Some(ref s3_ref) = s3 {
+            // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
+            if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
+                if let Some(key) = manifest.page_group_keys.first() {
+                    if !key.is_empty() {
+                        if cache.try_claim_group(0) {
+                            if let Ok(Some(pg_data)) = s3_ref.get_page_group(key) {
+                                let ft = manifest.frame_tables.first().map(|v| v.as_slice());
+                                let gp0 = manifest.group_page_nums(0);
+                                let _ = Self::decode_and_cache_group_static(
+                                    &cache,
+                                    &pg_data,
+                                    &gp0,
+                                    0, // gid
+                                    manifest.page_size,
+                                    manifest.page_count,
+                                    ft,
+                                    #[cfg(feature = "zstd")]
+                                    dictionary,
+                                    encryption_key.as_ref(),
+                                );
+                                cache.mark_group_present(0);
+                                cache.touch_group(0);
                             }
-                            Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
                         }
                     }
-                    eprintln!(
-                        "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                        total_pages, results.len(), total_bytes as f64 / 1024.0,
-                    );
                 }
-                Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
             }
-        }
 
-        // Index leaf bundles: lazy-aggressive prefetch.
-        // Instead of blocking connection open on potentially large index bundles
-        // (107MB at 750k rows), spawn a background thread. The first query serves
-        // index pages from data page groups via inline range GET (~100KB), while
-        // the background thread populates the full index cache.
-        let index_already_cached = !cache.index_pages.lock().is_empty();
-        if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached && s3.is_some() {
-            let cache_bg = Arc::clone(&cache);
-            let s3_bg = Arc::clone(s3.as_ref().expect("checked above"));
-            let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-            #[cfg(feature = "zstd")]
-            let dict_bg = dictionary.map(|d| d.to_vec());
-            let n_chunks = chunk_keys.len();
-            let encryption_key_bg = encryption_key;
-            eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
-            std::thread::spawn(move || {
-                match s3_bg.get_page_groups_by_key(&chunk_keys) {
+            // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
+            let interior_already_cached = !cache.interior_pages.lock().is_empty();
+            if interior_already_cached {
+                eprintln!(
+                    "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
+                    cache.interior_pages.lock().len(),
+                );
+            } else if !manifest.interior_chunk_keys.is_empty() {
+                let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
+                eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
+                match s3_ref.get_page_groups_by_key(&chunk_keys) {
                     Ok(results) => {
                         #[cfg(feature = "zstd")]
-                        let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
+                        let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
                         let mut total_pages = 0usize;
                         let mut total_bytes = 0usize;
                         for (key, data) in &results {
@@ -241,33 +192,81 @@ impl TieredHandle {
                             match decode_interior_bundle(
                                 data,
                                 #[cfg(feature = "zstd")]
-                                ix_decoder.as_ref(),
-                                encryption_key_bg.as_ref(),
+                                ib_decoder.as_ref(),
+                                encryption_key.as_ref(),
                             ) {
                                 Ok(pages) => {
                                     total_pages += pages.len();
                                     for (pnum, pdata) in &pages {
-                                        let _ = cache_bg.write_page(*pnum, pdata);
-                                        cache_bg.index_pages.lock().insert(*pnum);
+                                        let _ = cache.write_page(*pnum, pdata);
+                                        let loc = manifest.page_location(*pnum)
+                                            .expect("interior page must have group assignment");
+                                        cache.mark_interior_group(loc.group_id, *pnum, loc.index);
                                     }
                                 }
-                                Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                                Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
                             }
                         }
                         eprintln!(
-                            "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
+                            "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
                             total_pages, results.len(), total_bytes as f64 / 1024.0,
                         );
                     }
-                    Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
+                    Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
                 }
-            });
-        } else if index_already_cached {
-            eprintln!(
-                "[tiered] index pages already cached ({} pages), skipping chunk fetch",
-                cache.index_pages.lock().len(),
-            );
-        }
+            }
+
+            // Index leaf bundles: lazy-aggressive background fetch
+            let index_already_cached = !cache.index_pages.lock().is_empty();
+            if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
+                let cache_bg = Arc::clone(&cache);
+                let s3_bg = Arc::clone(s3_ref);
+                let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
+                #[cfg(feature = "zstd")]
+                let dict_bg = dictionary.map(|d| d.to_vec());
+                let n_chunks = chunk_keys.len();
+                let encryption_key_bg = encryption_key;
+                eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
+                std::thread::spawn(move || {
+                    match s3_bg.get_page_groups_by_key(&chunk_keys) {
+                        Ok(results) => {
+                            #[cfg(feature = "zstd")]
+                            let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
+                            let mut total_pages = 0usize;
+                            let mut total_bytes = 0usize;
+                            for (key, data) in &results {
+                                total_bytes += data.len();
+                                match decode_interior_bundle(
+                                    data,
+                                    #[cfg(feature = "zstd")]
+                                    ix_decoder.as_ref(),
+                                    encryption_key_bg.as_ref(),
+                                ) {
+                                    Ok(pages) => {
+                                        total_pages += pages.len();
+                                        for (pnum, pdata) in &pages {
+                                            let _ = cache_bg.write_page(*pnum, pdata);
+                                            cache_bg.index_pages.lock().insert(*pnum);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                                }
+                            }
+                            eprintln!(
+                                "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
+                                total_pages, results.len(), total_bytes as f64 / 1024.0,
+                            );
+                        }
+                        Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
+                    }
+                });
+            } else if index_already_cached {
+                eprintln!(
+                    "[tiered] index pages already cached ({} pages), skipping chunk fetch",
+                    cache.index_pages.lock().len(),
+                );
+            }
+        } // end #[cfg(feature = "cloud")] S3 eager fetch block
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {
@@ -1313,9 +1312,7 @@ impl DatabaseHandle for TieredHandle {
             ));
         }
 
-        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
         let manifest = self.manifest.read().clone();
-        let miss_start = Instant::now();
 
         // 5a. Re-check cache: a sibling prefetch may have completed since step 4.
         if cache.is_present(page_num) {
@@ -1330,6 +1327,12 @@ impl DatabaseHandle for TieredHandle {
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+
+        // S3 fetch paths (seekable + legacy) only available with cloud feature.
+        #[cfg(feature = "cloud")]
+        {
+        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
+        let miss_start = Instant::now();
 
         // Check if seekable format is available for sub-chunk range GETs.
         let frame_table = manifest.frame_tables.get(gid as usize);
@@ -1581,6 +1584,7 @@ impl DatabaseHandle for TieredHandle {
                 }
             }
         }
+        } // end #[cfg(feature = "cloud")] S3 fetch block
 
         // Read the page from cache (should be present now after legacy download).
         if cache.is_present(page_num) {
@@ -1847,6 +1851,16 @@ impl DatabaseHandle for TieredHandle {
 
             return Ok(());
         }
+
+        // Durable sync path: full S3 upload. Only available with cloud feature.
+        #[cfg(not(feature = "cloud"))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Durable sync requires cloud feature",
+        ));
+
+        #[cfg(feature = "cloud")]
+        {
 
         let page_size = *self.page_size.read();
 
@@ -2557,6 +2571,7 @@ impl DatabaseHandle for TieredHandle {
         }
 
         Ok(())
+        } // end #[cfg(feature = "cloud")] durable sync block
     }
 
     fn set_len(&mut self, size: u64) -> Result<(), io::Error> {

@@ -39,7 +39,6 @@ pub mod dict;
 pub mod ffi;
 #[cfg(feature = "loadable-extension")]
 pub mod ext;
-#[cfg(feature = "tiered")]
 pub mod tiered;
 pub mod btree_walker;
 

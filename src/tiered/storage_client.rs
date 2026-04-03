@@ -9,7 +9,7 @@ pub(crate) enum StorageClient {
     Local {
         base_dir: PathBuf,
     },
-    #[cfg(feature = "tiered")]
+    #[cfg(feature = "cloud")]
     S3(Arc<s3_client::S3Client>),
 }
 
@@ -23,7 +23,7 @@ impl StorageClient {
         Ok(StorageClient::Local { base_dir })
     }
 
-    #[cfg(feature = "tiered")]
+    #[cfg(feature = "cloud")]
     pub(crate) fn s3(client: Arc<s3_client::S3Client>) -> Self {
         StorageClient::S3(client)
     }
@@ -32,7 +32,7 @@ impl StorageClient {
     pub(crate) fn is_local(&self) -> bool {
         match self {
             StorageClient::Local { .. } => true,
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(_) => false,
         }
     }
@@ -51,7 +51,7 @@ impl StorageClient {
                     Err(e) => Err(e),
                 }
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.get_page_group(key),
         }
     }
@@ -71,7 +71,7 @@ impl StorageClient {
                 }
                 Ok(result)
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.get_page_groups_by_key(keys),
         }
     }
@@ -92,7 +92,7 @@ impl StorageClient {
                 }
                 Ok(())
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.put_page_groups(groups),
         }
     }
@@ -111,7 +111,7 @@ impl StorageClient {
                 }
                 Ok(())
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.delete_objects(keys),
         }
     }
@@ -132,7 +132,7 @@ impl StorageClient {
                     None => Ok(None),
                 }
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.get_manifest(),
         }
     }
@@ -147,7 +147,7 @@ impl StorageClient {
                 };
                 local.persist(base_dir)
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.put_manifest(manifest),
         }
     }
@@ -158,7 +158,7 @@ impl StorageClient {
             StorageClient::Local { base_dir } => {
                 Ok(base_dir.join("manifest.msgpack").exists())
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => {
                 Ok(s3.get_manifest()?.is_some())
             }
@@ -200,7 +200,7 @@ impl StorageClient {
                     Err(e) => Err(e),
                 }
             }
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.range_get(key, start, len),
         }
     }
@@ -209,7 +209,7 @@ impl StorageClient {
     pub(crate) fn fetch_count(&self) -> u64 {
         match self {
             StorageClient::Local { .. } => 0,
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.fetch_count.load(Ordering::Relaxed),
         }
     }
@@ -218,7 +218,7 @@ impl StorageClient {
     pub(crate) fn fetch_bytes(&self) -> u64 {
         match self {
             StorageClient::Local { .. } => 0,
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.fetch_bytes.load(Ordering::Relaxed),
         }
     }

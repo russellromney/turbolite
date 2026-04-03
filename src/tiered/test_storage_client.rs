@@ -291,7 +291,7 @@ fn test_effective_backend_local_with_empty_bucket() {
     assert!(matches!(config.effective_backend(), StorageBackend::Local));
 }
 
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[test]
 fn test_effective_backend_auto_upgrade_with_bucket() {
     let mut config = TieredConfig::default();
@@ -307,7 +307,7 @@ fn test_effective_backend_auto_upgrade_with_bucket() {
     }
 }
 
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[test]
 fn test_effective_backend_explicit_s3() {
     let mut config = TieredConfig::default();

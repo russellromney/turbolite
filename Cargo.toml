@@ -21,9 +21,11 @@ snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
 parallel = ["dep:rayon"]
-tiered = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:tokio", "dep:crc32fast", "dep:libc"]
-wal = ["tiered", "dep:walrust-core", "dep:hadb-io", "dep:async-trait"]
-lambda = ["dep:lambda_runtime", "tiered", "zstd"]
+cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:tokio", "dep:crc32fast", "dep:libc"]
+# Backward compat alias
+tiered = ["cloud"]
+wal = ["cloud", "dep:walrust-core", "dep:hadb-io", "dep:async-trait"]
+lambda = ["dep:lambda_runtime", "cloud", "zstd"]
 
 [dependencies]
 sqlite-vfs = "0.2"

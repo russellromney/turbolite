@@ -33,7 +33,7 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredSharedState> = std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
@@ -77,7 +77,7 @@ fn register_local() -> Result<(), std::io::Error> {
     crate::register("turbolite", vfs)
 }
 
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 fn register_tiered() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
     use crate::tiered::{TieredConfig, TieredVfs};
@@ -130,7 +130,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
 
 /// Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
 /// Returns 0 on success, 1 if no tiered VFS.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
     match BENCH_HANDLE.get() {
@@ -148,7 +148,7 @@ pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
 }
 
 /// Reset S3 counters. Returns 0 on success.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
     match BENCH_HANDLE.get() {
@@ -158,14 +158,14 @@ pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
 }
 
 /// Get S3 GET count since last reset.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
     BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().0 as i64)
 }
 
 /// Get S3 GET bytes since last reset.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
     BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().1 as i64)
@@ -175,7 +175,7 @@ pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
 
 /// Evict cached data for named trees. tree_names is a comma-separated C string.
 /// Returns number of groups evicted, or -1 if no tiered VFS.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
     if tree_names.is_null() {
@@ -191,7 +191,7 @@ pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c
     }
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::c_char) -> i32 {
     -1
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::
 /// Returns null if no tiered VFS.
 ///
 /// Uses a thread-local buffer to avoid allocation lifetime issues across FFI.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     thread_local! {
@@ -228,7 +228,7 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 /// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
 /// Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
 /// db must be a valid sqlite3 handle, sql must be a valid C string.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_warm(
     db: *mut std::ffi::c_void,
@@ -263,7 +263,7 @@ pub unsafe extern "C" fn turbolite_warm(
     }
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_warm(
     _db: *mut std::ffi::c_void,
@@ -274,7 +274,7 @@ pub unsafe extern "C" fn turbolite_warm(
 
 /// Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
 /// tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_query(
     db: *mut std::ffi::c_void,
@@ -296,7 +296,7 @@ pub unsafe extern "C" fn turbolite_evict_query(
     }
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_query(
     _db: *mut std::ffi::c_void,
@@ -307,7 +307,7 @@ pub unsafe extern "C" fn turbolite_evict_query(
 
 /// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
 /// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {
     if tier.is_null() {
@@ -323,13 +323,13 @@ pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i
     }
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(_tier: *const std::os::raw::c_char) -> i32 {
     -1
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     std::ptr::null()
@@ -337,7 +337,7 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 
 /// Full GC: list all S3 objects under prefix, delete orphans not in manifest.
 /// Returns number of objects deleted, or -1 if no tiered VFS.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
     match BENCH_HANDLE.get() {
@@ -354,7 +354,7 @@ pub extern "C" fn turbolite_gc() -> i32 {
 
 /// Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
 /// Returns JSON report string (caller must free), or null on error.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
 pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     match BENCH_HANDLE.get() {
@@ -372,19 +372,19 @@ pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     }
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     std::ptr::null()
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
     -1
 }
 
-#[cfg(not(feature = "tiered"))]
+#[cfg(not(feature = "cloud"))]
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

@@ -1,7 +1,22 @@
+// When cloud feature is disabled, PrefetchPool is a zero-size stub.
+#[cfg(not(feature = "cloud"))]
+pub(crate) struct PrefetchJob;
+
+#[cfg(not(feature = "cloud"))]
+pub(crate) struct PrefetchPool;
+
+#[cfg(not(feature = "cloud"))]
+impl PrefetchPool {
+    pub(crate) fn wait_idle(&self) {}
+    pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>) -> bool { false }
+}
+
+#[cfg(feature = "cloud")]
 use super::*;
 
 // ===== PrefetchPool =====
 
+#[cfg(feature = "cloud")]
 /// A job for the prefetch thread pool.
 pub(crate) struct PrefetchJob {
     pub(crate) gid: u64,
@@ -16,6 +31,7 @@ pub(crate) struct PrefetchJob {
     pub(crate) group_page_nums: Vec<u64>,
 }
 
+#[cfg(feature = "cloud")]
 /// Fixed thread pool for background page group prefetching.
 /// Workers loop on a shared mpsc receiver, fetching page groups from S3
 /// and writing them to the local cache. Default thread count: num_cpus + 1
@@ -26,6 +42,7 @@ pub(crate) struct PrefetchPool {
     pub(crate) workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
+#[cfg(feature = "cloud")]
 impl PrefetchPool {
     pub(crate) fn new(
         num_workers: u32,
@@ -238,6 +255,7 @@ impl PrefetchPool {
     }
 }
 
+#[cfg(feature = "cloud")]
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         // Drop sender to close the channel, then join all workers

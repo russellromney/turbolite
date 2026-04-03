@@ -12,7 +12,7 @@ pub enum StorageBackend {
     Local,
     /// S3-backed mode. Local disk is a cache; S3 is the source of truth.
     /// Requires the `cloud` feature for AWS SDK + tokio.
-    #[cfg(feature = "tiered")]
+    #[cfg(feature = "cloud")]
     S3 {
         /// S3 bucket name
         bucket: String,
@@ -128,37 +128,31 @@ pub struct TieredConfig {
     pub cache_dir: PathBuf,
     /// Zstd compression level (1-22, default 3)
     pub compression_level: i32,
-    /// Custom S3 endpoint URL (for MinIO/Tigris)
+    /// **Cloud-only.** Custom S3 endpoint URL (for MinIO/Tigris). Ignored in local mode.
     pub endpoint_url: Option<String>,
     /// Open in read-only mode (no writes, no WAL)
     pub read_only: bool,
     /// Tokio runtime handle (pass in, or a new runtime is created)
+    #[cfg(feature = "cloud")]
     pub runtime_handle: Option<TokioHandle>,
     /// Pages per page group (default 256 = 16MB uncompressed at 64KB page size, ~8MB compressed).
     /// Each S3 object contains this many contiguous compressed pages.
     /// At 4KB page size this is 1MB per group — increase to 4096 for small pages.
     pub pages_per_group: u32,
-    /// AWS region (default "us-east-1")
+    /// **Cloud-only.** AWS region (default "us-east-1"). Ignored in local mode.
     pub region: Option<String>,
     /// TTL for cached page groups in seconds (default 3600 = 1 hour).
     /// Page groups not accessed within this window are evicted from local NVMe.
     /// Interior page groups (B-tree internal nodes) are pinned permanently.
     pub cache_ttl_secs: u64,
-    /// Prefetch schedule for SEARCH queries (BTreeAware strategy).
-    /// SEARCH queries scan unknown portions of indexes/tables, need aggressive warmup.
-    /// Default [0.3, 0.3, 0.4] = prefetch 30% of siblings on first miss, ramp up.
-    /// SCAN queries bypass this entirely (plan-aware bulk prefetch).
-    /// Tunable at runtime via `turbolite_config_set('prefetch_search', '0.3,0.3,0.4')`.
+    /// **Cloud-only.** Prefetch schedule for SEARCH queries (BTreeAware strategy).
+    /// Default [0.3, 0.3, 0.4]. Ignored in local mode.
     pub prefetch_search: Vec<f32>,
-    /// Prefetch schedule for index lookups / point queries (BTreeAware strategy).
-    /// Lookups hit 1-2 pages per tree, so prefetch should be conservative.
-    /// Default [0, 0, 0] = three free hops before any prefetch.
-    /// Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
-    /// Tunable at runtime via `turbolite_config_set('prefetch_lookup', '0,0,0')`.
+    /// **Cloud-only.** Prefetch schedule for index lookups / point queries.
+    /// Default [0, 0, 0]. Ignored in local mode.
     pub prefetch_lookup: Vec<f32>,
-    /// Number of prefetch worker threads (default: num_cpus + 1).
-    /// N+1 keeps the pipeline full: when a thread blocks on S3 I/O,
-    /// the extra thread uses that core for decompression/cache writes.
+    /// **Cloud-only.** Number of prefetch worker threads (default: num_cpus + 1).
+    /// Ignored in local mode (no S3 I/O to parallelize).
     pub prefetch_threads: u32,
     /// Zstd compression dictionary (for 2-5x better compression on structured data)
     #[cfg(feature = "zstd")]
@@ -173,26 +167,23 @@ pub struct TieredConfig {
     /// deleted from S3 asynchronously after the new manifest is uploaded.
     /// Default: true. Set to false only for debugging or if external tooling manages S3 lifecycle.
     pub gc_enabled: bool,
-    /// Load all index leaf bundles on VFS open (default true).
-    /// When true, index leaf pages are fetched in parallel during connection open,
-    /// so the first indexed query pays zero index-fetch latency.
-    /// Same pattern as interior bundle loading.
+    /// **Cloud-only.** Load all index leaf bundles on VFS open (default true).
+    /// Fetches index leaf pages in parallel from S3 during connection open.
+    /// Ignored in local mode (index pages loaded on demand from local page groups).
     pub eager_index_load: bool,
     /// AES-256-GCM encryption key. When set, all data is encrypted:
     /// S3 page groups (per-frame), interior/index bundles, and local cache pages.
     /// The manifest is NOT encrypted (it contains only S3 keys and byte offsets, no user data).
     /// Requires the `encryption` feature for actual encryption; without it, the key is ignored.
     pub encryption_key: Option<[u8; 32]>,
-    /// Phase Verdun: enable predictive cross-tree prefetch + access history.
-    /// When true, the VFS learns which B-trees appear together in transactions
-    /// and prefetches them in parallel on subsequent queries.
-    /// Default: false (enable after testing).
+    /// **Cloud-only.** Enable predictive cross-tree prefetch + access history.
+    /// Default: false. Ignored in local mode.
     pub prediction_enabled: bool,
-    /// Checkpoint sync mode. Controls whether S3 upload happens during checkpoint
-    /// (Durable, blocking) or is deferred to flush_to_s3() (LocalThenFlush, non-blocking).
-    /// Default: Durable.
+    /// Checkpoint sync mode. In cloud mode: Durable uploads to S3 during checkpoint,
+    /// LocalThenFlush defers to flush_to_s3(). In local mode: always LocalThenFlush
+    /// (this field is overridden). Default: Durable.
     pub sync_mode: SyncMode,
-    /// Phase Marne: enable query-plan-aware prefetch.
+    /// **Cloud-only.** Enable query-plan-aware prefetch.
     /// When true, the VFS drains the global plan queue on first cache miss and
     /// submits all planned groups to the prefetch pool. The trace callback in
     /// the loadable extension populates the queue via EQP at start of step().
@@ -223,9 +214,10 @@ pub struct TieredConfig {
     /// Zstd compression level for local cache pages (1-22, default 3).
     /// Only used when cache_compression is true. Lower = faster, higher = smaller.
     pub cache_compression_level: i32,
-    /// Phase Gallipoli: where to load manifest on connection open.
+    /// **Cloud-only.** Where to load manifest on connection open.
     /// Auto (default): use local manifest if present, fall back to S3.
     /// S3: always fetch from S3 (for HA followers, multi-reader).
+    /// In local mode, manifest is always loaded from local disk.
     pub manifest_source: ManifestSource,
     /// Phase Somme: enable WAL replication via walrust.
     /// Ships WAL frames to S3 for transaction-level durability between checkpoints.
@@ -249,6 +241,7 @@ impl Default for TieredConfig {
             compression_level: 1,
             endpoint_url: None,
             read_only: false,
+            #[cfg(feature = "cloud")]
             runtime_handle: None,
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             region: None,
@@ -316,10 +309,10 @@ impl TieredConfig {
     /// If Local but `bucket` is non-empty, auto-upgrade to S3 (backward compat).
     pub fn effective_backend(&self) -> StorageBackend {
         match &self.storage_backend {
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageBackend::S3 { .. } => self.storage_backend.clone(),
             StorageBackend::Local => {
-                #[cfg(feature = "tiered")]
+                #[cfg(feature = "cloud")]
                 if !self.bucket.is_empty() {
                     return StorageBackend::S3 {
                         bucket: self.bucket.clone(),

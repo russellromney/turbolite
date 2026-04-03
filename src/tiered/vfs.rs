@@ -30,6 +30,7 @@ pub struct TieredVfs {
     page_count: Arc<AtomicU64>,
     config: TieredConfig,
     /// Owned runtime (if we created one ourselves)
+    #[cfg(feature = "cloud")]
     _runtime: Option<tokio::runtime::Runtime>,
     /// Shared manifest state. Written by TieredHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
@@ -55,6 +56,7 @@ pub struct TieredVfs {
     wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
     /// Tokio runtime handle for spawning WAL replication background task.
     /// None in local-only mode (no tokio dependency).
+    #[cfg(feature = "cloud")]
     runtime_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -63,7 +65,7 @@ impl TieredVfs {
     pub fn new(config: TieredConfig) -> io::Result<Self> {
         match config.effective_backend() {
             StorageBackend::Local => Self::new_local(config),
-            #[cfg(feature = "tiered")]
+            #[cfg(feature = "cloud")]
             StorageBackend::S3 { .. } => Self::new_cloud(config),
         }
     }
@@ -125,6 +127,7 @@ impl TieredVfs {
             prefetch_pool: None,
             page_count,
             config,
+            #[cfg(feature = "cloud")]
             _runtime: None,
             shared_manifest,
             shared_dirty_groups,
@@ -133,11 +136,13 @@ impl TieredVfs {
             flush_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
+            #[cfg(feature = "cloud")]
             runtime_handle: None,
         })
     }
 
     /// Construct a cloud (S3-backed) VFS. Requires tokio runtime.
+    #[cfg(feature = "cloud")]
     fn new_cloud(config: TieredConfig) -> io::Result<Self> {
         let (runtime_handle, owned_runtime) =
             if let Some(ref handle) = config.runtime_handle {
@@ -315,7 +320,8 @@ impl TieredVfs {
     /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
     /// Panics if called in local-only mode (no S3 client).
-    pub fn shared_state(&self) -> TieredSharedState {
+    #[cfg(feature = "cloud")]
+    pub fn shared_state(&self) -> bench::TieredSharedState {
         TieredSharedState {
             s3: self.s3.as_ref().expect("shared_state requires S3 backend").clone(),
             cache: Arc::clone(&self.cache),
@@ -434,6 +440,7 @@ impl TieredVfs {
     /// - `clear_cache*` methods protect pending groups from eviction
     ///
     /// After flush_to_s3() completes, data is durable on S3.
+    #[cfg(feature = "cloud")]
     pub fn flush_to_s3(&self) -> io::Result<()> {
         let s3 = self.s3.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "flush_to_s3 requires S3 backend")
@@ -476,34 +483,35 @@ impl TieredVfs {
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
-    /// Returns (0, 0) in local-only mode.
+    /// Returns (0, 0) in local-only mode or when cloud feature is disabled.
     pub fn reset_s3_counters(&self) -> (u64, u64) {
-        match &self.s3 {
-            Some(s3) => {
-                let count = s3.fetch_count.swap(0, Ordering::Relaxed);
-                let bytes = s3.fetch_bytes.swap(0, Ordering::Relaxed);
-                (count, bytes)
-            }
-            None => (0, 0),
+        #[cfg(feature = "cloud")]
+        if let Some(s3) = &self.s3 {
+            let count = s3.fetch_count.swap(0, Ordering::Relaxed);
+            let bytes = s3.fetch_bytes.swap(0, Ordering::Relaxed);
+            return (count, bytes);
         }
+        (0, 0)
     }
 
     /// Read current S3 I/O counters without resetting.
-    /// Returns (0, 0) in local-only mode.
+    /// Returns (0, 0) in local-only mode or when cloud feature is disabled.
     pub fn s3_counters(&self) -> (u64, u64) {
-        match &self.s3 {
-            Some(s3) => (
+        #[cfg(feature = "cloud")]
+        if let Some(s3) = &self.s3 {
+            return (
                 s3.fetch_count.load(Ordering::Relaxed),
                 s3.fetch_bytes.load(Ordering::Relaxed),
-            ),
-            None => (0, 0),
+            );
         }
+        (0, 0)
     }
 
     /// Garbage collect orphaned S3 objects not referenced by the current manifest.
     /// Lists all objects under the prefix, compares against manifest keys, and
     /// deletes unreferenced page groups and interior chunks.
     /// Returns the number of objects deleted.
+    #[cfg(feature = "cloud")]
     pub fn gc(&self) -> io::Result<usize> {
         let s3 = self.s3.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "gc requires S3 backend")
@@ -544,6 +552,7 @@ impl TieredVfs {
     }
 
     /// Helper to destroy all S3 data for a prefix.
+    #[cfg(feature = "cloud")]
     pub fn destroy_s3(&self) -> io::Result<()> {
         let s3 = self.s3.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "destroy_s3 requires S3 backend")
