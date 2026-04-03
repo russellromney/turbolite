@@ -19,7 +19,7 @@ use super::*;
 /// ```
 pub struct TieredVfs {
     /// Unified storage client: Local (filesystem) or S3.
-    pub(crate) storage: StorageClient,
+    pub(crate) storage: Arc<StorageClient>,
     /// S3 client (only set in cloud mode). Kept separate because PrefetchPool
     /// and flush_to_s3 need Arc<S3Client> directly.
     s3: Option<Arc<S3Client>>,
@@ -73,7 +73,7 @@ impl TieredVfs {
     fn new_local(mut config: TieredConfig) -> io::Result<Self> {
         // Local mode always uses LocalThenFlush (no S3 to upload to)
         config.sync_mode = SyncMode::LocalThenFlush;
-        let storage = StorageClient::local(config.cache_dir.clone())?;
+        let storage = Arc::new(StorageClient::local(config.cache_dir.clone())?);
 
         // Load manifest from local disk (or empty for new database)
         let (mut manifest, recovered_dirty_groups) = match storage.get_manifest()? {
@@ -190,7 +190,7 @@ impl TieredVfs {
         cache.ensure_group_capacity(manifest_groups);
 
         let s3 = Arc::new(s3);
-        let storage = StorageClient::s3(Arc::clone(&s3));
+        let storage = Arc::new(StorageClient::s3(Arc::clone(&s3)));
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
@@ -699,6 +699,7 @@ impl Vfs for TieredVfs {
 
             Ok(TieredHandle::new_tiered(
                 self.s3.clone(),
+                if self.storage.is_local() { Some(Arc::clone(&self.storage)) } else { None },
                 Arc::clone(&self.cache),
                 Arc::clone(&self.shared_manifest),
                 Arc::clone(&self.shared_dirty_groups),

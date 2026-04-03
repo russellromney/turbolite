@@ -9,6 +9,8 @@ use super::*;
 pub struct TieredHandle {
     // --- Tiered mode (MainDb) ---
     s3: Option<Arc<S3Client>>,
+    /// Unified storage client for local page group flush (local mode only).
+    storage: Option<Arc<StorageClient>>,
     cache: Option<Arc<DiskCache>>,
     /// Shared manifest (Arc'd so flush_to_s3 can read/update outside SQLite lock).
     manifest: Arc<RwLock<Manifest>>,
@@ -109,6 +111,7 @@ impl TieredHandle {
     /// Create a tiered handle backed by S3 + local page cache.
     pub(crate) fn new_tiered(
         s3: Option<Arc<S3Client>>,
+        storage: Option<Arc<StorageClient>>,
         cache: Arc<DiskCache>,
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
@@ -298,6 +301,7 @@ impl TieredHandle {
 
         Self {
             s3,
+            storage,
             cache: Some(cache),
             manifest: shared_manifest,
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -345,6 +349,7 @@ impl TieredHandle {
     pub(crate) fn new_passthrough(file: File, db_path: PathBuf, encryption_key: Option<[u8; 32]>) -> Self {
         Self {
             s3: None,
+            storage: None,
             cache: None,
             manifest: Arc::new(RwLock::new(Manifest::empty())),
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -1248,18 +1253,67 @@ impl DatabaseHandle for TieredHandle {
 
         // 5. Cache miss - fetch from storage (S3 or local page groups).
         cache.stat_misses.fetch_add(1, Ordering::Relaxed);
-        let s3_arc = match self.s3.as_ref() {
-            Some(s3) => Arc::clone(s3),
-            None => {
-                // Local-only mode: no S3 to fetch from. Page should be in cache.
-                // If we get here, the cache file was deleted or corrupted.
-                // Phase Unification-c will add local page group fetch here.
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("page {} not in local cache (no storage backend to fetch from)", page_num),
-                ));
+
+        // 5.local: For local-only mode, fetch the page group from local pg/ directory,
+        // decode it, populate the cache, then read the page.
+        if self.s3.is_none() {
+            if let Some(ref storage) = self.storage {
+                let manifest = self.manifest.read().clone();
+                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                    if !key.is_empty() {
+                        if let Ok(Some(pg_data)) = storage.get_page_group(key) {
+                            let pages_in_group = manifest.group_page_nums(gid);
+                            let ft = manifest.frame_tables.get(gid as usize);
+                            let has_ft = manifest.sub_pages_per_frame > 0
+                                && ft.map(|f| !f.is_empty()).unwrap_or(false);
+
+                            if has_ft {
+                                if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
+                                    &pg_data,
+                                    ft.expect("checked above"),
+                                    manifest.page_size,
+                                    pages_in_group.len() as u32,
+                                    manifest.page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    self.decoder_dict.as_ref(),
+                                    self.encryption_key.as_ref(),
+                                ) {
+                                    cache.write_pages_scattered(
+                                        &pages_in_group, &bulk_data, gid, 0,
+                                    )?;
+                                }
+                            } else if let Ok((_pc, _ps, bulk_data)) = decode_page_group_bulk(
+                                &pg_data,
+                                #[cfg(feature = "zstd")]
+                                self.decoder_dict.as_ref(),
+                                self.encryption_key.as_ref(),
+                            ) {
+                                cache.write_pages_scattered(
+                                    &pages_in_group, &bulk_data, gid, 0,
+                                )?;
+                            }
+
+                            cache.mark_group_present(gid);
+                            cache.touch_group(gid);
+
+                            // Now read the page from cache
+                            if cache.is_present(page_num) {
+                                cache.read_page(page_num, buf)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
-        };
+
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("page {} not recoverable from local page groups", page_num),
+            ));
+        }
+
+        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
         let manifest = self.manifest.read().clone();
         let miss_start = Instant::now();
 
@@ -1773,6 +1827,23 @@ impl DatabaseHandle for TieredHandle {
 
             // Persist bitmap so cached pages survive process restart
             cache.persist_bitmap()?;
+
+            // Local mode: flush dirty page groups to local pg/ directory immediately.
+            // This encodes page groups from the cache and writes them alongside the manifest,
+            // so data can be recovered even if the cache file is deleted.
+            if let Some(ref storage) = self.storage {
+                flush::flush_local_groups(
+                    storage,
+                    cache,
+                    &self.manifest,
+                    &self.s3_dirty_groups,
+                    &self.pending_flushes,
+                    self.compression_level,
+                    #[cfg(feature = "zstd")]
+                    None, // TODO: pass dictionary raw bytes when available on handle
+                    self.encryption_key,
+                )?;
+            }
 
             return Ok(());
         }

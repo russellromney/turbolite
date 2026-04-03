@@ -185,6 +185,146 @@ fn test_local_vfs_s3_counters_zero() {
     assert_eq!(vfs.reset_s3_counters(), (0, 0));
 }
 
+/// RED TEST: Delete cache file after checkpoint, reopen, verify data recovered from local page groups.
+#[test]
+fn test_local_vfs_recover_from_page_groups() {
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: write data and checkpoint
+    {
+        let config = TieredConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_pg1_{}", std::process::id());
+        let vfs = TieredVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        for i in 0..100 {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("value_{}", i)]).unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Verify page groups exist on disk
+    let pg_dir = dir.path().join("pg");
+    assert!(pg_dir.is_dir(), "pg/ directory should exist");
+    let pg_files: Vec<_> = std::fs::read_dir(&pg_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext != "tmp").unwrap_or(true))
+        .collect();
+    assert!(!pg_files.is_empty(), "page group files should exist in pg/");
+
+    // Phase 2: delete cache file + bitmap (simulate cache loss), reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TieredConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_pg2_{}", std::process::id());
+        let vfs = TieredVfs::new(config).expect("reopen VFS after cache loss");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        // All data should be recoverable from local page groups
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 100, "all 100 rows should be recovered from page groups");
+
+        let val: String = conn.query_row(
+            "SELECT val FROM t WHERE id = 42", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(val, "value_42");
+    }
+}
+
+/// Multiple checkpoints produce distinct page group versions; all data recoverable.
+#[test]
+fn test_local_vfs_multi_checkpoint() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TieredConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_mc_{}", std::process::id());
+        let vfs = TieredVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        // Checkpoint 1: insert 50 rows
+        for i in 0..50 {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v1_{}", i)]).unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Checkpoint 2: insert 50 more rows + update some existing
+        for i in 50..100 {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v2_{}", i)]).unwrap();
+        }
+        conn.execute("UPDATE t SET val = 'updated' WHERE id = 0", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Checkpoint 3: delete some rows
+        conn.execute("DELETE FROM t WHERE id >= 80", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Delete cache, reopen, verify final state from page groups
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TieredConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_mc2_{}", std::process::id());
+        let vfs = TieredVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Should see 80 rows (100 inserted - 20 deleted)
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 80, "should have 80 rows after multi-checkpoint recovery");
+
+        // Row 0 should be updated
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 0", [], |row| row.get(0)).unwrap();
+        assert_eq!(val, "updated");
+
+        // Rows 80-99 should not exist
+        let high: i64 = conn.query_row("SELECT COUNT(*) FROM t WHERE id >= 80", [], |row| row.get(0)).unwrap();
+        assert_eq!(high, 0, "deleted rows should not exist");
+    }
+}
+
 /// Local VFS data survives checkpoint + cold reopen.
 #[test]
 fn test_local_vfs_checkpoint_reopen() {

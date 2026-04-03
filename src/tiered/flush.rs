@@ -582,6 +582,192 @@ fn flush_inner(
     Ok(())
 }
 
+/// Flush dirty page groups to local disk (for StorageBackend::Local).
+///
+/// Reads dirty pages from the cache, encodes page groups (seekable format),
+/// and writes to `{cache_dir}/pg/{gid}_v{version}`. Updates the local manifest
+/// with new page_group_keys. Deletes old versions after manifest update.
+///
+/// Unlike flush_dirty_groups_to_s3, this is simple: all pages are in the cache
+/// (no S3 merge needed). Called at the end of sync() in local mode.
+pub(crate) fn flush_local_groups(
+    storage: &StorageClient,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    shared_dirty_groups: &Mutex<HashSet<u64>>,
+    pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+) -> io::Result<()> {
+    // 1. Drain pending state
+    let flushes: Vec<staging::PendingFlush> = {
+        let mut pf = pending_flushes.lock().unwrap();
+        std::mem::take(&mut *pf)
+    };
+    let legacy_dirty: HashSet<u64> = {
+        let mut pending = shared_dirty_groups.lock().unwrap();
+        std::mem::take(&mut *pending)
+    };
+
+    if flushes.is_empty() && legacy_dirty.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Read staged pages
+    let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
+    for flush_entry in &flushes {
+        let pages = staging::read_staging_log(
+            &flush_entry.staging_path,
+            flush_entry.page_size,
+        )?;
+        staging_paths.push(flush_entry.staging_path.clone());
+        staged_pages.extend(pages);
+    }
+
+    // 3. Snapshot manifest
+    let manifest_snap = shared_manifest.read().clone();
+    let page_count = manifest_snap.page_count;
+    let page_size = manifest_snap.page_size;
+
+    if page_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "flush_local: manifest has page_size=0",
+        ));
+    }
+
+    // 4. Dictionaries
+    #[cfg(feature = "zstd")]
+    let encoder_dict = dictionary
+        .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
+
+    // 5. Determine dirty groups
+    let mut dirty_groups: HashSet<u64> = legacy_dirty;
+    for &pnum in staged_pages.keys() {
+        if let Some(loc) = manifest_snap.page_location(pnum) {
+            dirty_groups.insert(loc.group_id);
+        }
+    }
+
+    if dirty_groups.is_empty() {
+        for path in &staging_paths {
+            staging::remove_staging_log(path);
+        }
+        return Ok(());
+    }
+
+    let next_version = manifest_snap.version + 1;
+    let change_counter = read_change_counter_from_cache(cache, page_size);
+    let old_sub_ppf = manifest_snap.sub_pages_per_frame;
+    let use_seekable = old_sub_ppf > 0;
+
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut new_keys = manifest_snap.page_group_keys.clone();
+    let mut replaced_keys: Vec<String> = Vec::new();
+    let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
+
+    // 6. For each dirty group: read pages from staging/cache, encode
+    for &gid in &dirty_groups {
+        let pages_in_group = manifest_snap.group_page_nums(gid);
+        let group_size = pages_in_group.len();
+        let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+
+        for (i, &pnum) in pages_in_group.iter().enumerate() {
+            if pnum >= page_count { break; }
+
+            // Priority: staging log > cache (no S3 merge needed for local mode)
+            if let Some(staged_data) = staged_pages.get(&pnum) {
+                pages[i] = Some(staged_data.clone());
+            } else if cache.is_present(pnum) {
+                let mut page_buf = vec![0u8; page_size as usize];
+                if cache.read_page(pnum, &mut page_buf).is_ok() {
+                    pages[i] = Some(page_buf);
+                }
+            }
+            // Pages not in staging or cache stay None (zero-filled in encoder)
+        }
+
+        // Encode
+        let key = StorageClient::page_group_key(gid, next_version);
+        if use_seekable {
+            let (encoded, ft) = encode_page_group_seekable(
+                &pages, page_size, old_sub_ppf, compression_level,
+                #[cfg(feature = "zstd")]
+                encoder_dict.as_ref(),
+                encryption_key.as_ref(),
+            )?;
+            uploads.push((key.clone(), encoded));
+            while new_frame_tables.len() <= gid as usize {
+                new_frame_tables.push(Vec::new());
+            }
+            new_frame_tables[gid as usize] = ft;
+        } else {
+            let encoded = encode_page_group(
+                &pages, page_size, compression_level,
+                #[cfg(feature = "zstd")]
+                encoder_dict.as_ref(),
+                encryption_key.as_ref(),
+            )?;
+            uploads.push((key.clone(), encoded));
+        }
+
+        // Track replaced key
+        while new_keys.len() <= gid as usize {
+            new_keys.push(String::new());
+        }
+        if let Some(old_key) = new_keys.get(gid as usize) {
+            if !old_key.is_empty() {
+                replaced_keys.push(old_key.clone());
+            }
+        }
+        new_keys[gid as usize] = key;
+    }
+
+    // 7. Write page groups to local storage
+    storage.put_page_groups(&uploads)?;
+
+    // 8. Build and persist new manifest
+    let new_manifest = Manifest {
+        version: next_version,
+        change_counter,
+        page_count,
+        page_size,
+        pages_per_group: manifest_snap.pages_per_group,
+        page_group_keys: new_keys,
+        interior_chunk_keys: manifest_snap.interior_chunk_keys.clone(),
+        index_chunk_keys: manifest_snap.index_chunk_keys.clone(),
+        frame_tables: new_frame_tables,
+        sub_pages_per_frame: old_sub_ppf,
+        strategy: manifest_snap.strategy,
+        group_pages: manifest_snap.group_pages.clone(),
+        btrees: manifest_snap.btrees.clone(),
+        ..Manifest::empty()
+    };
+
+    storage.put_manifest(&new_manifest, &[])?;
+
+    // 9. Commit to shared manifest
+    {
+        let mut m = shared_manifest.write();
+        cache.set_group_pages(new_manifest.group_pages.clone());
+        *m = new_manifest;
+    }
+
+    // 10. Delete old page group versions
+    if !replaced_keys.is_empty() {
+        let _ = storage.delete_page_groups(&replaced_keys);
+    }
+
+    // 11. Clean up staging logs
+    for path in &staging_paths {
+        staging::remove_staging_log(path);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "test_flush.rs"]
 mod tests;
