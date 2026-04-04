@@ -8,7 +8,7 @@ pub(crate) struct PrefetchPool;
 #[cfg(not(feature = "cloud"))]
 impl PrefetchPool {
     pub(crate) fn wait_idle(&self) {}
-    pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>) -> bool { false }
+    pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>, _overrides: std::collections::HashMap<usize, super::manifest::SubframeOverride>) -> bool { false }
 }
 
 #[cfg(feature = "cloud")]
@@ -29,6 +29,8 @@ pub(crate) struct PrefetchJob {
     pub(crate) sub_pages_per_frame: u32,
     /// Page numbers in this group (Phase Midway: B-tree groups). Empty = legacy positional.
     pub(crate) group_page_nums: Vec<u64>,
+    /// Phase Drift-c: override frames for this group.
+    pub(crate) overrides: HashMap<usize, super::manifest::SubframeOverride>,
 }
 
 #[cfg(feature = "cloud")]
@@ -205,6 +207,36 @@ impl PrefetchPool {
                         }
                     }
 
+                    // Phase Drift-c: apply override frames
+                    if !job.overrides.is_empty() && job.sub_pages_per_frame > 0 {
+                        let spf = job.sub_pages_per_frame as usize;
+                        for (&frame_idx, ovr) in &job.overrides {
+                            let ovr_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&ovr.key)) {
+                                Ok(Some(data)) => data,
+                                _ => continue,
+                            };
+                            #[cfg(feature = "zstd")]
+                            let ovr_decoder = dictionary.as_deref().map(|d| zstd::dict::DecoderDictionary::copy(d));
+                            if let Ok(decompressed) = decode_seekable_subchunk(
+                                &ovr_data,
+                                #[cfg(feature = "zstd")]
+                                ovr_decoder.as_ref(),
+                                encryption_key.as_ref().as_ref(),
+                            ) {
+                                let frame_start = frame_idx * spf;
+                                let frame_end = std::cmp::min(frame_start + spf, job.group_page_nums.len());
+                                let frame_page_nums = &job.group_page_nums[frame_start..frame_end];
+                                let data_len = frame_page_nums.len() * _pg_size as usize;
+                                if data_len <= decompressed.len() {
+                                    let _ = cache.write_pages_scattered(
+                                        frame_page_nums, &decompressed[..data_len],
+                                        job.gid, frame_start as u32,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     cache.mark_group_present(job.gid);
                     cache.touch_group(job.gid);
                     if std::env::var("BENCH_VERBOSE").is_ok() {
@@ -229,7 +261,7 @@ impl PrefetchPool {
     }
 
     /// Submit a prefetch job (non-blocking). Returns false if channel is closed.
-    pub(crate) fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>) -> bool {
+    pub(crate) fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>, overrides: HashMap<usize, super::manifest::SubframeOverride>) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
         match self.sender.send(PrefetchJob {
             gid,
@@ -238,6 +270,7 @@ impl PrefetchPool {
             page_size,
             sub_pages_per_frame: sub_ppf,
             group_page_nums,
+            overrides,
         }) {
             Ok(()) => true,
             Err(_) => {

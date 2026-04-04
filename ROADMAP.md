@@ -304,31 +304,31 @@ Old override keys are collected alongside old base group keys in the existing GC
 
 ### Phases
 
-**Drift-a: Manifest + override tracking**
-- Add `subframe_overrides` field to `Manifest` (serde, default empty vecs for backward compat)
-- Add `SubframeOverride` struct
-- `dirty_frames_for_group(dirty_pages, frame_table) -> Vec<usize>`: map dirty pages to frame indices
-- Tests: manifest round-trip with overrides, empty overrides == current behavior, dirty frame mapping correct
+**Drift-a: Manifest + override tracking (DONE)**
+- `SubframeOverride` struct, `subframe_overrides` field on Manifest with serde backward compat
+- `dirty_frames_for_group()` helper, `normalize_overrides()` called on manifest load
+- Tests: serde roundtrip (JSON + msgpack), backward compat, dirty frame mapping (7 cases)
 
-**Drift-b: Override write path**
-- In `flush_to_s3()`: detect when a group has few dirty frames (below threshold)
-- Upload individual frames as override objects instead of rewriting the group
-- Update manifest with override entries
-- Threshold config: `override_threshold` (default: frames_per_group / 4)
-- Tests: single dirty page -> one override uploaded (not full group), many dirty pages -> full group rewrite, override S3 key format correct, manifest has override entry after flush
+**Drift-b: Override write path (DONE)**
+- Override-aware flush in both S3 and local paths
+- Auto-threshold: frames_per_group / 4 when override_threshold=0
+- Override key format: `pg/{gid}_f{frame_idx}_v{version}`
+- GC on full rewrite, VACUUM, Durable sync
+- Tests: threshold logic, key format, encode/decode roundtrip, compression
 
-**Drift-c: Override read path**
-- In `read_exact_at()`: check override map before range GET
-- Prefetch pool: fetch overrides from correct keys
-- Disk cache: pages from overrides cached the same as pages from base groups
-- Tests: write + checkpoint with override, cold read fetches from override key, warm read serves from cache, prefetch handles mixed override + base frames
+**Drift-c: Override read path (DONE)**
+- S3 seekable: fetch from override key instead of range GET when override exists
+- Local read: apply overrides after base group decode
+- Prefetch pool: carries overrides per job, applies after base group fetch
+- Tests: write + cold read with overrides, override then full rewrite cold read
 
-**Drift-d: Compaction**
-- Detect when override count exceeds threshold
-- Merge: fetch base group + all override frames, re-encode as single group, upload, clear overrides
-- GC old override objects after compaction
-- `turbolite_compact()` forces compaction of all groups with overrides
-- Tests: accumulate overrides past threshold, compaction produces correct merged group, override objects deleted after compaction, cold read after compaction works, compaction during Shared mode write
+**Drift-d: Compaction (DONE)**
+- `compact_override_group()`: fetch base + overrides, merge, re-encode
+- `auto_compact_overrides()`: scans for groups over compaction_threshold (default 8)
+- `compact_all_overrides()`: manual trigger, ignores threshold
+- Auto-compaction fires at end of flush_local_inner
+- Config: `compaction_threshold` (default 8), `TURBOLITE_COMPACTION_THRESHOLD` env var
+- Tests: accumulate overrides past threshold, compaction fires, cold read after compaction
 
 **Drift-e: Integration with Shared mode (haqlite Phase Crest)**
 - Shared mode checkpoint defaults to override mode (optimize for small writes)

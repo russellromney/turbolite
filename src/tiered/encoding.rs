@@ -412,6 +412,34 @@ pub(crate) fn decode_interior_bundle(
     Ok(result)
 }
 
+/// Phase Drift: encode a single override frame from dirty pages.
+pub(crate) fn encode_override_frame(
+    dirty_pages: &[(u64, Vec<u8>)],
+    page_size: u32,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    encryption_key: Option<&[u8; 32]>,
+) -> io::Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(dirty_pages.len() * page_size as usize);
+    for (_pnum, data) in dirty_pages {
+        raw.extend_from_slice(data);
+        if data.len() < page_size as usize {
+            raw.resize(raw.len() + page_size as usize - data.len(), 0);
+        }
+    }
+    let mut frame_data = compress::compress(
+        &raw, compression_level,
+        #[cfg(feature = "zstd")] encoder_dict,
+        #[cfg(not(feature = "zstd"))] None,
+    )?;
+    #[cfg(feature = "encryption")]
+    if let Some(key) = encryption_key {
+        frame_data = compress::encrypt_gcm_random_nonce(&frame_data, key)?;
+    }
+    let _ = encryption_key; // suppress unused warning when encryption feature is off
+    Ok(frame_data)
+}
+
 #[cfg(test)]
 #[path = "test_encoding.rs"]
 mod tests;

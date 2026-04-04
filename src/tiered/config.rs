@@ -205,6 +205,10 @@ pub struct TurboliteConfig {
     /// hop-schedule guessing. Currently adds overhead without proven latency improvement.
     /// Default: false. Set `TURBOLITE_JENA=true` to enable.
     pub jena_enabled: bool,
+    /// Phase Drift: override threshold. 0 = auto (frames_per_group / 4).
+    pub override_threshold: u32,
+    /// Phase Drift-d: compaction threshold. Default 8.
+    pub compaction_threshold: u32,
     /// Compress pages in the local disk cache using zstd before writing.
     /// Saves disk space at the cost of CPU on cache hits (compress on write, decompress on read).
     /// When combined with encryption_key, order is: compress then encrypt on write,
@@ -276,6 +280,14 @@ impl Default for TurboliteConfig {
             jena_enabled: std::env::var("TURBOLITE_JENA")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),
+            override_threshold: std::env::var("TURBOLITE_OVERRIDE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            compaction_threshold: std::env::var("TURBOLITE_COMPACTION_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
             cache_compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),

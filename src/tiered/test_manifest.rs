@@ -762,3 +762,182 @@ fn test_shared_manifest_arc_write_visible_to_readers() {
     }
 }
 
+// =========================================================================
+// Phase Drift: dirty_frames_for_group tests
+// =========================================================================
+
+use crate::tiered::manifest::{dirty_frames_for_group, SubframeOverride};
+
+#[test]
+fn test_dirty_frames_single_page_correct_frame() {
+    let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
+    let ft = vec![
+        FrameEntry { offset: 0, len: 100 },
+        FrameEntry { offset: 100, len: 100 },
+    ];
+    // Page 10 is at position 0, frame 0 (sub_ppf=4, 0/4=0)
+    let result = dirty_frames_for_group(&[10], &group_pages, &ft, 4);
+    assert_eq!(result, vec![0]);
+}
+
+#[test]
+fn test_dirty_frames_multiple_in_same_frame() {
+    let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
+    let ft = vec![
+        FrameEntry { offset: 0, len: 100 },
+        FrameEntry { offset: 100, len: 100 },
+    ];
+    // Pages 10, 11, 12 all in frame 0
+    let result = dirty_frames_for_group(&[10, 11, 12], &group_pages, &ft, 4);
+    assert_eq!(result, vec![0]);
+}
+
+#[test]
+fn test_dirty_frames_across_frames() {
+    let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
+    let ft = vec![
+        FrameEntry { offset: 0, len: 100 },
+        FrameEntry { offset: 100, len: 100 },
+    ];
+    // Page 10 in frame 0, page 14 in frame 1
+    let result = dirty_frames_for_group(&[10, 14], &group_pages, &ft, 4);
+    assert_eq!(result, vec![0, 1]);
+}
+
+#[test]
+fn test_dirty_frames_no_dirty_pages() {
+    let group_pages = vec![10, 11, 12, 13];
+    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    let result = dirty_frames_for_group(&[], &group_pages, &ft, 4);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_dirty_frames_page_not_in_group() {
+    let group_pages = vec![10, 11, 12, 13];
+    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    // Page 99 is not in the group
+    let result = dirty_frames_for_group(&[99], &group_pages, &ft, 4);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_dirty_frames_zero_sub_ppf() {
+    let group_pages = vec![10, 11, 12, 13];
+    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    let result = dirty_frames_for_group(&[10], &group_pages, &ft, 0);
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_dirty_frames_empty_frame_table() {
+    let group_pages = vec![10, 11, 12, 13];
+    let ft: Vec<FrameEntry> = Vec::new();
+    let result = dirty_frames_for_group(&[10], &group_pages, &ft, 4);
+    assert!(result.is_empty());
+}
+
+// =========================================================================
+// Phase Drift: SubframeOverride serde tests
+// =========================================================================
+
+#[test]
+fn test_subframe_override_json_roundtrip() {
+    let ovr = SubframeOverride {
+        key: "pg/0_f1_v5".to_string(),
+        entry: FrameEntry { offset: 0, len: 1234 },
+    };
+    let json = serde_json::to_string(&ovr).expect("json serialize");
+    let ovr2: SubframeOverride = serde_json::from_str(&json).expect("json deserialize");
+    assert_eq!(ovr, ovr2);
+}
+
+#[test]
+fn test_subframe_override_msgpack_roundtrip() {
+    let ovr = SubframeOverride {
+        key: "pg/3_f2_v10".to_string(),
+        entry: FrameEntry { offset: 0, len: 5678 },
+    };
+    let bytes = rmp_serde::to_vec(&ovr).expect("msgpack serialize");
+    let ovr2: SubframeOverride = rmp_serde::from_slice(&bytes).expect("msgpack deserialize");
+    assert_eq!(ovr, ovr2);
+}
+
+#[test]
+fn test_manifest_backward_compat_no_overrides() {
+    // Old manifest JSON without subframe_overrides should deserialize to empty vec
+    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["pg/0_v1"]}"#;
+    let m: Manifest = serde_json::from_str(json).expect("deserialize");
+    assert!(m.subframe_overrides.is_empty());
+}
+
+#[test]
+fn test_manifest_with_overrides_serde_roundtrip() {
+    let mut overrides = HashMap::new();
+    overrides.insert(1, SubframeOverride {
+        key: "pg/0_f1_v5".to_string(),
+        entry: FrameEntry { offset: 0, len: 1000 },
+    });
+    let m = Manifest {
+        version: 5,
+        page_count: 100,
+        page_size: 4096,
+        pages_per_group: 32,
+        page_group_keys: vec!["pg/0_v4".to_string()],
+        subframe_overrides: vec![overrides],
+        ..Manifest::empty()
+    };
+    let json = serde_json::to_string(&m).expect("serialize");
+    let m2: Manifest = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(m2.subframe_overrides.len(), 1);
+    assert_eq!(m2.subframe_overrides[0].len(), 1);
+    let ovr = &m2.subframe_overrides[0][&1];
+    assert_eq!(ovr.key, "pg/0_f1_v5");
+    assert_eq!(ovr.entry.len, 1000);
+}
+
+#[test]
+fn test_vacuum_clears_overrides() {
+    let mut overrides = HashMap::new();
+    overrides.insert(0, SubframeOverride {
+        key: "pg/0_f0_v3".to_string(),
+        entry: FrameEntry { offset: 0, len: 500 },
+    });
+    let mut m = Manifest {
+        version: 3,
+        page_count: 100,
+        page_size: 4096,
+        pages_per_group: 32,
+        subframe_overrides: vec![overrides],
+        ..Manifest::empty()
+    };
+    // Simulate VACUUM clearing overrides (collecting keys for GC)
+    let mut gc_keys = Vec::new();
+    for overrides in &m.subframe_overrides {
+        for ovr in overrides.values() {
+            gc_keys.push(ovr.key.clone());
+        }
+    }
+    m.subframe_overrides.clear();
+    assert_eq!(gc_keys, vec!["pg/0_f0_v3"]);
+    assert!(m.subframe_overrides.is_empty());
+}
+
+#[test]
+fn test_normalize_overrides_extends_to_match_groups() {
+    let mut m = Manifest {
+        version: 1,
+        page_count: 100,
+        page_size: 4096,
+        pages_per_group: 32,
+        page_group_keys: vec!["pg/0_v1".into(), "pg/1_v1".into(), "pg/2_v1".into()],
+        subframe_overrides: Vec::new(), // empty
+        ..Manifest::empty()
+    };
+    m.normalize_overrides();
+    assert_eq!(m.subframe_overrides.len(), 3);
+    assert!(m.subframe_overrides[0].is_empty());
+    assert!(m.subframe_overrides[1].is_empty());
+    assert!(m.subframe_overrides[2].is_empty());
+}
+

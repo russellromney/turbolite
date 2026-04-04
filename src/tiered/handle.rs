@@ -51,6 +51,8 @@ pub struct TurboliteHandle {
 
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
+    override_threshold: u32,
+    compaction_threshold: u32,
 
     /// AES-256-GCM encryption key for S3 data and local cache.
     encryption_key: Option<[u8; 32]>,
@@ -319,6 +321,8 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool,
             gc_enabled,
+            override_threshold: 0,
+            compaction_threshold: 0,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict,
@@ -369,6 +373,8 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool: None,
             gc_enabled: false,
+            override_threshold: 0,
+            compaction_threshold: 0,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict: None,
@@ -716,7 +722,8 @@ impl TurboliteHandle {
                     if !key.is_empty() {
                         let ft = manifest.frame_tables.get(*gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(*gid).into_owned();
-                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp) {
+                        let ovrs = manifest.subframe_overrides.get(*gid as usize).cloned().unwrap_or_default();
+                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(*gid);
@@ -775,7 +782,8 @@ impl TurboliteHandle {
                 if !key.is_empty() {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                    let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                         submitted += 1;
                     } else {
                         cache.unclaim_group(gid);
@@ -823,7 +831,8 @@ impl TurboliteHandle {
                     if !key.is_empty() {
                         let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(gid).into_owned();
-                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(gid);
@@ -890,7 +899,8 @@ impl TurboliteHandle {
                 if !key.is_empty() {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                    let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                         *submitted += 1;
                         return true;
                     }
@@ -1225,7 +1235,8 @@ impl DatabaseHandle for TurboliteHandle {
                                         if !key.is_empty() {
                                             let ft = manifest_snap.frame_tables.get(plan_gid as usize).cloned().unwrap_or_default();
                                             let gp = manifest_snap.group_page_nums(plan_gid).into_owned();
-                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp) {
+                                            let ovrs = manifest_snap.subframe_overrides.get(plan_gid as usize).cloned().unwrap_or_default();
+                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp, ovrs) {
                                                 cache_ref.unclaim_group(plan_gid);
                                             }
                                         } else {
@@ -1303,6 +1314,33 @@ impl DatabaseHandle for TurboliteHandle {
                             } else { false };
 
                             if decoded_ok {
+                                // Phase Drift-c: apply override frames
+                                if let Some(overrides) = manifest.subframe_overrides.get(gid as usize) {
+                                    if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
+                                        let spf = manifest.sub_pages_per_frame as usize;
+                                        for (&frame_idx, ovr) in overrides {
+                                            if let Ok(Some(ovr_data)) = storage.get_page_group(&ovr.key) {
+                                                if let Ok(decompressed) = decode_seekable_subchunk(
+                                                    &ovr_data,
+                                                    #[cfg(feature = "zstd")]
+                                                    self.decoder_dict.as_ref(),
+                                                    self.encryption_key.as_ref(),
+                                                ) {
+                                                    let frame_start = frame_idx * spf;
+                                                    let frame_end = std::cmp::min(frame_start + spf, pages_in_group.len());
+                                                    let frame_page_nums = &pages_in_group[frame_start..frame_end];
+                                                    let data_len = frame_page_nums.len() * manifest.page_size as usize;
+                                                    if data_len <= decompressed.len() {
+                                                        let _ = cache.write_pages_scattered(
+                                                            frame_page_nums, &decompressed[..data_len],
+                                                            gid, frame_start as u32,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 cache.mark_group_present(gid);
                                 cache.touch_group(gid);
                             }
@@ -1358,9 +1396,14 @@ impl DatabaseHandle for TurboliteHandle {
             let ft = frame_table.unwrap();
 
             if frame_idx < ft.len() {
-                let key = manifest.page_group_keys.get(gid as usize)
+                let base_key = manifest.page_group_keys.get(gid as usize)
                     .expect("gid must be valid index into page_group_keys");
                 let entry = &ft[frame_idx];
+
+                // Phase Drift-c: check for override frame
+                let override_entry = manifest.subframe_overrides
+                    .get(gid as usize)
+                    .and_then(|ovs| ovs.get(&frame_idx));
 
                 // Submit the CURRENT group to prefetch pool (full group fetch in background).
                 self.increment_misses(current_tree_name.as_ref());
@@ -1371,7 +1414,8 @@ impl DatabaseHandle for TurboliteHandle {
                         if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                             if !key.is_empty() {
                                 let gp_owned = manifest.group_page_nums(gid).into_owned();
-                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned) {
+                                let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned, ovrs) {
                                     cache.unclaim_group(gid);
                                 }
                             } else {
@@ -1386,7 +1430,12 @@ impl DatabaseHandle for TurboliteHandle {
                 self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
 
                 let s3_start = Instant::now();
-                match s3_arc.range_get(key, entry.offset, entry.len) {
+                let fetch_result = if let Some(ovr) = override_entry {
+                    s3_arc.get_page_group(&ovr.key).map(|opt| opt.map(|d| d))
+                } else {
+                    s3_arc.range_get(base_key, entry.offset, entry.len)
+                };
+                match fetch_result {
                     Ok(Some(compressed_frame)) => {
                         let s3_ms = s3_start.elapsed().as_millis();
                         let decode_start = Instant::now();
@@ -1867,6 +1916,8 @@ impl DatabaseHandle for TurboliteHandle {
                     #[cfg(feature = "zstd")]
                     self.dictionary_bytes.as_deref(),
                     self.encryption_key,
+                    self.override_threshold,
+                    self.compaction_threshold,
                 )?;
             }
 
@@ -1999,6 +2050,13 @@ impl DatabaseHandle for TurboliteHandle {
                         manifest.interior_chunk_keys.clear();
                         manifest.index_chunk_keys.clear();
                         manifest.frame_tables.clear();
+                        // Phase Drift: clear overrides on VACUUM
+                        for overrides in &manifest.subframe_overrides {
+                            for ovr in overrides.values() {
+                                vacuum_keys.push(ovr.key.clone());
+                            }
+                        }
+                        manifest.subframe_overrides.clear();
                         manifest.build_page_index();
 
                         self.vacuum_replaced_keys = Some(vacuum_keys);
@@ -2456,6 +2514,17 @@ impl DatabaseHandle for TurboliteHandle {
             // untouched groups keep their existing frame tables from import.
             frame_tables: new_frame_tables,
             sub_pages_per_frame: old_sub_ppf,
+            subframe_overrides: {
+                let mut ovs = old_manifest.subframe_overrides.clone();
+                for &gid in groups_dirty.keys() {
+                    if let Some(group_ovs) = ovs.get_mut(gid as usize) {
+                        for (_, ov) in group_ovs.drain() {
+                            replaced_keys.push(ov.key);
+                        }
+                    }
+                }
+                ovs
+            },
             // Carry forward strategy + B-tree-aware fields
             strategy: old_manifest.strategy,
             group_pages: old_manifest.group_pages.clone(),

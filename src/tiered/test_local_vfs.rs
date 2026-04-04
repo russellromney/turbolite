@@ -370,3 +370,193 @@ fn test_local_vfs_checkpoint_reopen() {
         assert_eq!(val, "persisted");
     }
 }
+
+// =========================================================================
+// Phase Drift: override write + cold read tests
+// =========================================================================
+
+/// Write data with override_threshold=100 (high, so overrides are used),
+/// cold reopen, verify data survives.
+#[test]
+fn test_local_vfs_override_write_cold_read() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Write phase
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100, // high threshold: everything goes to override path
+            compaction_threshold: 0, // disable auto-compact
+            ..Default::default()
+        };
+        let vfs_name = format!("local_ovr_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'override_test')", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Cold reopen
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("local_ovr_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(val, "override_test");
+    }
+}
+
+/// Write with override, then full rewrite via another checkpoint, cold reopen.
+#[test]
+fn test_local_vfs_override_then_full_rewrite() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Write phase 1: create table and initial data
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("local_ovr_fr1_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first')", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Write phase 2: update to different value (full rewrite, threshold=0)
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 0, // back to default, full rewrite
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("local_ovr_fr2_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+        conn.execute("UPDATE t SET val = 'final' WHERE id = 1", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    // Cold reopen: verify final value
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_ovr_fr3_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("final reopen");
+        crate::tiered::register(&vfs_name, vfs).expect("register3");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("final open");
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(val, "final");
+    }
+}
+
+/// Accumulate overrides past compaction threshold, verify compaction fires, cold reopen.
+#[test]
+fn test_local_vfs_override_compaction() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Initial write
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 2, // compact after 2 overrides
+            ..Default::default()
+        };
+        let vfs_name = format!("local_cmpct1_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        for i in 1..=10 {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("val_{}", i)]).unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Update a few times to accumulate overrides, each followed by checkpoint
+        for round in 1..=3 {
+            conn.execute("UPDATE t SET val = ?1 WHERE id = 1", rusqlite::params![format!("round_{}", round)]).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+    }
+
+    // Cold reopen: data should be consistent after compaction
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("local_cmpct2_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(val, "round_3");
+
+        // Other rows should be intact
+        let val5: String = conn
+            .query_row("SELECT val FROM t WHERE id = 5", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(val5, "val_5");
+    }
+}

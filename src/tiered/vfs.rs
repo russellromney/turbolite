@@ -344,6 +344,8 @@ impl TurboliteVfs {
             dictionary: self.config.dictionary.clone(),
             encryption_key: self.config.encryption_key,
             gc_enabled: self.config.gc_enabled,
+            override_threshold: self.config.override_threshold,
+            compaction_threshold: self.config.compaction_threshold,
         }
     }
 
@@ -466,6 +468,8 @@ impl TurboliteVfs {
             self.config.dictionary.as_deref(),
             self.config.encryption_key,
             self.config.gc_enabled,
+            self.config.override_threshold,
+            self.config.compaction_threshold,
         )
     }
 

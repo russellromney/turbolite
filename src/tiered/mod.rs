@@ -103,7 +103,7 @@ pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, S
 pub use handle::TurboliteHandle;
 #[cfg(feature = "cloud")]
 pub use import::import_sqlite_file;
-pub use manifest::{FrameEntry, Manifest};
+pub use manifest::{FrameEntry, Manifest, SubframeOverride};
 pub use vfs::TurboliteVfs;
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query};
 pub use settings::{turbolite_config_set, push_setting};

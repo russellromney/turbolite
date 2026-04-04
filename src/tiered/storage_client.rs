@@ -192,6 +192,11 @@ impl StorageClient {
         format!("ixb/{}_v{}", chunk_id, version)
     }
 
+    /// Phase Drift: override frame key.
+    pub(crate) fn override_frame_key(group_id: u64, frame_idx: usize, version: u64) -> String {
+        format!("pg/{}_f{}_v{}", group_id, frame_idx, version)
+    }
+
     // ── S3-specific operations (no-op for local) ──
 
     /// Byte-range GET (S3 only). Local mode reads the full file.

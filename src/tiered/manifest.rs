@@ -40,6 +40,10 @@ pub struct Manifest {
     #[serde(default)]
     pub sub_pages_per_frame: u32,
 
+    /// Phase Drift: per-group subframe overrides. Indexed by group_id, keyed by frame_index.
+    #[serde(default)]
+    pub subframe_overrides: Vec<HashMap<usize, SubframeOverride>>,
+
     /// Grouping strategy used to build this manifest.
     /// Positional (legacy): gid = page_num / ppg. BTreeAware: explicit mapping.
     #[serde(default = "default_strategy")]
@@ -88,12 +92,21 @@ fn default_strategy() -> GroupingStrategy {
 
 /// A single frame entry in a seekable page group. Points to a byte range within the S3 object
 /// containing an independently-decompressible sub-chunk of pages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FrameEntry {
     /// Byte offset from start of the S3 object
     pub offset: u64,
     /// Compressed length in bytes
     pub len: u32,
+}
+
+/// Phase Drift: a subframe override entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubframeOverride {
+    /// S3 key for the override object
+    pub key: String,
+    /// Frame entry (offset always 0, len is full object size)
+    pub entry: FrameEntry,
 }
 
 pub(crate) fn default_pages_per_group() -> u32 {
@@ -156,6 +169,7 @@ impl Manifest {
             index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
+            subframe_overrides: Vec::new(),
             strategy: GroupingStrategy::Positional,
             group_pages: Vec::new(),
             btrees: HashMap::new(),
@@ -281,14 +295,47 @@ impl Manifest {
         self.btree_groups.get(&gid).cloned().unwrap_or_default()
     }
 
+    /// Phase Drift: ensure subframe_overrides vec length matches page_group_keys.
+    pub fn normalize_overrides(&mut self) {
+        while self.subframe_overrides.len() < self.page_group_keys.len() {
+            self.subframe_overrides.push(HashMap::new());
+        }
+    }
+
     /// Detect strategy from manifest contents (for backward compat with manifests
     /// that lack the strategy field). Call after deserialization.
     pub fn detect_and_normalize_strategy(&mut self) {
         if !self.group_pages.is_empty() && self.strategy == GroupingStrategy::Positional {
             self.strategy = GroupingStrategy::BTreeAware;
         }
+        self.normalize_overrides();
         self.build_page_index();
     }
+}
+
+/// Phase Drift: given dirty page numbers and a group's page list, return which
+/// frame indices contain at least one dirty page.
+pub(crate) fn dirty_frames_for_group(
+    dirty_page_nums: &[u64],
+    group_pages: &[u64],
+    frame_table: &[FrameEntry],
+    sub_pages_per_frame: u32,
+) -> Vec<usize> {
+    if sub_pages_per_frame == 0 || frame_table.is_empty() {
+        return Vec::new();
+    }
+    let mut dirty_frame_set: HashSet<usize> = HashSet::new();
+    for &dirty_pnum in dirty_page_nums {
+        if let Some(pos) = group_pages.iter().position(|&p| p == dirty_pnum) {
+            let frame_idx = pos / sub_pages_per_frame as usize;
+            if frame_idx < frame_table.len() {
+                dirty_frame_set.insert(frame_idx);
+            }
+        }
+    }
+    let mut result: Vec<usize> = dirty_frame_set.into_iter().collect();
+    result.sort_unstable();
+    result
 }
 
 #[cfg(test)]

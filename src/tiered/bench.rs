@@ -22,6 +22,8 @@ pub struct TurboliteSharedState {
     pub(super) dictionary: Option<Vec<u8>>,
     pub(super) encryption_key: Option<[u8; 32]>,
     pub(super) gc_enabled: bool,
+    pub(super) override_threshold: u32,
+    pub(super) compaction_threshold: u32,
 }
 
 impl TurboliteSharedState {
@@ -238,6 +240,8 @@ impl TurboliteSharedState {
             self.dictionary.as_deref(),
             self.encryption_key,
             self.gc_enabled,
+            self.override_threshold,
+            self.compaction_threshold,
         )
     }
 
@@ -434,10 +438,11 @@ impl TurboliteSharedState {
                             .cloned().unwrap_or_default();
                         let gp = manifest.group_pages.get(gid as usize)
                             .cloned().unwrap_or_default();
+                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
                         self.prefetch_pool.submit(
                             gid, key.clone(), ft,
                             manifest.page_size, manifest.sub_pages_per_frame,
-                            gp,
+                            gp, ovrs,
                         );
                         groups_submitted += 1;
                     }

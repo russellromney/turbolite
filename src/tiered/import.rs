@@ -342,6 +342,7 @@ pub fn import_sqlite_file(
         index_chunk_keys,
         frame_tables,
         sub_pages_per_frame: if use_seekable { sub_ppf } else { 0 },
+        subframe_overrides: Vec::new(),
         strategy: GroupingStrategy::BTreeAware,
         group_pages: group_pages_list,
         btrees: btrees_manifest,

@@ -126,6 +126,11 @@ impl S3Client {
         self.s3_key(&format!("ixb/{}_v{}", chunk_id, version))
     }
 
+    /// Phase Drift: override frame key.
+    pub(crate) fn override_frame_key(&self, group_id: u64, frame_idx: usize, version: u64) -> String {
+        self.s3_key(&format!("pg/{}_f{}_v{}", group_id, frame_idx, version))
+    }
+
     // --- Generic GET/PUT ---
 
     pub(crate) async fn get_object_async(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
