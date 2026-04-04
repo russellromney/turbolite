@@ -21,7 +21,7 @@ Simulate an IoT sensor logger: generate 10 temperature readings, store them in a
 ## How it works
 
 1. `#include "turbolite.h"` - auto-generated C header from `make header`
-2. `turbolite_register_compressed` (local) or `turbolite_register_tiered` (S3)
+2. `turbolite_register_local` (local) or `turbolite_register_cloud` (S3)
 3. `turbolite_open` - open a database through the VFS
 4. `turbolite_exec` - insert sensor readings
 5. `turbolite_query_json` - query aggregates, get JSON back
