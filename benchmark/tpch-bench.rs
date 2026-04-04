@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -100,10 +100,10 @@ fn open_reader(db_name: &str, vfs_name: &str, cache_pages: i64) -> Connection {
     conn
 }
 
-fn make_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
+fn make_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let unique_prefix = format!("tpch/{}/{}", prefix,
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    TieredConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: unique_prefix,
         cache_dir: cache_dir.to_path_buf(),
@@ -114,8 +114,8 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
     }
 }
 
-fn make_reader_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
-    TieredConfig {
+fn make_reader_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -485,7 +485,7 @@ fn bench_cold_query(
         let cache = TempDir::new().expect("temp dir");
         let vfs_name = unique_vfs_name("cold_q");
         let config = make_reader_config(s3_prefix, cache.path());
-        let vfs = TieredVfs::new(config).expect("cold VFS");
+        let vfs = TurboliteVfs::new(config).expect("cold VFS");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let start = Instant::now();
         let conn = open_reader(db_name, &vfs_name, 1);
@@ -528,7 +528,7 @@ fn main() {
     let config = make_config(&format!("sf_{}", scale), cache_dir.path());
     let s3_prefix = config.prefix.clone();
     let vfs_name = unique_vfs_name("write");
-    let vfs = TieredVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_name = format!("tpch_sf{}.db", scale);
@@ -574,7 +574,7 @@ fn main() {
     println!("--- WARM (disk cache + 20% page cache) ---");
     let warm_vfs_name = unique_vfs_name("warm");
     let warm_config = make_reader_config(&s3_prefix, cache_dir.path());
-    let warm_vfs = TieredVfs::new(warm_config).expect("warm VFS");
+    let warm_vfs = TurboliteVfs::new(warm_config).expect("warm VFS");
     turbolite::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
 
     let cache_pages = (est_db_mb * 1024.0 * 1024.0 * 0.2 / 65536.0) as i64;
@@ -607,7 +607,7 @@ fn main() {
             let cache = TempDir::new().unwrap();
             let vn = unique_vfs_name("cold_pt");
             let cfg = make_reader_config(&s3_prefix, cache.path());
-            let v = TieredVfs::new(cfg).expect("cold VFS");
+            let v = TurboliteVfs::new(cfg).expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -628,7 +628,7 @@ fn main() {
             let cache = TempDir::new().unwrap();
             let vn = unique_vfs_name("cold_rng");
             let cfg = make_reader_config(&s3_prefix, cache.path());
-            let v = TieredVfs::new(cfg).expect("cold VFS");
+            let v = TurboliteVfs::new(cfg).expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -666,13 +666,13 @@ fn main() {
     if !cli.no_cleanup {
         eprint!("  Cleaning up S3... ");
         let cleanup_cache = TempDir::new().unwrap();
-        let cleanup_config = TieredConfig {
+        let cleanup_config = TurboliteConfig {
             bucket: test_bucket(), prefix: s3_prefix,
             cache_dir: cleanup_cache.path().to_path_buf(), compression_level: 3,
             endpoint_url: Some(endpoint_url()), region: Some("auto".to_string()),
             ..Default::default()
         };
-        let cleanup_vfs = TieredVfs::new(cleanup_config).expect("cleanup VFS");
+        let cleanup_vfs = TurboliteVfs::new(cleanup_config).expect("cleanup VFS");
         cleanup_vfs.destroy_s3().expect("S3 cleanup failed");
         eprintln!("done");
     }

@@ -1,7 +1,16 @@
+// When cloud feature is disabled, S3Client is a zero-size type that can never
+// be constructed. The type exists so Option<Arc<S3Client>> compiles everywhere.
+#[cfg(not(feature = "cloud"))]
+pub(crate) struct S3Client {
+    _private: (),  // prevent construction
+}
+
+#[cfg(feature = "cloud")]
 use super::*;
 
 // ===== S3Client (sync wrapper around async SDK) =====
 
+#[cfg(feature = "cloud")]
 /// Synchronous S3 client wrapping the async AWS SDK.
 pub(crate) struct S3Client {
     pub(crate) client: aws_sdk_s3::Client,
@@ -18,9 +27,10 @@ pub(crate) struct S3Client {
     pub(crate) put_bytes: AtomicU64,
 }
 
+#[cfg(feature = "cloud")]
 impl S3Client {
     /// Create a new S3 client.
-    pub(crate) async fn new_async(config: &TieredConfig) -> io::Result<Self> {
+    pub(crate) async fn new_async(config: &TurboliteConfig) -> io::Result<Self> {
         eprintln!("[s3] new_async: loading aws_config...");
         let mut aws_config = aws_config::from_env();
 
@@ -51,7 +61,7 @@ impl S3Client {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    "No tokio runtime available. Pass runtime_handle in TieredConfig \
+                    "No tokio runtime available. Pass runtime_handle in TurboliteConfig \
                      or call from within a tokio context.",
                 )
             })?;
@@ -69,7 +79,7 @@ impl S3Client {
     }
 
     /// Blocking constructor.
-    pub(crate) fn new_blocking(config: &TieredConfig, runtime: &TokioHandle) -> io::Result<Self> {
+    pub(crate) fn new_blocking(config: &TurboliteConfig, runtime: &TokioHandle) -> io::Result<Self> {
         Self::block_on(runtime, Self::new_async(config))
     }
 
@@ -114,6 +124,11 @@ impl S3Client {
     /// Generate versioned S3 key for a chunked index leaf bundle piece.
     pub(crate) fn index_chunk_key(&self, chunk_id: u32, version: u64) -> String {
         self.s3_key(&format!("ixb/{}_v{}", chunk_id, version))
+    }
+
+    /// Phase Drift: override frame key.
+    pub(crate) fn override_frame_key(&self, group_id: u64, frame_idx: usize, version: u64) -> String {
+        self.s3_key(&format!("pg/{}_f{}_v{}", group_id, frame_idx, version))
     }
 
     // --- Generic GET/PUT ---
@@ -549,6 +564,7 @@ impl S3Client {
     }
 }
 
+#[cfg(feature = "cloud")]
 /// Check if an S3 error is a 404 / NoSuchKey.
 pub(crate) fn is_not_found<E: std::fmt::Display + std::fmt::Debug>(
     err: &aws_sdk_s3::error::SdkError<E>,

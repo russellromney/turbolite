@@ -7,8 +7,8 @@ use super::*;
 
 /// Lightweight handle for benchmarking -- shares the same S3 client, cache,
 /// manifest, and dirty groups as the VFS.
-/// Obtained via [`TieredVfs::shared_state`] before registering the VFS.
-pub struct TieredSharedState {
+/// Obtained via [`TurboliteVfs::shared_state`] before registering the VFS.
+pub struct TurboliteSharedState {
     pub(super) s3: Arc<S3Client>,
     pub(super) cache: Arc<DiskCache>,
     pub(super) prefetch_pool: Arc<PrefetchPool>,
@@ -22,9 +22,11 @@ pub struct TieredSharedState {
     pub(super) dictionary: Option<Vec<u8>>,
     pub(super) encryption_key: Option<[u8; 32]>,
     pub(super) gc_enabled: bool,
+    pub(super) override_threshold: u32,
+    pub(super) compaction_threshold: u32,
 }
 
-impl TieredSharedState {
+impl TurboliteSharedState {
     /// Evict data pages only -- interior B-tree pages and group 0 stay warm.
     /// Simulates production where structural pages are always hot.
     ///
@@ -78,6 +80,23 @@ impl TieredSharedState {
                 }
             }
             let _ = bitmap.persist();
+        }
+
+        // Prune compressed cache index
+        {
+            let mut keep = pinned_pages.clone();
+            keep.extend(&index_pages);
+            for pages in pending_groups.values() {
+                keep.extend(pages);
+            }
+            let gp = self.cache.group_pages.read();
+            if let Some(g0_pages) = gp.first() {
+                keep.extend(g0_pages);
+            } else {
+                let ppg = self.cache.pages_per_group as u64;
+                for p in 0..ppg { keep.insert(p); }
+            }
+            self.cache.prune_cache_index(&keep);
         }
 
         // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
@@ -139,6 +158,22 @@ impl TieredSharedState {
             let _ = bitmap.persist();
         }
 
+        // Prune compressed cache index
+        {
+            let mut keep = pinned_pages.clone();
+            for pages in pending_groups.values() {
+                keep.extend(pages);
+            }
+            let gp = self.cache.group_pages.read();
+            if let Some(g0_pages) = gp.first() {
+                keep.extend(g0_pages);
+            } else {
+                let ppg = self.cache.pages_per_group as u64;
+                for p in 0..ppg { keep.insert(p); }
+            }
+            self.cache.prune_cache_index(&keep);
+        }
+
         // Clear sub-chunk tracker: evict Index + Data tiers, keep Pinned only
         {
             let mut tracker = self.cache.tracker.lock();
@@ -180,6 +215,9 @@ impl TieredSharedState {
             let _ = bitmap.persist();
         }
 
+        // Clear compressed cache index entirely
+        self.cache.clear_cache_index();
+
         // Clear ALL sub-chunk tracker entries including Pinned and Index
         {
             let mut tracker = self.cache.tracker.lock();
@@ -188,7 +226,7 @@ impl TieredSharedState {
     }
 
     /// Upload locally-checkpointed dirty pages to S3 without holding any SQLite lock.
-    /// See [`TieredVfs::flush_to_s3`] for full documentation.
+    /// See [`TurboliteVfs::flush_to_s3`] for full documentation.
     pub fn flush_to_s3(&self) -> io::Result<()> {
         let _guard = self.flush_lock.lock().unwrap();
         flush::flush_dirty_groups_to_s3(
@@ -202,6 +240,8 @@ impl TieredSharedState {
             self.dictionary.as_deref(),
             self.encryption_key,
             self.gc_enabled,
+            self.override_threshold,
+            self.compaction_threshold,
         )
     }
 
@@ -398,10 +438,11 @@ impl TieredSharedState {
                             .cloned().unwrap_or_default();
                         let gp = manifest.group_pages.get(gid as usize)
                             .cloned().unwrap_or_default();
+                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
                         self.prefetch_pool.submit(
                             gid, key.clone(), ft,
                             manifest.page_size, manifest.sub_pages_per_frame,
-                            gp,
+                            gp, ovrs,
                         );
                         groups_submitted += 1;
                     }

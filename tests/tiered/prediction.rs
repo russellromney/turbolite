@@ -14,7 +14,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_rt");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_rt.db?vfs={}", vfs_name);
@@ -69,7 +69,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     }
 
     // Read manifest from S3
-    let manifest = turbolite::tiered::get_manifest(&TieredConfig {
+    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
         bucket: bucket.clone(), prefix: prefix.clone(),
         endpoint_url: endpoint.clone(), region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
@@ -82,7 +82,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
 
     // Reopen from S3 with a fresh VFS and verify patterns survived
     let reader_cache = tempfile::tempdir().unwrap();
-    let reader_manifest = turbolite::tiered::get_manifest(&TieredConfig {
+    let reader_manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: reader_cache.path().to_path_buf(),
@@ -112,7 +112,7 @@ fn test_checkpoint_no_patterns_when_disabled() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_off");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_off.db?vfs={}", vfs_name);
@@ -129,7 +129,7 @@ fn test_checkpoint_no_patterns_when_disabled() {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    let manifest = turbolite::tiered::get_manifest(&TieredConfig {
+    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
@@ -150,7 +150,7 @@ fn test_single_table_no_predictions() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_single");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_single.db?vfs={}", vfs_name);
@@ -188,7 +188,7 @@ fn test_single_table_no_predictions() {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    let manifest = turbolite::tiered::get_manifest(&TieredConfig {
+    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
@@ -209,7 +209,7 @@ fn test_vacuum_predictions_no_corruption() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_vac");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_vac.db?vfs={}", vfs_name);
@@ -267,7 +267,7 @@ fn test_vacuum_predictions_no_corruption() {
     // Cold reader should see data (patterns keyed by name survive VACUUM)
     {
         let reader_cache = tempfile::tempdir().unwrap();
-        let reader_config = TieredConfig {
+        let reader_config = TurboliteConfig {
             bucket, prefix, endpoint_url: endpoint,
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
@@ -275,7 +275,7 @@ fn test_vacuum_predictions_no_corruption() {
             ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("pred_vac_reader");
-        let reader_vfs = TieredVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:pred_vac.db?vfs={}", reader_vfs_name);
@@ -296,7 +296,7 @@ fn test_drop_create_same_name_no_crash() {
     config.prediction_enabled = true;
 
     let vfs_name = unique_vfs_name("pred_drop");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_drop.db?vfs={}", vfs_name);

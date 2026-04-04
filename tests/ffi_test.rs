@@ -262,6 +262,296 @@ fn test_persistence_across_connections() {
     turbolite_close(db);
 }
 
+// --- turbolite_register_local ---
+
+#[test]
+fn test_register_local_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-local-test").unwrap();
+    let cache_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+
+    let rc = turbolite_register_local(name.as_ptr(), cache_dir.as_ptr(), 3);
+    assert_eq!(rc, 0, "register_local should succeed");
+
+    let err = turbolite_last_error();
+    assert!(err.is_null());
+}
+
+#[test]
+fn test_register_local_null_name_fails() {
+    let cache_dir = CString::new("/tmp/ffi-local-null-name").unwrap();
+    let rc = turbolite_register_local(std::ptr::null(), cache_dir.as_ptr(), 3);
+    assert_eq!(rc, -1);
+
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("name"), "error should mention 'name', got: {}", msg);
+}
+
+#[test]
+fn test_register_local_null_cache_dir_fails() {
+    let name = CString::new("ffi-local-null-dir").unwrap();
+    let rc = turbolite_register_local(name.as_ptr(), std::ptr::null(), 3);
+    assert_eq!(rc, -1);
+
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("cache_dir"), "error should mention 'cache_dir', got: {}", msg);
+}
+
+#[test]
+fn test_register_local_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let vfs_name = CString::new("ffi-local-roundtrip").unwrap();
+    let cache_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+
+    let rc = turbolite_register_local(vfs_name.as_ptr(), cache_dir.as_ptr(), 3);
+    assert_eq!(rc, 0);
+
+    let db_path = CString::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null(), "open should return non-null handle");
+
+    // Create table, insert, query
+    let sql = CString::new(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); \
+         INSERT INTO items VALUES (1, 'alpha'); \
+         INSERT INTO items VALUES (2, 'beta');"
+    ).unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+
+    let query = CString::new("SELECT * FROM items ORDER BY id").unwrap();
+    let json_ptr = turbolite_query_json(db, query.as_ptr());
+    assert!(!json_ptr.is_null());
+
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+    let rows = parsed.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], 1);
+    assert_eq!(rows[0]["name"], "alpha");
+    assert_eq!(rows[1]["id"], 2);
+    assert_eq!(rows[1]["name"], "beta");
+
+    turbolite_free_string(json_ptr);
+    turbolite_close(db);
+}
+
+#[test]
+fn test_register_local_persistence_across_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let vfs_name = CString::new("ffi-local-persist").unwrap();
+    let cache_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+    turbolite_register_local(vfs_name.as_ptr(), cache_dir.as_ptr(), 3);
+
+    let db_path = CString::new(dir.path().join("persist.db").to_str().unwrap()).unwrap();
+
+    // Write
+    {
+        let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
+        assert!(!db.is_null());
+        let sql = CString::new(
+            "CREATE TABLE kv (k TEXT, v TEXT); INSERT INTO kv VALUES ('x', 'y');"
+        ).unwrap();
+        turbolite_exec(db, sql.as_ptr());
+        turbolite_close(db);
+    }
+
+    // Re-open and read
+    {
+        let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
+        assert!(!db.is_null());
+        let query = CString::new("SELECT * FROM kv").unwrap();
+        let json_ptr = turbolite_query_json(db, query.as_ptr());
+        assert!(!json_ptr.is_null());
+
+        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let rows = parsed.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["k"], "x");
+        assert_eq!(rows[0]["v"], "y");
+
+        turbolite_free_string(json_ptr);
+        turbolite_close(db);
+    }
+}
+
+#[test]
+fn test_register_local_duplicate_name_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-local-dup").unwrap();
+    let cache_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+
+    let rc1 = turbolite_register_local(name.as_ptr(), cache_dir.as_ptr(), 3);
+    assert_eq!(rc1, 0);
+
+    let rc2 = turbolite_register_local(name.as_ptr(), cache_dir.as_ptr(), 3);
+    assert_eq!(rc2, 0, "re-registering same name should succeed");
+}
+
+// --- turbolite_register (JSON config) ---
+
+#[test]
+fn test_register_json_local_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-json-local").unwrap();
+    let config = format!(r#"{{ "cache_dir": "{}" }}"#, dir.path().to_str().unwrap());
+    let config_json = CString::new(config).unwrap();
+
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0, "register with JSON should succeed");
+
+    // Verify it works by opening a database
+    let db_path = CString::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (42);").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+
+    let query = CString::new("SELECT id FROM t").unwrap();
+    let json_ptr = turbolite_query_json(db, query.as_ptr());
+    assert!(!json_ptr.is_null());
+
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+    assert_eq!(parsed[0]["id"], 42);
+
+    turbolite_free_string(json_ptr);
+    turbolite_close(db);
+}
+
+#[test]
+fn test_register_json_with_compression_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-json-level").unwrap();
+    let config = format!(
+        r#"{{ "cache_dir": "{}", "compression_level": 9 }}"#,
+        dir.path().to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_register_json_invalid_json_fails() {
+    let name = CString::new("ffi-json-bad").unwrap();
+    let config_json = CString::new("not valid json {{{").unwrap();
+
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, -1);
+
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("JSON") || msg.contains("json"), "error should mention JSON, got: {}", msg);
+}
+
+#[test]
+fn test_register_json_null_name_fails() {
+    let config_json = CString::new("{}").unwrap();
+    let rc = turbolite_register(std::ptr::null(), config_json.as_ptr());
+    assert_eq!(rc, -1);
+}
+
+#[test]
+fn test_register_json_null_config_fails() {
+    let name = CString::new("ffi-json-null-config").unwrap();
+    let rc = turbolite_register(name.as_ptr(), std::ptr::null());
+    assert_eq!(rc, -1);
+
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("config_json"), "error should mention 'config_json', got: {}", msg);
+}
+
+#[test]
+fn test_register_json_empty_object_uses_defaults() {
+    let name = CString::new("ffi-json-defaults").unwrap();
+    let config_json = CString::new("{}").unwrap();
+
+    // Should succeed with all defaults (Local backend, default cache_dir)
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_register_json_explicit_local_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-json-explicit-local").unwrap();
+    let config = format!(
+        r#"{{ "storage_backend": "Local", "cache_dir": "{}" }}"#,
+        dir.path().to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0);
+
+    // Verify it works
+    let db_path = CString::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+
+    let sql = CString::new("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('ok');").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+
+    let query = CString::new("SELECT v FROM t").unwrap();
+    let json_ptr = turbolite_query_json(db, query.as_ptr());
+    assert!(!json_ptr.is_null());
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+    assert_eq!(parsed[0]["v"], "ok");
+
+    turbolite_free_string(json_ptr);
+    turbolite_close(db);
+}
+
+#[test]
+fn test_register_json_unknown_fields_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = CString::new("ffi-json-unknown").unwrap();
+    let config = format!(
+        r#"{{ "cache_dir": "{}", "some_future_field": true, "another_thing": 42 }}"#,
+        dir.path().to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0, "unknown fields should be silently ignored");
+}
+
+// --- turbolite_register_tiered alias ---
+
+#[cfg(feature = "cloud")]
+#[test]
+fn test_register_tiered_null_bucket_fails() {
+    let name = CString::new("ffi-tiered-alias").unwrap();
+    let prefix = CString::new("prefix").unwrap();
+    let cache_dir = CString::new("/tmp/ffi-tiered-alias").unwrap();
+
+    let rc = turbolite_register_tiered(
+        name.as_ptr(),
+        std::ptr::null(),
+        prefix.as_ptr(),
+        cache_dir.as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+    assert_eq!(rc, -1);
+
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("bucket"), "error should mention 'bucket', got: {}", msg);
+}
+
 // --- Cache utilities ---
 
 #[test]

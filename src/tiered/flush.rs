@@ -19,6 +19,7 @@ use super::*;
 /// # Safety contract
 /// - Must NOT be called concurrently with itself (caller holds flush_lock).
 /// - Staging log files must exist for all pending flushes.
+#[cfg(feature = "cloud")]
 pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
@@ -29,6 +30,8 @@ pub(crate) fn flush_dirty_groups_to_s3(
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
     gc_enabled: bool,
+    override_threshold: u32,
+    compaction_threshold: u32,
 ) -> io::Result<()> {
     // 1. Drain pending flushes (staging logs) + legacy dirty groups
     let flushes: Vec<staging::PendingFlush> = {
@@ -54,6 +57,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
         #[cfg(feature = "zstd")] dictionary,
         encryption_key, gc_enabled,
         &flushes, &legacy_dirty_groups,
+        override_threshold, compaction_threshold,
     );
 
     if let Err(ref e) = result {
@@ -72,6 +76,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 }
 
 /// Inner flush logic. Separated so the outer function can restore state on error.
+#[cfg(feature = "cloud")]
 fn flush_inner(
     s3: &S3Client,
     cache: &DiskCache,
@@ -82,6 +87,8 @@ fn flush_inner(
     gc_enabled: bool,
     flushes: &[staging::PendingFlush],
     legacy_dirty_groups: &HashSet<u64>,
+    override_threshold: u32,
+    compaction_threshold: u32,
 ) -> io::Result<()> {
     // 2. Read all staging logs and merge into a single page map.
     // Later staging logs overwrite earlier ones (correct: later checkpoint wins).
@@ -159,6 +166,16 @@ fn flush_inner(
     let use_seekable = old_sub_ppf > 0;
     let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
 
+    // Phase Drift: carry forward subframe overrides, track which groups get full rewrite
+    let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
+    let effective_threshold = if override_threshold > 0 {
+        override_threshold as usize
+    } else if use_seekable && old_sub_ppf > 0 {
+        let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
+        std::cmp::max(1, frames_per_group / 4)
+    } else { 0 };
+    let mut full_rewrite_groups: HashSet<u64> = HashSet::new();
+
     // Track page numbers from dirty groups (for interior/index chunk dirtiness)
     let mut dirty_page_nums: HashSet<u64> = HashSet::new();
 
@@ -166,121 +183,156 @@ fn flush_inner(
     for &gid in &dirty_groups {
         let pages_in_group = manifest_snap.group_page_nums(gid);
         let group_size = pages_in_group.len();
-        let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
-        let mut need_s3_merge = false;
 
-        for (i, &pnum) in pages_in_group.iter().enumerate() {
-            if pnum >= page_count {
-                break;
-            }
-            dirty_page_nums.insert(pnum);
-
-            // Priority: staging log > cache > S3 merge
-            if let Some(staged_data) = staged_pages.get(&pnum) {
-                pages[i] = Some(staged_data.clone());
-            } else if cache.is_present(pnum) {
-                let mut page_buf = vec![0u8; page_size as usize];
-                if cache.read_page(pnum, &mut page_buf).is_ok() {
-                    pages[i] = Some(page_buf);
-                } else {
-                    need_s3_merge = true;
-                }
-            } else {
-                need_s3_merge = true;
-            }
+        // Track all pages in dirty groups for interior/index chunk dirtiness
+        for &pnum in pages_in_group.iter() {
+            if pnum < page_count { dirty_page_nums.insert(pnum); }
         }
 
-        // If some pages aren't in staging or cache, fetch existing group from S3 and merge
-        if need_s3_merge {
-            if let Some(existing_key) = new_keys.get(gid as usize) {
-                if !existing_key.is_empty() {
-                    if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
-                        let existing_ft = manifest_snap.frame_tables.get(gid as usize);
-                        let has_ft = use_seekable
-                            && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
-                        if has_ft {
-                            let ft = existing_ft.unwrap();
-                            if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
-                                &pg_data,
-                                ft,
-                                page_size,
-                                pages_in_group.len() as u32,
-                                page_count,
-                                0,
-                                #[cfg(feature = "zstd")]
-                                decoder_dict.as_ref(),
-                                encryption_key.as_ref(),
-                            ) {
-                                let ps = page_size as usize;
-                                for j in 0..pages_in_group.len() {
-                                    if pages_in_group[j] >= page_count { break; }
-                                    if pages[j].is_none() {
-                                        let start = j * ps;
-                                        let end = start + ps;
-                                        if end <= bulk_data.len() {
-                                            pages[j] = Some(bulk_data[start..end].to_vec());
+        // Phase Drift: determine if we can use override path
+        let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
+            .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
+            .copied().collect();
+        let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
+        let has_frame_table = use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
+        let dirty_frames = if has_frame_table && effective_threshold > 0 {
+            manifest::dirty_frames_for_group(
+                &group_dirty_pnums, &pages_in_group,
+                frame_table_ref.expect("checked above"), old_sub_ppf,
+            )
+        } else { Vec::new() };
+        let use_override = has_frame_table
+            && effective_threshold > 0
+            && !dirty_frames.is_empty()
+            && dirty_frames.len() < effective_threshold;
+
+        if use_override {
+            // Phase Drift: override path -- encode only dirty frames
+            while new_subframe_overrides.len() <= gid as usize {
+                new_subframe_overrides.push(HashMap::new());
+            }
+            for &frame_idx in &dirty_frames {
+                let frame_start = frame_idx * old_sub_ppf as usize;
+                let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+                for pos in frame_start..frame_end {
+                    let pnum = pages_in_group[pos];
+                    if pnum >= page_count { break; }
+                    let data = if let Some(staged) = staged_pages.get(&pnum) {
+                        staged.clone()
+                    } else if cache.is_present(pnum) {
+                        let mut buf = vec![0u8; page_size as usize];
+                        if cache.read_page(pnum, &mut buf).is_ok() { buf }
+                        else { vec![0u8; page_size as usize] }
+                    } else { vec![0u8; page_size as usize] };
+                    frame_pages.push((pnum, data));
+                }
+                let override_key = s3.override_frame_key(gid, frame_idx, next_version);
+                let encoded = encode_override_frame(
+                    &frame_pages, page_size, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                if let Some(old_ov) = new_subframe_overrides[gid as usize].get(&frame_idx) {
+                    replaced_keys.push(old_ov.key.clone());
+                }
+                uploads.push((override_key.clone(), encoded.clone()));
+                new_subframe_overrides[gid as usize].insert(frame_idx, manifest::SubframeOverride {
+                    key: override_key,
+                    entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
+                });
+            }
+            // Base group key stays the same -- no re-upload, no key replacement
+        } else {
+            // Full rewrite path (existing behavior)
+            full_rewrite_groups.insert(gid);
+            let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+            let mut need_s3_merge = false;
+
+            for (i, &pnum) in pages_in_group.iter().enumerate() {
+                if pnum >= page_count { break; }
+                if let Some(staged_data) = staged_pages.get(&pnum) {
+                    pages[i] = Some(staged_data.clone());
+                } else if cache.is_present(pnum) {
+                    let mut page_buf = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut page_buf).is_ok() {
+                        pages[i] = Some(page_buf);
+                    } else { need_s3_merge = true; }
+                } else { need_s3_merge = true; }
+            }
+
+            if need_s3_merge {
+                if let Some(existing_key) = new_keys.get(gid as usize) {
+                    if !existing_key.is_empty() {
+                        if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                            let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+                            let has_ft = use_seekable
+                                && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+                            if has_ft {
+                                let ft = existing_ft.unwrap();
+                                if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
+                                    &pg_data, ft, page_size, pages_in_group.len() as u32,
+                                    page_count, 0,
+                                    #[cfg(feature = "zstd")] decoder_dict.as_ref(),
+                                    encryption_key.as_ref(),
+                                ) {
+                                    let ps = page_size as usize;
+                                    for j in 0..pages_in_group.len() {
+                                        if pages_in_group[j] >= page_count { break; }
+                                        if pages[j].is_none() {
+                                            let start = j * ps;
+                                            let end = start + ps;
+                                            if end <= bulk_data.len() {
+                                                pages[j] = Some(bulk_data[start..end].to_vec());
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
-                            &pg_data,
-                            #[cfg(feature = "zstd")]
-                            decoder_dict.as_ref(),
-                            encryption_key.as_ref(),
-                        ) {
-                            for (j, existing_page) in existing_pages.into_iter().enumerate() {
-                                if j >= pages_in_group.len() { break; }
-                                if pages_in_group[j] >= page_count { break; }
-                                if pages[j].is_none() {
-                                    pages[j] = Some(existing_page);
+                            } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
+                                &pg_data,
+                                #[cfg(feature = "zstd")] decoder_dict.as_ref(),
+                                encryption_key.as_ref(),
+                            ) {
+                                for (j, existing_page) in existing_pages.into_iter().enumerate() {
+                                    if j >= pages_in_group.len() { break; }
+                                    if pages_in_group[j] >= page_count { break; }
+                                    if pages[j].is_none() { pages[j] = Some(existing_page); }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Encode
-        let key = s3.page_group_key(gid, next_version);
-        if use_seekable {
-            let (encoded, ft) = encode_page_group_seekable(
-                &pages,
-                page_size,
-                old_sub_ppf,
-                compression_level,
-                #[cfg(feature = "zstd")]
-                encoder_dict.as_ref(),
-                encryption_key.as_ref(),
-            )?;
-            uploads.push((key.clone(), encoded));
-            while new_frame_tables.len() <= gid as usize {
-                new_frame_tables.push(Vec::new());
+            let key = s3.page_group_key(gid, next_version);
+            if use_seekable {
+                let (encoded, ft) = encode_page_group_seekable(
+                    &pages, page_size, old_sub_ppf, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                uploads.push((key.clone(), encoded));
+                while new_frame_tables.len() <= gid as usize {
+                    new_frame_tables.push(Vec::new());
+                }
+                new_frame_tables[gid as usize] = ft;
+            } else {
+                let encoded = encode_page_group(
+                    &pages, page_size, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                uploads.push((key.clone(), encoded));
             }
-            new_frame_tables[gid as usize] = ft;
-        } else {
-            let encoded = encode_page_group(
-                &pages,
-                page_size,
-                compression_level,
-                #[cfg(feature = "zstd")]
-                encoder_dict.as_ref(),
-                encryption_key.as_ref(),
-            )?;
-            uploads.push((key.clone(), encoded));
-        }
 
-        // Track replaced key
-        while new_keys.len() <= gid as usize {
-            new_keys.push(String::new());
-        }
-        if let Some(old_key) = new_keys.get(gid as usize) {
-            if !old_key.is_empty() {
-                replaced_keys.push(old_key.clone());
+            while new_keys.len() <= gid as usize {
+                new_keys.push(String::new());
             }
+            if let Some(old_key) = new_keys.get(gid as usize) {
+                if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
+            }
+            new_keys[gid as usize] = key;
         }
-        new_keys[gid as usize] = key;
     }
 
     // 7. Upload all dirty page groups
@@ -513,6 +565,17 @@ fn flush_inner(
     }
 
     // 10. Update manifest atomically
+    // Phase Drift: GC overrides for fully-rewritten groups before manifest construction
+    while new_subframe_overrides.len() < new_keys.len() {
+        new_subframe_overrides.push(HashMap::new());
+    }
+    for &gid in &full_rewrite_groups {
+        if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
+            for (_, ov) in group_ovs.drain() {
+                replaced_keys.push(ov.key);
+            }
+        }
+    }
     let new_manifest = {
         let old_manifest = manifest_snap;
         let mut m = Manifest {
@@ -526,6 +589,7 @@ fn flush_inner(
             index_chunk_keys: new_index_chunk_keys,
             frame_tables: new_frame_tables,
             sub_pages_per_frame: old_sub_ppf,
+            subframe_overrides: new_subframe_overrides,
             strategy: old_manifest.strategy,
             group_pages: old_manifest.group_pages.clone(),
             btrees: old_manifest.btrees.clone(),
@@ -578,7 +642,316 @@ fn flush_inner(
         }
     }
 
+    // TODO(Phase Drift-d): S3 compaction requires a StorageClient wrapper around
+    // S3Client, or an S3-specific compaction path. For now, compaction only runs
+    // on the local flush path. S3 mode is the cloud path where compaction latency
+    // matters less (overrides are merged on read).
+    let _ = (override_threshold, compaction_threshold);
+
     eprintln!("[flush] complete");
+    Ok(())
+}
+
+/// Flush dirty page groups to local disk (for StorageBackend::Local).
+///
+/// Reads dirty pages from the cache, encodes page groups (seekable format),
+/// and writes to `{cache_dir}/pg/{gid}_v{version}`. Updates the local manifest
+/// with new page_group_keys. Deletes old versions after manifest update.
+///
+/// Unlike flush_dirty_groups_to_s3, this is simple: all pages are in the cache
+/// (no S3 merge needed). Called at the end of sync() in local mode.
+pub(crate) fn flush_local_groups(
+    storage: &StorageClient,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    shared_dirty_groups: &Mutex<HashSet<u64>>,
+    pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+    override_threshold: u32,
+    compaction_threshold: u32,
+) -> io::Result<()> {
+    // 1. Drain pending state
+    let flushes: Vec<staging::PendingFlush> = {
+        let mut pf = pending_flushes.lock().unwrap();
+        std::mem::take(&mut *pf)
+    };
+    let legacy_dirty: HashSet<u64> = {
+        let mut pending = shared_dirty_groups.lock().unwrap();
+        std::mem::take(&mut *pending)
+    };
+
+    if flushes.is_empty() && legacy_dirty.is_empty() {
+        return Ok(());
+    }
+
+    // Run inner flush, restoring drained state on error (same pattern as flush_to_s3)
+    let result = flush_local_inner(
+        storage, cache, shared_manifest, compression_level,
+        #[cfg(feature = "zstd")] dictionary,
+        encryption_key,
+        &flushes, &legacy_dirty,
+        override_threshold, compaction_threshold,
+    );
+
+    if let Err(ref e) = result {
+        eprintln!("[flush-local] ERROR: flush failed, restoring pending state: {}", e);
+        if !flushes.is_empty() {
+            pending_flushes.lock().unwrap().extend(flushes);
+        }
+        if !legacy_dirty.is_empty() {
+            shared_dirty_groups.lock().unwrap().extend(legacy_dirty);
+        }
+    }
+
+    result
+}
+
+fn flush_local_inner(
+    storage: &StorageClient,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+    flushes: &[staging::PendingFlush],
+    legacy_dirty: &HashSet<u64>,
+    override_threshold: u32,
+    compaction_threshold: u32,
+) -> io::Result<()> {
+    // 2. Read staged pages
+    let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
+    for flush_entry in flushes {
+        let pages = staging::read_staging_log(
+            &flush_entry.staging_path,
+            flush_entry.page_size,
+        )?;
+        staging_paths.push(flush_entry.staging_path.clone());
+        staged_pages.extend(pages);
+    }
+
+    // 3. Snapshot manifest
+    let manifest_snap = shared_manifest.read().clone();
+    let page_count = manifest_snap.page_count;
+    let page_size = manifest_snap.page_size;
+
+    if page_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "flush_local: manifest has page_size=0",
+        ));
+    }
+
+    // 4. Dictionaries
+    #[cfg(feature = "zstd")]
+    let encoder_dict = dictionary
+        .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
+
+    // 5. Determine dirty groups
+    let mut dirty_groups: HashSet<u64> = legacy_dirty.clone();
+    for &pnum in staged_pages.keys() {
+        if let Some(loc) = manifest_snap.page_location(pnum) {
+            dirty_groups.insert(loc.group_id);
+        }
+    }
+
+    if dirty_groups.is_empty() {
+        for path in &staging_paths {
+            staging::remove_staging_log(path);
+        }
+        return Ok(());
+    }
+
+    let next_version = manifest_snap.version + 1;
+    let change_counter = read_change_counter_from_cache(cache, page_size);
+    let old_sub_ppf = manifest_snap.sub_pages_per_frame;
+    let use_seekable = old_sub_ppf > 0;
+
+    let ppg = manifest_snap.pages_per_group;
+    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut new_keys = manifest_snap.page_group_keys.clone();
+    let mut replaced_keys: Vec<String> = Vec::new();
+    let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
+
+    // Phase Drift: carry forward overrides, track full rewrites
+    let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
+    let effective_threshold = if override_threshold > 0 {
+        override_threshold as usize
+    } else if use_seekable && old_sub_ppf > 0 {
+        let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
+        std::cmp::max(1, frames_per_group / 4)
+    } else { 0 };
+    let mut full_rewrite_groups: HashSet<u64> = HashSet::new();
+
+    // 6. For each dirty group: read pages from staging/cache, encode
+    for &gid in &dirty_groups {
+        let pages_in_group = manifest_snap.group_page_nums(gid);
+        let group_size = pages_in_group.len();
+
+        // Phase Drift: determine if we can use override path
+        let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
+            .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
+            .copied().collect();
+        let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
+        let has_frame_table = use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
+        let dirty_frames = if has_frame_table && effective_threshold > 0 {
+            manifest::dirty_frames_for_group(
+                &group_dirty_pnums, &pages_in_group,
+                frame_table_ref.expect("checked above"), old_sub_ppf,
+            )
+        } else { Vec::new() };
+        let use_override = has_frame_table
+            && effective_threshold > 0
+            && !dirty_frames.is_empty()
+            && dirty_frames.len() < effective_threshold;
+
+        if use_override {
+            while new_subframe_overrides.len() <= gid as usize {
+                new_subframe_overrides.push(HashMap::new());
+            }
+            for &frame_idx in &dirty_frames {
+                let frame_start = frame_idx * old_sub_ppf as usize;
+                let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+                for pos in frame_start..frame_end {
+                    let pnum = pages_in_group[pos];
+                    if pnum >= page_count { break; }
+                    let data = if let Some(staged) = staged_pages.get(&pnum) {
+                        staged.clone()
+                    } else if cache.is_present(pnum) {
+                        let mut buf = vec![0u8; page_size as usize];
+                        if cache.read_page(pnum, &mut buf).is_ok() { buf }
+                        else { vec![0u8; page_size as usize] }
+                    } else { vec![0u8; page_size as usize] };
+                    frame_pages.push((pnum, data));
+                }
+                let override_key = StorageClient::override_frame_key(gid, frame_idx, next_version);
+                let encoded = encode_override_frame(
+                    &frame_pages, page_size, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                if let Some(old_ov) = new_subframe_overrides[gid as usize].get(&frame_idx) {
+                    replaced_keys.push(old_ov.key.clone());
+                }
+                uploads.push((override_key.clone(), encoded.clone()));
+                new_subframe_overrides[gid as usize].insert(frame_idx, manifest::SubframeOverride {
+                    key: override_key,
+                    entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
+                });
+            }
+        } else {
+            full_rewrite_groups.insert(gid);
+            let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+
+            for (i, &pnum) in pages_in_group.iter().enumerate() {
+                if pnum >= page_count { break; }
+                if let Some(staged_data) = staged_pages.get(&pnum) {
+                    pages[i] = Some(staged_data.clone());
+                } else if cache.is_present(pnum) {
+                    let mut page_buf = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut page_buf).is_ok() {
+                        pages[i] = Some(page_buf);
+                    }
+                }
+            }
+
+            let key = StorageClient::page_group_key(gid, next_version);
+            if use_seekable {
+                let (encoded, ft) = encode_page_group_seekable(
+                    &pages, page_size, old_sub_ppf, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                uploads.push((key.clone(), encoded));
+                while new_frame_tables.len() <= gid as usize {
+                    new_frame_tables.push(Vec::new());
+                }
+                new_frame_tables[gid as usize] = ft;
+            } else {
+                let encoded = encode_page_group(
+                    &pages, page_size, compression_level,
+                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                uploads.push((key.clone(), encoded));
+            }
+
+            while new_keys.len() <= gid as usize {
+                new_keys.push(String::new());
+            }
+            if let Some(old_key) = new_keys.get(gid as usize) {
+                if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
+            }
+            new_keys[gid as usize] = key;
+        }
+    }
+
+    // 7. Write page groups to local storage
+    storage.put_page_groups(&uploads)?;
+
+    // 8. Build and persist new manifest
+    // Phase Drift: GC overrides only for fully-rewritten groups
+    while new_subframe_overrides.len() < new_keys.len() {
+        new_subframe_overrides.push(HashMap::new());
+    }
+    for &gid in &full_rewrite_groups {
+        if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
+            for (_, ov) in group_ovs.drain() {
+                replaced_keys.push(ov.key);
+            }
+        }
+    }
+    let new_manifest = Manifest {
+        version: next_version,
+        change_counter,
+        page_count,
+        page_size,
+        pages_per_group: ppg,
+        page_group_keys: new_keys,
+        interior_chunk_keys: manifest_snap.interior_chunk_keys.clone(),
+        index_chunk_keys: manifest_snap.index_chunk_keys.clone(),
+        frame_tables: new_frame_tables,
+        sub_pages_per_frame: old_sub_ppf,
+        subframe_overrides: new_subframe_overrides,
+        strategy: manifest_snap.strategy,
+        group_pages: manifest_snap.group_pages.clone(),
+        btrees: manifest_snap.btrees.clone(),
+        ..Manifest::empty()
+    };
+
+    storage.put_manifest(&new_manifest, &[])?;
+
+    // 9. Commit to shared manifest
+    {
+        let mut m = shared_manifest.write();
+        cache.set_group_pages(new_manifest.group_pages.clone());
+        *m = new_manifest;
+    }
+
+    // 10. Delete old page group versions
+    if !replaced_keys.is_empty() {
+        let _ = storage.delete_page_groups(&replaced_keys);
+    }
+
+    // 11. Clean up staging logs
+    for path in &staging_paths {
+        staging::remove_staging_log(path);
+    }
+
+    // Phase Drift-d: auto-compact overrides if threshold reached
+    if compaction_threshold > 0 {
+        if let Err(e) = compact::auto_compact_overrides(
+            storage, shared_manifest, compaction_threshold, compression_level,
+            #[cfg(feature = "zstd")] dictionary,
+            encryption_key,
+        ) {
+            eprintln!("[flush-local] compaction error (non-fatal): {}", e);
+        }
+    }
+
     Ok(())
 }
 

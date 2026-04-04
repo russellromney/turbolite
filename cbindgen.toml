@@ -25,7 +25,8 @@ rename_variants = "ScreamingSnakeCase"
 
 [defines]
 "feature = encryption" = "TURBOLITE_ENCRYPTION"
-"feature = tiered" = "TURBOLITE_TIERED"
+"feature = cloud" = "TURBOLITE_CLOUD"
+"feature = tiered" = "TURBOLITE_CLOUD"
 
 [parse]
 parse_deps = false
@@ -33,4 +34,4 @@ extra_bindings = []
 
 [parse.expand]
 # Expand feature-gated items
-features = ["encryption", "tiered"]
+features = ["encryption", "cloud"]

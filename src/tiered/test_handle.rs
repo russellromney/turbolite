@@ -20,7 +20,7 @@ fn test_passthrough_write_read_roundtrip_encrypted() {
     let path = dir.path().join("test.wal");
     let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
     let key = test_key();
-    let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+    let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), Some(key));
 
     // Write data at various offsets
     let data1 = vec![0xAAu8; 128];
@@ -46,7 +46,7 @@ fn test_passthrough_on_disk_not_plaintext() {
     let path = dir.path().join("test.wal");
     let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
     let key = test_key();
-    let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+    let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), Some(key));
 
     let plaintext = vec![0xCCu8; 512];
     handle.write_all_at(&plaintext, 0).unwrap();
@@ -67,13 +67,13 @@ fn test_passthrough_wrong_key_returns_garbage() {
     {
         let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
         let key = test_key();
-        let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+        let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), Some(key));
         handle.write_all_at(&vec![0xDDu8; 256], 0).unwrap();
     }
 
     // Read with wrong key
     let file = FsOpenOptions::new().read(true).open(&path).unwrap();
-    let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(wrong_key()));
+    let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), Some(wrong_key()));
     let mut buf = vec![0u8; 256];
     handle.read_exact_at(&mut buf, 0).unwrap(); // CTR doesn't fail, just produces wrong data
     assert_ne!(buf, vec![0xDDu8; 256], "wrong key must not produce original plaintext");
@@ -86,7 +86,7 @@ fn test_passthrough_no_encryption_is_plaintext() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test.wal");
     let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
-    let mut handle = TieredHandle::new_passthrough(file, path.clone(), None);
+    let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), None);
 
     let plaintext = vec![0xEEu8; 128];
     handle.write_all_at(&plaintext, 0).unwrap();
@@ -104,7 +104,7 @@ fn test_passthrough_different_offsets_different_ciphertext() {
     let path = dir.path().join("test.wal");
     let file = FsOpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
     let key = test_key();
-    let mut handle = TieredHandle::new_passthrough(file, path.clone(), Some(key));
+    let mut handle = TurboliteHandle::new_passthrough(file, path.clone(), Some(key));
 
     let data = vec![0xFFu8; 64];
     handle.write_all_at(&data, 0).unwrap();

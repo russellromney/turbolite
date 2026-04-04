@@ -16,7 +16,7 @@
 //!   AWS_SECRET_ACCESS_KEY     S3 credentials
 
 use rusqlite::{params, Connection, OpenFlags};
-use turbolite::tiered::{register, TieredConfig, TieredVfs};
+use turbolite::tiered::{register, TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
 
     let cache_dir = TempDir::new().expect("create temp dir");
 
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket,
         prefix: "books".to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -34,7 +34,7 @@ fn main() {
         ..Default::default()
     };
 
-    let vfs = TieredVfs::new(config).expect("create tiered VFS");
+    let vfs = TurboliteVfs::new(config).expect("create tiered VFS");
     register("tiered", vfs).expect("register tiered VFS");
 
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;

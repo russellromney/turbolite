@@ -6,7 +6,7 @@
 //! (fresh cache dir) to test eviction. The cold reader fetches from S3,
 //! which populates the sub-chunk tracker (the source of truth for eviction).
 
-use turbolite::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -20,7 +20,7 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
     let s3_prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -55,10 +55,10 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
 /// Open a cold reader VFS (fresh cache) and return (conn, shared_state, cache_dir).
 fn cold_reader(
     bucket: &str, prefix: &str, endpoint: &Option<String>,
-    config_fn: impl FnOnce(&mut TieredConfig),
-) -> (rusqlite::Connection, turbolite::tiered::TieredSharedState, TempDir) {
+    config_fn: impl FnOnce(&mut TurboliteConfig),
+) -> (rusqlite::Connection, turbolite::tiered::TurboliteSharedState, TempDir) {
     let cache_dir = TempDir::new().unwrap();
-    let mut config = TieredConfig {
+    let mut config = TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
@@ -71,7 +71,7 @@ fn cold_reader(
     config_fn(&mut config);
     let vfs_name = unique_vfs_name("evict_cold");
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -86,7 +86,7 @@ fn cold_reader(
 
 fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
     let cache_dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
@@ -94,7 +94,7 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let _ = TieredVfs::new(config).unwrap().destroy_s3();
+    let _ = TurboliteVfs::new(config).unwrap().destroy_s3();
 }
 
 // ── turbolite_evict('data'/'index'/'all') ──
@@ -189,7 +189,7 @@ fn test_evict_on_checkpoint_clears_data_tier() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 

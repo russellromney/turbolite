@@ -99,7 +99,7 @@ pub struct PredictionEntry {
     pub hit_count: u32,
 }
 
-/// Shared prediction state. Lives on TieredVfs, accessed by all connections.
+/// Shared prediction state. Lives on TurboliteVfs, accessed by all connections.
 pub struct PredictionTable {
     /// Learned patterns: pattern (sorted name set) -> entry.
     pub patterns: HashMap<BTreeSet<String>, PredictionEntry>,
@@ -331,10 +331,10 @@ impl AccessHistory {
     }
 }
 
-/// Shared prediction state passed from TieredVfs to each TieredHandle.
+/// Shared prediction state passed from TurboliteVfs to each TurboliteHandle.
 pub type SharedPrediction = Arc<RwLock<PredictionTable>>;
 
-/// Shared access history passed from TieredVfs to each TieredHandle.
+/// Shared access history passed from TurboliteVfs to each TurboliteHandle.
 pub type SharedAccessHistory = Arc<RwLock<AccessHistory>>;
 
 #[cfg(test)]

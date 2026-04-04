@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
-use turbolite::tiered::{TieredSharedState, TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -112,8 +112,8 @@ fn endpoint_url() -> Option<String> {
         .ok()
 }
 
-fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TieredConfig {
-    TieredConfig {
+fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -127,8 +127,8 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TieredCo
     }
 }
 
-fn make_reader_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TieredConfig {
-    TieredConfig {
+fn make_reader_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -197,18 +197,18 @@ struct S3Snapshot {
     get_bytes: u64,
 }
 
-fn s3_snapshot(bench: &TieredSharedState) -> S3Snapshot {
+fn s3_snapshot(bench: &TurboliteSharedState) -> S3Snapshot {
     let (puts, put_bytes) = bench.s3_put_counters();
     let (gets, get_bytes) = bench.s3_counters();
     S3Snapshot { puts, put_bytes, gets, get_bytes }
 }
 
-fn s3_put_delta(bench: &TieredSharedState, before: &S3Snapshot) -> (u64, u64) {
+fn s3_put_delta(bench: &TurboliteSharedState, before: &S3Snapshot) -> (u64, u64) {
     let (puts, bytes) = bench.s3_put_counters();
     (puts - before.puts, bytes - before.put_bytes)
 }
 
-fn s3_get_delta(bench: &TieredSharedState, before: &S3Snapshot) -> (u64, u64) {
+fn s3_get_delta(bench: &TurboliteSharedState, before: &S3Snapshot) -> (u64, u64) {
     let (gets, bytes) = bench.s3_counters();
     (gets - before.gets, bytes - before.get_bytes)
 }
@@ -233,7 +233,7 @@ struct CheckpointStats {
     s3_bytes: u64,
 }
 
-fn timed_checkpoint(conn: &Connection, bench: &TieredSharedState) -> CheckpointStats {
+fn timed_checkpoint(conn: &Connection, bench: &TurboliteSharedState) -> CheckpointStats {
     let before = s3_snapshot(bench);
     let start = Instant::now();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -257,7 +257,7 @@ struct TwoPhaseCheckpointStats {
 
 /// Two-phase checkpoint: fast local phase (holds lock briefly) + async S3 upload (no lock).
 /// Reads and writes can continue during the S3 upload phase.
-fn timed_checkpoint_two_phase(conn: &Connection, bench: &TieredSharedState) -> TwoPhaseCheckpointStats {
+fn timed_checkpoint_two_phase(conn: &Connection, bench: &TurboliteSharedState) -> TwoPhaseCheckpointStats {
     let before = s3_snapshot(bench);
     let total_start = Instant::now();
 
@@ -287,7 +287,7 @@ fn verify_cold_reader(prefix: &str, db_name: &str, cli: &Cli, expected_rows: usi
     let reader_cache = TempDir::new().expect("reader temp dir");
     let reader_config = make_reader_config(prefix, reader_cache.path(), cli);
     let vfs_name = unique_vfs_name("verify");
-    let vfs = TieredVfs::new(reader_config).expect("reader VFS");
+    let vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -347,7 +347,7 @@ fn groups_for(page_count: i64, ppg: u32) -> i64 {
 
 struct VfsSetup {
     conn: Connection,
-    bench: TieredSharedState,
+    bench: TurboliteSharedState,
     prefix: String,
     db_name: String,
     _cache_dir: TempDir,
@@ -360,7 +360,7 @@ fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
     let db_name = format!("{}_test.db", name_prefix);
 
     let vfs_name = unique_vfs_name(name_prefix);
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -584,7 +584,7 @@ fn scenario_update(cli: &Cli) {
         let reader_cache = TempDir::new().expect("reader temp dir");
         let reader_config = make_reader_config(&s.prefix, reader_cache.path(), cli);
         let vfs_name = unique_vfs_name("verify_upd");
-        let vfs = TieredVfs::new(reader_config).expect("reader VFS");
+        let vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let reader = Connection::open_with_flags_and_vfs(
             &s.db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &vfs_name,
@@ -832,7 +832,7 @@ fn scenario_cold_write(cli: &Cli) {
     let db_name = "cold_write_test.db";
 
     let vfs_name = unique_vfs_name("cold_seed");
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let bench_seed = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -858,7 +858,7 @@ fn scenario_cold_write(cli: &Cli) {
     let cold_cache = TempDir::new().expect("cold cache dir");
     let cold_config = make_config(&prefix, cold_cache.path(), cli);
     let cold_vfs_name = unique_vfs_name("cold_write");
-    let cold_vfs = TieredVfs::new(cold_config).expect("cold TieredVfs");
+    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold TurboliteVfs");
     let cold_bench = cold_vfs.shared_state();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
@@ -917,7 +917,7 @@ fn scenario_merge_write(cli: &Cli) {
     // Open cold VFS (empty cache) against existing S3 prefix
     let cache_dir = TempDir::new().expect("cache dir");
     // Use default config but override ppg/page_size from manifest (manifest takes precedence)
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -930,7 +930,7 @@ fn scenario_merge_write(cli: &Cli) {
         ..Default::default()
     };
     let vfs_name = unique_vfs_name("merge_write");
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -1046,7 +1046,7 @@ fn scenario_arctic_write(cli: &Cli) {
     println!("  prefix={}, db={}", prefix, cli.db_name);
 
     let cache_dir = TempDir::new().expect("cache dir");
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -1059,7 +1059,7 @@ fn scenario_arctic_write(cli: &Cli) {
         ..Default::default()
     };
     let vfs_name = unique_vfs_name("arctic_write");
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -1156,7 +1156,7 @@ fn scenario_two_phase(cli: &Cli) {
     println!("  prefix={}, db={}", prefix, cli.db_name);
 
     let cache_dir = TempDir::new().expect("cache dir");
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -1169,7 +1169,7 @@ fn scenario_two_phase(cli: &Cli) {
         ..Default::default()
     };
     let vfs_name = unique_vfs_name("two_phase");
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 

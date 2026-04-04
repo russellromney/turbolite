@@ -135,10 +135,10 @@ impl Drop for WalReplicationState {
 
 /// Recover WAL segments from S3, apply to a materialized DB, load pages into cache.
 ///
-/// Called from TieredVfs after construction (shared_state is available).
+/// Called from TurboliteVfs after construction (shared_state is available).
 /// Returns number of pages loaded from WAL recovery, or 0 if no WAL to replay.
 pub(crate) fn recover_wal_from_shared_state(
-    shared_state: &super::bench::TieredSharedState,
+    shared_state: &super::bench::TurboliteSharedState,
     cache: &super::DiskCache,
     manifest_version: u64,
     page_size: u32,

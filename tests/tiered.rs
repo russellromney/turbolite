@@ -9,7 +9,7 @@
 //!   cargo test --features tiered,zstd tiered
 //! ```
 
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 mod tiered {
     pub mod helpers;
     mod basic;
@@ -29,4 +29,5 @@ mod tiered {
     mod jena;
     #[cfg(feature = "wal")]
     mod wal_integration;
+    mod zenith;
 }

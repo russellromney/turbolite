@@ -1,6 +1,6 @@
 //! Shared helpers for tiered integration tests.
 
-use turbolite::tiered::{Manifest, TieredConfig};
+use turbolite::tiered::{Manifest, TurboliteConfig};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
@@ -47,8 +47,8 @@ pub fn endpoint_url() -> String {
         .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
-/// Create a TieredConfig with a unique prefix (so tests don't collide).
-pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
+/// Create a TurboliteConfig with a unique prefix (so tests don't collide).
+pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let unique_prefix = format!(
         "test/{}/{}",
         prefix,
@@ -57,7 +57,7 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
             .unwrap()
             .as_nanos()
     );
-    TieredConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: unique_prefix,
         cache_dir: cache_dir.to_path_buf(),
@@ -70,10 +70,10 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TieredConfig {
     }
 }
 
-/// Create a read-only TieredConfig for cold reader tests.
+/// Create a read-only TurboliteConfig for cold reader tests.
 /// Uses the shared runtime to prevent tokio contention.
-pub fn cold_reader_config(bucket: &str, prefix: &str, endpoint: &Option<String>, cache_dir: &std::path::Path) -> TieredConfig {
-    TieredConfig {
+pub fn cold_reader_config(bucket: &str, prefix: &str, endpoint: &Option<String>, cache_dir: &std::path::Path) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),

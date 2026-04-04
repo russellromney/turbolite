@@ -1,6 +1,6 @@
 //! Data operation tests: UPDATE/DELETE, VACUUM, rollback, multiple tables, BLOBs, journal modes.
 
-use turbolite::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -10,7 +10,7 @@ fn test_rollback_discards_dirty_pages() {
     let config = test_config("rollback", cache_dir.path());
     let vfs_name = unique_vfs_name("tiered_rollback");
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -100,7 +100,7 @@ fn test_large_representative_db() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -191,7 +191,7 @@ fn test_large_representative_db() {
 
     // Cold read from a completely fresh cache
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -201,7 +201,7 @@ fn test_large_representative_db() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_large_reader");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -301,7 +301,7 @@ fn test_oltp_with_indexes() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -396,7 +396,7 @@ fn test_oltp_with_indexes() {
 
     // Cold read from S3
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -406,7 +406,7 @@ fn test_oltp_with_indexes() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_oltp_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -467,7 +467,7 @@ fn test_update_delete_operations() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -532,7 +532,7 @@ fn test_update_delete_operations() {
 
     // Cold read
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -542,7 +542,7 @@ fn test_update_delete_operations() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_upddel_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -601,7 +601,7 @@ fn test_multiple_tables() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -656,7 +656,7 @@ fn test_multiple_tables() {
 
     // Cold read
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -666,7 +666,7 @@ fn test_multiple_tables() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_multitbl_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -710,7 +710,7 @@ fn test_large_overflow_blobs() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -750,7 +750,7 @@ fn test_large_overflow_blobs() {
 
     // Cold read
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -760,7 +760,7 @@ fn test_large_overflow_blobs() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_overflow_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -817,7 +817,7 @@ fn test_vacuum_reorganizes() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -889,7 +889,7 @@ fn test_vacuum_reorganizes() {
 
     // Cold read after VACUUM
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -899,7 +899,7 @@ fn test_vacuum_reorganizes() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_vacuum_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -938,7 +938,7 @@ fn test_delete_preserves_s3() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     // Write data and checkpoint to S3
@@ -988,7 +988,7 @@ fn test_delete_preserves_s3() {
 
     // Cold read from fresh cache to prove S3 data survived
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -998,7 +998,7 @@ fn test_delete_preserves_s3() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_del_s3_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -1027,7 +1027,7 @@ fn test_delete_journal_mode() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1072,7 +1072,7 @@ fn test_delete_journal_mode() {
 
     // Cold read from fresh cache
     let cold_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -1082,7 +1082,7 @@ fn test_delete_journal_mode() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_jdel_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 

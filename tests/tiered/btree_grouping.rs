@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// Helper: create a local SQLite DB, then import it to S3 for B-tree-aware grouping.
 fn create_and_import(
-    config: &TieredConfig,
+    config: &TurboliteConfig,
     local_path: &Path,
     setup_fn: impl FnOnce(&rusqlite::Connection),
 ) -> Manifest {
@@ -52,7 +52,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
 
     // Open via VFS, insert more rows, checkpoint
     let vfs_name = unique_vfs_name("btree_cp");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -74,14 +74,14 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
     // Cold reader: verify data from S3 (includes both import + VFS writes)
     {
         let reader_cache = tempfile::tempdir().unwrap();
-        let reader_config = TieredConfig {
+        let reader_config = TurboliteConfig {
             bucket, prefix, endpoint_url: endpoint,
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_cp_reader");
-        let reader_vfs = TieredVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:local.db?vfs={}", reader_vfs_name);
@@ -121,7 +121,7 @@ fn test_write_amplification_btree_grouping() {
     let total_groups = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count();
 
     let vfs_name = unique_vfs_name("btree_wa");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -168,7 +168,7 @@ fn test_vacuum_produces_correct_mapping() {
     });
 
     let vfs_name = unique_vfs_name("btree_vac");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:vac.db?vfs={}", vfs_name);
@@ -184,7 +184,7 @@ fn test_vacuum_produces_correct_mapping() {
     }
 
     // All pages should have valid assignments
-    let mut manifest = turbolite::tiered::get_manifest(&TieredConfig {
+    let mut manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
         bucket: bucket.clone(), prefix: prefix.clone(),
         endpoint_url: endpoint.clone(), region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
@@ -199,14 +199,14 @@ fn test_vacuum_produces_correct_mapping() {
     // Cold reader should see 200 rows
     {
         let reader_cache = tempfile::tempdir().unwrap();
-        let reader_config = TieredConfig {
+        let reader_config = TurboliteConfig {
             bucket, prefix, endpoint_url: endpoint,
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_vac_reader");
-        let reader_vfs = TieredVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:vac.db?vfs={}", reader_vfs_name);

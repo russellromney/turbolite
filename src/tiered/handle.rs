@@ -1,14 +1,16 @@
 use super::*;
 
-// ===== TieredHandle =====
+// ===== TurboliteHandle =====
 
 /// Database handle for tiered S3-backed storage.
 ///
 /// MainDb files are backed by S3 with a local page-level cache.
 /// WAL/journal files are passthrough to local disk.
-pub struct TieredHandle {
+pub struct TurboliteHandle {
     // --- Tiered mode (MainDb) ---
     s3: Option<Arc<S3Client>>,
+    /// Unified storage client for local page group flush (local mode only).
+    storage: Option<Arc<StorageClient>>,
     cache: Option<Arc<DiskCache>>,
     /// Shared manifest (Arc'd so flush_to_s3 can read/update outside SQLite lock).
     manifest: Arc<RwLock<Manifest>>,
@@ -43,9 +45,19 @@ pub struct TieredHandle {
     encoder_dict: Option<zstd::dict::EncoderDictionary<'static>>,
     #[cfg(feature = "zstd")]
     decoder_dict: Option<zstd::dict::DecoderDictionary<'static>>,
+    /// Raw dictionary bytes for local flush (EncoderDictionary is not Clone).
+    #[cfg(feature = "zstd")]
+    dictionary_bytes: Option<Vec<u8>>,
+
+    /// Phase Zenith-c: true if dirty pages have been written since the last
+    /// successful sync. Used to detect transaction rollback (lock downgrade
+    /// from EXCLUSIVE/RESERVED without sync having been called).
+    dirty_since_sync: bool,
 
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
+    override_threshold: u32,
+    compaction_threshold: u32,
 
     /// AES-256-GCM encryption key for S3 data and local cache.
     encryption_key: Option<[u8; 32]>,
@@ -105,10 +117,11 @@ const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
 
-impl TieredHandle {
+impl TurboliteHandle {
     /// Create a tiered handle backed by S3 + local page cache.
     pub(crate) fn new_tiered(
-        s3: Arc<S3Client>,
+        s3: Option<Arc<S3Client>>,
+        storage: Option<Arc<StorageClient>>,
         cache: Arc<DiskCache>,
         shared_manifest: Arc<RwLock<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
@@ -135,102 +148,53 @@ impl TieredHandle {
         let manifest = shared_manifest.read().clone();
         let page_size = manifest.page_size;
 
-        // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
-        if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
-            if let Some(key) = manifest.page_group_keys.first() {
-                if !key.is_empty() {
-                    if cache.try_claim_group(0) {
-                        if let Ok(Some(pg_data)) = s3.get_page_group(key) {
-                            let ft = manifest.frame_tables.first().map(|v| v.as_slice());
-                            let gp0 = manifest.group_page_nums(0);
-                            let _ = Self::decode_and_cache_group_static(
-                                &cache,
-                                &pg_data,
-                                &gp0,
-                                0, // gid
-                                manifest.page_size,
-                                manifest.page_count,
-                                ft,
-                                #[cfg(feature = "zstd")]
-                                dictionary,
-                                encryption_key.as_ref(),
-                            );
-                            cache.mark_group_present(0);
-                            cache.touch_group(0);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
-        // Fetched in parallel — after this, every B-tree traversal is a cache hit.
-        // Skip if interior pages are already cached (survived clear_cache pinning).
-        let interior_already_cached = !cache.interior_pages.lock().is_empty();
-        if interior_already_cached {
-            eprintln!(
-                "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
-                cache.interior_pages.lock().len(),
-            );
-        } else if !manifest.interior_chunk_keys.is_empty() {
-            // Parallel fetch all interior chunks
-            let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
-            eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
-            match s3.get_page_groups_by_key(&chunk_keys) {
-                Ok(results) => {
-                    #[cfg(feature = "zstd")]
-                    let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                    let mut total_pages = 0usize;
-                    let mut total_bytes = 0usize;
-                    for (key, data) in &results {
-                        total_bytes += data.len();
-                        match decode_interior_bundle(
-                            data,
-                            #[cfg(feature = "zstd")]
-                            ib_decoder.as_ref(),
-                            encryption_key.as_ref(),
-                        ) {
-                            Ok(pages) => {
-                                total_pages += pages.len();
-                                for (pnum, pdata) in &pages {
-                                    let _ = cache.write_page(*pnum, pdata);
-                                    let loc = manifest.page_location(*pnum)
-                                        .expect("interior page must have group assignment");
-                                    cache.mark_interior_group(loc.group_id, *pnum, loc.index);
-                                }
+        // Eagerly fetch page group 0 and interior/index chunks from S3.
+        // In local mode (s3=None), these are not fetched eagerly; they're fetched
+        // on demand from local page groups when first accessed.
+        #[cfg(feature = "cloud")]
+        if let Some(ref s3_ref) = s3 {
+            // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
+            if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
+                if let Some(key) = manifest.page_group_keys.first() {
+                    if !key.is_empty() {
+                        if cache.try_claim_group(0) {
+                            if let Ok(Some(pg_data)) = s3_ref.get_page_group(key) {
+                                let ft = manifest.frame_tables.first().map(|v| v.as_slice());
+                                let gp0 = manifest.group_page_nums(0);
+                                let _ = Self::decode_and_cache_group_static(
+                                    &cache,
+                                    &pg_data,
+                                    &gp0,
+                                    0, // gid
+                                    manifest.page_size,
+                                    manifest.page_count,
+                                    ft,
+                                    #[cfg(feature = "zstd")]
+                                    dictionary,
+                                    encryption_key.as_ref(),
+                                );
+                                cache.mark_group_present(0);
+                                cache.touch_group(0);
                             }
-                            Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
                         }
                     }
-                    eprintln!(
-                        "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                        total_pages, results.len(), total_bytes as f64 / 1024.0,
-                    );
                 }
-                Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
             }
-        }
 
-        // Index leaf bundles: lazy-aggressive prefetch.
-        // Instead of blocking connection open on potentially large index bundles
-        // (107MB at 750k rows), spawn a background thread. The first query serves
-        // index pages from data page groups via inline range GET (~100KB), while
-        // the background thread populates the full index cache.
-        let index_already_cached = !cache.index_pages.lock().is_empty();
-        if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
-            let cache_bg = Arc::clone(&cache);
-            let s3_bg = Arc::clone(&s3);
-            let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-            #[cfg(feature = "zstd")]
-            let dict_bg = dictionary.map(|d| d.to_vec());
-            let n_chunks = chunk_keys.len();
-            let encryption_key_bg = encryption_key;
-            eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
-            std::thread::spawn(move || {
-                match s3_bg.get_page_groups_by_key(&chunk_keys) {
+            // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
+            let interior_already_cached = !cache.interior_pages.lock().is_empty();
+            if interior_already_cached {
+                eprintln!(
+                    "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
+                    cache.interior_pages.lock().len(),
+                );
+            } else if !manifest.interior_chunk_keys.is_empty() {
+                let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
+                eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
+                match s3_ref.get_page_groups_by_key(&chunk_keys) {
                     Ok(results) => {
                         #[cfg(feature = "zstd")]
-                        let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
+                        let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
                         let mut total_pages = 0usize;
                         let mut total_bytes = 0usize;
                         for (key, data) in &results {
@@ -238,33 +202,81 @@ impl TieredHandle {
                             match decode_interior_bundle(
                                 data,
                                 #[cfg(feature = "zstd")]
-                                ix_decoder.as_ref(),
-                                encryption_key_bg.as_ref(),
+                                ib_decoder.as_ref(),
+                                encryption_key.as_ref(),
                             ) {
                                 Ok(pages) => {
                                     total_pages += pages.len();
                                     for (pnum, pdata) in &pages {
-                                        let _ = cache_bg.write_page(*pnum, pdata);
-                                        cache_bg.index_pages.lock().insert(*pnum);
+                                        let _ = cache.write_page(*pnum, pdata);
+                                        let loc = manifest.page_location(*pnum)
+                                            .expect("interior page must have group assignment");
+                                        cache.mark_interior_group(loc.group_id, *pnum, loc.index);
                                     }
                                 }
-                                Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                                Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
                             }
                         }
                         eprintln!(
-                            "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
+                            "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
                             total_pages, results.len(), total_bytes as f64 / 1024.0,
                         );
                     }
-                    Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
+                    Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
                 }
-            });
-        } else if index_already_cached {
-            eprintln!(
-                "[tiered] index pages already cached ({} pages), skipping chunk fetch",
-                cache.index_pages.lock().len(),
-            );
-        }
+            }
+
+            // Index leaf bundles: lazy-aggressive background fetch
+            let index_already_cached = !cache.index_pages.lock().is_empty();
+            if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
+                let cache_bg = Arc::clone(&cache);
+                let s3_bg = Arc::clone(s3_ref);
+                let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
+                #[cfg(feature = "zstd")]
+                let dict_bg = dictionary.map(|d| d.to_vec());
+                let n_chunks = chunk_keys.len();
+                let encryption_key_bg = encryption_key;
+                eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
+                std::thread::spawn(move || {
+                    match s3_bg.get_page_groups_by_key(&chunk_keys) {
+                        Ok(results) => {
+                            #[cfg(feature = "zstd")]
+                            let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
+                            let mut total_pages = 0usize;
+                            let mut total_bytes = 0usize;
+                            for (key, data) in &results {
+                                total_bytes += data.len();
+                                match decode_interior_bundle(
+                                    data,
+                                    #[cfg(feature = "zstd")]
+                                    ix_decoder.as_ref(),
+                                    encryption_key_bg.as_ref(),
+                                ) {
+                                    Ok(pages) => {
+                                        total_pages += pages.len();
+                                        for (pnum, pdata) in &pages {
+                                            let _ = cache_bg.write_page(*pnum, pdata);
+                                            cache_bg.index_pages.lock().insert(*pnum);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                                }
+                            }
+                            eprintln!(
+                                "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
+                                total_pages, results.len(), total_bytes as f64 / 1024.0,
+                            );
+                        }
+                        Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
+                    }
+                });
+            } else if index_already_cached {
+                eprintln!(
+                    "[tiered] index pages already cached ({} pages), skipping chunk fetch",
+                    cache.index_pages.lock().len(),
+                );
+            }
+        } // end #[cfg(feature = "cloud")] S3 eager fetch block
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {
@@ -297,7 +309,8 @@ impl TieredHandle {
         };
 
         Self {
-            s3: Some(s3),
+            s3,
+            storage,
             cache: Some(cache),
             manifest: shared_manifest,
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -312,12 +325,17 @@ impl TieredHandle {
             prefetch_lookup,
             search_trees: HashSet::new(),
             prefetch_pool,
+            dirty_since_sync: false,
             gc_enabled,
+            override_threshold: 0,
+            compaction_threshold: 0,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            #[cfg(feature = "zstd")]
+            dictionary_bytes: dictionary.map(|d| d.to_vec()),
             query_plan_prefetch,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
@@ -345,6 +363,7 @@ impl TieredHandle {
     pub(crate) fn new_passthrough(file: File, db_path: PathBuf, encryption_key: Option<[u8; 32]>) -> Self {
         Self {
             s3: None,
+            storage: None,
             cache: None,
             manifest: Arc::new(RwLock::new(Manifest::empty())),
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -359,12 +378,17 @@ impl TieredHandle {
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
             prefetch_pool: None,
+            dirty_since_sync: false,
             gc_enabled: false,
+            override_threshold: 0,
+            compaction_threshold: 0,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict: None,
             #[cfg(feature = "zstd")]
             decoder_dict: None,
+            #[cfg(feature = "zstd")]
+            dictionary_bytes: None,
             query_plan_prefetch: false,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
@@ -705,7 +729,8 @@ impl TieredHandle {
                     if !key.is_empty() {
                         let ft = manifest.frame_tables.get(*gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(*gid).into_owned();
-                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp) {
+                        let ovrs = manifest.subframe_overrides.get(*gid as usize).cloned().unwrap_or_default();
+                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(*gid);
@@ -764,7 +789,8 @@ impl TieredHandle {
                 if !key.is_empty() {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                    let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                         submitted += 1;
                     } else {
                         cache.unclaim_group(gid);
@@ -812,7 +838,8 @@ impl TieredHandle {
                     if !key.is_empty() {
                         let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(gid).into_owned();
-                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(gid);
@@ -879,7 +906,8 @@ impl TieredHandle {
                 if !key.is_empty() {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                    let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
                         *submitted += 1;
                         return true;
                     }
@@ -976,7 +1004,7 @@ impl TieredHandle {
 
 }
 
-impl DatabaseHandle for TieredHandle {
+impl DatabaseHandle for TurboliteHandle {
     type WalIndex = FileWalIndex;
 
     fn size(&self) -> Result<u64, io::Error> {
@@ -1029,7 +1057,8 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // 3. Look up page location (Phase Midway). Safe to .expect() here because:
+        // 3. Look up page location (Phase Midway).
+        // Safe to .expect() here because:
         //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
         //    - Pages beyond page_count are zero-filled (returned above)
         //    - sync() assigns new pages to groups before clearing dirty_page_nums
@@ -1213,7 +1242,8 @@ impl DatabaseHandle for TieredHandle {
                                         if !key.is_empty() {
                                             let ft = manifest_snap.frame_tables.get(plan_gid as usize).cloned().unwrap_or_default();
                                             let gp = manifest_snap.group_page_nums(plan_gid).into_owned();
-                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp) {
+                                            let ovrs = manifest_snap.subframe_overrides.get(plan_gid as usize).cloned().unwrap_or_default();
+                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp, ovrs) {
                                                 cache_ref.unclaim_group(plan_gid);
                                             }
                                         } else {
@@ -1245,11 +1275,100 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        // 5. Cache miss - fetch from S3.
+        // 5. Cache miss - fetch from storage (S3 or local page groups).
         cache.stat_misses.fetch_add(1, Ordering::Relaxed);
-        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 client required"));
+
+        // 5.local: For local-only mode, fetch the page group from local pg/ directory,
+        // decode it, populate the cache, then read the page.
+        if self.s3.is_none() {
+            if let Some(ref storage) = self.storage {
+                let manifest = self.manifest.read().clone();
+                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                    if !key.is_empty() {
+                        if let Ok(Some(pg_data)) = storage.get_page_group(key) {
+                            let pages_in_group = manifest.group_page_nums(gid);
+                            let ft = manifest.frame_tables.get(gid as usize);
+                            let has_ft = manifest.sub_pages_per_frame > 0
+                                && ft.map(|f| !f.is_empty()).unwrap_or(false);
+
+                            let decoded_ok = if has_ft {
+                                if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
+                                    &pg_data,
+                                    ft.expect("checked above"),
+                                    manifest.page_size,
+                                    pages_in_group.len() as u32,
+                                    manifest.page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    self.decoder_dict.as_ref(),
+                                    self.encryption_key.as_ref(),
+                                ) {
+                                    cache.write_pages_scattered(
+                                        &pages_in_group, &bulk_data, gid, 0,
+                                    )?;
+                                    true
+                                } else { false }
+                            } else if let Ok((_pc, _ps, bulk_data)) = decode_page_group_bulk(
+                                &pg_data,
+                                #[cfg(feature = "zstd")]
+                                self.decoder_dict.as_ref(),
+                                self.encryption_key.as_ref(),
+                            ) {
+                                cache.write_pages_scattered(
+                                    &pages_in_group, &bulk_data, gid, 0,
+                                )?;
+                                true
+                            } else { false };
+
+                            if decoded_ok {
+                                // Phase Drift-c: apply override frames
+                                if let Some(overrides) = manifest.subframe_overrides.get(gid as usize) {
+                                    if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
+                                        let spf = manifest.sub_pages_per_frame as usize;
+                                        for (&frame_idx, ovr) in overrides {
+                                            if let Ok(Some(ovr_data)) = storage.get_page_group(&ovr.key) {
+                                                if let Ok(decompressed) = decode_seekable_subchunk(
+                                                    &ovr_data,
+                                                    #[cfg(feature = "zstd")]
+                                                    self.decoder_dict.as_ref(),
+                                                    self.encryption_key.as_ref(),
+                                                ) {
+                                                    let frame_start = frame_idx * spf;
+                                                    let frame_end = std::cmp::min(frame_start + spf, pages_in_group.len());
+                                                    let frame_page_nums = &pages_in_group[frame_start..frame_end];
+                                                    let data_len = frame_page_nums.len() * manifest.page_size as usize;
+                                                    if data_len <= decompressed.len() {
+                                                        let _ = cache.write_pages_scattered(
+                                                            frame_page_nums, &decompressed[..data_len],
+                                                            gid, frame_start as u32,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                cache.mark_group_present(gid);
+                                cache.touch_group(gid);
+                            }
+
+                            // Now read the page from cache
+                            if cache.is_present(page_num) {
+                                cache.read_page(page_num, buf)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("page {} not recoverable from local page groups", page_num),
+            ));
+        }
+
         let manifest = self.manifest.read().clone();
-        let miss_start = Instant::now();
 
         // 5a. Re-check cache: a sibling prefetch may have completed since step 4.
         if cache.is_present(page_num) {
@@ -1265,6 +1384,12 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
+        // S3 fetch paths (seekable + legacy) only available with cloud feature.
+        #[cfg(feature = "cloud")]
+        {
+        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
+        let miss_start = Instant::now();
+
         // Check if seekable format is available for sub-chunk range GETs.
         let frame_table = manifest.frame_tables.get(gid as usize);
         let has_frames = manifest.sub_pages_per_frame > 0
@@ -1278,9 +1403,14 @@ impl DatabaseHandle for TieredHandle {
             let ft = frame_table.unwrap();
 
             if frame_idx < ft.len() {
-                let key = manifest.page_group_keys.get(gid as usize)
+                let base_key = manifest.page_group_keys.get(gid as usize)
                     .expect("gid must be valid index into page_group_keys");
                 let entry = &ft[frame_idx];
+
+                // Phase Drift-c: check for override frame
+                let override_entry = manifest.subframe_overrides
+                    .get(gid as usize)
+                    .and_then(|ovs| ovs.get(&frame_idx));
 
                 // Submit the CURRENT group to prefetch pool (full group fetch in background).
                 self.increment_misses(current_tree_name.as_ref());
@@ -1291,7 +1421,8 @@ impl DatabaseHandle for TieredHandle {
                         if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                             if !key.is_empty() {
                                 let gp_owned = manifest.group_page_nums(gid).into_owned();
-                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned) {
+                                let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned, ovrs) {
                                     cache.unclaim_group(gid);
                                 }
                             } else {
@@ -1306,7 +1437,12 @@ impl DatabaseHandle for TieredHandle {
                 self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
 
                 let s3_start = Instant::now();
-                match s3_arc.range_get(key, entry.offset, entry.len) {
+                let fetch_result = if let Some(ovr) = override_entry {
+                    s3_arc.get_page_group(&ovr.key).map(|opt| opt.map(|d| d))
+                } else {
+                    s3_arc.range_get(base_key, entry.offset, entry.len)
+                };
+                match fetch_result {
                     Ok(Some(compressed_frame)) => {
                         let s3_ms = s3_start.elapsed().as_millis();
                         let decode_start = Instant::now();
@@ -1515,6 +1651,7 @@ impl DatabaseHandle for TieredHandle {
                 }
             }
         }
+        } // end #[cfg(feature = "cloud")] S3 fetch block
 
         // Read the page from cache (should be present now after legacy download).
         if cache.is_present(page_num) {
@@ -1559,7 +1696,7 @@ impl DatabaseHandle for TieredHandle {
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "TieredHandle is read-only",
+                "TurboliteHandle is read-only",
             ));
         }
 
@@ -1604,6 +1741,7 @@ impl DatabaseHandle for TieredHandle {
             cache.write_page(page_num, buf)?;
         }
         self.dirty_page_nums.write().insert(page_num);
+        self.dirty_since_sync = true;
 
         // Phase Jena: detect interior page writes for map rebuild (if enabled).
         if self.jena_enabled {
@@ -1643,6 +1781,16 @@ impl DatabaseHandle for TieredHandle {
             if manifest.pages_per_group == 0 {
                 manifest.pages_per_group = self.pages_per_group;
             }
+            // Seed sub_pages_per_frame from DiskCache config so local and cloud
+            // produce identical page group encoding (seekable multi-frame format).
+            if manifest.sub_pages_per_frame == 0 {
+                if let Some(cache) = &self.cache {
+                    let spf = cache.sub_pages_per_frame;
+                    if spf > 0 {
+                        manifest.sub_pages_per_frame = spf;
+                    }
+                }
+            }
 
             // Ensure group states capacity for new groups
             if let Some(cache) = &self.cache {
@@ -1673,6 +1821,7 @@ impl DatabaseHandle for TieredHandle {
             let dirty = self.dirty_page_nums.read();
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
+                self.dirty_since_sync = false;
                 return Ok(());
             }
             dirty.clone()
@@ -1725,10 +1874,11 @@ impl DatabaseHandle for TieredHandle {
             let total_interior = cache.interior_pages.lock().len();
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
+            self.dirty_since_sync = false;
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending_groups_snapshot.len());
+            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} dirty groups", n, interior_found, total_interior, pending_groups_snapshot.len());
 
             // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
             // The staging log captured exact page contents during write_all_at(),
@@ -1751,17 +1901,344 @@ impl DatabaseHandle for TieredHandle {
                 });
             }
 
-            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery
+            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery.
+            // Errors MUST propagate: if persist fails, SQLite must not discard the WAL.
             {
                 let m = self.manifest.read().clone();
                 let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot };
-                if let Err(e) = local.persist(&cache_dir) {
-                    eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
-                }
+                local.persist(&cache_dir)?;
+            }
+
+            // Persist bitmap so cached pages survive process restart
+            cache.persist_bitmap()?;
+
+            // Local mode: flush dirty page groups to local pg/ directory immediately.
+            // This encodes page groups from the cache and writes them alongside the manifest,
+            // so data can be recovered even if the cache file is deleted.
+            if let Some(ref storage) = self.storage {
+                flush::flush_local_groups(
+                    storage,
+                    cache,
+                    &self.manifest,
+                    &self.s3_dirty_groups,
+                    &self.pending_flushes,
+                    self.compression_level,
+                    #[cfg(feature = "zstd")]
+                    self.dictionary_bytes.as_deref(),
+                    self.encryption_key,
+                    self.override_threshold,
+                    self.compaction_threshold,
+                )?;
             }
 
             return Ok(());
         }
+
+        // ── S3Primary sync path: upload dirty frames as overrides + publish manifest ──
+        // Every xSync is an S3 commit. No staging logs, no deferred flush.
+        // Override-only (no full group rewrites) to keep per-commit latency bounded.
+        #[cfg(feature = "cloud")]
+        if self.sync_mode == SyncMode::S3Primary {
+            let page_size = *self.page_size.read();
+            let s3 = self.s3.as_ref().expect("S3Primary requires cloud feature with S3 client").clone();
+            let cache = self.cache.as_ref().expect("cache required").clone();
+
+            // Enforce journal_mode != WAL. SQLite stores journal mode at page 0
+            // offset 18-19. WAL mode = 2 at offset 18. S3Primary is incompatible
+            // with WAL because xSync must be the atomic commit point.
+            if dirty_snapshot.contains(&0) || self.manifest.read().version == 0 {
+                let mut page0 = vec![0u8; page_size as usize];
+                if cache.read_page(0, &mut page0).is_ok() && page0.len() > 19 {
+                    let journal_mode = page0[18];
+                    if journal_mode == 2 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "S3Primary mode requires journal_mode=OFF or MEMORY, not WAL. \
+                             Run PRAGMA journal_mode=OFF before enabling S3Primary.",
+                        ));
+                    }
+                }
+            }
+
+            // Assign new pages to groups
+            {
+                let mut manifest = self.manifest.write();
+                let unassigned: Vec<u64> = dirty_snapshot.iter()
+                    .filter(|&&pn| manifest.page_location(pn).is_none())
+                    .copied()
+                    .collect();
+                if !unassigned.is_empty() {
+                    Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+                }
+            }
+
+            let manifest_snap = self.manifest.read().clone();
+            let page_count = manifest_snap.page_count;
+            let next_version = manifest_snap.version + 1;
+            let change_counter = read_change_counter_from_cache(&cache, page_size);
+            let old_sub_ppf = manifest_snap.sub_pages_per_frame;
+            let use_seekable = old_sub_ppf > 0;
+
+            // Group dirty pages by group ID
+            let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
+            for &page_num in &dirty_snapshot {
+                let gid = manifest_snap.page_location(page_num)
+                    .expect("page must have group assignment after new-page assignment")
+                    .group_id;
+                groups_dirty.entry(gid).or_default().push(page_num);
+            }
+
+            let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
+            let mut new_keys = manifest_snap.page_group_keys.clone();
+            let mut new_frame_tables = manifest_snap.frame_tables.clone();
+            let mut replaced_keys: Vec<String> = Vec::new();
+
+            // Ensure override vectors are large enough
+            while new_subframe_overrides.len() <= manifest_snap.group_pages.len() {
+                new_subframe_overrides.push(HashMap::new());
+            }
+
+            for (&gid, dirty_pnums) in &groups_dirty {
+                let pages_in_group = manifest_snap.group_page_nums(gid);
+                let group_size = pages_in_group.len();
+                let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
+                let has_frame_table = use_seekable
+                    && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
+
+                if has_frame_table {
+                    // Override path: encode only dirty frames
+                    let dirty_frames = manifest::dirty_frames_for_group(
+                        dirty_pnums,
+                        &pages_in_group,
+                        frame_table_ref.expect("checked above"),
+                        old_sub_ppf,
+                    );
+
+                    for &frame_idx in &dirty_frames {
+                        let frame_start = frame_idx * old_sub_ppf as usize;
+                        let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                        let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+
+                        for pos in frame_start..frame_end {
+                            if pos >= pages_in_group.len() { break; }
+                            let pnum = pages_in_group[pos];
+                            if pnum >= page_count { break; }
+                            let mut buf = vec![0u8; page_size as usize];
+                            if cache.read_page(pnum, &mut buf).is_ok() {
+                                frame_pages.push((pnum, buf));
+                            } else {
+                                frame_pages.push((pnum, vec![0u8; page_size as usize]));
+                            }
+                        }
+
+                        let override_key = s3.override_frame_key(gid, frame_idx, next_version);
+                        let encoded = encode_override_frame(
+                            &frame_pages,
+                            page_size,
+                            self.compression_level,
+                            #[cfg(feature = "zstd")]
+                            self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+
+                        // Track old override being replaced
+                        if let Some(old_ov) = new_subframe_overrides
+                            .get(gid as usize)
+                            .and_then(|ovs| ovs.get(&frame_idx))
+                        {
+                            replaced_keys.push(old_ov.key.clone());
+                        }
+
+                        uploads.push((override_key.clone(), encoded.clone()));
+                        while new_subframe_overrides.len() <= gid as usize {
+                            new_subframe_overrides.push(HashMap::new());
+                        }
+                        new_subframe_overrides[gid as usize].insert(
+                            frame_idx,
+                            SubframeOverride {
+                                key: override_key,
+                                entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
+                            },
+                        );
+                    }
+                } else {
+                    // No frame table (legacy format or new group): full group rewrite
+                    let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+                    let mut need_s3_merge = false;
+
+                    for (i, &pnum) in pages_in_group.iter().enumerate() {
+                        if pnum >= page_count { break; }
+                        if cache.is_present(pnum) {
+                            let mut buf = vec![0u8; page_size as usize];
+                            if cache.read_page(pnum, &mut buf).is_ok() {
+                                pages[i] = Some(buf);
+                            }
+                        } else {
+                            need_s3_merge = true;
+                        }
+                    }
+
+                    if need_s3_merge {
+                        if let Some(existing_key) = new_keys.get(gid as usize) {
+                            if !existing_key.is_empty() {
+                                if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                                    let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+                                    let has_ft = use_seekable
+                                        && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+                                    if has_ft {
+                                        let ft = existing_ft.expect("checked");
+                                        if let Ok((_pc, _ps, bulk)) = decode_page_group_seekable_full(
+                                            &pg_data, ft, page_size,
+                                            pages_in_group.len() as u32, page_count, 0,
+                                            #[cfg(feature = "zstd")]
+                                            self.decoder_dict.as_ref(),
+                                            self.encryption_key.as_ref(),
+                                        ) {
+                                            let ps = page_size as usize;
+                                            for j in 0..pages_in_group.len() {
+                                                if pages_in_group[j] >= page_count { break; }
+                                                if pages[j].is_none() {
+                                                    let start = j * ps;
+                                                    let end = start + ps;
+                                                    if end <= bulk.len() {
+                                                        pages[j] = Some(bulk[start..end].to_vec());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if let Ok((_pc, _ps, existing)) = decode_page_group(
+                                        &pg_data,
+                                        #[cfg(feature = "zstd")]
+                                        self.decoder_dict.as_ref(),
+                                        self.encryption_key.as_ref(),
+                                    ) {
+                                        for (j, ep) in existing.into_iter().enumerate() {
+                                            if j >= pages_in_group.len() { break; }
+                                            if pages_in_group[j] >= page_count { break; }
+                                            if pages[j].is_none() { pages[j] = Some(ep); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let key = s3.page_group_key(gid, next_version);
+                    if use_seekable {
+                        let (encoded, ft) = encode_page_group_seekable(
+                            &pages, page_size, old_sub_ppf, self.compression_level,
+                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+                        uploads.push((key.clone(), encoded));
+                        while new_frame_tables.len() <= gid as usize {
+                            new_frame_tables.push(Vec::new());
+                        }
+                        new_frame_tables[gid as usize] = ft;
+                    } else {
+                        let encoded = encode_page_group(
+                            &pages, page_size, self.compression_level,
+                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+                        uploads.push((key.clone(), encoded));
+                    }
+
+                    while new_keys.len() <= gid as usize { new_keys.push(String::new()); }
+                    if let Some(old_key) = new_keys.get(gid as usize) {
+                        if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
+                    }
+                    new_keys[gid as usize] = key;
+
+                    // Clear overrides for this group (full rewrite supersedes them)
+                    if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
+                        for (_, ov) in group_ovs.drain() {
+                            replaced_keys.push(ov.key);
+                        }
+                    }
+                }
+            }
+
+            // Upload all overrides + page groups
+            if !uploads.is_empty() {
+                eprintln!("[sync:s3primary] uploading {} objects...", uploads.len());
+                s3.put_page_groups(&uploads)?;
+            }
+
+            // Build and publish new manifest
+            let old_manifest = manifest_snap;
+            let mut new_manifest = Manifest {
+                version: next_version,
+                change_counter,
+                page_count: old_manifest.page_count,
+                page_size: old_manifest.page_size,
+                pages_per_group: ppg,
+                page_group_keys: new_keys,
+                interior_chunk_keys: old_manifest.interior_chunk_keys.clone(),
+                index_chunk_keys: old_manifest.index_chunk_keys.clone(),
+                frame_tables: new_frame_tables,
+                sub_pages_per_frame: old_sub_ppf,
+                subframe_overrides: new_subframe_overrides,
+                strategy: old_manifest.strategy,
+                group_pages: old_manifest.group_pages.clone(),
+                btrees: old_manifest.btrees.clone(),
+                page_index: HashMap::new(),
+                btree_groups: HashMap::new(),
+                page_to_tree_name: HashMap::new(),
+                tree_name_to_groups: HashMap::new(),
+                group_to_tree_name: HashMap::new(),
+            };
+            new_manifest.build_page_index();
+            s3.put_manifest(&new_manifest)?;
+
+            // Commit local state
+            {
+                let mut m = self.manifest.write();
+                cache.set_group_pages(new_manifest.group_pages.clone());
+                *m = new_manifest.clone();
+            }
+            {
+                let mut dirty = self.dirty_page_nums.write();
+                for &page_num in &dirty_snapshot {
+                    dirty.remove(&page_num);
+                }
+            }
+            self.dirty_since_sync = false;
+
+            // Persist local manifest for crash recovery
+            let local = manifest::LocalManifest {
+                manifest: new_manifest,
+                dirty_groups: Vec::new(),
+            };
+            local.persist(&cache.cache_dir)?;
+            let _ = cache.persist_bitmap();
+
+            // Async GC of replaced keys
+            if self.gc_enabled && !replaced_keys.is_empty() {
+                let gc_s3 = Arc::clone(&s3);
+                let runtime = gc_s3.runtime.clone();
+                runtime.spawn(async move {
+                    gc_s3.delete_objects_async_owned(replaced_keys).await;
+                });
+            }
+
+            eprintln!(
+                "[sync:s3primary] committed v{} ({} dirty pages, {} uploads)",
+                next_version, dirty_snapshot.len(), uploads.len(),
+            );
+            return Ok(());
+        }
+
+        // Durable sync path: full S3 upload. Only available with cloud feature.
+        #[cfg(not(feature = "cloud"))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Durable sync requires cloud feature",
+        ));
+
+        #[cfg(feature = "cloud")]
+        {
 
         let page_size = *self.page_size.read();
 
@@ -1879,6 +2356,13 @@ impl DatabaseHandle for TieredHandle {
                         manifest.interior_chunk_keys.clear();
                         manifest.index_chunk_keys.clear();
                         manifest.frame_tables.clear();
+                        // Phase Drift: clear overrides on VACUUM
+                        for overrides in &manifest.subframe_overrides {
+                            for ovr in overrides.values() {
+                                vacuum_keys.push(ovr.key.clone());
+                            }
+                        }
+                        manifest.subframe_overrides.clear();
                         manifest.build_page_index();
 
                         self.vacuum_replaced_keys = Some(vacuum_keys);
@@ -2336,6 +2820,17 @@ impl DatabaseHandle for TieredHandle {
             // untouched groups keep their existing frame tables from import.
             frame_tables: new_frame_tables,
             sub_pages_per_frame: old_sub_ppf,
+            subframe_overrides: {
+                let mut ovs = old_manifest.subframe_overrides.clone();
+                for &gid in groups_dirty.keys() {
+                    if let Some(group_ovs) = ovs.get_mut(gid as usize) {
+                        for (_, ov) in group_ovs.drain() {
+                            replaced_keys.push(ov.key);
+                        }
+                    }
+                }
+                ovs
+            },
             // Carry forward strategy + B-tree-aware fields
             strategy: old_manifest.strategy,
             group_pages: old_manifest.group_pages.clone(),
@@ -2362,6 +2857,7 @@ impl DatabaseHandle for TieredHandle {
                 dirty.remove(&page_num);
             }
         }
+        self.dirty_since_sync = false;
 
         // Persist bitmap
         let _ = cache.persist_bitmap();
@@ -2472,6 +2968,7 @@ impl DatabaseHandle for TieredHandle {
         }
 
         Ok(())
+        } // end #[cfg(feature = "cloud")] durable sync block
     }
 
     fn set_len(&mut self, size: u64) -> Result<(), io::Error> {
@@ -2510,6 +3007,32 @@ impl DatabaseHandle for TieredHandle {
 
         if current == lock {
             return Ok(true);
+        }
+
+        // Phase Zenith-c: detect transaction rollback.
+        // If lock downgrades from EXCLUSIVE/RESERVED and we have unsynced dirty
+        // pages, the transaction was rolled back. Clear dirty pages and evict
+        // them from the disk cache so subsequent reads re-fetch from the source
+        // of truth (S3 or local pg/).
+        if (current == LockKind::Exclusive || current == LockKind::Reserved)
+            && (lock == LockKind::Shared || lock == LockKind::None)
+            && self.dirty_since_sync
+        {
+            let mut dirty = self.dirty_page_nums.write();
+            if !dirty.is_empty() {
+                let stale_pages: Vec<u64> = dirty.iter().copied().collect();
+                eprintln!(
+                    "[turbolite] lock downgrade without sync: clearing {} dirty pages (transaction rollback)",
+                    stale_pages.len(),
+                );
+                dirty.clear();
+                drop(dirty);
+                // Evict stale pages from disk cache so reads go back to source.
+                if let Some(cache) = &self.cache {
+                    cache.clear_pages_from_disk(&stale_pages);
+                }
+            }
+            self.dirty_since_sync = false;
         }
 
         let lock_file = self.ensure_lock_file()?;

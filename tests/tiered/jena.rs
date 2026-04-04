@@ -3,7 +3,7 @@
 //!
 //! These tests verify the full pipeline against real SQLite databases on Tigris.
 
-use turbolite::tiered::{TieredConfig, TieredVfs, SyncMode};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs, SyncMode};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -31,7 +31,7 @@ fn jena_interior_map_built_on_open() {
     let config = test_config("jena_imap", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_imap");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -54,7 +54,7 @@ fn jena_interior_map_built_on_open() {
 
     // Cold reader: verify data is accessible (interior map should build on open)
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -64,7 +64,7 @@ fn jena_interior_map_built_on_open() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_imap_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
@@ -90,7 +90,7 @@ fn jena_point_lookup_large_table() {
     let config = test_config("jena_point", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_point");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -111,7 +111,7 @@ fn jena_point_lookup_large_table() {
 
     // Cold reader: point lookup
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -121,7 +121,7 @@ fn jena_point_lookup_large_table() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_point_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
@@ -155,7 +155,7 @@ fn jena_index_scan() {
     let config = test_config("jena_idx", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_idx");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -179,7 +179,7 @@ fn jena_index_scan() {
 
     // Cold reader: range query via index
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -189,7 +189,7 @@ fn jena_index_scan() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_idx_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
@@ -217,7 +217,7 @@ fn jena_join_posts_users() {
     let config = test_config("jena_join", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_join");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -245,7 +245,7 @@ fn jena_join_posts_users() {
 
     // Cold reader: join query
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -255,7 +255,7 @@ fn jena_join_posts_users() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_join_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
@@ -292,7 +292,7 @@ fn jena_overflow_large_text() {
     let config = test_config("jena_ovfl", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_ovfl");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -315,7 +315,7 @@ fn jena_overflow_large_text() {
 
     // Cold reader: read a large row
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -325,7 +325,7 @@ fn jena_overflow_large_text() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_ovfl_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
@@ -354,7 +354,7 @@ fn jena_full_scan() {
     let config = test_config("jena_scan", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let vfs_name = unique_vfs_name("jena_scan");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -376,7 +376,7 @@ fn jena_full_scan() {
 
     // Cold reader: full scan with filter
     let cold_dir = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_dir.path().to_path_buf(),
@@ -386,7 +386,7 @@ fn jena_full_scan() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("jena_scan_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(

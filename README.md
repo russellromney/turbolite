@@ -51,7 +51,7 @@ pip install turbolite
 ```python
 import turbolite
 
-# tiered database — serve cold queries from S3-compatible storage (Tigris)
+# cloud database — serve cold queries from S3-compatible storage (Tigris)
 conn = turbolite.connect("my.db", mode="s3",
     bucket="my-bucket",
     endpoint="https://t3.storage.dev")
@@ -238,14 +238,14 @@ Use `tiered-tune` (see below) to find optimal schedules for your specific backen
 
 ```bash
 # Connect to existing database, test your queries
-cargo run --release --features tiered,zstd --bin tiered-tune -- \
+cargo run --release --features cloud,zstd --bin tiered-tune -- \
   --prefix "databases/tenant-123" \
   --query "SELECT * FROM users WHERE id = ?1" \
   --query "SELECT p.*, u.name FROM posts p JOIN users u ON p.user_id = u.id WHERE p.id = ?1" \
   --iterations 10
 
 # Custom schedule grid
-cargo run --release --features tiered,zstd --bin tiered-tune -- \
+cargo run --release --features cloud,zstd --bin tiered-tune -- \
   --prefix "databases/tenant-123" \
   --query "SELECT * FROM orders WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 20" \
   --search-schedules "0.3,0.3,0.4;0.5,0.5;1.0" \
@@ -283,7 +283,7 @@ With the `wal` feature flag enabled, turbolite ships WAL frames to S3 via [walru
 
 ```toml
 # Cargo.toml
-turbolite = { version = "0.2", features = ["tiered", "zstd", "wal"] }
+turbolite = { version = "0.2", features = ["cloud", "zstd", "wal"] }
 ```
 
 ```rust
@@ -323,7 +323,7 @@ import turbolite
 # Local compressed (no S3 needed)
 conn = turbolite.connect("my.db")
 
-# S3 tiered
+# S3 cloud
 conn = turbolite.connect("my.db", mode="s3", bucket="my-bucket", endpoint="https://t3.storage.dev")
 
 # Manual extension loading for full control
@@ -340,8 +340,8 @@ conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs T
 **Rust**:
 ```toml
 [dependencies]
-turbolite = "0.2"                                              # local compressed VFS
-turbolite = { version = "0.2", features = ["tiered"] }         # + S3 storage
+turbolite = "0.2"                                              # local VFS
+turbolite = { version = "0.2", features = ["cloud"] }          # + S3 storage
 turbolite = { version = "0.2", features = ["encryption"] }     # + encryption
 ```
 
@@ -352,7 +352,7 @@ make lib-bundled  # build libturbolite.{so,dylib}
 ```go
 // #cgo LDFLAGS: -L/path/to/target/release -lturbolite
 // #include <stdlib.h>
-// extern int turbolite_register_compressed(const char* name, const char* base_dir, int level);
+// extern int turbolite_register_local(const char* name, const char* cache_dir, int level);
 // extern void* turbolite_open(const char* path, const char* vfs_name);
 // extern int turbolite_exec(void* db, const char* sql);
 // extern char* turbolite_query_json(void* db, const char* sql);
@@ -397,13 +397,18 @@ db.close();
 
 Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [packages/node/](packages/node/) for full docs.
 
-### Rust
+### Rust (local)
 
 ```rust
-use turbolite::{register, CompressedVfs};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 
-let vfs = CompressedVfs::new("/path/to/data", 3);  // zstd level 3
-register("turbolite", vfs)?;
+let config = TurboliteConfig {
+    storage_backend: StorageBackend::Local,
+    cache_dir: "/path/to/data".into(),
+    ..Default::default()
+};
+let vfs = TurboliteVfs::new(config)?;
+turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(
     "mydb.db",
@@ -412,16 +417,22 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 )?;
 ```
 
-### Rust (S3 tiered)
+### Rust (S3 cloud)
 
 ```rust
-let config = TieredConfig {
-    bucket: "my-bucket".into(),
-    prefix: "my-database".into(),
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+
+let config = TurboliteConfig {
+    storage_backend: StorageBackend::S3 {
+        bucket: "my-bucket".into(),
+        prefix: "my-database".into(),
+        endpoint_url: None,
+        region: None,
+    },
     cache_dir: "/tmp/cache".into(),
     ..Default::default()
 };
-let vfs = TieredVfs::new(config)?;
+let vfs = TurboliteVfs::new(config)?;
 turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -489,11 +500,11 @@ The `tiered-bench` binary generates a social media dataset (users, posts, likes,
 ```bash
 # Basic benchmark: 100K posts, default settings
 TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://t3.storage.dev \
-  cargo run --features zstd,tiered --bin tiered-bench --release -- \
+  cargo run --features zstd,cloud --bin tiered-bench --release -- \
     --sizes 100000
 
 # 1M posts, 8 prefetch threads, only interior-level point queries
-cargo run --features zstd,tiered --bin tiered-bench --release -- \
+cargo run --features zstd,cloud --bin tiered-bench --release -- \
     --sizes 1000000 --prefetch-threads 8 --queries post --modes interior
 
 # Quick local VFS comparison (no S3 needed)
@@ -504,11 +515,11 @@ Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-thread
 
 ```bash
 # Matrix mode: test 10 schedule pairs x 6 queries at cold level
-cargo run --features zstd,tiered --bin tiered-bench --release -- \
+cargo run --features zstd,cloud --bin tiered-bench --release -- \
     --sizes 1000000 --import auto --plan-aware --matrix --iterations 10
 
 # Tune schedules for your own database and queries
-cargo run --features zstd,tiered --bin tiered-tune --release -- \
+cargo run --features zstd,cloud --bin tiered-tune --release -- \
     --prefix "databases/my-db" \
     --query "SELECT * FROM users WHERE id = ?1" --param 42 \
     --plan-aware --iterations 10
@@ -518,7 +529,7 @@ cargo run --features zstd,tiered --bin tiered-tune --release -- \
 
 ```bash
 cargo test --features zstd                    # local VFS tests
-cargo test --features zstd,tiered             # + S3 integration tests
+cargo test --features zstd,cloud             # + S3 integration tests
 cargo test --features zstd,encryption         # + encryption tests
 ```
 

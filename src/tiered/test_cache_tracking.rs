@@ -599,9 +599,9 @@ fn test_sub_chunk_tracker_no_encryption_stays_plaintext() {
     t.mark_present(id, SubChunkTier::Data);
     t.persist().unwrap();
 
-    // Raw file should be valid JSON
+    // Raw file should be valid JSON (v2 format: id, tier, count)
     let raw = std::fs::read(&path).unwrap();
-    let parse_result: Result<Vec<(SubChunkId, u8)>, _> = serde_json::from_slice(&raw);
+    let parse_result: Result<Vec<(SubChunkId, u8, u32)>, _> = serde_json::from_slice(&raw);
     assert!(parse_result.is_ok(), "unencrypted tracker file must be valid JSON");
 }
 

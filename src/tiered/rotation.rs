@@ -22,11 +22,17 @@ use crate::compress;
 /// **Offline operation**: close all connections before rotating. Open connections
 /// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
 /// keys, uncached reads from stale connections will fail with NotFound.
-#[cfg(feature = "encryption")]
+#[cfg(all(feature = "encryption", feature = "cloud"))]
 pub fn rotate_encryption_key(
-    config: &TieredConfig,
+    config: &TurboliteConfig,
     new_key: Option<[u8; 32]>,
 ) -> io::Result<()> {
+    if config.is_local() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "key rotation requires S3 backend (re-encrypts S3 objects in place)",
+        ));
+    }
     let old_key = config.encryption_key;
 
     if old_key.is_none() && new_key.is_none() {
@@ -62,7 +68,7 @@ pub fn rotate_encryption_key(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let handle = runtime.handle().clone();
 
-    let s3_cfg = TieredConfig {
+    let s3_cfg = TurboliteConfig {
         bucket: config.bucket.clone(),
         prefix: config.prefix.clone(),
         endpoint_url: config.endpoint_url.clone(),
@@ -315,6 +321,7 @@ pub fn rotate_encryption_key(
     let _ = std::fs::remove_file(config.cache_dir.join("data.cache"));
     let _ = std::fs::remove_file(config.cache_dir.join("sub_chunk_tracker"));
     let _ = std::fs::remove_file(config.cache_dir.join("page_bitmap"));
+    let _ = std::fs::remove_file(config.cache_dir.join("cache_index.json"));
     eprintln!("[rotate] cleared local cache");
 
     eprintln!("[rotate] {} complete", mode);

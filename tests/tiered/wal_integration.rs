@@ -21,8 +21,8 @@ struct WalTestParams {
 }
 
 impl WalTestParams {
-    fn wal_config(&self, cache_dir: &Path) -> TieredConfig {
-        let mut config = TieredConfig {
+    fn wal_config(&self, cache_dir: &Path) -> TurboliteConfig {
+        let mut config = TurboliteConfig {
             bucket: self.bucket.clone(),
             prefix: self.prefix.clone(),
             endpoint_url: self.endpoint.clone(),
@@ -35,8 +35,8 @@ impl WalTestParams {
         config
     }
 
-    fn read_config(&self, cache_dir: &Path) -> TieredConfig {
-        TieredConfig {
+    fn read_config(&self, cache_dir: &Path) -> TurboliteConfig {
+        TurboliteConfig {
             bucket: self.bucket.clone(),
             prefix: self.prefix.clone(),
             endpoint_url: self.endpoint.clone(),
@@ -92,7 +92,7 @@ fn test_version_is_change_counter() {
 
     // Open VFS, write, checkpoint - version should advance
     let vfs_name = unique_vfs_name("wal_ver");
-    let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:source.db?vfs={}", vfs_name);
@@ -137,7 +137,7 @@ fn test_crash_recovery_via_wal() {
     // Write more, let WAL ship, crash
     {
         let vfs_name = unique_vfs_name("wal_crash_w");
-        let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+        let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let db_path = format!("file:source.db?vfs={}", vfs_name);
@@ -157,7 +157,7 @@ fn test_crash_recovery_via_wal() {
     // Recover
     let recovery_cache = tempfile::tempdir().unwrap();
     let vfs_name = unique_vfs_name("wal_crash_r");
-    let vfs = TieredVfs::new(params.wal_config(recovery_cache.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(recovery_cache.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:source.db?vfs={}", vfs_name);
@@ -183,7 +183,7 @@ fn test_checkpoint_plus_wal_recovery() {
     // Phase 1: write + checkpoint
     {
         let vfs_name = unique_vfs_name("wal_cpw_1");
-        let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+        let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open_with_flags(&db_path,
@@ -197,7 +197,7 @@ fn test_checkpoint_plus_wal_recovery() {
     // Phase 2: WAL only
     {
         let vfs_name = unique_vfs_name("wal_cpw_2");
-        let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+        let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open_with_flags(&db_path,
@@ -212,7 +212,7 @@ fn test_checkpoint_plus_wal_recovery() {
     // Recover
     let rc = tempfile::tempdir().unwrap();
     let vfs_name = unique_vfs_name("wal_cpw_r");
-    let vfs = TieredVfs::new(params.wal_config(rc.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(rc.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),
@@ -238,7 +238,7 @@ fn test_no_wal_recovery_is_noop() {
 
     let rc = tempfile::tempdir().unwrap();
     let vfs_name = unique_vfs_name("wal_noop_r");
-    let vfs = TieredVfs::new(params.wal_config(rc.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(rc.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),
@@ -262,7 +262,7 @@ fn test_wal_gc_after_checkpoint() {
     });
 
     let vfs_name = unique_vfs_name("wal_gc");
-    let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let db_path = format!("file:source.db?vfs={}", vfs_name);
 
@@ -304,7 +304,7 @@ fn test_large_data_wal_recovery() {
     // Write + checkpoint + write + WAL
     {
         let vfs_name = unique_vfs_name("wal_lg_w");
-        let vfs = TieredVfs::new(params.wal_config(cache_dir.path())).unwrap();
+        let vfs = TurboliteVfs::new(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open_with_flags(&db_path,
@@ -323,7 +323,7 @@ fn test_large_data_wal_recovery() {
 
     let rc = tempfile::tempdir().unwrap();
     let vfs_name = unique_vfs_name("wal_lg_r");
-    let vfs = TieredVfs::new(params.wal_config(rc.path())).unwrap();
+    let vfs = TurboliteVfs::new(params.wal_config(rc.path())).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),

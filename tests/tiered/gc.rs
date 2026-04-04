@@ -1,6 +1,6 @@
 //! Garbage collection tests: post-checkpoint GC, disabled GC, full scan, no-orphan safety.
 
-use turbolite::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -14,7 +14,7 @@ fn test_gc_post_checkpoint() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -90,7 +90,7 @@ fn test_gc_disabled_preserves_old_versions() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -158,7 +158,7 @@ fn test_gc_full_scan() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -197,7 +197,7 @@ fn test_gc_full_scan() {
     // Open a fresh VFS to call gc()
     drop(conn);
     let gc_cache = TempDir::new().unwrap();
-    let gc_config = TieredConfig {
+    let gc_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
         cache_dir: gc_cache.path().to_path_buf(),
@@ -205,7 +205,7 @@ fn test_gc_full_scan() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let gc_vfs = TieredVfs::new(gc_config).unwrap();
+    let gc_vfs = TurboliteVfs::new(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
     eprintln!("Full GC deleted {} objects", deleted);
 
@@ -243,7 +243,7 @@ fn test_gc_no_orphans() {
     config.gc_enabled = true; // GC on from the start
     let vfs_name = unique_vfs_name("tiered_gc_noop");
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -268,7 +268,7 @@ fn test_gc_no_orphans() {
     // Full GC scan should find nothing to delete
     drop(conn);
     let gc_cache = TempDir::new().unwrap();
-    let gc_config = TieredConfig {
+    let gc_config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: "test/gc_noop/will_not_exist".to_string(),
         cache_dir: gc_cache.path().to_path_buf(),
@@ -276,7 +276,7 @@ fn test_gc_no_orphans() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let gc_vfs = TieredVfs::new(gc_config).unwrap();
+    let gc_vfs = TurboliteVfs::new(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
     assert_eq!(deleted, 0, "GC on empty prefix should delete nothing");
 }

@@ -701,7 +701,7 @@ fn test_assign_new_pages_to_groups_basic() {
 
     // Pages 8 and 9 are new (not in page_index)
     let unassigned = vec![8, 9];
-    TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+    TurboliteHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
 
     // Should be added to a group and in page_index
     assert!(manifest.page_location(8).is_some());
@@ -727,7 +727,7 @@ fn test_assign_new_pages_fills_last_group_first() {
     manifest.build_page_index();
 
     let unassigned = vec![5, 6];
-    TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+    TurboliteHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
 
     // Pages 5,6 should fill group 1 (had room)
     let loc5 = manifest.page_location(5).unwrap();
@@ -752,7 +752,7 @@ fn test_assign_new_pages_overflow_to_new_group() {
     manifest.build_page_index();
 
     let unassigned = vec![8, 9, 10, 11, 12];
-    TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+    TurboliteHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
 
     // 5 new pages, both groups full -> need new group(s)
     assert_eq!(manifest.group_pages.len(), 4); // 2 original + 2 new (4 + 1)
@@ -776,7 +776,7 @@ fn test_assign_new_pages_empty_input() {
     manifest.build_page_index();
     let original_groups = manifest.group_pages.len();
 
-    TieredHandle::assign_new_pages_to_groups(&mut manifest, &[], 4);
+    TurboliteHandle::assign_new_pages_to_groups(&mut manifest, &[], 4);
 
     assert_eq!(manifest.group_pages.len(), original_groups);
 }
@@ -793,7 +793,7 @@ fn test_assign_new_pages_no_duplicate_assignments() {
     manifest.build_page_index();
 
     let unassigned = vec![4, 5, 6, 7, 8, 9];
-    TieredHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
+    TurboliteHandle::assign_new_pages_to_groups(&mut manifest, &unassigned, 4);
 
     // Each page should appear exactly once across all groups
     let mut all_pages: Vec<u64> = manifest.group_pages.iter().flatten().copied().collect();

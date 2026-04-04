@@ -1,6 +1,6 @@
 //! Index bundle and index integrity tests.
 
-use turbolite::tiered::{TieredConfig, TieredVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -14,7 +14,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
     let region = config.region.clone();
     let vfs_name = unique_vfs_name("ixb");
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -86,7 +86,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
 
     // Cold read: open a new connection on a fresh cache
     let cold_cache = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
         cache_dir: cold_cache.path().to_path_buf(),
@@ -98,7 +98,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     let _bench = cold_vfs.shared_state();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
@@ -124,7 +124,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
     drop(cold_conn);
 
     // Destroy S3 data
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -133,7 +133,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -147,7 +147,7 @@ fn test_index_bundles_eager_load_disabled() {
     let region = config.region.clone();
     let vfs_name = unique_vfs_name("ixb_ne");
 
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -182,7 +182,7 @@ fn test_index_bundles_eager_load_disabled() {
 
     // Open cold reader with eager_index_load=false
     let cold_cache = TempDir::new().unwrap();
-    let cold_config = TieredConfig {
+    let cold_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
         cache_dir: cold_cache.path().to_path_buf(),
@@ -194,7 +194,7 @@ fn test_index_bundles_eager_load_disabled() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
-    let cold_vfs = TieredVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -212,7 +212,7 @@ fn test_index_bundles_eager_load_disabled() {
 
     drop(cold_conn);
 
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: cold_cache.path().to_path_buf(),
@@ -221,7 +221,7 @@ fn test_index_bundles_eager_load_disabled() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -236,7 +236,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
     let vfs_name = unique_vfs_name("warm_prof_w");
 
     // -- Phase 1: Create database with benchmark schema --
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -313,7 +313,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
 
     // -- Phase 2: Fresh reader VFS (simulates benchmark reader) --
     let reader_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
         cache_dir: reader_cache.path().to_path_buf(),
@@ -325,7 +325,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("warm_prof_r");
-    let reader_vfs = TieredVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let warm_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -394,7 +394,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
     drop(warm_conn);
 
     // Cleanup
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir: reader_cache.path().to_path_buf(),
@@ -403,7 +403,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -422,7 +422,7 @@ fn test_small_ppg_index_integrity() {
     let region = Some("auto".to_string());
 
     // Use ppg=8 to force many small page groups
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: unique_prefix.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -434,7 +434,7 @@ fn test_small_ppg_index_integrity() {
     };
 
     let vfs_name = unique_vfs_name("small_ppg_write");
-    let vfs = TieredVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -472,7 +472,7 @@ fn test_small_ppg_index_integrity() {
 
     // Cold reader: fresh cache, read from S3
     let read_cache = TempDir::new().unwrap();
-    let reader_config = TieredConfig {
+    let reader_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: unique_prefix.clone(),
         cache_dir: read_cache.path().to_path_buf(),
@@ -485,7 +485,7 @@ fn test_small_ppg_index_integrity() {
     };
 
     let reader_vfs_name = unique_vfs_name("small_ppg_reader");
-    let reader_vfs = TieredVfs::new(reader_config).expect("failed to create reader VFS");
+    let reader_vfs = TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -531,7 +531,7 @@ fn test_small_ppg_index_integrity() {
     // Cleanup S3
     {
         let cleanup_cache = TempDir::new().unwrap();
-        let cleanup_config = TieredConfig {
+        let cleanup_config = TurboliteConfig {
             bucket,
             prefix: unique_prefix,
             cache_dir: cleanup_cache.path().to_path_buf(),
@@ -541,7 +541,7 @@ fn test_small_ppg_index_integrity() {
             pages_per_group: 8,
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }

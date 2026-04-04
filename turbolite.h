@@ -13,12 +13,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(TURBOLITE_TIERED)
 /**
  * Minimum confidence to fire a prediction.
  */
 #define CONFIDENCE_THRESHOLD 0.5
-#endif
 
 /**
  * Opaque database connection handle.
@@ -42,7 +40,11 @@ const char *turbolite_last_error(void);
 const char *turbolite_version(void);
 
 /**
- * Register a compressed VFS with SQLite.
+ * Register a compressed VFS with SQLite (legacy CompressedVfs format).
+ *
+ * **Deprecated:** Prefer `turbolite_register_local()` which uses the new
+ * TurboliteVfs with manifest-based page group storage. This function is
+ * retained for backward compatibility with existing CompressedVfs databases.
  *
  * After registration, open databases with `sqlite3_open_v2(..., name)`.
  *
@@ -83,11 +85,57 @@ int turbolite_register_encrypted(const char *name,
                                  const char *password);
 #endif
 
-#if defined(TURBOLITE_TIERED)
 /**
- * Register a tiered S3-backed VFS.
+ * Register a local TurboliteVfs (page groups on disk, no S3).
  *
- * The VFS stores data in S3 with a local NVMe cache. Requires the `tiered`
+ * This is the recommended way to create a high-performance local SQLite VFS
+ * with compressed page groups and manifest-based storage.
+ *
+ * # Parameters
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
+ * - `cache_dir`: Directory where page groups and manifest are stored.
+ * - `compression_level`: zstd level 1-22 (3 is a good default).
+ *
+ * # Returns
+ * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+ */
+int turbolite_register_local(const char *name, const char *cache_dir, int compression_level);
+
+/**
+ * Register a TurboliteVfs from a JSON configuration string.
+ *
+ * Unified entry point that supports both local and cloud modes. The JSON
+ * object is deserialized into a `TurboliteConfig`. Unknown fields are ignored.
+ *
+ * # Minimal JSON (local mode)
+ *
+ * ```json
+ * { "cache_dir": "/data/mydb" }
+ * ```
+ *
+ * # Cloud mode
+ *
+ * ```json
+ * {
+ *   "storage_backend": { "S3": { "bucket": "my-bucket", "prefix": "db/" } },
+ *   "cache_dir": "/tmp/cache"
+ * }
+ * ```
+ *
+ * # Parameters
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
+ * - `config_json`: JSON string with configuration fields.
+ *
+ * # Returns
+ * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+ */
+int turbolite_register(const char *name, const char *config_json);
+
+#if defined(TURBOLITE_CLOUD)
+/**
+ * Register an S3-backed cloud VFS.
+ *
+ * The VFS stores data in S3 with a local NVMe cache. Requires the `cloud`
  * feature at build time.
  *
  * # Parameters
@@ -100,6 +148,18 @@ int turbolite_register_encrypted(const char *name,
  *
  * # Returns
  * 0 on success, -1 on error.
+ */
+int turbolite_register_cloud(const char *name,
+                             const char *bucket,
+                             const char *prefix,
+                             const char *cache_dir,
+                             const char *endpoint_url,
+                             const char *region);
+#endif
+
+#if defined(TURBOLITE_CLOUD)
+/**
+ * Backward-compatible alias for `turbolite_register_cloud`.
  */
 int turbolite_register_tiered(const char *name,
                               const char *bucket,
@@ -171,13 +231,13 @@ void turbolite_close(struct TurboliteDb *db);
  * Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
  * Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
  *
- * Always registers "turbolite" (local compressed VFS).
+ * Always registers "turbolite" (local TurboliteVfs).
  * If TURBOLITE_BUCKET is set, also registers "turbolite-s3" (tiered VFS).
  * Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
  */
 int turbolite_ext_register_vfs(void);
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
  * Returns 0 on success, 1 if no tiered VFS.
@@ -185,28 +245,28 @@ int turbolite_ext_register_vfs(void);
 int32_t turbolite_bench_clear_cache(int32_t mode);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Reset S3 counters. Returns 0 on success.
  */
 int32_t turbolite_bench_reset_s3(void);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Get S3 GET count since last reset.
  */
 int64_t turbolite_bench_s3_gets(void);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Get S3 GET bytes since last reset.
  */
 int64_t turbolite_bench_s3_bytes(void);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Evict cached data for named trees. tree_names is a comma-separated C string.
  * Returns number of groups evicted, or -1 if no tiered VFS.
@@ -214,11 +274,11 @@ int64_t turbolite_bench_s3_bytes(void);
 int32_t turbolite_evict_tree(const char *tree_names);
 #endif
 
-#if !defined(TURBOLITE_TIERED)
+#if !defined(TURBOLITE_CLOUD)
 int32_t turbolite_evict_tree(const char *_tree_names);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Return cache info as a JSON C string. Caller must treat as SQLITE_TRANSIENT.
  * Returns null if no tiered VFS.
@@ -228,7 +288,7 @@ int32_t turbolite_evict_tree(const char *_tree_names);
 const char *turbolite_cache_info(void);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
 /**
  * Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
  * Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
@@ -237,11 +297,23 @@ const char *turbolite_cache_info(void);
 const char *turbolite_warm(void *db, const char *sql);
 #endif
 
-#if !defined(TURBOLITE_TIERED)
+#if !defined(TURBOLITE_CLOUD)
 const char *turbolite_warm(void *_db, const char *_sql);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
+/**
+ * Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
+ * tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
+ */
+int32_t turbolite_evict_query(void *db, const char *sql);
+#endif
+
+#if !defined(TURBOLITE_CLOUD)
+int32_t turbolite_evict_query(void *_db, const char *_sql);
+#endif
+
+#if defined(TURBOLITE_CLOUD)
 /**
  * Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
  * Returns number of sub-chunks evicted, or -1 if no tiered VFS.
@@ -249,35 +321,52 @@ const char *turbolite_warm(void *_db, const char *_sql);
 int32_t turbolite_evict(const char *tier);
 #endif
 
-#if !defined(TURBOLITE_TIERED)
+#if !defined(TURBOLITE_CLOUD)
 int32_t turbolite_evict(const char *_tier);
 #endif
 
-#if !defined(TURBOLITE_TIERED)
+#if !defined(TURBOLITE_CLOUD)
 const char *turbolite_cache_info(void);
 #endif
 
-#if defined(TURBOLITE_TIERED)
+#if defined(TURBOLITE_CLOUD)
+/**
+ * Full GC: list all S3 objects under prefix, delete orphans not in manifest.
+ * Returns number of objects deleted, or -1 if no tiered VFS.
+ */
+int32_t turbolite_gc(void);
+#endif
+
+#if defined(TURBOLITE_CLOUD)
+/**
+ * Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
+ * Returns JSON report string (caller must free), or null on error.
+ */
+const char *turbolite_compact(void);
+#endif
+
+#if !defined(TURBOLITE_CLOUD)
+const char *turbolite_compact(void);
+#endif
+
+#if !defined(TURBOLITE_CLOUD)
+int32_t turbolite_gc(void);
+#endif
+
 extern int32_t sqlite3_prepare_v2(void *db,
                                   const char *sql,
                                   int32_t nbyte,
                                   void **stmt,
                                   const char **tail);
-#endif
 
-#if defined(TURBOLITE_TIERED)
 extern int32_t sqlite3_step(void *stmt);
-#endif
 
-#if defined(TURBOLITE_TIERED)
 extern const char *sqlite3_column_text(void *stmt, int32_t col);
-#endif
 
-#if defined(TURBOLITE_TIERED)
 extern int32_t sqlite3_finalize(void *stmt);
-#endif
 
-#if defined(TURBOLITE_TIERED)
+extern int64_t sqlite3_column_int64(void *stmt, int32_t col);
+
 /**
  * FFI entry point called from C trace callback.
  * Runs EQP, parses, and pushes to global queue.
@@ -286,17 +375,22 @@ extern int32_t sqlite3_finalize(void *stmt);
  * `db` must be a valid sqlite3 handle. `sql` must be a valid C string.
  */
 void turbolite_trace_push_plan(void *db, const char *sql);
-#endif
 
-#if defined(TURBOLITE_TIERED)
+/**
+ * Phase Jena-d2: discover schema from sqlite_master and push to global cache.
+ * Called once per db connection from the trace callback.
+ *
+ * # Safety
+ * `db` must be a valid sqlite3 handle.
+ */
+void turbolite_discover_schema(void *db);
+
 /**
  * FFI entry point called from C trace profile callback.
  * Signals query completion for between-query eviction.
  */
 void turbolite_trace_end_query(void);
-#endif
 
-#if defined(TURBOLITE_TIERED)
 /**
  * FFI entry point: `turbolite_config_set(key, value)` SQL function.
  *
@@ -304,7 +398,6 @@ void turbolite_trace_end_query(void);
  * `key` and `value` must be valid C strings.
  */
 int32_t turbolite_config_set(const char *key, const char *value);
-#endif
 
 #ifdef __cplusplus
 }  // extern "C"

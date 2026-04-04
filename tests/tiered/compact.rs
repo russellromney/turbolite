@@ -14,7 +14,7 @@ fn test_compact_reclaims_dead_space() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("compact_reclaim");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -71,7 +71,7 @@ fn test_compact_reclaims_dead_space() {
     // Verify data integrity: remaining 100 rows should be readable from a cold reader
     {
         let reader_cache = tempfile::tempdir().unwrap();
-        let reader_config = TieredConfig {
+        let reader_config = TurboliteConfig {
             bucket: bucket.clone(),
             prefix: prefix.clone(),
             endpoint_url: endpoint.clone(),
@@ -81,7 +81,7 @@ fn test_compact_reclaims_dead_space() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("compact_reader");
-        let reader_vfs = TieredVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:compact_reclaim.db?vfs={}", reader_vfs_name);
@@ -103,7 +103,7 @@ fn test_compact_noop_when_no_dead_space() {
     let config = test_config("compact_noop", cache_dir.path());
 
     let vfs_name = unique_vfs_name("compact_noop");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -148,7 +148,7 @@ fn test_compact_respects_threshold() {
     let config = test_config("compact_thresh", cache_dir.path());
 
     let vfs_name = unique_vfs_name("compact_thresh");
-    let vfs = TieredVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 

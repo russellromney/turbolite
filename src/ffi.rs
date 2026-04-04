@@ -19,11 +19,14 @@
 //! #include "turbolite.h"
 //! #include <sqlite3.h>
 //!
-//! // Register the VFS
-//! int rc = turbolite_register_compressed("turbolite", "/tmp/db", 3);
+//! // Register the VFS (local mode)
+//! int rc = turbolite_register_local("turbolite", "/data/mydb", 3);
 //! if (rc != 0) {
 //!     fprintf(stderr, "error: %s\n", turbolite_last_error());
 //! }
+//!
+//! // Or use JSON config for full control:
+//! // int rc = turbolite_register("turbolite", "{\"cache_dir\": \"/data/mydb\"}");
 //!
 //! // Open a database using the registered VFS
 //! sqlite3 *db;
@@ -75,7 +78,11 @@ pub extern "C" fn turbolite_version() -> *const c_char {
 
 // --- VFS registration ---
 
-/// Register a compressed VFS with SQLite.
+/// Register a compressed VFS with SQLite (legacy CompressedVfs format).
+///
+/// **Deprecated:** Prefer `turbolite_register_local()` which uses the new
+/// TurboliteVfs with manifest-based page group storage. This function is
+/// retained for backward compatibility with existing CompressedVfs databases.
 ///
 /// After registration, open databases with `sqlite3_open_v2(..., name)`.
 ///
@@ -183,9 +190,125 @@ pub extern "C" fn turbolite_register_encrypted(
     }
 }
 
-/// Register a tiered S3-backed VFS.
+/// Register a local TurboliteVfs (page groups on disk, no S3).
 ///
-/// The VFS stores data in S3 with a local NVMe cache. Requires the `tiered`
+/// This is the recommended way to create a high-performance local SQLite VFS
+/// with compressed page groups and manifest-based storage.
+///
+/// # Parameters
+/// - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
+/// - `cache_dir`: Directory where page groups and manifest are stored.
+/// - `compression_level`: zstd level 1-22 (3 is a good default).
+///
+/// # Returns
+/// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+#[no_mangle]
+pub extern "C" fn turbolite_register_local(
+    name: *const c_char,
+    cache_dir: *const c_char,
+    compression_level: c_int,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let cache_dir = match cstr_to_str(cache_dir, "cache_dir") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let config = crate::tiered::TurboliteConfig {
+        storage_backend: crate::tiered::StorageBackend::Local,
+        cache_dir: std::path::PathBuf::from(cache_dir),
+        compression_level,
+        ..Default::default()
+    };
+
+    let vfs = match crate::tiered::TurboliteVfs::new(config) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("local vfs creation failed: {}", e));
+            return -1;
+        }
+    };
+    match crate::tiered::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register a TurboliteVfs from a JSON configuration string.
+///
+/// Unified entry point that supports both local and cloud modes. The JSON
+/// object is deserialized into a `TurboliteConfig`. Unknown fields are ignored.
+///
+/// # Minimal JSON (local mode)
+///
+/// ```json
+/// { "cache_dir": "/data/mydb" }
+/// ```
+///
+/// # Cloud mode
+///
+/// ```json
+/// {
+///   "storage_backend": { "S3": { "bucket": "my-bucket", "prefix": "db/" } },
+///   "cache_dir": "/tmp/cache"
+/// }
+/// ```
+///
+/// # Parameters
+/// - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
+/// - `config_json`: JSON string with configuration fields.
+///
+/// # Returns
+/// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+#[no_mangle]
+pub extern "C" fn turbolite_register(
+    name: *const c_char,
+    config_json: *const c_char,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let config_json = match cstr_to_str(config_json, "config_json") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let config: crate::tiered::TurboliteConfig = match serde_json::from_str(config_json) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(&format!("invalid config JSON: {}", e));
+            return -1;
+        }
+    };
+
+    let vfs = match crate::tiered::TurboliteVfs::new(config) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("vfs creation failed: {}", e));
+            return -1;
+        }
+    };
+    match crate::tiered::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register an S3-backed cloud VFS.
+///
+/// The VFS stores data in S3 with a local NVMe cache. Requires the `cloud`
 /// feature at build time.
 ///
 /// # Parameters
@@ -198,9 +321,9 @@ pub extern "C" fn turbolite_register_encrypted(
 ///
 /// # Returns
 /// 0 on success, -1 on error.
-#[cfg(feature = "tiered")]
+#[cfg(feature = "cloud")]
 #[no_mangle]
-pub extern "C" fn turbolite_register_tiered(
+pub extern "C" fn turbolite_register_cloud(
     name: *const c_char,
     bucket: *const c_char,
     prefix: *const c_char,
@@ -228,29 +351,45 @@ pub extern "C" fn turbolite_register_tiered(
     let endpoint_url = nullable_cstr_to_option(endpoint_url);
     let region = nullable_cstr_to_option(region);
 
-    let config = crate::tiered::TieredConfig {
-        bucket: bucket.to_string(),
-        prefix: prefix.to_string(),
+    let config = crate::tiered::TurboliteConfig {
+        storage_backend: crate::tiered::StorageBackend::S3 {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint_url: endpoint_url.map(|s| s.to_string()),
+            region: region.map(|s| s.to_string()),
+        },
         cache_dir: std::path::PathBuf::from(cache_dir),
-        endpoint_url: endpoint_url.map(|s| s.to_string()),
-        region: region.map(|s| s.to_string()),
         ..Default::default()
     };
 
-    let vfs = match crate::tiered::TieredVfs::new(config) {
+    let vfs = match crate::tiered::TurboliteVfs::new(config) {
         Ok(v) => v,
         Err(e) => {
-            set_last_error(&format!("tiered vfs creation failed: {}", e));
+            set_last_error(&format!("cloud vfs creation failed: {}", e));
             return -1;
         }
     };
     match crate::tiered::register(name, vfs) {
         Ok(()) => 0,
         Err(e) => {
-            set_last_error(&format!("tiered register failed: {}", e));
+            set_last_error(&format!("cloud register failed: {}", e));
             -1
         }
     }
+}
+
+/// Backward-compatible alias for `turbolite_register_cloud`.
+#[cfg(feature = "cloud")]
+#[no_mangle]
+pub extern "C" fn turbolite_register_tiered(
+    name: *const c_char,
+    bucket: *const c_char,
+    prefix: *const c_char,
+    cache_dir: *const c_char,
+    endpoint_url: *const c_char,
+    region: *const c_char,
+) -> c_int {
+    turbolite_register_cloud(name, bucket, prefix, cache_dir, endpoint_url, region)
 }
 
 // --- Utilities ---

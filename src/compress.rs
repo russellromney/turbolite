@@ -1,7 +1,7 @@
 //! Compression and encryption free functions.
 //!
 //! These are extracted from CompressedHandle so they can be reused by
-//! both CompressedHandle and TieredHandle without duplication.
+//! both CompressedHandle and TurboliteHandle without duplication.
 
 use std::io;
 

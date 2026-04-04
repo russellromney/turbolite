@@ -3,13 +3,14 @@ use crate::tiered::*;
 
 #[test]
 fn test_tiered_config_default() {
-    let c = TieredConfig::default();
+    let c = TurboliteConfig::default();
     assert_eq!(c.bucket, "");
     assert_eq!(c.prefix, "");
-    assert_eq!(c.cache_dir, PathBuf::from("/tmp/sqlces-cache"));
+    assert_eq!(c.cache_dir, PathBuf::from("/tmp/turbolite-cache"));
     assert_eq!(c.compression_level, 1);
     assert_eq!(c.endpoint_url, None);
     assert!(!c.read_only);
+    #[cfg(feature = "cloud")]
     assert!(c.runtime_handle.is_none());
     assert_eq!(c.pages_per_group, DEFAULT_PAGES_PER_GROUP);
     assert_eq!(c.region, None);
@@ -25,6 +26,6 @@ fn test_tiered_config_default() {
 #[test]
 fn test_tiered_config_default_pages_per_group() {
     assert_eq!(DEFAULT_PAGES_PER_GROUP, 256);
-    assert_eq!(TieredConfig::default().pages_per_group, 256);
+    assert_eq!(TurboliteConfig::default().pages_per_group, 256);
 }
 

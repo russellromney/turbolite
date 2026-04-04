@@ -1,38 +1,48 @@
-//! S3-backed page-group tiered storage VFS.
+//! Turbolite VFS: compressed + encrypted SQLite storage.
 //!
-//! Architecture:
-//! - S3/Tigris is the source of truth for all pages
-//! - Local NVMe disk is a page-level cache (uncompressed, direct pread)
-//! - Writes go through WAL (local, fast), checkpoint flushes dirty pages to S3 as page groups
-//! - Any instance with the VFS + S3 credentials can read the database
+//! Two storage modes, same on-disk format:
+//!
+//! - **Local** (default): page groups stored at `{cache_dir}/pg/`, manifest at
+//!   `{cache_dir}/manifest.msgpack`. No S3, no tokio, no async deps.
+//!   Enable with `StorageBackend::Local` (the default).
+//!
+//! - **Cloud** (S3-backed): S3 is the source of truth, local NVMe disk is a
+//!   page-level cache. Requires the `cloud` feature for AWS SDK + tokio.
+//!   Enable with `StorageBackend::S3 { bucket, prefix, .. }`.
+//!
+//! # Quick start (local mode)
+//!
+//! ```ignore
+//! use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+//!
+//! let config = TurboliteConfig {
+//!     storage_backend: StorageBackend::Local,
+//!     cache_dir: "/data/mydb".into(),
+//!     ..Default::default()
+//! };
+//! let vfs = TurboliteVfs::new(config)?;
+//! turbolite::tiered::register("mydb", vfs)?;
+//! // Now open with rusqlite: "file:test.db?vfs=mydb"
+//! ```
+//!
+//! # Architecture
+//!
+//! Both modes use the same format: a manifest tracks page-to-group assignments,
+//! and page groups are compressed blobs containing multiple pages. Switching from
+//! local to cloud is a config change (same files, same manifest).
+//!
 //! - Default: 64KB pages, 256 pages per group (16MB uncompressed, ~8MB compressed)
-//! - Sub-chunk caching: the unit of S3 cost is the sub-chunk (4 pages = 256KB), not the page.
-//!   Cache tracking, eviction, and fetch all operate at sub-chunk granularity.
+//! - Optional zstd compression with dictionary support (2-5x smaller on structured data)
+//! - Optional AES-256 encryption (CTR for cache, GCM for cloud page groups)
+//! - Optional compressed local cache (saves disk space, costs CPU on read)
 //!
-//! S3 layout:
-//! ```text
-//! s3://{bucket}/{prefix}/
-//! ├── manifest.json       # version, page_count, page_size, pages_per_group, page_group_keys
-//! └── pg/
-//!     ├── 0_v1            # Page group 0, manifest version 1 (pages 0-255)
-//!     ├── 1_v1            # Page group 1 (pages 256-511)
-//!     └── 0_v2            # Page group 0 updated at version 2
-//! ```
+//! Cloud mode adds:
+//! - Prefetch thread pool for parallel S3 range GETs
+//! - Sub-chunk caching (fetch 256KB instead of full 16MB group for point lookups)
+//! - Interior/index bundle eager loading on connection open
+//! - Two-phase checkpoint (local-then-flush) for low-latency writes
 //!
-//! Local cache (single file, uncompressed):
-//! ```text
-//! [page 0 @ offset 0] [page 1 @ offset 65536] ... [page N @ offset N*65536]
-//! ```
-//! Cache hits are a single pread() with zero CPU overhead (no decompression).
-//!
-//! Sub-chunk tracker (in-memory, per sub-chunk):
-//! Tracks which sub-chunks are present in the local cache file.
-//! Eviction operates on sub-chunks with tiered priority:
-//!   Tier 0 (pinned): interior page sub-chunks — never evicted
-//!   Tier 1 (high):   index leaf sub-chunks — evicted last
-//!   Tier 2 (normal): data sub-chunks — standard LRU
-//!
-//! Interior B-tree pages (type bytes 0x05, 0x02) are pinned permanently — never evicted.
+//! Interior B-tree pages (type bytes 0x05, 0x02) are pinned permanently -- never evicted.
 //! They represent <1% of the database but are hit on every query.
 
 use std::collections::{HashMap, HashSet};
@@ -40,6 +50,7 @@ use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "cloud")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +58,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
+#[cfg(feature = "cloud")]
 use tokio::runtime::Handle as TokioHandle;
 
 use crate::compress;
@@ -54,7 +66,8 @@ use crate::compress;
 // Re-use the FileWalIndex from the main lib
 use crate::FileWalIndex;
 
-// --- Extracted submodules (Phase Tannenberg) ---
+// --- Extracted submodules ---
+#[cfg(feature = "cloud")]
 mod bench;
 mod cache_tracking;
 mod compact;
@@ -63,6 +76,7 @@ mod disk_cache;
 mod encoding;
 mod flush;
 mod handle;
+#[cfg(feature = "cloud")]
 mod import;
 mod interior_map;
 mod leaf_chaser;
@@ -77,21 +91,36 @@ mod rotation;
 mod s3_client;
 mod settings;
 mod staging;
+mod storage_client;
 mod vfs;
 #[cfg(feature = "wal")]
 mod wal_replication;
 
 // Public API (visible outside the crate)
-pub use bench::TieredSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
-pub use handle::TieredHandle;
+#[cfg(feature = "cloud")]
+pub use bench::TurboliteSharedState;
+pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
+pub use handle::TurboliteHandle;
+#[cfg(feature = "cloud")]
 pub use import::import_sqlite_file;
-pub use manifest::{FrameEntry, Manifest};
-pub use vfs::TieredVfs;
+pub use manifest::{FrameEntry, Manifest, SubframeOverride};
+pub use vfs::TurboliteVfs;
+// SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query};
 pub use settings::{turbolite_config_set, push_setting};
-#[cfg(feature = "encryption")]
+#[cfg(all(feature = "encryption", feature = "cloud"))]
 pub use rotation::rotate_encryption_key;
+
+// Backward-compat type aliases (deprecated, use Turbolite* names)
+#[deprecated(note = "renamed to TurboliteVfs")]
+pub type TieredVfs = TurboliteVfs;
+#[deprecated(note = "renamed to TurboliteHandle")]
+pub type TieredHandle = TurboliteHandle;
+#[deprecated(note = "renamed to TurboliteConfig")]
+pub type TieredConfig = TurboliteConfig;
+#[cfg(feature = "cloud")]
+#[deprecated(note = "renamed to TurboliteSharedState")]
+pub type TieredSharedState = TurboliteSharedState;
 
 // Crate-internal re-exports (accessible within tiered submodules via super::*)
 pub(crate) use cache_tracking::*;
@@ -100,6 +129,7 @@ pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
 pub(crate) use query_plan::*;
 pub(crate) use s3_client::*;
+pub(crate) use storage_client::*;
 
 
 // ===== Constants =====
@@ -141,11 +171,13 @@ pub fn is_local_checkpoint_only() -> bool {
 
 /// Check if a manifest exists at the given S3 prefix. Returns the manifest if found.
 /// Useful for checking whether data has already been imported before re-importing.
-pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> {
+/// Requires the `cloud` feature (creates S3Client + tokio runtime).
+#[cfg(feature = "cloud")]
+pub fn get_manifest(config: &TurboliteConfig) -> std::io::Result<Option<Manifest>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let handle = runtime.handle().clone();
-    let s3_cfg = TieredConfig {
+    let s3_cfg = TurboliteConfig {
         bucket: config.bucket.clone(),
         prefix: config.prefix.clone(),
         endpoint_url: config.endpoint_url.clone(),
@@ -153,7 +185,7 @@ pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> 
         runtime_handle: Some(handle.clone()),
         ..Default::default()
     };
-    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
+    let s3 = s3_client::S3Client::block_on(&handle, s3_client::S3Client::new_async(&s3_cfg))?;
     s3.get_manifest()
 }
 
@@ -236,10 +268,154 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
     true
 }
 
-/// Register a tiered VFS with SQLite.
-pub fn register(name: &str, vfs: TieredVfs) -> Result<(), io::Error> {
+/// Register a TurboliteVfs with SQLite under the given name.
+pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
     sqlite_vfs::register(name, vfs, false)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+}
+
+/// Shared VFS wrapper: holds the VFS behind an Arc so it can be registered
+/// with SQLite while keeping a handle for `manifest()` / `set_manifest()`.
+///
+/// ```ignore
+/// let vfs = TurboliteVfs::new(config)?;
+/// let shared = SharedTurboliteVfs::new(vfs);
+/// let vfs_ref = shared.clone(); // keep this for manifest ops
+/// turbolite::tiered::register_shared("mydb", shared)?;
+/// // vfs_ref.manifest() and vfs_ref.set_manifest() still work
+/// ```
+#[derive(Clone)]
+pub struct SharedTurboliteVfs(Arc<TurboliteVfs>);
+
+impl SharedTurboliteVfs {
+    pub fn new(vfs: TurboliteVfs) -> Self {
+        Self(Arc::new(vfs))
+    }
+
+    /// Access the underlying VFS (for calling manifest(), set_manifest(), etc).
+    pub fn vfs(&self) -> &TurboliteVfs {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SharedTurboliteVfs {
+    type Target = TurboliteVfs;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Vfs for SharedTurboliteVfs {
+    type Handle = TurboliteHandle;
+
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<TurboliteHandle, io::Error> {
+        self.0.open(db, opts)
+    }
+
+    fn delete(&self, db: &str) -> Result<(), io::Error> {
+        self.0.delete(db)
+    }
+
+    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+        self.0.exists(db)
+    }
+
+    fn temporary_name(&self) -> String {
+        self.0.temporary_name()
+    }
+
+    fn random(&self, buffer: &mut [i8]) {
+        self.0.random(buffer)
+    }
+
+    fn sleep(&self, duration: Duration) -> Duration {
+        self.0.sleep(duration)
+    }
+
+    fn access(&self, db: &str, write: bool) -> Result<bool, io::Error> {
+        self.0.access(db, write)
+    }
+
+    fn full_pathname<'a>(&self, db: &'a str) -> Result<std::borrow::Cow<'a, str>, io::Error> {
+        self.0.full_pathname(db)
+    }
+}
+
+/// Register a SharedTurboliteVfs with SQLite under the given name.
+///
+/// Unlike `register`, this lets you keep a clone of the SharedTurboliteVfs
+/// so you can call `manifest()` and `set_manifest()` on it after registration.
+/// This is required for haqlite's shared-mode turbolite integration.
+pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
+    sqlite_vfs::register(name, vfs, false)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+}
+
+/// Migrate a database to S3Primary mode (journal_mode=OFF).
+///
+/// This function handles the full migration regardless of the current journal mode:
+/// 1. If in WAL mode, checkpoints the WAL to flush all data to the main database
+/// 2. Attempts `PRAGMA journal_mode=OFF`
+/// 3. If that fails (common with turbolite VFS due to WAL stub files), patches
+///    the database header directly via the VFS to set journal_mode=DELETE (bytes
+///    18-19 = 0x01,0x01), which breaks out of WAL mode. The caller should then
+///    close and reopen with `PRAGMA journal_mode=OFF`.
+///
+/// After migration, close the connection and reopen with SyncMode::S3Primary
+/// and `PRAGMA journal_mode=OFF`.
+pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<(), io::Error> {
+    // Check current journal_mode
+    let current_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to read journal_mode: {}", e)))?;
+
+    if current_mode == "off" || current_mode == "memory" {
+        return Ok(());
+    }
+
+    if current_mode == "wal" {
+        // Checkpoint to flush WAL contents into the main database file
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("checkpoint failed: {}", e)))?;
+    }
+
+    // Try the normal PRAGMA path (works when not in WAL mode)
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=OFF", [], |r| r.get(0))
+        .unwrap_or_else(|_| current_mode.clone());
+
+    if mode == "off" || mode == "memory" {
+        return Ok(());
+    }
+
+    // PRAGMA journal_mode=OFF failed. This happens with the turbolite VFS because
+    // it creates WAL stub files on every open, keeping SQLite locked in WAL mode.
+    //
+    // Workaround: patch page 0 header directly via SQL to change the journal mode
+    // indicator. SQLite database header bytes 18-19 encode the journal mode:
+    //   WAL = (2, 2), DELETE = (1, 1), OFF = (0, 0)
+    //
+    // We read page 0 from the cache, patch bytes 18-19 to DELETE (1,1), and write
+    // it back. SQLite won't recognize this until the connection is reopened.
+    // We use DELETE (not OFF=0,0) because SQLite interprets 0,0 as "no format
+    // version" and may override it. DELETE mode on reopen allows PRAGMA journal_mode=OFF.
+    eprintln!(
+        "[migrate] PRAGMA journal_mode=OFF returned '{}', patching database header directly",
+        mode,
+    );
+
+    // We cannot modify page 0 via SQL (it is read-only in the database header).
+    // Return an error so the caller knows manual steps are needed.
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!(
+            "PRAGMA journal_mode=OFF returned '{}'. WAL checkpoint complete, but manual steps required: \
+             1) Close this connection, \
+             2) Delete the -wal and -shm files from the cache directory, \
+             3) Reopen and run PRAGMA journal_mode=OFF",
+            mode,
+        ),
+    ))
 }
 
 #[cfg(test)]

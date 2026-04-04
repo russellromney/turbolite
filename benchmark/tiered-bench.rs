@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TieredSharedState, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
+use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -356,8 +356,8 @@ fn make_config(
     prefetch_threads: u32,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
-) -> TieredConfig {
-    TieredConfig {
+) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -379,8 +379,8 @@ fn make_reader_config(
     prefetch_threads: u32,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
-) -> TieredConfig {
-    TieredConfig {
+) -> TurboliteConfig {
+    TurboliteConfig {
         bucket: test_bucket(),
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
@@ -804,7 +804,7 @@ fn run_query_pair(
 /// Cache level: data — everything cached, reuse connection. Measures pread latency.
 fn bench_data(
     conn: &Connection,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -843,7 +843,7 @@ fn bench_data(
 fn bench_index(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -898,7 +898,7 @@ fn bench_index(
 fn bench_interior(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -953,7 +953,7 @@ fn bench_interior(
 fn bench_none(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1007,7 +1007,7 @@ fn bench_none(
 fn bench_none_pair(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1122,7 +1122,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     if cli.import.is_some() {
         // Fast path: generate plain SQLite DB locally, then import to S3.
         // When --import auto and data already exists on S3, skip generation and import.
-        let check_config = turbolite::tiered::TieredConfig {
+        let check_config = turbolite::tiered::TurboliteConfig {
             bucket: test_bucket(),
             prefix: s3_prefix.clone(),
             endpoint_url: endpoint_url(),
@@ -1157,7 +1157,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             };
 
             let import_start = Instant::now();
-            let config = turbolite::tiered::TieredConfig {
+            let config = turbolite::tiered::TurboliteConfig {
                 bucket: test_bucket(),
                 prefix: s3_prefix.clone(),
                 endpoint_url: endpoint_url(),
@@ -1181,7 +1181,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         // Legacy VFS generation path
         let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
         let vfs_name = unique_vfs_name("write");
-        let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
+        let vfs = TurboliteVfs::new(config).expect("failed to create TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = Connection::open_with_flags_and_vfs(
@@ -1235,9 +1235,9 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         reader_config.eager_index_load = false;
         eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
     }
-    eprintln!("[bench] calling TieredVfs::new()...");
-    let reader_vfs = TieredVfs::new(reader_config).expect("reader VFS");
-    eprintln!("[bench] TieredVfs::new() returned OK");
+    eprintln!("[bench] calling TurboliteVfs::new()...");
+    let reader_vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
+    eprintln!("[bench] TurboliteVfs::new() returned OK");
     let shared_state = reader_vfs.shared_state();
     let reader_vfs_name = unique_vfs_name("reader");
     eprintln!("[bench] registering VFS '{}'", reader_vfs_name);
@@ -1503,7 +1503,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     if cli.cleanup {
         eprint!("  Cleaning up S3... ");
         let cleanup_cache = TempDir::new().expect("cleanup temp dir");
-        let cleanup_config = TieredConfig {
+        let cleanup_config = TurboliteConfig {
             bucket: test_bucket(),
             prefix: s3_prefix,
             cache_dir: cleanup_cache.path().to_path_buf(),
@@ -1512,7 +1512,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             region: std::env::var("AWS_REGION").ok(),
             ..Default::default()
         };
-        let cleanup_vfs = TieredVfs::new(cleanup_config).expect("cleanup VFS");
+        let cleanup_vfs = TurboliteVfs::new(cleanup_config).expect("cleanup VFS");
         cleanup_vfs.destroy_s3().expect("S3 cleanup failed");
         eprintln!("done");
     }

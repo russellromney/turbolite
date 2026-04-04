@@ -631,6 +631,107 @@ fn wrong_key() -> [u8; 32] {
     [0xFFu8; 32]
 }
 
+// =========================================================================
+// Phase Drift: encode_override_frame tests
+// =========================================================================
+
+#[test]
+fn test_encode_override_frame_single_page_roundtrip() {
+    let page_size = 64u32;
+    let page_data = vec![(42u64, vec![0xAB; page_size as usize])];
+    let encoded = encode_override_frame(
+        &page_data, page_size, 3,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("encode");
+    // Decode with decode_seekable_subchunk (same format)
+    let decoded = decode_seekable_subchunk(
+        &encoded,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("decode");
+    assert_eq!(decoded.len(), page_size as usize);
+    assert_eq!(&decoded[..], &vec![0xAB; page_size as usize][..]);
+}
+
+#[test]
+fn test_encode_override_frame_multiple_pages() {
+    let page_size = 64u32;
+    let pages = vec![
+        (10u64, vec![0x11; page_size as usize]),
+        (11u64, vec![0x22; page_size as usize]),
+        (12u64, vec![0x33; page_size as usize]),
+    ];
+    let encoded = encode_override_frame(
+        &pages, page_size, 3,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("encode");
+    let decoded = decode_seekable_subchunk(
+        &encoded,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("decode");
+    assert_eq!(decoded.len(), 3 * page_size as usize);
+    assert_eq!(&decoded[0..64], &vec![0x11u8; 64][..]);
+    assert_eq!(&decoded[64..128], &vec![0x22u8; 64][..]);
+    assert_eq!(&decoded[128..192], &vec![0x33u8; 64][..]);
+}
+
+#[test]
+fn test_encode_override_frame_short_page_padding() {
+    let page_size = 64u32;
+    let short_data = vec![0xCC; 32]; // only 32 bytes, should pad to 64
+    let pages = vec![(0u64, short_data)];
+    let encoded = encode_override_frame(
+        &pages, page_size, 3,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("encode");
+    let decoded = decode_seekable_subchunk(
+        &encoded,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("decode");
+    assert_eq!(decoded.len(), page_size as usize);
+    assert_eq!(&decoded[..32], &vec![0xCC; 32][..]);
+    assert_eq!(&decoded[32..64], &vec![0u8; 32][..]); // zero-padded
+}
+
+#[test]
+fn test_encode_override_frame_empty() {
+    let page_size = 64u32;
+    let pages: Vec<(u64, Vec<u8>)> = Vec::new();
+    let encoded = encode_override_frame(
+        &pages, page_size, 3,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("encode");
+    let decoded = decode_seekable_subchunk(
+        &encoded,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("decode");
+    assert!(decoded.is_empty());
+}
+
+#[test]
+fn test_encode_override_frame_compression_reduces_size() {
+    let page_size = 4096u32;
+    // Highly compressible data (all same byte)
+    let pages = vec![
+        (0u64, vec![0x00; page_size as usize]),
+        (1u64, vec![0x00; page_size as usize]),
+    ];
+    let encoded = encode_override_frame(
+        &pages, page_size, 3,
+        #[cfg(feature = "zstd")] None,
+        None,
+    ).expect("encode");
+    let raw_size = 2 * page_size as usize;
+    assert!(encoded.len() < raw_size, "compressed {} should be < raw {}", encoded.len(), raw_size);
+}
+
 #[test]
 #[cfg(feature = "encryption")]
 fn test_encrypted_cache_write_read_roundtrip() {

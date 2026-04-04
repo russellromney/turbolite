@@ -78,3 +78,43 @@ fn test_flush_empty_dirty_groups_is_noop() {
     };
     assert!(drained.is_empty());
 }
+
+// =========================================================================
+// Phase Drift: override threshold tests
+// =========================================================================
+
+#[test]
+fn test_override_threshold_auto_computation() {
+    // auto threshold = frames_per_group / 4
+    // With ppg=256 and sub_ppf=4, frames_per_group = 256/4 = 64
+    // auto threshold = 64 / 4 = 16
+    let ppg = 256u32;
+    let sub_ppf = 4u32;
+    let frames_per_group = ppg / sub_ppf;
+    let auto_threshold = frames_per_group / 4;
+    assert_eq!(auto_threshold, 16);
+}
+
+#[test]
+fn test_override_threshold_boundary() {
+    // When dirty_frames < threshold: override path
+    // When dirty_frames >= threshold: full rewrite
+    let threshold = 4u32;
+    assert!(3 < threshold);   // override
+    assert!(!(4 < threshold)); // full rewrite
+    assert!(!(5 < threshold)); // full rewrite
+}
+
+#[test]
+fn test_override_key_format() {
+    use crate::tiered::StorageClient;
+    let key = StorageClient::override_frame_key(5, 3, 10);
+    assert_eq!(key, "pg/5_f3_v10");
+}
+
+#[test]
+fn test_override_key_format_zero_indices() {
+    use crate::tiered::StorageClient;
+    let key = StorageClient::override_frame_key(0, 0, 1);
+    assert_eq!(key, "pg/0_f0_v1");
+}

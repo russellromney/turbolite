@@ -2,7 +2,7 @@
 //! Tests that manifest is persisted locally, survives reconnection,
 //! and dirty groups are recovered after simulated crash.
 
-use turbolite::tiered::{SyncMode, TieredConfig, TieredVfs};
+use turbolite::tiered::{SyncMode, TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -16,7 +16,7 @@ fn test_local_manifest_persisted_on_checkpoint() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -43,13 +43,13 @@ fn test_local_manifest_persisted_on_checkpoint() {
     assert!(!bytes.is_empty(), "manifest file should not be empty");
 
     drop(conn);
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 /// Second connection open with Auto manifest source should NOT hit S3.
@@ -62,7 +62,7 @@ fn test_warm_reconnect_skips_s3() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     let state = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -105,13 +105,13 @@ fn test_warm_reconnect_skips_s3() {
     eprintln!("S3 GETs: before={}, after={}", gets_before, gets_after);
 
     drop(state);
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 /// LocalThenFlush dirty groups survive in local manifest and are recovered.
@@ -130,7 +130,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         let mut cfg1 = test_config("dirty_recovery_placeholder", cache_dir.path());
         cfg1.prefix = prefix.clone();
         cfg1.sync_mode = SyncMode::LocalThenFlush;
-        let vfs = TieredVfs::new(cfg1).expect("TieredVfs");
+        let vfs = TurboliteVfs::new(cfg1).expect("TurboliteVfs");
         let state = vfs.shared_state();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -174,7 +174,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     let mut cfg2 = test_config("dirty_recovery_placeholder2", cache_dir.path());
     cfg2.prefix = prefix.clone();
     cfg2.sync_mode = SyncMode::LocalThenFlush;
-    let vfs2 = TieredVfs::new(cfg2).expect("TieredVfs after restart");
+    let vfs2 = TurboliteVfs::new(cfg2).expect("TurboliteVfs after restart");
     let state2 = vfs2.shared_state();
     turbolite::tiered::register(&vfs_name2, vfs2).unwrap();
 
@@ -198,13 +198,13 @@ fn test_dirty_groups_recovered_from_local_manifest() {
 
     drop(conn2);
     drop(state2);
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 /// Durable mode local manifest has no dirty groups.
@@ -217,7 +217,7 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TieredVfs::new(config).expect("TieredVfs");
+    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -241,11 +241,11 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     assert!(!bytes.is_empty(), "local manifest should be non-empty after Durable checkpoint");
 
     drop(conn);
-    let cleanup_config = TieredConfig {
+    let cleanup_config = TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
 }

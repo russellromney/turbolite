@@ -16,7 +16,7 @@
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{
-    TieredSharedState, TieredConfig, TieredVfs,
+    TurboliteSharedState, TurboliteConfig, TurboliteVfs,
     parse_eqp_output, push_planned_accesses, push_setting,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -274,7 +274,7 @@ fn run_query_pair(
 fn bench_cold(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -332,7 +332,7 @@ fn bench_cold(
 fn bench_index_level(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredSharedState,
+    handle: &TurboliteSharedState,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -446,7 +446,7 @@ fn main() {
     // Register VFS
     let cache_dir = TempDir::new().expect("failed to create temp dir");
     let vfs_name = unique_vfs_name();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         bucket: test_bucket(),
         prefix: cli.prefix.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
@@ -460,7 +460,7 @@ fn main() {
         ..Default::default()
     };
 
-    let vfs = TieredVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
     let handle = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
 
