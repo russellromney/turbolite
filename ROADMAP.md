@@ -419,13 +419,12 @@ Read latency: unchanged. Cache hit = ~1us. Cache miss = ~20-100ms (S3 range GET 
 
 ### Phases
 
-**Zenith-a: S3Primary SyncMode + xSync override upload**
-- Add `SyncMode::S3Primary` variant
-- In `xSync()` (handle.rs sync path): if S3Primary, collect dirty frames, encode, upload as overrides, publish manifest
-- Enforce `journal_mode=OFF` on connection open when S3Primary
-- Error if database is in WAL mode
-- Clear dirty set after successful S3 upload + manifest publish
-- Tests: single write transaction, xSync uploads overrides, manifest published, cold open from S3 sees data
+**Zenith-a: S3Primary SyncMode + xSync override upload (DONE)**
+- `SyncMode::S3Primary` variant gated behind `#[cfg(feature = "cloud")]`
+- sync() S3Primary path: collects dirty frames, encodes as overrides (or full group rewrite for legacy format), uploads, publishes manifest, persists local manifest
+- WAL mode detection: returns error if page 0 journal mode byte = 2 (WAL)
+- WAL stub creation skipped for S3Primary in vfs.rs
+- Tests: single write + cold read, sequential version increments, empty sync no-op, bulk multi-row transaction
 
 **Zenith-b: Cache validation on open**
 - On open: fetch S3 manifest, compare with local

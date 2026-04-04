@@ -688,7 +688,15 @@ impl Vfs for TurboliteVfs {
             // WAL file, and silently falls back to rollback journal mode even
             // if the header says WAL. The stub is empty (0 bytes); SQLite
             // treats an empty WAL as "cleanly shut down, start fresh".
-            if !self.config.read_only {
+            //
+            // S3Primary mode: skip WAL stub. S3Primary requires journal_mode=OFF
+            // or MEMORY (no WAL). Without the stub, SQLite stays in non-WAL mode.
+            #[cfg(feature = "cloud")]
+            let skip_wal_stub = self.config.sync_mode == SyncMode::S3Primary;
+            #[cfg(not(feature = "cloud"))]
+            let skip_wal_stub = false;
+
+            if !self.config.read_only && !skip_wal_stub {
                 let wal_path = self.config.cache_dir.join(format!("{}-wal", db));
                 let _ = FsOpenOptions::new()
                     .create(true)

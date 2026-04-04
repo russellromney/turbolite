@@ -29,4 +29,5 @@ mod tiered {
     mod jena;
     #[cfg(feature = "wal")]
     mod wal_integration;
+    mod zenith;
 }

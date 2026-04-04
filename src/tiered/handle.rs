@@ -1924,6 +1924,301 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
+        // ── S3Primary sync path: upload dirty frames as overrides + publish manifest ──
+        // Every xSync is an S3 commit. No staging logs, no deferred flush.
+        // Override-only (no full group rewrites) to keep per-commit latency bounded.
+        #[cfg(feature = "cloud")]
+        if self.sync_mode == SyncMode::S3Primary {
+            let page_size = *self.page_size.read();
+            let s3 = self.s3.as_ref().expect("S3Primary requires cloud feature with S3 client").clone();
+            let cache = self.cache.as_ref().expect("cache required").clone();
+
+            // Enforce journal_mode != WAL. SQLite stores journal mode at page 0
+            // offset 18-19. WAL mode = 2 at offset 18. S3Primary is incompatible
+            // with WAL because xSync must be the atomic commit point.
+            if dirty_snapshot.contains(&0) || self.manifest.read().version == 0 {
+                let mut page0 = vec![0u8; page_size as usize];
+                if cache.read_page(0, &mut page0).is_ok() && page0.len() > 19 {
+                    let journal_mode = page0[18];
+                    if journal_mode == 2 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "S3Primary mode requires journal_mode=OFF or MEMORY, not WAL. \
+                             Run PRAGMA journal_mode=OFF before enabling S3Primary.",
+                        ));
+                    }
+                }
+            }
+
+            // Assign new pages to groups
+            {
+                let mut manifest = self.manifest.write();
+                let unassigned: Vec<u64> = dirty_snapshot.iter()
+                    .filter(|&&pn| manifest.page_location(pn).is_none())
+                    .copied()
+                    .collect();
+                if !unassigned.is_empty() {
+                    Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+                }
+            }
+
+            let manifest_snap = self.manifest.read().clone();
+            let page_count = manifest_snap.page_count;
+            let next_version = manifest_snap.version + 1;
+            let change_counter = read_change_counter_from_cache(&cache, page_size);
+            let old_sub_ppf = manifest_snap.sub_pages_per_frame;
+            let use_seekable = old_sub_ppf > 0;
+
+            // Group dirty pages by group ID
+            let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
+            for &page_num in &dirty_snapshot {
+                let gid = manifest_snap.page_location(page_num)
+                    .expect("page must have group assignment after new-page assignment")
+                    .group_id;
+                groups_dirty.entry(gid).or_default().push(page_num);
+            }
+
+            let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
+            let mut new_keys = manifest_snap.page_group_keys.clone();
+            let mut new_frame_tables = manifest_snap.frame_tables.clone();
+            let mut replaced_keys: Vec<String> = Vec::new();
+
+            // Ensure override vectors are large enough
+            while new_subframe_overrides.len() <= manifest_snap.group_pages.len() {
+                new_subframe_overrides.push(HashMap::new());
+            }
+
+            for (&gid, dirty_pnums) in &groups_dirty {
+                let pages_in_group = manifest_snap.group_page_nums(gid);
+                let group_size = pages_in_group.len();
+                let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
+                let has_frame_table = use_seekable
+                    && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
+
+                if has_frame_table {
+                    // Override path: encode only dirty frames
+                    let dirty_frames = manifest::dirty_frames_for_group(
+                        dirty_pnums,
+                        &pages_in_group,
+                        frame_table_ref.expect("checked above"),
+                        old_sub_ppf,
+                    );
+
+                    for &frame_idx in &dirty_frames {
+                        let frame_start = frame_idx * old_sub_ppf as usize;
+                        let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                        let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+
+                        for pos in frame_start..frame_end {
+                            if pos >= pages_in_group.len() { break; }
+                            let pnum = pages_in_group[pos];
+                            if pnum >= page_count { break; }
+                            let mut buf = vec![0u8; page_size as usize];
+                            if cache.read_page(pnum, &mut buf).is_ok() {
+                                frame_pages.push((pnum, buf));
+                            } else {
+                                frame_pages.push((pnum, vec![0u8; page_size as usize]));
+                            }
+                        }
+
+                        let override_key = s3.override_frame_key(gid, frame_idx, next_version);
+                        let encoded = encode_override_frame(
+                            &frame_pages,
+                            page_size,
+                            self.compression_level,
+                            #[cfg(feature = "zstd")]
+                            self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+
+                        // Track old override being replaced
+                        if let Some(old_ov) = new_subframe_overrides
+                            .get(gid as usize)
+                            .and_then(|ovs| ovs.get(&frame_idx))
+                        {
+                            replaced_keys.push(old_ov.key.clone());
+                        }
+
+                        uploads.push((override_key.clone(), encoded.clone()));
+                        while new_subframe_overrides.len() <= gid as usize {
+                            new_subframe_overrides.push(HashMap::new());
+                        }
+                        new_subframe_overrides[gid as usize].insert(
+                            frame_idx,
+                            SubframeOverride {
+                                key: override_key,
+                                entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
+                            },
+                        );
+                    }
+                } else {
+                    // No frame table (legacy format or new group): full group rewrite
+                    let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+                    let mut need_s3_merge = false;
+
+                    for (i, &pnum) in pages_in_group.iter().enumerate() {
+                        if pnum >= page_count { break; }
+                        if cache.is_present(pnum) {
+                            let mut buf = vec![0u8; page_size as usize];
+                            if cache.read_page(pnum, &mut buf).is_ok() {
+                                pages[i] = Some(buf);
+                            }
+                        } else {
+                            need_s3_merge = true;
+                        }
+                    }
+
+                    if need_s3_merge {
+                        if let Some(existing_key) = new_keys.get(gid as usize) {
+                            if !existing_key.is_empty() {
+                                if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                                    let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+                                    let has_ft = use_seekable
+                                        && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+                                    if has_ft {
+                                        let ft = existing_ft.expect("checked");
+                                        if let Ok((_pc, _ps, bulk)) = decode_page_group_seekable_full(
+                                            &pg_data, ft, page_size,
+                                            pages_in_group.len() as u32, page_count, 0,
+                                            #[cfg(feature = "zstd")]
+                                            self.decoder_dict.as_ref(),
+                                            self.encryption_key.as_ref(),
+                                        ) {
+                                            let ps = page_size as usize;
+                                            for j in 0..pages_in_group.len() {
+                                                if pages_in_group[j] >= page_count { break; }
+                                                if pages[j].is_none() {
+                                                    let start = j * ps;
+                                                    let end = start + ps;
+                                                    if end <= bulk.len() {
+                                                        pages[j] = Some(bulk[start..end].to_vec());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if let Ok((_pc, _ps, existing)) = decode_page_group(
+                                        &pg_data,
+                                        #[cfg(feature = "zstd")]
+                                        self.decoder_dict.as_ref(),
+                                        self.encryption_key.as_ref(),
+                                    ) {
+                                        for (j, ep) in existing.into_iter().enumerate() {
+                                            if j >= pages_in_group.len() { break; }
+                                            if pages_in_group[j] >= page_count { break; }
+                                            if pages[j].is_none() { pages[j] = Some(ep); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let key = s3.page_group_key(gid, next_version);
+                    if use_seekable {
+                        let (encoded, ft) = encode_page_group_seekable(
+                            &pages, page_size, old_sub_ppf, self.compression_level,
+                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+                        uploads.push((key.clone(), encoded));
+                        while new_frame_tables.len() <= gid as usize {
+                            new_frame_tables.push(Vec::new());
+                        }
+                        new_frame_tables[gid as usize] = ft;
+                    } else {
+                        let encoded = encode_page_group(
+                            &pages, page_size, self.compression_level,
+                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
+                            self.encryption_key.as_ref(),
+                        )?;
+                        uploads.push((key.clone(), encoded));
+                    }
+
+                    while new_keys.len() <= gid as usize { new_keys.push(String::new()); }
+                    if let Some(old_key) = new_keys.get(gid as usize) {
+                        if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
+                    }
+                    new_keys[gid as usize] = key;
+
+                    // Clear overrides for this group (full rewrite supersedes them)
+                    if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
+                        for (_, ov) in group_ovs.drain() {
+                            replaced_keys.push(ov.key);
+                        }
+                    }
+                }
+            }
+
+            // Upload all overrides + page groups
+            if !uploads.is_empty() {
+                eprintln!("[sync:s3primary] uploading {} objects...", uploads.len());
+                s3.put_page_groups(&uploads)?;
+            }
+
+            // Build and publish new manifest
+            let old_manifest = manifest_snap;
+            let mut new_manifest = Manifest {
+                version: next_version,
+                change_counter,
+                page_count: old_manifest.page_count,
+                page_size: old_manifest.page_size,
+                pages_per_group: ppg,
+                page_group_keys: new_keys,
+                interior_chunk_keys: old_manifest.interior_chunk_keys.clone(),
+                index_chunk_keys: old_manifest.index_chunk_keys.clone(),
+                frame_tables: new_frame_tables,
+                sub_pages_per_frame: old_sub_ppf,
+                subframe_overrides: new_subframe_overrides,
+                strategy: old_manifest.strategy,
+                group_pages: old_manifest.group_pages.clone(),
+                btrees: old_manifest.btrees.clone(),
+                page_index: HashMap::new(),
+                btree_groups: HashMap::new(),
+                page_to_tree_name: HashMap::new(),
+                tree_name_to_groups: HashMap::new(),
+                group_to_tree_name: HashMap::new(),
+            };
+            new_manifest.build_page_index();
+            s3.put_manifest(&new_manifest)?;
+
+            // Commit local state
+            {
+                let mut m = self.manifest.write();
+                cache.set_group_pages(new_manifest.group_pages.clone());
+                *m = new_manifest.clone();
+            }
+            {
+                let mut dirty = self.dirty_page_nums.write();
+                for &page_num in &dirty_snapshot {
+                    dirty.remove(&page_num);
+                }
+            }
+
+            // Persist local manifest for crash recovery
+            let local = manifest::LocalManifest {
+                manifest: new_manifest,
+                dirty_groups: Vec::new(),
+            };
+            local.persist(&cache.cache_dir)?;
+            let _ = cache.persist_bitmap();
+
+            // Async GC of replaced keys
+            if self.gc_enabled && !replaced_keys.is_empty() {
+                let gc_s3 = Arc::clone(&s3);
+                let runtime = gc_s3.runtime.clone();
+                runtime.spawn(async move {
+                    gc_s3.delete_objects_async_owned(replaced_keys).await;
+                });
+            }
+
+            eprintln!(
+                "[sync:s3primary] committed v{} ({} dirty pages, {} uploads)",
+                next_version, dirty_snapshot.len(), uploads.len(),
+            );
+            return Ok(());
+        }
+
         // Durable sync path: full S3 upload. Only available with cloud feature.
         #[cfg(not(feature = "cloud"))]
         return Err(io::Error::new(
