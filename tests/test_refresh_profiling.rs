@@ -1,14 +1,18 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::{register, CompressedVfs};
-use std::path::PathBuf;
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 
 /// Simple test to verify refresh profiling works
 /// Creates data, then opens new connections that must scan the file
 #[test]
 fn test_refresh_profiling_simple() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_refresh_prof", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_refresh_prof", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
 

@@ -91,23 +91,22 @@ Mechanical rename across codebase.
 - [x] Fix stale env var (`SQLCES_PREFETCH_THREADS` -> `TURBOLITE_PREFETCH_THREADS`)
 - [x] Update README: Rust examples, feature flag references (`tiered` -> `cloud`), Go FFI example
 
-### g. Migration tool for CompressedVfs databases
+### g. ~~Migration tool for CompressedVfs databases~~ (skipped, no users)
 
-- [ ] `turbolite migrate <source.db> <dest_dir>` CLI command
-- [ ] Read CompressedVfs format (SQLCEvfS header, scan page records)
-- [ ] Write as TurboliteVfs local format (manifest + page groups in `pg/`)
-- [ ] Handle dictionary embedding (extract from CompressedVfs header, store in config)
-- [ ] Handle encryption (re-encrypt from password-derived key to raw key format)
-- [ ] `CompressedVfs::migrate_to_turbolite()` programmatic API
-- [ ] Tests: migrate a CompressedVfs database, open with TurboliteVfs, verify all data intact
+### h. Remove CompressedVfs
 
-### h. Deprecate and remove CompressedVfs
-
-- [ ] Mark `CompressedVfs`, `CompressedHandle`, old `register()` as `#[deprecated]`
-- [ ] Migrate all integration tests from CompressedVfs to TurboliteVfs local mode
-- [ ] Remove CompressedVfs code from src/lib.rs (~700 lines)
-- [ ] Remove `CompressedHandle` page index, shared write state, append-only format code
-- [ ] Keep `compress.rs` and `dict.rs` (shared utilities)
+- [x] Migrate all integration tests from CompressedVfs to TurboliteVfs local mode
+- [x] Migrate concurrent/profiling tests (concurrent_test, cross_connection, refresh_profiling)
+- [x] Remove CompressedVfs code from src/lib.rs (~2000 lines removed, 300 kept for shared infra)
+- [x] Remove CompressedHandle, SharedWriteState, FileHeader, PageIndex, append-only format code
+- [x] Remove CompressedVfs FFI functions (register_compressed, register_passthrough, register_encrypted)
+- [x] Remove CompressedVfs FFI tests, update DB operation tests to use register_local
+- [x] Remove cli_integration.rs (CompressedVfs format compaction tests)
+- [x] Remove CLI binary commands (info, compact, convert, encrypt, decrypt, embed-dict, extract-dict)
+- [x] Update benchmarks: quick-bench rewritten for TurboliteVfs, turbolite-bench modes migrated
+- [x] Update examples: Rust local.rs, Node.js lib.rs migrated to TurboliteVfs
+- [x] Keep compress.rs and dict.rs (shared utilities)
+- [x] Regenerate turbolite.h (CompressedVfs functions removed from header)
 
 ---
 

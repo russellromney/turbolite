@@ -1,22 +1,18 @@
 //! Integration tests using the VFS with SQLite
 
 use rusqlite::Connection;
-use turbolite::{register, CompressedVfs};
-use std::sync::Once;
-
-static INIT: Once = Once::new();
-
-fn init_vfs(dir: &std::path::Path) {
-    INIT.call_once(|| {
-        let vfs = CompressedVfs::new(dir, 3);
-        register("compressed", vfs).expect("Failed to register VFS");
-    });
-}
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 
 #[test]
 fn test_basic_operations() {
     let dir = tempfile::tempdir().unwrap();
-    init_vfs(dir.path());
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("compressed", vfs).expect("Failed to register VFS");
 
     // Open connection with our VFS
     let conn = Connection::open_with_flags_and_vfs(
@@ -55,8 +51,13 @@ fn test_basic_operations() {
 #[test]
 fn test_large_data() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("compressed2", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("compressed2", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
         dir.path().join("large.db"),
@@ -94,8 +95,13 @@ fn test_large_data() {
 #[test]
 fn test_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("compressed_wal", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("compressed_wal", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
         dir.path().join("wal_test.db"),
@@ -141,8 +147,13 @@ fn test_wal_mode() {
 #[test]
 fn test_persistence_with_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("compressed_persist", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("compressed_persist", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("persist.db");
 
@@ -178,8 +189,14 @@ fn test_persistence_with_reopen() {
 #[test]
 fn test_passthrough_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::passthrough(dir.path());
-    register("passthrough_test", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        compression_level: 0,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("passthrough_test", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
         dir.path().join("passthrough.db"),
@@ -202,455 +219,549 @@ fn test_passthrough_mode() {
 }
 
 #[test]
-#[cfg(feature = "encryption")]
-fn test_encrypted_mode() {
+fn test_delete_and_update() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::encrypted(dir.path(), "test-password");
-    register("encrypted_test", vfs).expect("Failed to register VFS");
-
-    let db_path = dir.path().join("encrypted.db");
-
-    // Write data
-    {
-        let conn = Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            "encrypted_test",
-        )
-        .unwrap();
-
-        conn.execute("CREATE TABLE secure (id INTEGER, secret TEXT)", []).unwrap();
-        conn.execute("INSERT INTO secure VALUES (1, 'top secret')", []).unwrap();
-        conn.execute("INSERT INTO secure VALUES (2, 'classified')", []).unwrap();
-    }
-
-    // Reopen and verify encryption works
-    {
-        let conn = Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            "encrypted_test",
-        )
-        .unwrap();
-
-        let secrets: Vec<String> = conn
-            .prepare("SELECT secret FROM secure ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-
-        assert_eq!(secrets, vec!["top secret", "classified"]);
-    }
-}
-
-#[test]
-#[cfg(feature = "encryption")]
-fn test_compressed_encrypted_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::compressed_encrypted(dir.path(), 3, "super-secret");
-    register("comp_enc_test", vfs).expect("Failed to register VFS");
-
-    let db_path = dir.path().join("comp_enc.db");
-
-    // Write large compressible data
-    {
-        let conn = Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            "comp_enc_test",
-        )
-        .unwrap();
-
-        conn.execute("CREATE TABLE logs (id INTEGER, message TEXT)", []).unwrap();
-
-        // Insert highly compressible repeated data
-        let repeated_msg = "ERROR: connection timeout ".repeat(100);
-        for i in 0..100 {
-            conn.execute(
-                "INSERT INTO logs VALUES (?1, ?2)",
-                rusqlite::params![i, &repeated_msg],
-            ).unwrap();
-        }
-    }
-
-    // Reopen and verify both compression and encryption work
-    {
-        let conn = Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-            "comp_enc_test",
-        )
-        .unwrap();
-
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 100);
-
-        // Verify data integrity
-        let msg: String = conn
-            .query_row("SELECT message FROM logs WHERE id = 50", [], |r| r.get(0))
-            .unwrap();
-        assert!(msg.starts_with("ERROR: connection timeout"));
-    }
-}
-
-/// Test dictionary compression improves compression and works correctly
-#[test]
-fn test_dictionary_compression() {
-    use turbolite::dict::train_dictionary;
-
-    let dir = tempfile::tempdir().unwrap();
-
-    // Create sample data with repeated patterns (simulates Redis-like workload)
-    let samples: Vec<Vec<u8>> = (0..100)
-        .map(|i| format!("user:{}:session:active:timestamp:1234567890:data:{}", i, "x".repeat(100)).into_bytes())
-        .collect();
-
-    // Train a dictionary from the samples
-    let dict = train_dictionary(&samples, 16 * 1024).expect("Failed to train dictionary");
-    assert!(!dict.is_empty(), "Dictionary should not be empty");
-
-    // Create VFS with dictionary
-    let vfs = CompressedVfs::new_with_dict(dir.path(), 3, dict);
-    register("dict_test", vfs).unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_delete_update", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
-        dir.path().join("dict.db"),
+        dir.path().join("test.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-        "dict_test",
+        "integ_delete_update",
     )
-    .unwrap();
+    .expect("Failed to open database");
 
-    // Create table and insert data with repeated patterns
-    conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
-        .unwrap();
-
-    // Insert data similar to training samples
-    for i in 0..50 {
-        let key = format!("user:{}:session", i);
-        let value = format!("active:timestamp:1234567890:data:{}", "x".repeat(100));
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)", []).unwrap();
+    for i in 1..=10 {
         conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, value],
+            "INSERT INTO items (id, name, qty) VALUES (?1, ?2, ?3)",
+            rusqlite::params![i, format!("item_{}", i), i * 10],
         )
         .unwrap();
     }
 
-    // Verify data integrity
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+    // Update rows 3 and 7
+    conn.execute("UPDATE items SET qty = 999 WHERE id IN (3, 7)", []).unwrap();
+
+    // Delete rows 1, 5, 10
+    conn.execute("DELETE FROM items WHERE id IN (1, 5, 10)", []).unwrap();
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 7);
+
+    // Verify updated rows
+    let qty3: i64 = conn.query_row("SELECT qty FROM items WHERE id = 3", [], |r| r.get(0)).unwrap();
+    assert_eq!(qty3, 999);
+    let qty7: i64 = conn.query_row("SELECT qty FROM items WHERE id = 7", [], |r| r.get(0)).unwrap();
+    assert_eq!(qty7, 999);
+
+    // Verify deleted rows are gone
+    let deleted: Vec<i64> = conn
+        .prepare("SELECT id FROM items ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(count, 50);
+    assert_eq!(deleted, vec![2, 3, 4, 6, 7, 8, 9]);
 
-    // Check specific row
-    let value: String = conn
-        .query_row("SELECT value FROM kv WHERE key = 'user:25:session'", [], |r| r.get(0))
-        .unwrap();
-    assert!(value.starts_with("active:timestamp:"));
+    // Verify an unmodified row
+    let qty4: i64 = conn.query_row("SELECT qty FROM items WHERE id = 4", [], |r| r.get(0)).unwrap();
+    assert_eq!(qty4, 40);
+}
 
-    // Close and reopen to test persistence with dictionary
-    drop(conn);
+#[test]
+fn test_rollback_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_rollback", vfs).expect("Failed to register VFS");
 
-    let vfs2 = CompressedVfs::new_with_dict(
-        dir.path(),
-        3,
-        train_dictionary(&samples, 16 * 1024).unwrap(),
-    );
-    register("dict_test2", vfs2).unwrap();
-
-    let conn2 = Connection::open_with_flags_and_vfs(
-        dir.path().join("dict.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        "dict_test2",
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_rollback",
     )
-    .unwrap();
+    .expect("Failed to open database");
 
-    let count2: i64 = conn2
-        .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count2, 50);
+    conn.execute("CREATE TABLE rb (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+    // BEGIN, INSERT, ROLLBACK
+    conn.execute_batch("BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); ROLLBACK;").unwrap();
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0, "ROLLBACK should leave no rows");
+
+    // BEGIN, INSERT, COMMIT
+    conn.execute_batch("BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); COMMIT;").unwrap();
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2, "COMMIT should persist rows");
+
+    let val: String = conn.query_row("SELECT val FROM rb WHERE id = 2", [], |r| r.get(0)).unwrap();
+    assert_eq!(val, "b");
 }
 
 #[test]
-#[cfg(feature = "encryption")]
-fn test_all_four_modes_comparison() {
+fn test_create_index_and_query() {
     let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_index", vfs).expect("Failed to register VFS");
 
-    // Test data
-    let test_data = "SELECT * FROM users WHERE name LIKE 'John%'".repeat(50);
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_index",
+    )
+    .expect("Failed to open database");
 
-    // 1. Compressed
-    let vfs1 = CompressedVfs::new(dir.path(), 3);
-    register("mode_comp", vfs1).unwrap();
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price REAL)", []).unwrap();
+    conn.execute("CREATE INDEX idx_category ON products(category)", []).unwrap();
 
-    // 2. Passthrough
-    let vfs2 = CompressedVfs::passthrough(dir.path());
-    register("mode_pass", vfs2).unwrap();
-
-    // 3. Encrypted
-    let vfs3 = CompressedVfs::encrypted(dir.path(), "pwd");
-    register("mode_enc", vfs3).unwrap();
-
-    // 4. Compressed+Encrypted
-    let vfs4 = CompressedVfs::compressed_encrypted(dir.path(), 3, "pwd");
-    register("mode_both", vfs4).unwrap();
-
-    // Test each mode
-    for (mode_name, db_name) in [
-        ("mode_comp", "comp.db"),
-        ("mode_pass", "pass.db"),
-        ("mode_enc", "enc.db"),
-        ("mode_both", "both.db"),
-    ] {
-        let conn = Connection::open_with_flags_and_vfs(
-            dir.path().join(db_name),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            mode_name,
+    let categories = ["electronics", "books", "clothing"];
+    for i in 1..=90 {
+        conn.execute(
+            "INSERT INTO products (id, category, price) VALUES (?1, ?2, ?3)",
+            rusqlite::params![i, categories[(i as usize - 1) % 3], i as f64 * 1.5],
         )
         .unwrap();
-
-        conn.execute("CREATE TABLE queries (sql TEXT)", []).unwrap();
-
-        for _ in 0..20 {
-            conn.execute("INSERT INTO queries VALUES (?1)", rusqlite::params![&test_data]).unwrap();
-        }
-
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM queries", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 20);
-
-        let retrieved: String = conn
-            .query_row("SELECT sql FROM queries LIMIT 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(retrieved, test_data);
     }
+
+    // Query using the indexed column
+    let elec_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM products WHERE category = 'electronics'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(elec_count, 30);
+
+    let book_prices: Vec<f64> = conn
+        .prepare("SELECT price FROM products WHERE category = 'books' ORDER BY price LIMIT 3")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(book_prices, vec![3.0, 7.5, 12.0]);
 }
 
-/// Test compact_with_recompression with parallel compression
 #[test]
-fn test_compact_with_recompression() {
-    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
-
+fn test_multiple_tables_and_joins() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("recompress_test", vfs).unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_joins", vfs).expect("Failed to register VFS");
 
-    let db_path = dir.path().join("recompress.db");
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_joins",
+    )
+    .expect("Failed to open database");
 
-    // Create database and insert data
-    {
-        let conn = Connection::open_with_flags_and_vfs(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            "recompress_test",
-        )
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)", []).unwrap();
+
+    conn.execute("INSERT INTO users VALUES (1, 'Alice')", []).unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'Bob')", []).unwrap();
+    conn.execute("INSERT INTO users VALUES (3, 'Charlie')", []).unwrap();
+
+    conn.execute("INSERT INTO orders VALUES (1, 1, 100.0)", []).unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 1, 200.0)", []).unwrap();
+    conn.execute("INSERT INTO orders VALUES (3, 2, 50.0)", []).unwrap();
+
+    // JOIN query: total per user
+    let results: Vec<(String, f64)> = conn
+        .prepare("SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id ORDER BY u.name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
 
-        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
-            .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], ("Alice".to_string(), 300.0));
+    assert_eq!(results[1], ("Bob".to_string(), 50.0));
 
-        // Insert data and update it multiple times to create dead space
-        let test_data = "x".repeat(1000);
-        for i in 0..100 {
-            conn.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, &test_data],
-            )
-            .unwrap();
-        }
+    // LEFT JOIN to include Charlie with no orders
+    let all_users: Vec<(String, Option<f64>)> = conn
+        .prepare("SELECT u.name, SUM(o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id ORDER BY u.name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
-        // Update rows to create dead space (superseded records)
-        let updated_data = "y".repeat(1000);
-        for i in 0..50 {
-            conn.execute(
-                "UPDATE data SET value = ?1 WHERE id = ?2",
-                rusqlite::params![&updated_data, i],
-            )
-            .unwrap();
-        }
+    assert_eq!(all_users.len(), 3);
+    assert_eq!(all_users[2], ("Charlie".to_string(), None));
+}
+
+#[test]
+fn test_alter_table_add_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_alter", vfs).expect("Failed to register VFS");
+
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_alter",
+    )
+    .expect("Failed to open database");
+
+    conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
+    conn.execute("INSERT INTO people VALUES (1, 'Alice')", []).unwrap();
+    conn.execute("INSERT INTO people VALUES (2, 'Bob')", []).unwrap();
+
+    conn.execute("ALTER TABLE people ADD COLUMN age INTEGER", []).unwrap();
+
+    conn.execute("INSERT INTO people VALUES (3, 'Charlie', 30)", []).unwrap();
+
+    // Old rows should have NULL for the new column
+    let alice_age: Option<i64> = conn
+        .query_row("SELECT age FROM people WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(alice_age, None);
+
+    // New row should have the value
+    let charlie_age: Option<i64> = conn
+        .query_row("SELECT age FROM people WHERE id = 3", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(charlie_age, Some(30));
+
+    // Verify all rows still present
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_page_size_64k() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_page64k", vfs).expect("Failed to register VFS");
+
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_page64k",
+    )
+    .expect("Failed to open database");
+
+    conn.execute_batch("PRAGMA page_size = 65536;").unwrap();
+    conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, data BLOB)", []).unwrap();
+
+    let page_size: i64 = conn
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .unwrap();
+    assert_eq!(page_size, 65536);
+
+    // Insert enough data for multiple pages (each row ~1KB, 200 rows = ~200KB > 3 pages)
+    let blob = vec![0xCDu8; 1024];
+    for i in 0..200 {
+        conn.execute(
+            "INSERT INTO big (id, data) VALUES (?1, ?2)",
+            rusqlite::params![i, &blob],
+        )
+        .unwrap();
     }
 
-    // Check initial stats
-    let stats_before = inspect_database(&db_path).unwrap();
-    println!(
-        "Before recompression: file_size={}, dead_space={} ({:.1}%)",
-        stats_before.file_size, stats_before.dead_space, stats_before.dead_space_pct
-    );
-    assert!(stats_before.dead_space > 0, "Should have dead space from updates");
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM big", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 200);
 
-    // Compact with recompression (parallel by default when feature enabled)
-    let config = CompactionConfig::new(3).with_parallel(true);
-    let freed = compact_with_recompression(&db_path, config).unwrap();
-    println!("Freed {} bytes", freed);
+    let retrieved: Vec<u8> = conn
+        .query_row("SELECT data FROM big WHERE id = 150", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(retrieved, blob);
+}
 
-    // Check stats after
-    let stats_after = inspect_database(&db_path).unwrap();
-    println!(
-        "After recompression: file_size={}, dead_space={} ({:.1}%)",
-        stats_after.file_size, stats_after.dead_space, stats_after.dead_space_pct
-    );
-    assert!(
-        stats_after.file_size <= stats_before.file_size,
-        "File should not be larger after compaction"
-    );
-    assert!(
-        stats_after.dead_space_pct < 5.0,
-        "Dead space should be minimal after compaction"
-    );
+#[test]
+fn test_page_size_4k() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_page4k", vfs).expect("Failed to register VFS");
 
-    // Verify data integrity
-    let vfs2 = CompressedVfs::new(dir.path(), 3);
-    register("recompress_verify", vfs2).unwrap();
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_page4k",
+    )
+    .expect("Failed to open database");
+
+    conn.execute_batch("PRAGMA page_size = 4096;").unwrap();
+    conn.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+
+    let page_size: i64 = conn
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .unwrap();
+    assert_eq!(page_size, 4096);
+
+    // Insert enough data to span many 4K pages
+    for i in 0..500 {
+        conn.execute(
+            "INSERT INTO small (id, data) VALUES (?1, ?2)",
+            rusqlite::params![i, format!("row_data_{:0>100}", i)],
+        )
+        .unwrap();
+    }
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM small", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 500);
+
+    let val: String = conn
+        .query_row("SELECT data FROM small WHERE id = 499", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(val, format!("row_data_{:0>100}", 499));
+}
+
+#[test]
+fn test_vacuum() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_vacuum", vfs).expect("Failed to register VFS");
+
+    let db_path = dir.path().join("test.db");
 
     let conn = Connection::open_with_flags_and_vfs(
         &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        "recompress_verify",
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_vacuum",
+    )
+    .expect("Failed to open database");
+
+    conn.execute("CREATE TABLE vac (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+    for i in 0..1000 {
+        conn.execute(
+            "INSERT INTO vac VALUES (?1, ?2)",
+            rusqlite::params![i, format!("padding_{:0>200}", i)],
+        )
+        .unwrap();
+    }
+
+    // Delete half
+    conn.execute("DELETE FROM vac WHERE id >= 500", []).unwrap();
+
+    // VACUUM
+    conn.execute_batch("VACUUM;").unwrap();
+
+    // Verify remaining data
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 500);
+
+    let val: String = conn
+        .query_row("SELECT data FROM vac WHERE id = 0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(val, format!("padding_{:0>200}", 0));
+
+    // Close and reopen to verify not corrupted
+    drop(conn);
+
+    let conn2 = Connection::open_with_flags_and_vfs(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "integ_vacuum",
     )
     .unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 100);
+    let count2: i64 = conn2.query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0)).unwrap();
+    assert_eq!(count2, 500);
 
-    // Verify updated rows have new value
-    let value: String = conn
-        .query_row("SELECT value FROM data WHERE id = 25", [], |r| r.get(0))
+    // Integrity check
+    let integrity: String = conn2
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .unwrap();
-    assert!(value.starts_with("y"), "Updated rows should have new value");
-
-    // Verify non-updated rows have original value
-    let value: String = conn
-        .query_row("SELECT value FROM data WHERE id = 75", [], |r| r.get(0))
-        .unwrap();
-    assert!(value.starts_with("x"), "Non-updated rows should have original value");
+    assert_eq!(integrity, "ok");
 }
 
-/// Test compact_if_needed helper
 #[test]
-fn test_compact_if_needed() {
-    use turbolite::{compact_if_needed, inspect_database};
-
+fn test_savepoint_release_and_rollback() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("compact_needed_test", vfs).unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_savepoint", vfs).expect("Failed to register VFS");
 
-    let db_path = dir.path().join("compact_needed.db");
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_savepoint",
+    )
+    .expect("Failed to open database");
 
-    // Create database with some dead space
+    conn.execute("CREATE TABLE sp (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+    conn.execute_batch("SAVEPOINT sp1;").unwrap();
+    conn.execute("INSERT INTO sp VALUES (1, 'first')", []).unwrap();
+
+    conn.execute_batch("SAVEPOINT sp2;").unwrap();
+    conn.execute("INSERT INTO sp VALUES (2, 'second')", []).unwrap();
+
+    conn.execute_batch("ROLLBACK TO sp2;").unwrap();
+    conn.execute_batch("RELEASE sp1;").unwrap();
+
+    // Only the first INSERT should exist
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM sp", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+
+    let val: String = conn
+        .query_row("SELECT val FROM sp WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(val, "first");
+
+    // Verify second row is gone
+    let missing = conn.query_row("SELECT val FROM sp WHERE id = 2", [], |r| r.get::<_, String>(0));
+    assert!(missing.is_err(), "Row 2 should not exist after ROLLBACK TO sp2");
+}
+
+#[test]
+fn test_large_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_large_tx", vfs).expect("Failed to register VFS");
+
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("test.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "integ_large_tx",
+    )
+    .expect("Failed to open database");
+
+    conn.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)", []).unwrap();
+
+    conn.execute_batch("BEGIN;").unwrap();
+    for i in 0..10_000 {
+        conn.execute(
+            "INSERT INTO bulk VALUES (?1, ?2)",
+            rusqlite::params![i, format!("payload_{}", i)],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT;").unwrap();
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM bulk", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 10_000);
+
+    // Check random rows for integrity
+    for check_id in [0, 999, 4567, 9999] {
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM bulk WHERE id = ?1",
+                rusqlite::params![check_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, format!("payload_{}", check_id));
+    }
+}
+
+#[test]
+fn test_checkpoint_truncate() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("integ_checkpoint", vfs).expect("Failed to register VFS");
+
+    let db_path = dir.path().join("test.db");
+
     {
         let conn = Connection::open_with_flags_and_vfs(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            "compact_needed_test",
+            "integ_checkpoint",
         )
-        .unwrap();
+        .expect("Failed to open database");
 
-        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
+        assert!(
+            mode.eq_ignore_ascii_case("wal"),
+            "Expected WAL mode, got {}",
+            mode
+        );
 
-        let test_data = "z".repeat(500);
-        for i in 0..50 {
+        conn.execute("CREATE TABLE ckpt (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        for i in 0..100 {
             conn.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, &test_data],
+                "INSERT INTO ckpt VALUES (?1, ?2)",
+                rusqlite::params![i, format!("ckpt_{}", i)],
             )
             .unwrap();
         }
 
-        // Create dead space with updates
-        let updated = "w".repeat(500);
-        for i in 0..25 {
-            conn.execute(
-                "UPDATE data SET value = ?1 WHERE id = ?2",
-                rusqlite::params![&updated, i],
-            )
-            .unwrap();
-        }
+        // Checkpoint with TRUNCATE
+        let _: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .expect("Checkpoint failed");
+
+        // Verify data after checkpoint
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 100);
     }
 
-    let stats = inspect_database(&db_path).unwrap();
-    println!("Dead space: {:.1}%", stats.dead_space_pct);
-
-    // With very high threshold, should not compact
-    let result = compact_if_needed(&db_path, 99.0).unwrap();
-    assert!(result.is_none(), "Should not compact when below threshold");
-
-    // With low threshold, should compact
-    let result = compact_if_needed(&db_path, 1.0).unwrap();
-    assert!(result.is_some(), "Should compact when above threshold");
-    println!("Freed {} bytes", result.unwrap());
-
-    // After compaction, dead space should be minimal
-    let stats_after = inspect_database(&db_path).unwrap();
-    assert!(
-        stats_after.dead_space_pct < 5.0,
-        "Dead space should be minimal after compaction"
-    );
-}
-
-/// Test parallel vs serial compaction produces same results
-#[test]
-fn test_parallel_serial_consistency() {
-    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
-
-    let dir = tempfile::tempdir().unwrap();
-
-    // Create two identical databases
-    for (vfs_name, db_name) in [("par_test1", "parallel.db"), ("par_test2", "serial.db")] {
-        let vfs = CompressedVfs::new(dir.path(), 3);
-        register(vfs_name, vfs).unwrap();
-
-        let db_path = dir.path().join(db_name);
+    // Reopen and verify persistence
+    {
         let conn = Connection::open_with_flags_and_vfs(
             &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-            vfs_name,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "integ_checkpoint",
         )
         .unwrap();
 
-        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
-            .unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 100);
 
-        let test_data = "test_data_".repeat(100);
-        for i in 0..50 {
-            conn.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, &test_data],
-            )
+        let val: String = conn
+            .query_row("SELECT data FROM ckpt WHERE id = 50", [], |r| r.get(0))
             .unwrap();
-        }
-
-        // Create dead space
-        let updated = "updated___".repeat(100);
-        for i in 0..25 {
-            conn.execute(
-                "UPDATE data SET value = ?1 WHERE id = ?2",
-                rusqlite::params![&updated, i],
-            )
-            .unwrap();
-        }
+        assert_eq!(val, "ckpt_50");
     }
-
-    // Compact parallel.db with parallel=true
-    let config_parallel = CompactionConfig::new(3).with_parallel(true);
-    compact_with_recompression(dir.path().join("parallel.db"), config_parallel).unwrap();
-
-    // Compact serial.db with parallel=false
-    let config_serial = CompactionConfig::new(3).with_parallel(false);
-    compact_with_recompression(dir.path().join("serial.db"), config_serial).unwrap();
-
-    // Both should have similar stats (may differ slightly due to compression variance)
-    let stats_parallel = inspect_database(dir.path().join("parallel.db")).unwrap();
-    let stats_serial = inspect_database(dir.path().join("serial.db")).unwrap();
-
-    assert_eq!(stats_parallel.page_count, stats_serial.page_count);
-    // File sizes should be very close (within 5% due to compression non-determinism)
-    let size_diff = (stats_parallel.file_size as f64 - stats_serial.file_size as f64).abs();
-    let max_diff = stats_parallel.file_size as f64 * 0.05;
-    assert!(
-        size_diff <= max_diff,
-        "Parallel and serial compaction should produce similar file sizes"
-    );
 }

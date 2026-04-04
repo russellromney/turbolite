@@ -30,4 +30,5 @@ mod tiered {
     #[cfg(feature = "wal")]
     mod wal_integration;
     mod zenith;
+    mod drift;
 }

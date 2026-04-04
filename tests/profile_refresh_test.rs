@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::{register, CompressedVfs};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -10,8 +10,13 @@ use std::time::Duration;
 #[test]
 fn test_checkpoint_refresh_performance() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_checkpoint", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_checkpoint", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
     let db_path = Arc::new(db_path);

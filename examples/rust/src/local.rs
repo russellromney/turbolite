@@ -1,21 +1,26 @@
-//! turbolite example — Rust local compressed (native API)
+//! turbolite example -- Rust local storage (native API)
 //!
-//! A small CLI that stores and queries books in a compressed SQLite database (local mode).
-//! See tiered.rs for S3 tiered storage.
+//! A small CLI that stores and queries books in a local TurboliteVfs database.
+//! See tiered.rs for S3 cloud storage.
 //!
 //! Run:
 //!   cd examples/rust && cargo run --bin local
 
 use rusqlite::{params, Connection, OpenFlags};
-use turbolite::{register, CompressedVfs};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 use tempfile::TempDir;
 
 fn main() {
     let data_dir = TempDir::new().expect("create temp dir");
 
-    // Register a zstd-compressed VFS (level 3)
-    let vfs = CompressedVfs::new(data_dir.path(), 3);
-    register("demo", vfs).expect("register VFS");
+    // Register a local TurboliteVfs (compressed page groups + manifest)
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: data_dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    turbolite::tiered::register("demo", vfs).expect("register VFS");
 
     // Open a database through the VFS
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;

@@ -65,7 +65,7 @@ pub fn train_dictionary(samples: &[Vec<u8>], dict_size: usize) -> io::Result<Vec
 /// std::fs::write("prod.dict", &dict)?;
 ///
 /// // Use with new VFS
-/// let vfs = CompressedVfs::new_with_dict(dir, 3, &dict);
+/// // Pass dictionary via TurboliteConfig.dictionary field
 /// ```
 #[cfg(feature = "zstd")]
 pub fn train_from_database(db_path: &str, dict_size: usize) -> io::Result<Vec<u8>> {

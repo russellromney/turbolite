@@ -14,7 +14,8 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use turbolite::{clear_all_caches, register, CompressedVfs};
+use turbolite::clear_all_caches;
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -504,33 +505,13 @@ fn bench_with_corpus(
     let vfs_id = vfs_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let vfs_name = format!("bench_{}_{}", mode, vfs_id);
 
-    let vfs = match mode {
-        "passthrough" => CompressedVfs::passthrough(&target_db_dir),
-        "compressed" => CompressedVfs::new(&target_db_dir, 3),
-        "encrypted" => {
-            #[cfg(feature = "encryption")]
-            {
-                CompressedVfs::encrypted(&target_db_dir, encryption_key)
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                return Err("Encryption not enabled".into());
-            }
-        }
-        "both" => {
-            #[cfg(feature = "encryption")]
-            {
-                CompressedVfs::compressed_encrypted(&target_db_dir, 3, encryption_key)
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                return Err("Encryption not enabled".into());
-            }
-        }
-        _ => return Err(format!("Unknown mode: {}", mode).into()),
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: target_db_dir.clone(),
+        ..Default::default()
     };
-
-    register(&vfs_name, vfs)?;
+    let vfs = TurboliteVfs::new(config)?;
+    turbolite::tiered::register(&vfs_name, vfs)?;
 
     if target_needs_creation {
         println!("  Converting to {} mode...", mode);
@@ -702,35 +683,13 @@ fn bench_existing_db(
     let temp_dir = tempfile::TempDir::new()?;
     let vfs_name = format!("bench_{}", mode);
 
-    let vfs = match mode {
-        "passthrough" => CompressedVfs::passthrough(temp_dir.path()),
-        "compressed" => CompressedVfs::new(temp_dir.path(), 3),
-        "encrypted" => {
-            #[cfg(feature = "encryption")]
-            {
-                let key = encryption_key.ok_or("Encryption key required")?;
-                CompressedVfs::encrypted(temp_dir.path(), key)
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                return Err("Encryption not enabled".into());
-            }
-        }
-        "both" => {
-            #[cfg(feature = "encryption")]
-            {
-                let key = encryption_key.ok_or("Encryption key required")?;
-                CompressedVfs::compressed_encrypted(temp_dir.path(), 3, key)
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                return Err("Encryption not enabled".into());
-            }
-        }
-        _ => return Err(format!("Unknown mode: {}", mode).into()),
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: temp_dir.path().into(),
+        ..Default::default()
     };
-
-    register(&vfs_name, vfs)?;
+    let vfs = TurboliteVfs::new(config)?;
+    turbolite::tiered::register(&vfs_name, vfs)?;
 
     // Create NEW database with VFS and copy data from source
     let setup_start = Instant::now();
@@ -1309,9 +1268,17 @@ fn split_into_sections(text: &str, author: &str, title: &str) -> Vec<(String, St
     sections
 }
 
-/// Benchmark parallel vs serial compaction
-fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32, gutenberg: bool, corpus_size_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use turbolite::{compact_with_recompression, inspect_database, CompactionConfig};
+/// Benchmark parallel vs serial compaction (removed: CompressedVfs was removed)
+fn bench_compact_command(_rows: usize, _iterations: usize, _compression_level: i32, _gutenberg: bool, _corpus_size_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("bench-compact is no longer available (CompressedVfs was removed).");
+    Ok(())
+}
+
+// The original bench_compact body used CompressedVfs compaction functions
+// (inspect_database, CompactionConfig, compact_with_recompression) which
+// operated on the old SQLCEvfS file format and have been removed.
+#[cfg(any())] // never compiled
+fn _bench_compact_removed() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1347,8 +1314,14 @@ fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32,
             let vfs_id = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
             let vfs_name = format!("compact_bench_{}_{}", mode, vfs_id);
 
-            let vfs = CompressedVfs::new(dir.path(), compression_level);
-            register(&vfs_name, vfs)?;
+            let config = TurboliteConfig {
+                storage_backend: StorageBackend::Local,
+                cache_dir: dir.path().into(),
+                compression_level,
+                ..Default::default()
+            };
+            let vfs = TurboliteVfs::new(config)?;
+            turbolite::tiered::register(&vfs_name, vfs)?;
 
             let db_path = dir.path().join("bench.db");
 

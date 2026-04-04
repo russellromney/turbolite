@@ -941,3 +941,45 @@ fn test_normalize_overrides_extends_to_match_groups() {
     assert!(m.subframe_overrides[2].is_empty());
 }
 
+#[test]
+fn test_full_manifest_with_overrides_msgpack_roundtrip() {
+    // Test that a full Manifest with subframe_overrides roundtrips through msgpack.
+    // This catches issues with HashMap<usize, SubframeOverride> serialization.
+    let mut overrides_g0 = HashMap::new();
+    overrides_g0.insert(2usize, manifest::SubframeOverride {
+        key: "pg/0_f2_v3".to_string(),
+        entry: FrameEntry { offset: 0, len: 500 },
+    });
+    overrides_g0.insert(5usize, manifest::SubframeOverride {
+        key: "pg/0_f5_v3".to_string(),
+        entry: FrameEntry { offset: 0, len: 800 },
+    });
+
+    let m = Manifest {
+        version: 3,
+        page_count: 256,
+        page_size: 4096,
+        pages_per_group: 128,
+        sub_pages_per_frame: 8,
+        page_group_keys: vec!["pg/0_v2".to_string(), "pg/1_v2".to_string()],
+        frame_tables: vec![
+            vec![FrameEntry { offset: 0, len: 100 }, FrameEntry { offset: 100, len: 200 }],
+            vec![FrameEntry { offset: 0, len: 150 }],
+        ],
+        subframe_overrides: vec![overrides_g0, HashMap::new()],
+        ..Manifest::empty()
+    };
+
+    let bytes = rmp_serde::to_vec(&m).expect("msgpack serialize full manifest with overrides");
+    let m2: Manifest = rmp_serde::from_slice(&bytes).expect("msgpack deserialize full manifest with overrides");
+
+    assert_eq!(m2.version, 3);
+    assert_eq!(m2.subframe_overrides.len(), 2);
+    assert_eq!(m2.subframe_overrides[0].len(), 2, "group 0 should have 2 overrides");
+    assert!(m2.subframe_overrides[0].contains_key(&2), "should have override for frame 2");
+    assert!(m2.subframe_overrides[0].contains_key(&5), "should have override for frame 5");
+    assert_eq!(m2.subframe_overrides[0][&2].key, "pg/0_f2_v3");
+    assert_eq!(m2.subframe_overrides[0][&5].entry.len, 800);
+    assert!(m2.subframe_overrides[1].is_empty(), "group 1 should have no overrides");
+}
+
