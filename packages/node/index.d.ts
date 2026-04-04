@@ -20,7 +20,7 @@ export interface DatabaseOptions {
   /** AWS region (mode = "s3"). */
   region?: string
 }
-/** A SQLite database connection with transparent compression or S3 tiered storage. */
+/** A SQLite database connection with TurboliteVfs (local or S3 cloud storage). */
 export declare class Database {
   /**
    * Open a database.

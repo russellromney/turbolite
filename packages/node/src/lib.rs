@@ -25,7 +25,7 @@ pub struct DatabaseOptions {
     pub region: Option<String>,
 }
 
-/// A SQLite database connection with transparent compression or S3 tiered storage.
+/// A SQLite database connection with TurboliteVfs (local or S3 cloud storage).
 #[napi]
 pub struct Database {
     conn: Option<Connection>,

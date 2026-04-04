@@ -1,12 +1,12 @@
 """
-turbolite — compressed SQLite with S3 tiered storage for Python.
+turbolite -- SQLite with compressed page groups and optional S3 cloud storage for Python.
 
 Local mode (default)::
 
     import turbolite
     conn = turbolite.connect("my.db")
 
-S3 tiered mode::
+S3 cloud mode::
 
     conn = turbolite.connect("my.db", mode="s3",
         bucket="my-bucket",
@@ -53,9 +53,9 @@ def load(conn: sqlite3.Connection) -> None:
     """
     Load the turbolite extension into a sqlite3 connection.
 
-    After loading, the "turbolite" VFS (local compressed) is always
-    registered. If TURBOLITE_BUCKET is set in the environment,
-    "turbolite-s3" (tiered S3) is also registered.
+    After loading, the "turbolite" VFS (local mode) is always registered.
+    If TURBOLITE_BUCKET is set in the environment, "turbolite-s3"
+    (S3 cloud mode) is also registered.
 
     Args:
         conn: Any open sqlite3.Connection (can be :memory:).
@@ -87,7 +87,7 @@ def connect(
 
     Args:
         path: Path to the database file.
-        mode: "local" for compressed VFS, "s3" for S3 tiered VFS.
+        mode: "local" for local VFS, "s3" for S3 cloud VFS.
         bucket: S3 bucket (required for mode="s3", or set TURBOLITE_BUCKET).
         prefix: S3 key prefix (default "turbolite").
         endpoint: S3 endpoint URL (Tigris, MinIO). Falls back to AWS_ENDPOINT_URL.
@@ -102,7 +102,7 @@ def connect(
 
     Raises:
         ValueError: If mode="s3" but no bucket is configured.
-        RuntimeError: If the tiered VFS fails to initialize.
+        RuntimeError: If the S3 VFS fails to initialize.
     """
     if mode not in ("local", "s3"):
         raise ValueError(f"mode must be 'local' or 's3', got {mode!r}")

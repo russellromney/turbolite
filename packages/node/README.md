@@ -1,6 +1,6 @@
 # turbolite
 
-Compressed SQLite for Node.js with optional S3 tiered storage. Transparent zstd compression via a custom VFS — just `npm install` and use.
+SQLite for Node.js with compressed page groups and optional S3 cloud storage. Transparent zstd compression via TurboliteVfs.
 
 ## Install
 
@@ -29,7 +29,7 @@ const rows = db.query("SELECT * FROM users WHERE age > 20");
 db.close();
 ```
 
-### S3 tiered mode
+### S3 cloud mode
 
 Pages are compressed locally and durably synced to S3 (or any S3-compatible store). Any instance with access to the same bucket can read the database.
 
@@ -79,13 +79,13 @@ const db = new Database("my.db", { compression: 9 });
 const db = new Database("my.db", { compression: null });
 ```
 
-#### S3 tiered mode options
+#### S3 cloud mode options
 
-Set `mode: "s3"` to enable S3 tiered storage.
+Set `mode: "s3"` to enable S3 cloud storage.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `"s3"` | — | Enables S3 tiered storage. |
+| `mode` | `"s3"` | — | Enables S3 cloud storage. |
 | `bucket` | `string` | — | **Required.** S3 bucket name. Also read from `TURBOLITE_BUCKET`. |
 | `region` | `string` | SDK default | AWS region (e.g. `"us-east-1"`). Also read from `TURBOLITE_REGION`. |
 | `endpoint` | `string` | AWS S3 | Custom S3 endpoint URL. Also read from `TURBOLITE_ENDPOINT_URL`. |
