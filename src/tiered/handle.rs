@@ -1821,6 +1821,7 @@ impl DatabaseHandle for TurboliteHandle {
             let dirty = self.dirty_page_nums.read();
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
+                self.dirty_since_sync = false;
                 return Ok(());
             }
             dirty.clone()

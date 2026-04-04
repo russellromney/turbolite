@@ -87,8 +87,8 @@ fn flush_inner(
     gc_enabled: bool,
     flushes: &[staging::PendingFlush],
     legacy_dirty_groups: &HashSet<u64>,
-    _override_threshold: u32,
-    _compaction_threshold: u32,
+    override_threshold: u32,
+    compaction_threshold: u32,
 ) -> io::Result<()> {
     // 2. Read all staging logs and merge into a single page map.
     // Later staging logs overwrite earlier ones (correct: later checkpoint wins).
@@ -168,8 +168,8 @@ fn flush_inner(
 
     // Phase Drift: carry forward subframe overrides, track which groups get full rewrite
     let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
-    let effective_threshold = if _override_threshold > 0 {
-        _override_threshold as usize
+    let effective_threshold = if override_threshold > 0 {
+        override_threshold as usize
     } else if use_seekable && old_sub_ppf > 0 {
         let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
         std::cmp::max(1, frames_per_group / 4)
@@ -641,6 +641,12 @@ fn flush_inner(
             eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
         }
     }
+
+    // TODO(Phase Drift-d): S3 compaction requires a StorageClient wrapper around
+    // S3Client, or an S3-specific compaction path. For now, compaction only runs
+    // on the local flush path. S3 mode is the cloud path where compaction latency
+    // matters less (overrides are merged on read).
+    let _ = (override_threshold, compaction_threshold);
 
     eprintln!("[flush] complete");
     Ok(())

@@ -404,18 +404,18 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
         mode,
     );
 
-    // Read page 0 via SQL to get the raw header
     // We cannot modify page 0 via SQL (it is read-only in the database header).
-    // Instead, signal to the caller that they need to close, delete WAL/SHM,
-    // and reopen. The checkpoint already flushed all WAL data.
-    eprintln!(
-        "[migrate] WAL checkpoint complete. To finish migration:\n\
-         1. Close this connection\n\
-         2. Delete the -wal and -shm files from the cache directory\n\
-         3. Reopen and run PRAGMA journal_mode=OFF",
-    );
-
-    Ok(())
+    // Return an error so the caller knows manual steps are needed.
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        format!(
+            "PRAGMA journal_mode=OFF returned '{}'. WAL checkpoint complete, but manual steps required: \
+             1) Close this connection, \
+             2) Delete the -wal and -shm files from the cache directory, \
+             3) Reopen and run PRAGMA journal_mode=OFF",
+            mode,
+        ),
+    ))
 }
 
 #[cfg(test)]
