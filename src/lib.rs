@@ -40,7 +40,7 @@ pub mod ffi;
 #[cfg(feature = "loadable-extension")]
 pub mod ext;
 pub mod tiered;
-pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle};
+pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
 pub mod btree_walker;
 
 use parking_lot::{Mutex, RwLock};

@@ -105,6 +105,7 @@ pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
 pub use vfs::TurboliteVfs;
+// SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query};
 pub use settings::{turbolite_config_set, push_setting};
 #[cfg(all(feature = "encryption", feature = "cloud"))]
@@ -269,6 +270,83 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
 
 /// Register a TurboliteVfs with SQLite under the given name.
 pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
+    sqlite_vfs::register(name, vfs, false)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+}
+
+/// Shared VFS wrapper: holds the VFS behind an Arc so it can be registered
+/// with SQLite while keeping a handle for `manifest()` / `set_manifest()`.
+///
+/// ```ignore
+/// let vfs = TurboliteVfs::new(config)?;
+/// let shared = SharedTurboliteVfs::new(vfs);
+/// let vfs_ref = shared.clone(); // keep this for manifest ops
+/// turbolite::tiered::register_shared("mydb", shared)?;
+/// // vfs_ref.manifest() and vfs_ref.set_manifest() still work
+/// ```
+#[derive(Clone)]
+pub struct SharedTurboliteVfs(Arc<TurboliteVfs>);
+
+impl SharedTurboliteVfs {
+    pub fn new(vfs: TurboliteVfs) -> Self {
+        Self(Arc::new(vfs))
+    }
+
+    /// Access the underlying VFS (for calling manifest(), set_manifest(), etc).
+    pub fn vfs(&self) -> &TurboliteVfs {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SharedTurboliteVfs {
+    type Target = TurboliteVfs;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Vfs for SharedTurboliteVfs {
+    type Handle = TurboliteHandle;
+
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<TurboliteHandle, io::Error> {
+        self.0.open(db, opts)
+    }
+
+    fn delete(&self, db: &str) -> Result<(), io::Error> {
+        self.0.delete(db)
+    }
+
+    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+        self.0.exists(db)
+    }
+
+    fn temporary_name(&self) -> String {
+        self.0.temporary_name()
+    }
+
+    fn random(&self, buffer: &mut [i8]) {
+        self.0.random(buffer)
+    }
+
+    fn sleep(&self, duration: Duration) -> Duration {
+        self.0.sleep(duration)
+    }
+
+    fn access(&self, db: &str, write: bool) -> Result<bool, io::Error> {
+        self.0.access(db, write)
+    }
+
+    fn full_pathname<'a>(&self, db: &'a str) -> Result<std::borrow::Cow<'a, str>, io::Error> {
+        self.0.full_pathname(db)
+    }
+}
+
+/// Register a SharedTurboliteVfs with SQLite under the given name.
+///
+/// Unlike `register`, this lets you keep a clone of the SharedTurboliteVfs
+/// so you can call `manifest()` and `set_manifest()` on it after registration.
+/// This is required for haqlite's shared-mode turbolite integration.
+pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
     sqlite_vfs::register(name, vfs, false)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
 }

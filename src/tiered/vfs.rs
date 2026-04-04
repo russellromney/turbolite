@@ -639,6 +639,56 @@ impl TurboliteVfs {
             Ok(())
         })
     }
+
+    /// Return a clone of the current manifest state.
+    pub fn manifest(&self) -> Manifest {
+        self.shared_manifest.read().clone()
+    }
+
+    /// Update the internal manifest from external state (e.g. haqlite catch-up).
+    ///
+    /// Rebuilds page_index and normalizes strategy, updates the disk cache's
+    /// group_pages mapping, invalidates cache entries for groups whose
+    /// page_group_keys changed, and atomically updates page_count.
+    pub fn set_manifest(&self, mut manifest: Manifest) {
+        manifest.detect_and_normalize_strategy();
+
+        // Snapshot old page_group_keys before swapping
+        let old_keys: Vec<String> = {
+            let old = self.shared_manifest.read();
+            old.page_group_keys.clone()
+        };
+
+        // Update cache group_pages if present
+        if !manifest.group_pages.is_empty() {
+            self.cache.set_group_pages(manifest.group_pages.clone());
+            self.cache.ensure_group_capacity(manifest.group_pages.len());
+        }
+
+        // Invalidate cache entries for groups whose page_group_keys changed.
+        // Compare old vs new: any group whose key differs (or is new/removed)
+        // gets reset to GroupState::None so the VFS refetches from S3.
+        let new_keys = &manifest.page_group_keys;
+        let max_len = std::cmp::max(old_keys.len(), new_keys.len());
+        if max_len > 0 {
+            let states = self.cache.group_states.lock();
+            for gid in 0..max_len {
+                let old_key = old_keys.get(gid).map(|s| s.as_str());
+                let new_key = new_keys.get(gid).map(|s| s.as_str());
+                if old_key != new_key {
+                    if let Some(s) = states.get(gid) {
+                        s.store(GroupState::None as u8, Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        // Update page_count atomic
+        self.page_count.store(manifest.page_count, Ordering::Release);
+
+        // Write manifest to shared state
+        *self.shared_manifest.write() = manifest;
+    }
 }
 
 impl Vfs for TurboliteVfs {
