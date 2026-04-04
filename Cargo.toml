@@ -1,6 +1,6 @@
 [package]
 name = "turbolite"
-version = "0.2.19"
+version = "0.3.0"
 edition = "2021"
 description = "turbolite - SQLite VFS with sub-50ms cold queries from S3 + page-level compression and encryption"
 license = "Apache-2.0"
