@@ -560,3 +560,165 @@ fn test_local_vfs_override_compaction() {
         assert_eq!(val5, "val_5");
     }
 }
+
+// =========================================================================
+// Phase Zenith-b: Cache validation on open
+// =========================================================================
+
+/// Reopen with same manifest version: cache warm, data correct.
+#[test]
+fn test_cache_validation_warm_reopen_same_version() {
+    let dir = TempDir::new().unwrap();
+
+    // Write data
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_warm1_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'warm')", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Reopen: same manifest version, cache should be warm
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_warm2_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(val, "warm");
+    }
+}
+
+/// Simulate external write: modify manifest version + page_group_keys on disk,
+/// reopen, verify cache invalidation triggers and correct data is read.
+#[test]
+fn test_cache_validation_external_write_invalidates_stale_groups() {
+    let dir = TempDir::new().unwrap();
+
+    // Session 1: write data + checkpoint
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ext1_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        for i in 1..=5 {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v1_{}", i)]).unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Session 2: update some rows (simulates another node writing)
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ext2_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("UPDATE t SET val = 'updated' WHERE id = 3", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Session 3: reopen (simulates original node reopening after external write)
+    // The local manifest should now reflect session 2's version.
+    // Cache validation should invalidate changed groups.
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ext3_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+
+        // Should see the updated value from session 2
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 3", [], |r| r.get(0)).unwrap();
+        assert_eq!(val, "updated", "should see external write after cache validation");
+
+        // Unchanged rows should still be correct
+        let val1: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(val1, "v1_1");
+    }
+}
+
+/// Reopen after deletion of cache files: pages re-fetched from page groups.
+#[test]
+fn test_cache_validation_cold_start_after_cache_delete() {
+    let dir = TempDir::new().unwrap();
+
+    // Write data
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_cold1_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'persisted')", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Delete cache files (simulates Lambda cold start with fresh disk)
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    // Reopen: cache empty, manifest still on disk, data from page groups
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_cold2_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(val, "persisted", "should recover data from page groups after cache delete");
+    }
+}

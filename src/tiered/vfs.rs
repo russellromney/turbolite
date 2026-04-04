@@ -708,6 +708,69 @@ impl Vfs for TurboliteVfs {
                 self.config.pages_per_group
             };
 
+            // Phase Zenith-b: validate cache against manifest.
+            // Compare loaded manifest with previous session's cached manifest.
+            // Invalidate groups whose page_group_keys changed (another node wrote).
+            {
+                let old_manifest = self.shared_manifest.read().clone();
+                if old_manifest.version > 0 && old_manifest.version != manifest.version {
+                    if old_manifest.version > manifest.version {
+                        // Local ahead of S3 (crash recovery): full cache invalidation.
+                        // Local writes were not published; S3 is authoritative.
+                        eprintln!(
+                            "[cache-validate] local v{} ahead of manifest v{}, full cache invalidation",
+                            old_manifest.version, manifest.version,
+                        );
+                        let states = self.cache.group_states.lock();
+                        for state in states.iter() {
+                            state.store(GroupState::None as u8, Ordering::Release);
+                        }
+                        self.cache.group_condvar.notify_all();
+                    } else {
+                        // Manifest is newer: diff page_group_keys, invalidate changed groups.
+                        let mut invalidated = 0usize;
+                        let max_groups = std::cmp::max(
+                            old_manifest.page_group_keys.len(),
+                            manifest.page_group_keys.len(),
+                        );
+                        let states = self.cache.group_states.lock();
+                        for gid in 0..max_groups {
+                            let old_key = old_manifest.page_group_keys.get(gid);
+                            let new_key = manifest.page_group_keys.get(gid);
+                            if old_key != new_key {
+                                if let Some(state) = states.get(gid) {
+                                    state.store(GroupState::None as u8, Ordering::Release);
+                                    invalidated += 1;
+                                }
+                            }
+                            // Also invalidate groups with overrides that changed
+                            let old_ovs = old_manifest.subframe_overrides.get(gid);
+                            let new_ovs = manifest.subframe_overrides.get(gid);
+                            if old_ovs != new_ovs {
+                                if let Some(state) = states.get(gid) {
+                                    if state.load(Ordering::Acquire) != GroupState::None as u8 {
+                                        state.store(GroupState::None as u8, Ordering::Release);
+                                        invalidated += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if invalidated > 0 {
+                            self.cache.group_condvar.notify_all();
+                            eprintln!(
+                                "[cache-validate] manifest v{} -> v{}: invalidated {} groups",
+                                old_manifest.version, manifest.version, invalidated,
+                            );
+                        } else {
+                            eprintln!(
+                                "[cache-validate] manifest v{} -> v{}: no groups changed",
+                                old_manifest.version, manifest.version,
+                            );
+                        }
+                    }
+                }
+            }
+
             // Update cache's group_pages from latest manifest (BTreeAware only)
             if !manifest.group_pages.is_empty() {
                 self.cache.set_group_pages(manifest.group_pages.clone());
