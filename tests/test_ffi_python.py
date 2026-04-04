@@ -48,11 +48,8 @@ lib.turbolite_version.restype = ctypes.c_char_p
 lib.turbolite_version.argtypes = []
 
 # Registration
-lib.turbolite_register_compressed.restype = ctypes.c_int
-lib.turbolite_register_compressed.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-
-lib.turbolite_register_passthrough.restype = ctypes.c_int
-lib.turbolite_register_passthrough.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+lib.turbolite_register_local.restype = ctypes.c_int
+lib.turbolite_register_local.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
 
 # Database operations
 lib.turbolite_open.restype = ctypes.c_void_p
@@ -124,7 +121,7 @@ def _():
 
 @test("null name returns error")
 def _():
-    rc = lib.turbolite_register_compressed(None, b"/tmp", 3)
+    rc = lib.turbolite_register_local(None, b"/tmp", 3)
     assert rc == -1
     err = lib.turbolite_last_error()
     assert err is not None
@@ -133,7 +130,7 @@ def _():
 
 @test("null base_dir returns error")
 def _():
-    rc = lib.turbolite_register_compressed(b"null-test", None, 3)
+    rc = lib.turbolite_register_local(b"null-test", None, 3)
     assert rc == -1
     err = lib.turbolite_last_error()
     assert b"base_dir" in err
@@ -142,21 +139,14 @@ def _():
 @test("register compressed VFS")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        rc = lib.turbolite_register_compressed(b"py-compressed", d.encode(), 3)
+        rc = lib.turbolite_register_local(b"py-compressed", d.encode(), 3)
         assert rc == 0, f"register failed: {lib.turbolite_last_error()}"
 
 
-@test("register passthrough VFS")
+@test("open database with local VFS")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        rc = lib.turbolite_register_passthrough(b"py-passthrough", d.encode())
-        assert rc == 0, f"register failed: {lib.turbolite_last_error()}"
-
-
-@test("open database with compressed VFS")
-def _():
-    with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-open-test", d.encode(), 3)
+        lib.turbolite_register_local(b"py-open-test", d.encode(), 3)
         db_path = os.path.join(d, "test.db").encode()
         db = lib.turbolite_open(db_path, b"py-open-test")
         assert db is not None, f"open failed: {lib.turbolite_last_error()}"
@@ -166,7 +156,7 @@ def _():
 @test("exec CREATE TABLE + INSERT")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-exec-test", d.encode(), 3)
+        lib.turbolite_register_local(b"py-exec-test", d.encode(), 3)
         db_path = os.path.join(d, "test.db").encode()
         db = lib.turbolite_open(db_path, b"py-exec-test")
         assert db
@@ -183,7 +173,7 @@ def _():
 @test("full round-trip: create, insert, query, verify")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-roundtrip", d.encode(), 3)
+        lib.turbolite_register_local(b"py-roundtrip", d.encode(), 3)
         db_path = os.path.join(d, "test.db").encode()
         db = lib.turbolite_open(db_path, b"py-roundtrip")
         assert db
@@ -207,7 +197,7 @@ def _():
 @test("query with WHERE clause")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-where", d.encode(), 3)
+        lib.turbolite_register_local(b"py-where", d.encode(), 3)
         db_path = os.path.join(d, "test.db").encode()
         db = lib.turbolite_open(db_path, b"py-where")
         assert db
@@ -230,7 +220,7 @@ def _():
 @test("reopen database preserves data (persistence)")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-persist", d.encode(), 3)
+        lib.turbolite_register_local(b"py-persist", d.encode(), 3)
         db_path = os.path.join(d, "persist.db").encode()
 
         # Write
@@ -249,26 +239,10 @@ def _():
         lib.turbolite_close(db)
 
 
-@test("passthrough VFS round-trip")
-def _():
-    with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_passthrough(b"py-pt-roundtrip", d.encode())
-        db_path = os.path.join(d, "test.db").encode()
-        db = lib.turbolite_open(db_path, b"py-pt-roundtrip")
-        assert db
-
-        lib.turbolite_exec(db, b"CREATE TABLE t (x INTEGER)")
-        lib.turbolite_exec(db, b"INSERT INTO t VALUES (42)")
-        rows = query_json(db, "SELECT x FROM t")
-        assert rows == [{"x": 42}]
-
-        lib.turbolite_close(db)
-
-
 @test("exec with bad SQL returns error")
 def _():
     with tempfile.TemporaryDirectory() as d:
-        lib.turbolite_register_compressed(b"py-badsql", d.encode(), 3)
+        lib.turbolite_register_local(b"py-badsql", d.encode(), 3)
         db_path = os.path.join(d, "test.db").encode()
         db = lib.turbolite_open(db_path, b"py-badsql")
         assert db

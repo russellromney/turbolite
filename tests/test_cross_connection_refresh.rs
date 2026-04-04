@@ -1,12 +1,17 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::{register, CompressedVfs};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 
 /// Test refresh when one connection writes and another reads the new data
 #[test]
 fn test_cross_connection_refresh() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_cross", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_cross", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
 

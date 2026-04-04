@@ -173,6 +173,35 @@ impl TurboliteHandle {
                                     dictionary,
                                     encryption_key.as_ref(),
                                 );
+                                // Phase Drift-c: apply overrides for group 0
+                                if let Some(overrides) = manifest.subframe_overrides.get(0) {
+                                    if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
+                                        let spf = manifest.sub_pages_per_frame as usize;
+                                        for (&frame_idx, ovr) in overrides {
+                                            if let Ok(Some(ovr_data)) = s3_ref.get_page_group(&ovr.key) {
+                                                if let Ok(decompressed) = decode_seekable_subchunk(
+                                                    &ovr_data,
+                                                    #[cfg(feature = "zstd")]
+                                                    dictionary.map(|d| zstd::dict::DecoderDictionary::copy(d)).as_ref(),
+                                                    encryption_key.as_ref(),
+                                                ) {
+                                                    let frame_start = frame_idx * spf;
+                                                    let frame_end = std::cmp::min(frame_start + spf, gp0.len());
+                                                    if frame_end > frame_start {
+                                                        let frame_page_nums = &gp0[frame_start..frame_end];
+                                                        let data_len = frame_page_nums.len() * manifest.page_size as usize;
+                                                        if data_len <= decompressed.len() {
+                                                            let _ = cache.write_pages_scattered(
+                                                                frame_page_nums, &decompressed[..data_len],
+                                                                0, frame_start as u32,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 cache.mark_group_present(0);
                                 cache.touch_group(0);
                             }
@@ -1411,6 +1440,7 @@ impl DatabaseHandle for TurboliteHandle {
                 let override_entry = manifest.subframe_overrides
                     .get(gid as usize)
                     .and_then(|ovs| ovs.get(&frame_idx));
+
 
                 // Submit the CURRENT group to prefetch pool (full group fetch in background).
                 self.increment_misses(current_tree_name.as_ref());

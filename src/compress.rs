@@ -1,7 +1,6 @@
 //! Compression and encryption free functions.
 //!
-//! These are extracted from CompressedHandle so they can be reused by
-//! both CompressedHandle and TurboliteHandle without duplication.
+//! Used by TurboliteHandle for page-level compression/decompression.
 
 use std::io;
 

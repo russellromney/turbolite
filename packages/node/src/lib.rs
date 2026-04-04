@@ -1,8 +1,7 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::{register, CompressedVfs};
-use turbolite::tiered::{register as tiered_register, TieredConfig, TieredVfs};
+use turbolite::tiered::{register as tiered_register, TurboliteConfig, TurboliteVfs, StorageBackend};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -26,7 +25,7 @@ pub struct DatabaseOptions {
     pub region: Option<String>,
 }
 
-/// A SQLite database connection with transparent compression or S3 tiered storage.
+/// A SQLite database connection with TurboliteVfs (local or S3 cloud storage).
 #[napi]
 pub struct Database {
     conn: Option<Connection>,
@@ -90,19 +89,21 @@ impl Database {
                 .filter(|s| !s.is_empty())
                 .or_else(|| std::env::var("TURBOLITE_REGION").ok().filter(|s| !s.is_empty()));
 
-            let config = TieredConfig {
-                bucket,
-                prefix,
+            let config = TurboliteConfig {
+                storage_backend: StorageBackend::S3 {
+                    bucket,
+                    prefix,
+                    endpoint_url,
+                    region,
+                },
                 cache_dir,
-                endpoint_url,
-                region,
                 ..Default::default()
             };
 
-            let vfs = TieredVfs::new(config)
-                .map_err(|e| Error::from_reason(format!("create tiered VFS: {e}")))?;
+            let vfs = TurboliteVfs::new(config)
+                .map_err(|e| Error::from_reason(format!("create cloud VFS: {e}")))?;
             tiered_register(&vfs_name, vfs)
-                .map_err(|e| Error::from_reason(format!("register tiered VFS: {e}")))?;
+                .map_err(|e| Error::from_reason(format!("register cloud VFS: {e}")))?;
 
             let conn = Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)
                 .map_err(|e| Error::from_reason(format!("open: {e}")))?;
@@ -116,12 +117,16 @@ impl Database {
 
             conn
         } else {
-            let compression = options.as_ref().and_then(|o| o.compression);
-            let vfs = match compression {
-                Some(level) => CompressedVfs::new(base_dir, level),
-                None => CompressedVfs::passthrough(base_dir),
+            let compression = options.as_ref().and_then(|o| o.compression).unwrap_or(3);
+            let config = TurboliteConfig {
+                storage_backend: StorageBackend::Local,
+                cache_dir: base_dir,
+                compression_level: compression,
+                ..Default::default()
             };
-            register(&vfs_name, vfs)
+            let vfs = TurboliteVfs::new(config)
+                .map_err(|e| Error::from_reason(format!("create local VFS: {e}")))?;
+            tiered_register(&vfs_name, vfs)
                 .map_err(|e| Error::from_reason(format!("register VFS: {e}")))?;
 
             Connection::open_with_flags_and_vfs(&abs_path, flags, &vfs_name)

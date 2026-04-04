@@ -35,7 +35,7 @@ int main(void) {
     printf("Data dir: %s\n\n", data_dir);
 
     /* Register VFS and open database */
-    if (turbolite_register_compressed("sensor", data_dir, 3) != 0)
+    if (turbolite_register_local("sensor", data_dir, 3) != 0)
         die("register VFS");
 
     char db_path[512];

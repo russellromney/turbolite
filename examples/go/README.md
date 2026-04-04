@@ -26,7 +26,7 @@ curl localhost:8080/books
 ## How it works
 
 1. Declare FFI functions in the cgo preamble (`extern` declarations)
-2. `turbolite_register_compressed` (local) or `turbolite_register_tiered` (S3)
+2. `turbolite_register_local` (local) or `turbolite_register_cloud` (S3)
 3. `turbolite_open` - open a database through the VFS
 4. HTTP handlers call `turbolite_exec` (writes) and `turbolite_query_json` (reads)
 

@@ -53,7 +53,7 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --lib --target ${{ matrix.target }} \
-            --no-default-features --features loadable-extension,zstd,tiered
+            --no-default-features --features loadable-extension,zstd,cloud
 
       - name: Determine library filename
         id: lib

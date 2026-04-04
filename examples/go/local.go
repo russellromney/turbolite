@@ -20,7 +20,7 @@ package main
 
 extern const char* turbolite_version();
 extern const char* turbolite_last_error();
-extern int turbolite_register_compressed(const char* name, const char* base_dir, int level);
+extern int turbolite_register_local(const char* name, const char* base_dir, int level);
 extern void* turbolite_open(const char* path, const char* vfs_name);
 extern int turbolite_exec(void* db, const char* sql);
 extern char* turbolite_query_json(void* db, const char* sql);
@@ -71,7 +71,7 @@ func main() {
 	defer C.free(unsafe.Pointer(name))
 	base := cstr(dataDir)
 	defer C.free(unsafe.Pointer(base))
-	C.turbolite_register_compressed(name, base, 3)
+	C.turbolite_register_local(name, base, 3)
 
 	dbPath := cstr(filepath.Join(dataDir, "books.db"))
 	defer C.free(unsafe.Pointer(dbPath))

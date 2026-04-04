@@ -13,8 +13,7 @@ package main
 // turbolite FFI declarations
 extern const char* turbolite_version();
 extern const char* turbolite_last_error();
-extern int turbolite_register_compressed(const char* name, const char* base_dir, int compression_level);
-extern int turbolite_register_passthrough(const char* name, const char* base_dir);
+extern int turbolite_register_local(const char* name, const char* base_dir, int compression_level);
 extern void* turbolite_open(const char* path, const char* vfs_name);
 extern int turbolite_exec(void* db, const char* sql);
 extern char* turbolite_query_json(void* db, const char* sql);
@@ -89,7 +88,7 @@ func main() {
 
 	// --- Null args ---
 	test("null name returns error", func() error {
-		rc := C.turbolite_register_compressed(nil, cstr("/tmp"), 3)
+		rc := C.turbolite_register_local(nil, cstr("/tmp"), 3)
 		if rc != -1 {
 			return fmt.Errorf("expected -1, got %d", rc)
 		}
@@ -103,7 +102,7 @@ func main() {
 	test("null base_dir returns error", func() error {
 		name := cstr("go-null-test")
 		defer C.free(unsafe.Pointer(name))
-		rc := C.turbolite_register_compressed(name, nil, 3)
+		rc := C.turbolite_register_local(name, nil, 3)
 		if rc != -1 {
 			return fmt.Errorf("expected -1, got %d", rc)
 		}
@@ -118,23 +117,9 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		rc := C.turbolite_register_compressed(name, base, 3)
+		rc := C.turbolite_register_local(name, base, 3)
 		if rc != 0 {
 			return fmt.Errorf("rc=%d: %s", rc, C.GoString(C.turbolite_last_error()))
-		}
-		return nil
-	})
-
-	test("register passthrough VFS", func() error {
-		dir, _ := os.MkdirTemp("", "turbolite-go-")
-		defer os.RemoveAll(dir)
-		name := cstr("go-passthrough")
-		defer C.free(unsafe.Pointer(name))
-		base := cstr(dir)
-		defer C.free(unsafe.Pointer(base))
-		rc := C.turbolite_register_passthrough(name, base)
-		if rc != 0 {
-			return fmt.Errorf("rc=%d", rc)
 		}
 		return nil
 	})
@@ -147,7 +132,7 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		C.turbolite_register_compressed(name, base, 3)
+		C.turbolite_register_local(name, base, 3)
 
 		dbPath := cstr(filepath.Join(dir, "test.db"))
 		defer C.free(unsafe.Pointer(dbPath))
@@ -167,7 +152,7 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		C.turbolite_register_compressed(name, base, 3)
+		C.turbolite_register_local(name, base, 3)
 
 		dbPath := cstr(filepath.Join(dir, "test.db"))
 		defer C.free(unsafe.Pointer(dbPath))
@@ -193,7 +178,7 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		C.turbolite_register_compressed(name, base, 3)
+		C.turbolite_register_local(name, base, 3)
 
 		dbPath := cstr(filepath.Join(dir, "test.db"))
 		defer C.free(unsafe.Pointer(dbPath))
@@ -217,7 +202,7 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		C.turbolite_register_compressed(name, base, 3)
+		C.turbolite_register_local(name, base, 3)
 
 		dbPath := cstr(filepath.Join(dir, "test.db"))
 		defer C.free(unsafe.Pointer(dbPath))
@@ -262,7 +247,7 @@ func main() {
 		defer C.free(unsafe.Pointer(name))
 		base := cstr(dir)
 		defer C.free(unsafe.Pointer(base))
-		C.turbolite_register_compressed(name, base, 3)
+		C.turbolite_register_local(name, base, 3)
 
 		dbPath := cstr(filepath.Join(dir, "persist.db"))
 		defer C.free(unsafe.Pointer(dbPath))

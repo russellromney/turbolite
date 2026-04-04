@@ -65,13 +65,13 @@ cleanup:;
 
 static void test_null_args(void) {
     TEST("null arguments return error");
-    int rc = turbolite_register_compressed(NULL, "/tmp", 3);
+    int rc = turbolite_register_local(NULL, "/tmp", 3);
     ASSERT(rc == -1);
     const char *err = turbolite_last_error();
     ASSERT(err != NULL);
     ASSERT(strstr(err, "name") != NULL);
 
-    rc = turbolite_register_compressed("test", NULL, 3);
+    rc = turbolite_register_local("test", NULL, 3);
     ASSERT(rc == -1);
     err = turbolite_last_error();
     ASSERT(strstr(err, "base_dir") != NULL);
@@ -83,27 +83,18 @@ static void test_register_compressed(void) {
     TEST("register compressed VFS");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    int rc = turbolite_register_compressed("c-compressed", dir, 3);
+    int rc = turbolite_register_local("c-compressed", dir, 3);
     ASSERT(rc == 0);
     PASS();
 cleanup:;
 }
 
-static void test_register_passthrough(void) {
-    TEST("register passthrough VFS");
-    const char *dir = make_tmpdir();
-    ASSERT(dir != NULL);
-    int rc = turbolite_register_passthrough("c-passthrough", dir);
-    ASSERT(rc == 0);
-    PASS();
-cleanup:;
-}
 
 static void test_open_close(void) {
     TEST("open and close database");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    turbolite_register_compressed("c-openclose", dir, 3);
+    turbolite_register_local("c-openclose", dir, 3);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", dir);
@@ -119,7 +110,7 @@ static void test_exec(void) {
     TEST("exec CREATE TABLE + INSERT");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    turbolite_register_compressed("c-exec", dir, 3);
+    turbolite_register_local("c-exec", dir, 3);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", dir);
@@ -140,7 +131,7 @@ static void test_bad_sql(void) {
     TEST("bad SQL returns error");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    turbolite_register_compressed("c-badsql", dir, 3);
+    turbolite_register_local("c-badsql", dir, 3);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", dir);
@@ -160,7 +151,7 @@ static void test_roundtrip(void) {
     TEST("full round-trip: create, insert, query, verify");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    turbolite_register_compressed("c-roundtrip", dir, 3);
+    turbolite_register_local("c-roundtrip", dir, 3);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", dir);
@@ -193,7 +184,7 @@ static void test_persistence(void) {
     TEST("data persists across connections");
     const char *dir = make_tmpdir();
     ASSERT(dir != NULL);
-    turbolite_register_compressed("c-persist", dir, 3);
+    turbolite_register_local("c-persist", dir, 3);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/persist.db", dir);
@@ -319,7 +310,6 @@ int main(void) {
     test_version();
     test_null_args();
     test_register_compressed();
-    test_register_passthrough();
     test_open_close();
     test_exec();
     test_bad_sql();

@@ -30,15 +30,10 @@ const lib = koffi.load(libPath);
 
 const turbolite_version = lib.func("turbolite_version", "str", []);
 const turbolite_last_error = lib.func("turbolite_last_error", "str", []);
-const turbolite_register_compressed = lib.func(
-  "turbolite_register_compressed",
+const turbolite_register_local = lib.func(
+  "turbolite_register_local",
   "int",
   ["str", "str", "int"]
-);
-const turbolite_register_passthrough = lib.func(
-  "turbolite_register_passthrough",
-  "int",
-  ["str", "str"]
 );
 const turbolite_open = lib.func("turbolite_open", "void*", ["str", "str"]);
 const turbolite_exec = lib.func("turbolite_exec", "int", ["void*", "str"]);
@@ -103,30 +98,21 @@ test("version returns valid string", () => {
 });
 
 test("null name returns error", () => {
-  const rc = turbolite_register_compressed(null, "/tmp", 3);
+  const rc = turbolite_register_local(null, "/tmp", 3);
   assertEqual(rc, -1);
   const err = turbolite_last_error();
   assert(err && err.includes("name"), `error should mention name: ${err}`);
 });
 
 test("null base_dir returns error", () => {
-  const rc = turbolite_register_compressed("node-null-test", null, 3);
+  const rc = turbolite_register_local("node-null-test", null, 3);
   assertEqual(rc, -1);
 });
 
-test("register compressed VFS", () => {
+test("register local VFS", () => {
   const dir = makeTmpDir();
   try {
-    assertEqual(turbolite_register_compressed("node-compressed", dir, 3), 0);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("register passthrough VFS", () => {
-  const dir = makeTmpDir();
-  try {
-    assertEqual(turbolite_register_passthrough("node-passthrough", dir), 0);
+    assertEqual(turbolite_register_local("node-local", dir, 3), 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -135,7 +121,7 @@ test("register passthrough VFS", () => {
 test("open and close database", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-openclose", dir, 3);
+    turbolite_register_local("node-openclose", dir, 3);
     const db = turbolite_open(join(dir, "test.db"), "node-openclose");
     assert(db, `open returned null: ${turbolite_last_error()}`);
     turbolite_close(db);
@@ -147,7 +133,7 @@ test("open and close database", () => {
 test("exec CREATE TABLE + INSERT", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-exec", dir, 3);
+    turbolite_register_local("node-exec", dir, 3);
     const db = turbolite_open(join(dir, "test.db"), "node-exec");
     assert(db);
 
@@ -167,7 +153,7 @@ test("exec CREATE TABLE + INSERT", () => {
 test("bad SQL returns error", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-badsql", dir, 3);
+    turbolite_register_local("node-badsql", dir, 3);
     const db = turbolite_open(join(dir, "test.db"), "node-badsql");
     assert(db);
 
@@ -183,7 +169,7 @@ test("bad SQL returns error", () => {
 test("full round-trip: create, insert, query, verify", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-roundtrip", dir, 3);
+    turbolite_register_local("node-roundtrip", dir, 3);
     const db = turbolite_open(join(dir, "test.db"), "node-roundtrip");
     assert(db);
 
@@ -211,7 +197,7 @@ test("full round-trip: create, insert, query, verify", () => {
 test("query with WHERE clause", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-where", dir, 3);
+    turbolite_register_local("node-where", dir, 3);
     const db = turbolite_open(join(dir, "test.db"), "node-where");
     assert(db);
 
@@ -240,7 +226,7 @@ test("query with WHERE clause", () => {
 test("data persists across connections", () => {
   const dir = makeTmpDir();
   try {
-    turbolite_register_compressed("node-persist", dir, 3);
+    turbolite_register_local("node-persist", dir, 3);
     const dbPath = join(dir, "persist.db");
 
     // Write

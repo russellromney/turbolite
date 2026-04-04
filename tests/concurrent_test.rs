@@ -1,5 +1,6 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::{register, CompressedVfs, clear_all_caches};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::clear_all_caches;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -8,8 +9,13 @@ use std::time::{Duration, Instant};
 #[test]
 fn test_concurrent_read_write() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_concurrent", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_concurrent", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
     let db_path = Arc::new(db_path);
@@ -108,8 +114,13 @@ fn test_concurrent_read_write() {
 #[test]
 fn test_concurrent_no_wal() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_no_wal", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_no_wal", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
     let db_path = Arc::new(db_path);
@@ -230,8 +241,13 @@ fn test_concurrent_no_wal() {
 #[test]
 fn test_concurrent_high_throughput() {
     let dir = tempfile::tempdir().unwrap();
-    let vfs = CompressedVfs::new(dir.path(), 3);
-    register("test_high_throughput", vfs).expect("Failed to register VFS");
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    turbolite::tiered::register("test_high_throughput", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
     let db_path = Arc::new(db_path);
