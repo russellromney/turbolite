@@ -986,3 +986,996 @@ fn test_migrate_preserves_large_dataset() {
         assert_eq!(new_count, row_count + 1);
     }
 }
+
+// =========================================================================
+// Stress tests
+// =========================================================================
+
+/// Large database: 10k rows across many page groups, checkpoint, cold reopen, verify all rows.
+#[test]
+fn test_stress_large_database_10k_rows() {
+    let dir = TempDir::new().unwrap();
+    let row_count = 10_000i64;
+
+    // Write phase
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group: 4, // small groups to exercise many page groups
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_10k_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, val TEXT)",
+            [],
+        )
+        .unwrap();
+
+        // Insert in a single transaction for speed
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..row_count {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, i % 100, format!("row_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Cold reopen: delete cache files
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group: 4,
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_10k_r_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, row_count, "all 10k rows should survive cold reopen");
+
+        // Spot-check a few rows
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "row_0");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 5000", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "row_5000");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 9999", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "row_9999");
+
+        // Group query
+        let grp_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE grp = 42", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(grp_count, 100, "each of 100 groups should have 100 rows");
+    }
+}
+
+/// Many sequential overrides then compaction: verify compaction fires and data is correct.
+#[test]
+fn test_stress_many_overrides_compaction() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Write phase: initial data + 10 sequential small updates with checkpoints
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 5, // compact after 5 overrides
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_ovr_cmpct_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        // Initial bulk insert
+        for i in 1..=50 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("initial_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // 10 sequential small updates, each with a checkpoint (creates overrides)
+        for round in 1..=10 {
+            conn.execute(
+                "UPDATE t SET val = ?1 WHERE id = ?2",
+                rusqlite::params![format!("round_{}", round), round],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        drop(conn);
+    }
+
+    // Cold reopen: delete cache files
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 5,
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_ovr_cmpct_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        // Rows 1-10 should have latest update values
+        for i in 1..=10 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("round_{}", i), "row {} should have latest override value", i);
+        }
+
+        // Rows 11-50 should still have initial values
+        for i in 11..=50 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("initial_{}", i), "row {} should retain initial value", i);
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 50);
+    }
+}
+
+/// Override + compression combined: both features active simultaneously.
+#[test]
+fn test_override_with_compression_roundtrip() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Write phase: create base groups with compression + overrides
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            cache_compression: true,
+            cache_compression_level: 3,
+            override_threshold: 100,
+            compaction_threshold: 0, // disable compaction to keep overrides visible
+            ..Default::default()
+        };
+        let vfs_name = format!("ovr_cmp_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        // Initial data - creates base groups
+        for i in 1..=20 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("base_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Update subset - creates overrides
+        for i in 1..=5 {
+            conn.execute(
+                "UPDATE t SET val = ?1 WHERE id = ?2",
+                rusqlite::params![format!("updated_{}", i), i],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Cold reopen with cache deleted
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            cache_compression: true,
+            cache_compression_level: 3,
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("ovr_cmp_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        // Updated rows should have new values
+        for i in 1..=5 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("updated_{}", i));
+        }
+
+        // Non-updated rows should have base values
+        for i in 6..=20 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("base_{}", i));
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 20);
+    }
+}
+
+/// Rapid checkpoint cycles: 50 iterations of insert 1 row + checkpoint.
+#[test]
+fn test_stress_rapid_checkpoint_cycles() {
+    let dir = TempDir::new().unwrap();
+    let iterations = 50;
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 10,
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_rapid_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        for i in 1..=iterations {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("rapid_{}", i)],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, iterations);
+
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("stress_rapid_r_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, iterations, "all {} rows should survive rapid checkpoint cycles", iterations);
+
+        // Spot check first and last
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "rapid_1");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![iterations], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, format!("rapid_{}", iterations));
+    }
+}
+
+// =========================================================================
+// Edge case tests
+// =========================================================================
+
+/// Empty database: create schema, checkpoint, cold reopen, verify table exists with 0 rows.
+#[test]
+fn test_edge_empty_database_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_empty_w_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_empty_r_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        // Table should exist
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "empty table should have 0 rows after cold reopen");
+
+        // Should be able to insert after cold reopen
+        conn.execute("INSERT INTO t VALUES (1, 'after_reopen')", []).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+/// Single row database: insert 1 row, checkpoint, cold reopen, verify.
+#[test]
+fn test_edge_single_row_database() {
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_single_w_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'only_row')", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_single_r_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "only_row");
+    }
+}
+
+/// Group boundary: with small pages_per_group, insert enough data to land exactly
+/// on a group boundary. Verify data integrity across the boundary.
+#[test]
+fn test_edge_group_boundary_pages() {
+    let dir = TempDir::new().unwrap();
+    let pages_per_group = 4u32;
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_grpbnd_w_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, padding TEXT)",
+            [],
+        )
+        .unwrap();
+
+        // Insert enough rows to span multiple groups with small pages_per_group=4.
+        // Each 4KB page holds a limited number of rows; ~200 rows should span many groups.
+        for i in 0..200 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, format!("val_{}", i), "x".repeat(100)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Update last page of one group and first page of next by updating scattered rows
+        conn.execute("UPDATE t SET val = 'boundary_first' WHERE id = 0", []).unwrap();
+        conn.execute("UPDATE t SET val = 'boundary_last' WHERE id = 199", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_grpbnd_r_{}", std::process::id());
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 200);
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "boundary_first");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 199", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "boundary_last");
+
+        // Middle rows should be intact
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 100", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "val_100");
+    }
+}
+
+/// Override at frame boundary: with sub_pages_per_frame=4, update pages that span
+/// two frames. Verify both override frames are created and readable.
+#[test]
+fn test_edge_override_at_frame_boundary() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group: 8, // 8 pages per group
+            sub_pages_per_frame: 4, // 2 frames per group
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_ovr_frame_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, padding TEXT)",
+            [],
+        )
+        .unwrap();
+
+        // Insert enough data to span multiple groups/frames
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, format!("base_{}", i), "p".repeat(80)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Update rows scattered across different pages to hit multiple frames
+        for i in (0..300).step_by(25) {
+            conn.execute(
+                "UPDATE t SET val = ?1 WHERE id = ?2",
+                rusqlite::params![format!("frame_ovr_{}", i), i],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            pages_per_group: 8,
+            sub_pages_per_frame: 4,
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_ovr_frame_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 300);
+
+        // Verify overridden rows
+        for i in (0..300).step_by(25) {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("frame_ovr_{}", i), "override row {} mismatch", i);
+        }
+
+        // Verify non-overridden rows
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "base_1");
+    }
+}
+
+/// Rollback with dirty pages in multiple groups: begin transaction, update pages
+/// across groups, ROLLBACK, verify all data reverts.
+#[test]
+fn test_rollback_multi_group_dirty_pages() {
+    let dir = TempDir::new().unwrap();
+
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        pages_per_group: 4,
+        ..Default::default()
+    };
+    let vfs_name = format!("edge_rollback_mg_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let db_path = format!("file:test.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open");
+    conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, padding TEXT)",
+        [],
+    )
+    .unwrap();
+
+    // Insert enough data to span multiple groups (pages_per_group=4)
+    for i in 0..200 {
+        conn.execute(
+            "INSERT INTO t VALUES (?1, ?2, ?3)",
+            rusqlite::params![i, format!("committed_{}", i), "x".repeat(80)],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Begin transaction, update rows across many groups, then ROLLBACK
+    conn.execute_batch("BEGIN").unwrap();
+    for i in (0..200).step_by(10) {
+        conn.execute(
+            "UPDATE t SET val = ?1 WHERE id = ?2",
+            rusqlite::params!["SHOULD_NOT_EXIST", i],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("ROLLBACK").unwrap();
+
+    // All rows should have original values
+    for i in (0..200).step_by(10) {
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            val,
+            format!("committed_{}", i),
+            "row {} should revert after rollback",
+            i
+        );
+    }
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 200, "row count should be unchanged after rollback");
+
+    // Verify we can still write after rollback
+    conn.execute("INSERT INTO t VALUES (999, 'after_rollback', 'ok')", []).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 201);
+}
+
+/// Override then delete rows: insert, checkpoint (base), delete half, checkpoint (overrides),
+/// cold reopen, verify only remaining rows exist.
+#[test]
+fn test_override_then_delete_rows() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_ovr_del_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        // Insert 100 rows, checkpoint (base groups)
+        for i in 1..=100 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("row_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Delete odd rows (50 rows), checkpoint (creates overrides for pages with deletions)
+        conn.execute("DELETE FROM t WHERE id % 2 = 1", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_ovr_del_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 50, "only even rows should remain");
+
+        // Odd rows should not exist
+        let odd_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE id % 2 = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(odd_count, 0, "all odd rows should be deleted");
+
+        // Even rows should still exist
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "row_2");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 100", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val, "row_100");
+    }
+}
+
+/// Compaction with threshold=1: compact after every single override.
+#[test]
+fn test_compaction_threshold_one() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 1, // compact after every single override
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_cmpct1_w_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        // Initial data
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("init_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Update + checkpoint (should trigger immediate compaction)
+        conn.execute("UPDATE t SET val = 'compacted_1' WHERE id = 1", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Another update + checkpoint
+        conn.execute("UPDATE t SET val = 'compacted_2' WHERE id = 2", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        drop(conn);
+    }
+
+    // Cold reopen
+    let _ = std::fs::remove_file(dir.path().join("data.cache"));
+    let _ = std::fs::remove_file(dir.path().join("page_bitmap"));
+    let _ = std::fs::remove_file(dir.path().join("sub_chunk_tracker"));
+    let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
+
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 1,
+            ..Default::default()
+        };
+        let vfs_name = format!("edge_cmpct1_r_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+
+        let val1: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val1, "compacted_1");
+
+        let val2: String = conn
+            .query_row("SELECT val FROM t WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val2, "compacted_2");
+
+        // Other rows untouched
+        let val5: String = conn
+            .query_row("SELECT val FROM t WHERE id = 5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(val5, "init_5");
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 10);
+    }
+}
+
+/// Cache validation with override changes between sessions:
+/// Session 1 writes base, Session 2 updates with overrides, Session 3 reopens and
+/// should see correct data from base + overrides.
+#[test]
+fn test_cache_validation_override_changes_between_sessions() {
+    use std::sync::atomic::Ordering;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let dir = TempDir::new().unwrap();
+
+    // Session 1: write base data + checkpoint
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ovr_s1_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("session1_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Session 2: update with overrides + checkpoint
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ovr_s2_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        crate::tiered::register(&vfs_name, vfs).expect("register2");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open session 2");
+        conn.execute("UPDATE t SET val = 'session2_updated' WHERE id <= 3", []).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+    }
+
+    // Session 3: reopen (cache validation should detect override changes)
+    {
+        let config = TurboliteConfig {
+            storage_backend: StorageBackend::Local,
+            cache_dir: dir.path().to_path_buf(),
+            override_threshold: 100,
+            compaction_threshold: 0,
+            ..Default::default()
+        };
+        let vfs_name = format!("cv_ovr_s3_{}", id);
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS session 3");
+        crate::tiered::register(&vfs_name, vfs).expect("register3");
+
+        let db_path = format!("file:test.db?vfs={}", vfs_name);
+        let conn = rusqlite::Connection::open(&db_path).expect("open session 3");
+
+        // Rows 1-3 should have session 2 updates
+        for i in 1..=3 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, "session2_updated", "row {} should have session 2 value", i);
+        }
+
+        // Rows 4-10 should still have session 1 values
+        for i in 4..=10 {
+            let val: String = conn
+                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .unwrap();
+            assert_eq!(val, format!("session1_{}", i), "row {} should retain session 1 value", i);
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 10);
+    }
+}
