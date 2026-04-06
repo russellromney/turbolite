@@ -684,6 +684,15 @@ impl TurboliteVfs {
             self.cache.evict_group(*gid);
         }
 
+        // Write page 0 to local cache from manifest. This gives SQLite the
+        // correct database header (page count, schema cookie) immediately,
+        // without needing an S3 fetch or connection reopen.
+        if let Some(ref page0) = manifest.db_header {
+            let _ = self.cache.write_page(0, page0);
+            // Note: we only write page 0, not the full group. Don't mark the
+            // group as Present since other pages in the group may not be cached.
+        }
+
         // Update page_count atomic
         self.page_count.store(manifest.page_count, Ordering::Release);
 

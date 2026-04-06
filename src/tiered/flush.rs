@@ -598,6 +598,7 @@ fn flush_inner(
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: old_manifest.db_header.clone(),
         };
         m.build_page_index();
         m

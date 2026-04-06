@@ -2204,6 +2204,19 @@ impl DatabaseHandle for TurboliteHandle {
 
             // Build and publish new manifest
             let old_manifest = manifest_snap;
+            // Capture full page 0 for multiwriter catch-up
+            let ps = *self.page_size.read();
+            let db_header = if ps > 0 {
+                let mut page0 = vec![0u8; ps as usize];
+                if cache.read_page(0, &mut page0).is_ok() {
+                    Some(page0)
+                } else {
+                    old_manifest.db_header.clone()
+                }
+            } else {
+                None
+            };
+
             let mut new_manifest = Manifest {
                 version: next_version,
                 change_counter,
@@ -2224,6 +2237,7 @@ impl DatabaseHandle for TurboliteHandle {
                 page_to_tree_name: HashMap::new(),
                 tree_name_to_groups: HashMap::new(),
                 group_to_tree_name: HashMap::new(),
+                db_header,
             };
             new_manifest.build_page_index();
             s3.put_manifest(&new_manifest)?;
@@ -2845,6 +2859,18 @@ impl DatabaseHandle for TurboliteHandle {
 
         // Update manifest atomically
         let old_manifest = self.manifest.read().clone();
+        // Capture page 1 header (first 100 bytes) for multiwriter catch-up
+        let db_header = if old_manifest.page_size > 0 {
+            let mut hdr = vec![0u8; 100];
+            if cache.read_page(0, &mut hdr).is_ok() {
+                Some(hdr[..100].to_vec())
+            } else {
+                old_manifest.db_header.clone()
+            }
+        } else {
+            None
+        };
+
         let mut new_manifest = Manifest {
             version: next_version,
             change_counter,
@@ -2878,6 +2904,7 @@ impl DatabaseHandle for TurboliteHandle {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header,
         };
         new_manifest.build_page_index();
         s3.put_manifest(&new_manifest)?;
