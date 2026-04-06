@@ -46,7 +46,7 @@ impl S3Client {
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
         if let Some(endpoint) = &config.endpoint_url {
             eprintln!("[s3] setting endpoint: {}", endpoint);
-            s3_config = s3_config.endpoint_url(endpoint);
+            s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
         } else {
             eprintln!("[s3] using default AWS S3 endpoint");
         }

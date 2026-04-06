@@ -31,4 +31,6 @@ mod tiered {
     mod wal_integration;
     mod zenith;
     mod drift;
+    mod oracle_s3;
+    mod crash_flush;
 }

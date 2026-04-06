@@ -1,0 +1,34 @@
+[package]
+name = "turbolite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.turbolite]
+path = ".."
+
+[dependencies.rmp-serde]
+version = "1"
+
+[dependencies.serde_json]
+version = "1"
+
+[[bin]]
+name = "manifest_parse"
+path = "fuzz_targets/manifest_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vfs_operations"
+path = "fuzz_targets/vfs_operations.rs"
+test = false
+doc = false
+bench = false
