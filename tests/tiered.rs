@@ -33,4 +33,5 @@ mod tiered {
     mod drift;
     mod oracle_s3;
     mod crash_flush;
+    mod concurrent_eviction;
 }
