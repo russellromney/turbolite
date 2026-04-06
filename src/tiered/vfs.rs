@@ -840,7 +840,7 @@ impl Vfs for TurboliteVfs {
                 }
             }
 
-            Ok(TurboliteHandle::new_tiered(
+            TurboliteHandle::new_tiered(
                 self.s3.clone(),
                 if self.storage.is_local() { Some(Arc::clone(&self.storage)) } else { None },
                 Arc::clone(&self.cache),
@@ -865,7 +865,7 @@ impl Vfs for TurboliteVfs {
                 self.config.max_cache_bytes,
                 self.config.evict_on_checkpoint,
                 self.config.jena_enabled,
-            ))
+            )
         } else {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;

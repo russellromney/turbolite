@@ -143,7 +143,7 @@ impl TurboliteHandle {
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
         jena_enabled: bool,
-    ) -> Self {
+    ) -> io::Result<Self> {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = shared_manifest.read().clone();
         let page_size = manifest.page_size;
@@ -243,7 +243,10 @@ impl TurboliteHandle {
                                         cache.mark_interior_group(loc.group_id, *pnum, loc.index);
                                     }
                                 }
-                                Err(e) => eprintln!("[tiered] interior chunk {} decode failed: {}", key, e),
+                                Err(e) => {
+                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                        format!("interior chunk {} decode failed: {}", key, e)));
+                                }
                             }
                         }
                         eprintln!(
@@ -251,54 +254,56 @@ impl TurboliteHandle {
                             total_pages, results.len(), total_bytes as f64 / 1024.0,
                         );
                     }
-                    Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
+                    Err(e) => {
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("interior chunk fetch failed: {}", e)));
+                    }
                 }
             }
 
-            // Index leaf bundles: lazy-aggressive background fetch
+            // Index leaf bundles: synchronous fetch (errors must surface on open)
             let index_already_cached = !cache.index_pages.lock().is_empty();
             if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
-                let cache_bg = Arc::clone(&cache);
-                let s3_bg = Arc::clone(s3_ref);
                 let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-                #[cfg(feature = "zstd")]
-                let dict_bg = dictionary.map(|d| d.to_vec());
                 let n_chunks = chunk_keys.len();
-                let encryption_key_bg = encryption_key;
-                eprintln!("[tiered] scheduling {} index leaf chunks for background fetch...", n_chunks);
-                std::thread::spawn(move || {
-                    match s3_bg.get_page_groups_by_key(&chunk_keys) {
-                        Ok(results) => {
-                            #[cfg(feature = "zstd")]
-                            let ix_decoder = dict_bg.as_deref().map(zstd::dict::DecoderDictionary::copy);
-                            let mut total_pages = 0usize;
-                            let mut total_bytes = 0usize;
-                            for (key, data) in &results {
-                                total_bytes += data.len();
-                                match decode_interior_bundle(
-                                    data,
-                                    #[cfg(feature = "zstd")]
-                                    ix_decoder.as_ref(),
-                                    encryption_key_bg.as_ref(),
-                                ) {
-                                    Ok(pages) => {
-                                        total_pages += pages.len();
-                                        for (pnum, pdata) in &pages {
-                                            let _ = cache_bg.write_page(*pnum, pdata);
-                                            cache_bg.index_pages.lock().insert(*pnum);
-                                        }
+                eprintln!("[tiered] fetching {} index leaf chunks...", n_chunks);
+                match s3_ref.get_page_groups_by_key(&chunk_keys) {
+                    Ok(results) => {
+                        #[cfg(feature = "zstd")]
+                        let ix_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
+                        let mut total_pages = 0usize;
+                        let mut total_bytes = 0usize;
+                        for (key, data) in &results {
+                            total_bytes += data.len();
+                            match decode_interior_bundle(
+                                data,
+                                #[cfg(feature = "zstd")]
+                                ix_decoder.as_ref(),
+                                encryption_key.as_ref(),
+                            ) {
+                                Ok(pages) => {
+                                    total_pages += pages.len();
+                                    for (pnum, pdata) in &pages {
+                                        let _ = cache.write_page(*pnum, pdata);
+                                        cache.index_pages.lock().insert(*pnum);
                                     }
-                                    Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                                }
+                                Err(e) => {
+                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                        format!("index chunk {} decode failed: {}", key, e)));
                                 }
                             }
-                            eprintln!(
-                                "[tiered] index leaf chunks loaded (background): {} pages from {} chunks ({:.1}KB total)",
-                                total_pages, results.len(), total_bytes as f64 / 1024.0,
-                            );
                         }
-                        Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
+                        eprintln!(
+                            "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
+                            total_pages, results.len(), total_bytes as f64 / 1024.0,
+                        );
                     }
-                });
+                    Err(e) => {
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("index chunk fetch failed: {}", e)));
+                    }
+                }
             } else if index_already_cached {
                 eprintln!(
                     "[tiered] index pages already cached ({} pages), skipping chunk fetch",
@@ -337,7 +342,7 @@ impl TurboliteHandle {
             interior_map::InteriorMap::default()
         };
 
-        Self {
+        Ok(Self {
             s3,
             storage,
             cache: Some(cache),
@@ -385,7 +390,7 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
-        }
+        })
     }
 
     /// Create a passthrough handle for WAL/journal files (local file I/O).
