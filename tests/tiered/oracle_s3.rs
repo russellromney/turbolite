@@ -135,7 +135,7 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     // But we can't access the VFS after registration easily.
     // The checkpoint in WAL mode with Durable sync already uploads.
     // For LTF, the data won't be in S3 until flush -- skip cold read for LTF.
-    let skip_cold_read = matches!(mode, TestMode::CompressedLocalFlush);
+    let skip_cold_read = !mode.supports_cold_read();
 
     // Verify S3 manifest exists (except LTF which doesn't upload on checkpoint)
     if !skip_cold_read {
@@ -286,44 +286,14 @@ fn run_oracle_incremental(mode: TestMode) {
     assert_eq!(integrity, "ok", "[{}] integrity failed", mode.name());
 }
 
-// --- Parameterized tests across all modes ---
+// --- Parameterized tests: oracle x all mode combinations ---
 
 #[test]
-fn oracle_s3_compressed() {
-    run_oracle_write_checkpoint_cold_read(TestMode::Compressed);
+fn oracle_write_checkpoint_cold_read_all_modes() {
+    run_across_all_s3(run_oracle_write_checkpoint_cold_read);
 }
 
 #[test]
-fn oracle_s3_compressed_encrypted() {
-    run_oracle_write_checkpoint_cold_read(TestMode::CompressedEncrypted);
-}
-
-#[test]
-fn oracle_s3_plain() {
-    run_oracle_write_checkpoint_cold_read(TestMode::Plain);
-}
-
-#[test]
-fn oracle_s3_local_then_flush() {
-    run_oracle_write_checkpoint_cold_read(TestMode::CompressedLocalFlush);
-}
-
-#[test]
-fn oracle_s3_incremental_compressed() {
-    run_oracle_incremental(TestMode::Compressed);
-}
-
-#[test]
-fn oracle_s3_incremental_encrypted() {
-    run_oracle_incremental(TestMode::CompressedEncrypted);
-}
-
-#[test]
-fn oracle_s3_incremental_plain() {
-    run_oracle_incremental(TestMode::Plain);
-}
-
-#[test]
-fn oracle_s3_incremental_local_flush() {
-    run_oracle_incremental(TestMode::CompressedLocalFlush);
+fn oracle_incremental_all_modes() {
+    run_across_all_s3(run_oracle_incremental);
 }
