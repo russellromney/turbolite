@@ -2859,11 +2859,12 @@ impl DatabaseHandle for TurboliteHandle {
 
         // Update manifest atomically
         let old_manifest = self.manifest.read().clone();
-        // Capture page 1 header (first 100 bytes) for multiwriter catch-up
-        let db_header = if old_manifest.page_size > 0 {
-            let mut hdr = vec![0u8; 100];
-            if cache.read_page(0, &mut hdr).is_ok() {
-                Some(hdr[..100].to_vec())
+        // Capture full page 0 for multiwriter catch-up
+        let ps = *self.page_size.read();
+        let db_header = if ps > 0 {
+            let mut page0 = vec![0u8; ps as usize];
+            if cache.read_page(0, &mut page0).is_ok() {
+                Some(page0)
             } else {
                 old_manifest.db_header.clone()
             }
