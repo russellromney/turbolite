@@ -132,6 +132,14 @@ pub(crate) fn unlock_all_inprocess(path: &Path, conn_id: u64) {
     }
 }
 
+/// Release all in-process locks for a specific database path.
+/// Call after closing a connection to ensure the lock is released
+/// before reopening. More targeted than clear_all_caches().
+pub fn release_locks_for(path: &Path) {
+    let mut map = IN_PROCESS_LOCKS.lock();
+    map.remove(path);
+}
+
 // SQLite WAL-index lock byte offset (in the -shm file)
 // Locks are at bytes 120-127 in the WAL-index header
 const WAL_LOCK_OFFSET: u64 = 120;
