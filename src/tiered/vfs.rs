@@ -672,7 +672,7 @@ impl TurboliteVfs {
         let new_keys = &manifest.page_group_keys;
         let max_len = std::cmp::max(old_keys.len(), new_keys.len());
         // Collect changed groups first, then evict (avoids lock re-entry)
-        let changed_groups: Vec<u64> = (0..max_len)
+        let mut changed_groups: Vec<u64> = (0..max_len)
             .filter(|&gid| {
                 let old_key = old_keys.get(gid).map(|s| s.as_str());
                 let new_key = new_keys.get(gid).map(|s| s.as_str());
@@ -680,6 +680,24 @@ impl TurboliteVfs {
             })
             .map(|gid| gid as u64)
             .collect();
+        // Also check subframe_overrides: S3Primary uploads overrides rather than
+        // new page groups. If overrides changed, those groups need eviction too.
+        let old_version = {
+            let old = self.shared_manifest.read();
+            old.version
+        };
+        if manifest.version != old_version && manifest.version > 0 {
+            // Version changed: evict ALL groups with overrides in the new manifest
+            for (gid, ovs) in manifest.subframe_overrides.iter().enumerate() {
+                if !ovs.is_empty() && !changed_groups.contains(&(gid as u64)) {
+                    changed_groups.push(gid as u64);
+                }
+            }
+        }
+
+        if !changed_groups.is_empty() {
+            eprintln!("[set_manifest] evicting {} changed groups", changed_groups.len());
+        }
         for gid in &changed_groups {
             self.cache.evict_group(*gid);
         }
