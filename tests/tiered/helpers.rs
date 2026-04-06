@@ -47,66 +47,120 @@ pub fn endpoint_url() -> String {
         .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
-/// Named test mode: controls compression, encryption, and sync behavior.
-#[derive(Debug, Clone, Copy)]
-pub enum TestMode {
-    /// zstd compression, no encryption, Durable sync (default production mode)
-    Compressed,
-    /// zstd compression + AES-256-GCM encryption
-    CompressedEncrypted,
-    /// No compression, no encryption (baseline)
-    Plain,
-    /// zstd compression, LocalThenFlush sync (deferred S3 upload)
-    CompressedLocalFlush,
+/// Storage tier: local-only (no S3) or S3-backed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageTier {
+    /// Pure local storage, no S3 dependency.
+    Local,
+    /// S3-backed with Durable sync (checkpoint uploads to S3).
+    S3Durable,
+    /// S3-backed with LocalThenFlush (checkpoint writes locally, explicit flush uploads).
+    S3LocalThenFlush,
 }
 
+/// Test mode: combinatorial product of storage x compression x encryption.
+/// 3 storage tiers x 2 compression x 2 encryption = 12 combinations.
+#[derive(Debug, Clone, Copy)]
+pub struct TestMode {
+    pub storage: StorageTier,
+    pub compressed: bool,
+    pub encrypted: bool,
+}
+
+/// Deterministic test encryption key (NOT for production).
+const TEST_ENCRYPTION_KEY: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
 impl TestMode {
-    /// All modes to test. Use in parameterized tests.
-    pub fn all() -> &'static [TestMode] {
-        &[
-            TestMode::Compressed,
-            TestMode::CompressedEncrypted,
-            TestMode::Plain,
-            TestMode::CompressedLocalFlush,
-        ]
+    /// All 12 combinations.
+    pub fn all() -> Vec<TestMode> {
+        let mut modes = Vec::new();
+        for &storage in &[StorageTier::Local, StorageTier::S3Durable, StorageTier::S3LocalThenFlush] {
+            for &compressed in &[false, true] {
+                for &encrypted in &[false, true] {
+                    modes.push(TestMode { storage, compressed, encrypted });
+                }
+            }
+        }
+        modes
     }
 
-    pub fn name(&self) -> &'static str {
-        match self {
-            TestMode::Compressed => "zstd",
-            TestMode::CompressedEncrypted => "zstd_enc",
-            TestMode::Plain => "plain",
-            TestMode::CompressedLocalFlush => "zstd_ltf",
-        }
+    /// S3 modes only (Durable + LTF). For tests that need S3.
+    pub fn s3_modes() -> Vec<TestMode> {
+        Self::all().into_iter().filter(|m| m.storage != StorageTier::Local).collect()
+    }
+
+    /// S3 Durable modes only. For tests that need cold-read from S3.
+    pub fn s3_durable_modes() -> Vec<TestMode> {
+        Self::all().into_iter().filter(|m| m.storage == StorageTier::S3Durable).collect()
+    }
+
+    /// Short name for test output and unique prefixes.
+    pub fn name(&self) -> String {
+        let stor = match self.storage {
+            StorageTier::Local => "local",
+            StorageTier::S3Durable => "s3",
+            StorageTier::S3LocalThenFlush => "s3ltf",
+        };
+        let comp = if self.compressed { "_zstd" } else { "_plain" };
+        let enc = if self.encrypted { "_enc" } else { "" };
+        format!("{}{}{}", stor, comp, enc)
     }
 
     /// Apply this mode's settings to a TurboliteConfig.
     pub fn apply(&self, config: &mut TurboliteConfig) {
-        match self {
-            TestMode::Compressed => {
-                config.compression_level = 3;
+        config.compression_level = if self.compressed { 3 } else { 0 };
+
+        if self.encrypted {
+            #[cfg(feature = "encryption")]
+            {
+                config.encryption_key = Some(TEST_ENCRYPTION_KEY);
             }
-            TestMode::CompressedEncrypted => {
-                config.compression_level = 3;
-                #[cfg(feature = "encryption")]
-                {
-                    // Deterministic test key (NOT for production)
-                    config.encryption_key = Some([
-                        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-                        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-                        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-                    ]);
-                }
+        }
+
+        match self.storage {
+            StorageTier::Local => {
+                // Local mode: no S3 fields needed, test_config already sets them
+                // but we override to local-only by clearing bucket
             }
-            TestMode::Plain => {
-                config.compression_level = 0;
+            StorageTier::S3Durable => {
+                // Default sync_mode is Durable, no change needed
             }
-            TestMode::CompressedLocalFlush => {
-                config.compression_level = 3;
+            StorageTier::S3LocalThenFlush => {
                 config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
             }
         }
+    }
+
+    pub fn is_s3(&self) -> bool {
+        self.storage != StorageTier::Local
+    }
+
+    pub fn supports_cold_read(&self) -> bool {
+        self.storage == StorageTier::S3Durable
+    }
+}
+
+/// Macro to generate one #[test] fn per TestMode for a given test body function.
+/// Usage: `mode_tests!(test_fn_name, run_fn, modes_fn);`
+/// Run a test function across all S3 Durable mode combinations.
+/// Panics with mode name on failure.
+pub fn run_across_s3_durable(f: impl Fn(TestMode)) {
+    for mode in TestMode::s3_durable_modes() {
+        eprintln!("--- running mode: {} ---", mode.name());
+        f(mode);
+    }
+}
+
+/// Run a test function across all S3 mode combinations (Durable + LTF).
+pub fn run_across_all_s3(f: impl Fn(TestMode)) {
+    for mode in TestMode::s3_modes() {
+        eprintln!("--- running mode: {} ---", mode.name());
+        f(mode);
     }
 }
 

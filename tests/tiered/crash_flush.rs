@@ -244,17 +244,19 @@ fn run_large_dataset(mode: TestMode) {
     assert_eq!(integrity, "ok", "[{}] large dataset integrity failed", mode.name());
 }
 
-// --- Parameterized tests: crash recovery x mode ---
-// Skip LocalThenFlush for cold-read tests (checkpoint doesn't upload to S3 in LTF mode)
+// --- Parameterized tests: crash recovery x all S3 Durable mode combinations ---
 
-#[test] fn crash_incremental_compressed() { run_crash_incremental(TestMode::Compressed); }
-#[test] fn crash_incremental_encrypted() { run_crash_incremental(TestMode::CompressedEncrypted); }
-#[test] fn crash_incremental_plain() { run_crash_incremental(TestMode::Plain); }
+#[test]
+fn crash_incremental_all_modes() {
+    run_across_s3_durable(run_crash_incremental);
+}
 
-#[test] fn crash_uncommitted_compressed() { run_uncommitted_not_visible(TestMode::Compressed); }
-#[test] fn crash_uncommitted_encrypted() { run_uncommitted_not_visible(TestMode::CompressedEncrypted); }
-#[test] fn crash_uncommitted_plain() { run_uncommitted_not_visible(TestMode::Plain); }
+#[test]
+fn crash_uncommitted_all_modes() {
+    run_across_s3_durable(run_uncommitted_not_visible);
+}
 
-#[test] fn crash_large_compressed() { run_large_dataset(TestMode::Compressed); }
-#[test] fn crash_large_encrypted() { run_large_dataset(TestMode::CompressedEncrypted); }
-#[test] fn crash_large_plain() { run_large_dataset(TestMode::Plain); }
+#[test]
+fn crash_large_all_modes() {
+    run_across_s3_durable(run_large_dataset);
+}
