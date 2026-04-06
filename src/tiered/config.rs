@@ -156,9 +156,13 @@ pub struct TurboliteConfig {
     pub pages_per_group: u32,
     /// **Cloud-only.** AWS region (default "us-east-1"). Ignored in local mode.
     pub region: Option<String>,
-    /// TTL for cached page groups in seconds (default 3600 = 1 hour).
-    /// Page groups not accessed within this window are evicted from local NVMe.
-    /// Interior page groups (B-tree internal nodes) are pinned permanently.
+    /// TTL for cached page groups in seconds (default 0 = no automatic eviction).
+    /// When set to a positive value, page groups not accessed within this window
+    /// are evicted from local NVMe. Interior pages (B-tree nodes) are pinned permanently.
+    ///
+    /// Eviction forces re-fetch from S3 on next read (250ms+ latency spike).
+    /// Use 0 (disabled) for write-heavy workloads. Set to 3600 (1 hour) or higher
+    /// for long-running processes with large databases where NVMe space is limited.
     pub cache_ttl_secs: u64,
     /// **Cloud-only.** Prefetch schedule for SEARCH queries (BTreeAware strategy).
     /// Default [0.3, 0.3, 0.4]. Ignored in local mode.
@@ -257,14 +261,14 @@ impl Default for TurboliteConfig {
             bucket: String::new(),
             prefix: String::new(),
             cache_dir: PathBuf::from("/tmp/turbolite-cache"),
-            compression_level: 1,
+            compression_level: 3,
             endpoint_url: None,
             read_only: false,
             #[cfg(feature = "cloud")]
             runtime_handle: None,
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             region: None,
-            cache_ttl_secs: 3600,
+            cache_ttl_secs: 0,
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             prefetch_threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
