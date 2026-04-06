@@ -715,6 +715,13 @@ impl TurboliteVfs {
         }
     }
 
+    /// Get the path to the raw cache file (data.cache). This is the file that
+    /// stores SQLite pages at page_num * page_size offsets. External processes
+    /// (walrust) can read/write this file directly for snapshot/restore.
+    pub fn cache_file_path(&self) -> PathBuf {
+        self.config.cache_dir.join("data.cache")
+    }
+
     /// Sync VFS state after an external process (walrust restore) wrote pages
     /// directly to the cache file. Marks all pages as present in the bitmap
     /// and updates the page_count atomic.
