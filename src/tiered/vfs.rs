@@ -667,27 +667,43 @@ impl TurboliteVfs {
 
         // Invalidate cache entries for groups whose page_group_keys changed.
         // Compare old vs new: any group whose key differs (or is new/removed)
-        // gets reset to GroupState::None so the VFS refetches from S3.
+        // gets evicted from local cache (bitmap cleared, group state reset)
+        // so the VFS refetches from S3 on next read.
         let new_keys = &manifest.page_group_keys;
         let max_len = std::cmp::max(old_keys.len(), new_keys.len());
-        if max_len > 0 {
-            let states = self.cache.group_states.lock();
-            for gid in 0..max_len {
+        // Collect changed groups first, then evict (avoids lock re-entry)
+        let changed_groups: Vec<u64> = (0..max_len)
+            .filter(|&gid| {
                 let old_key = old_keys.get(gid).map(|s| s.as_str());
                 let new_key = new_keys.get(gid).map(|s| s.as_str());
-                if old_key != new_key {
-                    if let Some(s) = states.get(gid) {
-                        s.store(GroupState::None as u8, Ordering::Release);
-                    }
-                }
-            }
+                old_key != new_key
+            })
+            .map(|gid| gid as u64)
+            .collect();
+        for gid in &changed_groups {
+            self.cache.evict_group(*gid);
         }
 
         // Update page_count atomic
         self.page_count.store(manifest.page_count, Ordering::Release);
 
         // Write manifest to shared state
-        *self.shared_manifest.write() = manifest;
+        *self.shared_manifest.write() = manifest.clone();
+
+        // Persist to local disk so the next Connection::open -> load_manifest()
+        // picks up the new manifest instead of reading a stale local copy.
+        let local = super::manifest::LocalManifest {
+            manifest,
+            dirty_groups: Vec::new(),
+        };
+        if let Err(e) = local.persist(&self.config.cache_dir) {
+            eprintln!("[set_manifest] warning: failed to persist manifest locally: {}", e);
+        }
+
+        // Persist bitmap changes from eviction
+        if let Err(e) = self.cache.persist_bitmap() {
+            eprintln!("[set_manifest] warning: failed to persist bitmap: {}", e);
+        }
     }
 }
 
