@@ -645,6 +645,24 @@ impl TurboliteVfs {
         self.shared_manifest.read().clone()
     }
 
+    /// Fetch the latest manifest from S3 and apply it via set_manifest.
+    /// Returns the new manifest version, or None if no manifest exists in S3.
+    /// Used by HA followers to catch up from the leader's turbolite state.
+    #[cfg(feature = "cloud")]
+    pub fn fetch_and_apply_s3_manifest(&self) -> std::io::Result<Option<u64>> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "no S3 client (cloud feature required)")
+        })?;
+        match s3.get_manifest()? {
+            Some(manifest) => {
+                let version = manifest.version;
+                self.set_manifest(manifest);
+                Ok(Some(version))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Update the internal manifest from external state (e.g. haqlite catch-up).
     ///
     /// Rebuilds page_index and normalizes strategy, updates the disk cache's
