@@ -2096,6 +2096,46 @@ impl DatabaseHandle for TurboliteHandle {
                         let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
                         let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
 
+                        // Pre-fetch the existing frame data for pages not in cache.
+                        // Without this, evicted pages (e.g., after set_manifest) would
+                        // be zeroed in the override, silently corrupting the database.
+                        let existing_frame_data: Option<Vec<u8>> = {
+                            let needs_merge = (frame_start..frame_end).any(|pos| {
+                                pos < pages_in_group.len()
+                                    && pages_in_group[pos] < page_count
+                                    && !cache.is_present(pages_in_group[pos])
+                            });
+                            if needs_merge {
+                                // Try existing override first, then base page group
+                                let existing_ovr = manifest_snap.subframe_overrides
+                                    .get(gid as usize)
+                                    .and_then(|ovs| ovs.get(&frame_idx));
+                                if let Some(ovr) = existing_ovr {
+                                    s3.get_page_group(&ovr.key).ok().flatten()
+                                        .and_then(|data| decode_seekable_subchunk(
+                                            &data,
+                                            #[cfg(feature = "zstd")]
+                                            self.decoder_dict.as_ref(),
+                                            self.encryption_key.as_ref(),
+                                        ).ok())
+                                } else if let Some(base_key) = manifest_snap.page_group_keys.get(gid as usize) {
+                                    if !base_key.is_empty() {
+                                        let ft = frame_table_ref.expect("seekable path requires frame table");
+                                        if frame_idx < ft.len() {
+                                            let entry = &ft[frame_idx];
+                                            s3.range_get(base_key, entry.offset, entry.len).ok().flatten()
+                                                .and_then(|data| decode_seekable_subchunk(
+                                                    &data,
+                                                    #[cfg(feature = "zstd")]
+                                                    self.decoder_dict.as_ref(),
+                                                    self.encryption_key.as_ref(),
+                                                ).ok())
+                                        } else { None }
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        };
+
                         for pos in frame_start..frame_end {
                             if pos >= pages_in_group.len() { break; }
                             let pnum = pages_in_group[pos];
@@ -2103,7 +2143,21 @@ impl DatabaseHandle for TurboliteHandle {
                             let mut buf = vec![0u8; page_size as usize];
                             if cache.read_page(pnum, &mut buf).is_ok() {
                                 frame_pages.push((pnum, buf));
+                            } else if let Some(ref existing) = existing_frame_data {
+                                // Page evicted from cache: use existing S3 data
+                                let offset_in_frame = (pos - frame_start) * page_size as usize;
+                                let end = offset_in_frame + page_size as usize;
+                                if end <= existing.len() {
+                                    buf.copy_from_slice(&existing[offset_in_frame..end]);
+                                }
+                                frame_pages.push((pnum, buf));
                             } else {
+                                // No cache, no S3 fallback. This should not happen
+                                // in normal operation. Log and use zeros as last resort.
+                                eprintln!(
+                                    "[sync:s3primary] WARNING: page {} not in cache and no S3 fallback for gid={} frame={}",
+                                    pnum, gid, frame_idx
+                                );
                                 frame_pages.push((pnum, vec![0u8; page_size as usize]));
                             }
                         }
