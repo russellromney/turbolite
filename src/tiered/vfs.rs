@@ -286,8 +286,8 @@ impl TurboliteVfs {
     }
 
     /// Load manifest based on ManifestSource config.
-    /// Returns (manifest, recovered_dirty_groups).
-    fn load_manifest(&self) -> io::Result<(Manifest, Vec<u64>)> {
+    /// Returns (manifest, recovered_dirty_groups, was_warm_reconnect).
+    fn load_manifest(&self) -> io::Result<(Manifest, Vec<u64>, bool)> {
         let existing = self.shared_manifest.read();
         let has_loaded = existing.page_count > 0 || existing.version > 0;
         drop(existing);
@@ -298,7 +298,7 @@ impl TurboliteVfs {
                 if has_loaded {
                     let m = self.shared_manifest.read().clone();
                     eprintln!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
-                    return Ok((m, Vec::new()));
+                    return Ok((m, Vec::new(), true));
                 }
                 // Try local manifest first
                 if let Some(local) = manifest::LocalManifest::load(&self.config.cache_dir)? {
@@ -309,19 +309,19 @@ impl TurboliteVfs {
                     );
                     let mut m = local.manifest;
                     m.build_page_index();
-                    return Ok((m, dirty));
+                    return Ok((m, dirty, false));
                 }
                 // Fall back to storage (S3 or local)
                 eprintln!("[tiered] no local manifest, fetching from storage...");
                 let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
                 eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
-                Ok((m, Vec::new()))
+                Ok((m, Vec::new(), false))
             }
             ManifestSource::S3 => {
                 eprintln!("[tiered] fetching manifest from storage (manifest_source=S3)...");
                 let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
                 eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
-                Ok((m, Vec::new()))
+                Ok((m, Vec::new(), false))
             }
         }
     }
@@ -687,6 +687,21 @@ impl TurboliteVfs {
         // Compare old vs new: any group whose key differs (or is new/removed)
         // gets evicted from local cache (bitmap cleared, group state reset)
         // so the VFS refetches from S3 on next read.
+        //
+        // Special case: if the old manifest was empty (version 0), the cache may
+        // contain stale pages from schema creation during HA follower join.
+        // Clear ALL pages in this case since we can't diff page group keys.
+        let old_version = {
+            let old = self.shared_manifest.read();
+            old.version
+        };
+        if old_version == 0 && manifest.page_count > 0 {
+            eprintln!("[set_manifest] first manifest apply (v0 -> v{}): full cache clear ({} pages)",
+                manifest.version, manifest.page_count);
+            let all_pages: Vec<u64> = (0..manifest.page_count).collect();
+            self.cache.clear_pages_from_disk(&all_pages);
+        }
+
         let new_keys = &manifest.page_group_keys;
         let max_len = std::cmp::max(old_keys.len(), new_keys.len());
         // Collect changed groups first, then evict (avoids lock re-entry)
@@ -714,10 +729,21 @@ impl TurboliteVfs {
         }
 
         if !changed_groups.is_empty() {
-            eprintln!("[set_manifest] evicting {} changed groups", changed_groups.len());
+            eprintln!("[set_manifest] evicting {} changed groups (old_keys={}, new_keys={}): {:?}",
+                changed_groups.len(), old_keys.len(), new_keys.len(), changed_groups);
         }
         for gid in &changed_groups {
             self.cache.evict_group(*gid);
+        }
+        // Debug: verify eviction worked
+        if !changed_groups.is_empty() {
+            let present: Vec<u64> = (0..manifest.page_count)
+                .filter(|&p| self.cache.is_present(p))
+                .collect();
+            if !present.is_empty() {
+                eprintln!("[set_manifest] WARNING: after eviction, {} pages still present in cache: {:?}",
+                    present.len(), &present[..std::cmp::min(10, present.len())]);
+            }
         }
 
         // Write page 0 to local cache from manifest. This gives SQLite the
@@ -781,7 +807,7 @@ impl Vfs for TurboliteVfs {
 
         if matches!(opts.kind, OpenKind::MainDb) {
             // Phase Gallipoli: load manifest from local disk or S3 based on config.
-            let (mut manifest, recovered_dirty_groups) = self.load_manifest()?;
+            let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
 
             let ppg = if manifest.pages_per_group > 0 {
@@ -859,8 +885,12 @@ impl Vfs for TurboliteVfs {
                 self.cache.ensure_group_capacity(manifest.group_pages.len());
             }
 
-            // Update shared manifest
-            *self.shared_manifest.write() = manifest;
+            // Update shared manifest. Skip on warm reconnect: the manifest is
+            // already in shared state, and writing our clone back would race
+            // with set_manifest calls from HA follower catch-up threads.
+            if !warm_reconnect {
+                *self.shared_manifest.write() = manifest;
+            }
 
             // Recover dirty groups from local manifest (LocalThenFlush crash recovery)
             if !recovered_dirty_groups.is_empty() {
