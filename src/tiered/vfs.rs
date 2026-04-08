@@ -735,14 +735,14 @@ impl TurboliteVfs {
         for gid in &changed_groups {
             self.cache.evict_group(*gid);
         }
-        // Debug: verify eviction worked
+        // Verify eviction worked: no pages should be present after group eviction.
         if !changed_groups.is_empty() {
-            let present: Vec<u64> = (0..manifest.page_count)
+            let present: Vec<u64> = (0..std::cmp::max(manifest.page_count, 10))
                 .filter(|&p| self.cache.is_present(p))
                 .collect();
             if !present.is_empty() {
-                eprintln!("[set_manifest] WARNING: after eviction, {} pages still present in cache: {:?}",
-                    present.len(), &present[..std::cmp::min(10, present.len())]);
+                eprintln!("[set_manifest] BUG: after evicting groups {:?}, {} pages still present: {:?}",
+                    changed_groups, present.len(), &present[..std::cmp::min(20, present.len())]);
             }
         }
 
