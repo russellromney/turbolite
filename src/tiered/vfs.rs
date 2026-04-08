@@ -729,21 +729,6 @@ impl TurboliteVfs {
         // Compare old vs new: any group whose key differs (or is new/removed)
         // gets evicted from local cache (bitmap cleared, group state reset)
         // so the VFS refetches from S3 on next read.
-        //
-        // Special case: if the old manifest was empty (version 0), the cache may
-        // contain stale pages from schema creation during HA follower join.
-        // Clear ALL pages in this case since we can't diff page group keys.
-        let old_version = {
-            let old = self.shared_manifest.read();
-            old.version
-        };
-        if old_version == 0 && manifest.page_count > 0 {
-            eprintln!("[set_manifest] first manifest apply (v0 -> v{}): full cache clear ({} pages)",
-                manifest.version, manifest.page_count);
-            let all_pages: Vec<u64> = (0..manifest.page_count).collect();
-            self.cache.clear_pages_from_disk(&all_pages);
-        }
-
         let new_keys = &manifest.page_group_keys;
         let max_len = std::cmp::max(old_keys.len(), new_keys.len());
         // Collect changed groups first, then evict (avoids lock re-entry)
@@ -1002,24 +987,6 @@ impl Vfs for TurboliteVfs {
                         self.runtime_handle.clone(),
                     ) {
                         eprintln!("[tiered] WARNING: failed to start WAL replication: {}", e);
-                    }
-                }
-            }
-
-            // S3Primary: ensure journal_mode=DELETE in page 0 header.
-            // S3Primary relies on xSync to upload data to S3, but
-            // journal_mode=OFF (byte 18 = 0) prevents SQLite from calling
-            // xSync on commit. Patch to DELETE (byte 18 = 1) in the cache
-            // so SQLite uses DELETE mode and calls xSync for every commit.
-            #[cfg(feature = "cloud")]
-            if self.config.sync_mode == SyncMode::S3Primary {
-                let ps = self.cache.page_size.load(Ordering::Acquire) as usize;
-                if ps > 18 {
-                    let mut page0 = vec![0u8; ps];
-                    if self.cache.read_page(0, &mut page0).is_ok() && page0[18] == 0 {
-                        page0[18] = 1; // DELETE mode
-                        let _ = self.cache.write_page(0, &page0);
-                        self.cache.bitmap.lock().mark_present(0);
                     }
                 }
             }
