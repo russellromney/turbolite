@@ -2041,6 +2041,11 @@ impl DatabaseHandle for TurboliteHandle {
             let manifest_snap = self.manifest.read().clone();
             let page_count = manifest_snap.page_count;
             let next_version = manifest_snap.version + 1;
+            let ovr_count: usize = manifest_snap.subframe_overrides.iter()
+                .map(|ovs| ovs.len()).sum();
+            eprintln!("[sync:s3primary] building v{} from v{} (page_count={}, dirty={}, overrides={}, pg_keys={})",
+                next_version, manifest_snap.version, page_count, dirty_snapshot.len(),
+                ovr_count, manifest_snap.page_group_keys.len());
             let change_counter = read_change_counter_from_cache(&cache, page_size);
             let old_sub_ppf = manifest_snap.sub_pages_per_frame;
             let use_seekable = old_sub_ppf > 0;

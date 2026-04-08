@@ -672,6 +672,20 @@ impl TurboliteVfs {
     pub fn set_manifest(&self, mut manifest: Manifest) {
         manifest.detect_and_normalize_strategy();
 
+        // Refuse to downgrade. The manifest version is monotonically increasing.
+        // A stale S3 read (e.g., from a follower poll loop that raced with the
+        // leader's xSync) must not revert the in-memory manifest.
+        {
+            let current = self.shared_manifest.read();
+            if manifest.version > 0 && current.version > 0 && manifest.version <= current.version {
+                if manifest.version < current.version {
+                    eprintln!("[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
+                        manifest.version, current.version);
+                }
+                return;
+            }
+        }
+
         // Snapshot old page_group_keys before swapping
         let old_keys: Vec<String> = {
             let old = self.shared_manifest.read();
