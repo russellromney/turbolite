@@ -1868,6 +1868,8 @@ impl DatabaseHandle for TurboliteHandle {
     }
 
     fn sync(&mut self, _data_only: bool) -> Result<(), io::Error> {
+        let dirty_count = self.dirty_page_nums.read().len();
+        eprintln!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
         if self.is_passthrough() {
             return self
                 .passthrough_file
@@ -1887,8 +1889,10 @@ impl DatabaseHandle for TurboliteHandle {
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
                 self.dirty_since_sync = false;
+                eprintln!("[sync] early return: 0 dirty pages, 0 pending groups (sync_mode={:?})", self.sync_mode);
                 return Ok(());
             }
+            eprintln!("[sync] dirty={}, pending={}, sync_mode={:?}", dirty.len(), has_pending_groups, self.sync_mode);
             dirty.clone()
         };
 
@@ -2079,6 +2083,7 @@ impl DatabaseHandle for TurboliteHandle {
 
                 if has_frame_table {
                     // Override path: encode only dirty frames
+                    eprintln!("[sync:s3primary] gid={}: override path (frame_table has {} entries)", gid, frame_table_ref.map(|ft| ft.len()).unwrap_or(0));
                     let dirty_frames = manifest::dirty_frames_for_group(
                         dirty_pnums,
                         &pages_in_group,
@@ -2135,6 +2140,12 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 } else {
                     // No frame table (legacy format or new group): full group rewrite
+                    let existing_ovrs = new_subframe_overrides.get(gid as usize).map(|o| o.len()).unwrap_or(0);
+                    if existing_ovrs > 0 {
+                        eprintln!("[sync:s3primary] gid={}: FULL REWRITE draining {} overrides!", gid, existing_ovrs);
+                    } else {
+                        eprintln!("[sync:s3primary] gid={}: full rewrite (no overrides to drain)", gid);
+                    }
                     let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
                     let mut need_s3_merge = false;
 
