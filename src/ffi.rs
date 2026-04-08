@@ -34,6 +34,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
@@ -41,6 +42,12 @@ use std::os::raw::{c_char, c_int};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+// Track closed handle addresses to prevent use-after-close and double-close
+// We add BEFORE dropping so the second call sees the address still valid
+thread_local! {
+    static CLOSED_HANDLES: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
 
 fn set_last_error(msg: &str) {
@@ -156,10 +163,7 @@ pub extern "C" fn turbolite_register_local(
 /// # Returns
 /// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
 #[no_mangle]
-pub extern "C" fn turbolite_register(
-    name: *const c_char,
-    config_json: *const c_char,
-) -> c_int {
+pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_char) -> c_int {
     clear_last_error();
     let name = match cstr_to_str(name, "name") {
         Ok(s) => s,
@@ -326,10 +330,7 @@ pub struct TurboliteDb {
 /// # Returns
 /// Opaque handle on success, NULL on error. Must be closed with `turbolite_close`.
 #[no_mangle]
-pub extern "C" fn turbolite_open(
-    path: *const c_char,
-    vfs_name: *const c_char,
-) -> *mut TurboliteDb {
+pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -> *mut TurboliteDb {
     clear_last_error();
     let path = match cstr_to_str(path, "path") {
         Ok(s) => s,
@@ -340,11 +341,19 @@ pub extern "C" fn turbolite_open(
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
 
     match rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs_name) {
-        Ok(conn) => Box::into_raw(Box::new(TurboliteDb { conn })),
+        Ok(conn) => {
+            let db = Box::into_raw(Box::new(TurboliteDb { conn }));
+            // Clear any stale "closed" marker if this address was reused
+            let addr = db as u64;
+            CLOSED_HANDLES.with(|handles| {
+                handles.borrow_mut().remove(&addr);
+            });
+            db
+        }
         Err(e) => {
             set_last_error(&format!("open failed: {}", e));
             std::ptr::null_mut()
@@ -361,6 +370,12 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
     clear_last_error();
     if db.is_null() {
         set_last_error("db handle must not be NULL");
+        return -1;
+    }
+    let addr = db as u64;
+    let is_closed = CLOSED_HANDLES.with(|h| h.borrow().contains(&addr));
+    if is_closed {
+        set_last_error("db handle is already closed");
         return -1;
     }
     let sql = match cstr_to_str(sql, "sql") {
@@ -386,13 +401,16 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// Heap-allocated JSON string on success (caller must free with `turbolite_free_string`),
 /// or NULL on error.
 #[no_mangle]
-pub extern "C" fn turbolite_query_json(
-    db: *mut TurboliteDb,
-    sql: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
     clear_last_error();
     if db.is_null() {
         set_last_error("db handle must not be NULL");
+        return std::ptr::null_mut();
+    }
+    let addr = db as u64;
+    let is_closed = CLOSED_HANDLES.with(|h| h.borrow().contains(&addr));
+    if is_closed {
+        set_last_error("db handle is already closed");
         return std::ptr::null_mut();
     }
     let sql = match cstr_to_str(sql, "sql") {
@@ -402,7 +420,10 @@ pub extern "C" fn turbolite_query_json(
 
     let db = unsafe { &*db };
     let result = (|| -> Result<String, String> {
-        let mut stmt = db.conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
+        let mut stmt = db
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("prepare: {}", e))?;
         let col_count = stmt.column_count();
         let col_names: Vec<String> = (0..col_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -461,10 +482,19 @@ pub extern "C" fn turbolite_free_string(s: *mut c_char) {
 /// Close a database connection opened with `turbolite_open`.
 #[no_mangle]
 pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
-    if !db.is_null() {
-        unsafe {
-            drop(Box::from_raw(db));
-        }
+    if db.is_null() {
+        return;
+    }
+    let addr = db as u64;
+    let already_closed = CLOSED_HANDLES.with(|handles| handles.borrow().contains(&addr));
+    if already_closed {
+        return;
+    }
+    CLOSED_HANDLES.with(|handles| {
+        handles.borrow_mut().insert(addr);
+    });
+    unsafe {
+        drop(Box::from_raw(db));
     }
 }
 

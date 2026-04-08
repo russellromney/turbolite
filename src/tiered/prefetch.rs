@@ -8,7 +8,7 @@ pub(crate) struct PrefetchPool;
 #[cfg(not(feature = "cloud"))]
 impl PrefetchPool {
     pub(crate) fn wait_idle(&self) {}
-    pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>, _overrides: std::collections::HashMap<usize, super::manifest::SubframeOverride>) -> bool { false }
+    pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>, _overrides: std::collections::HashMap<usize, super::manifest::SubframeOverride>, _manifest_version: u64) -> bool { false }
 }
 
 #[cfg(feature = "cloud")]
@@ -31,6 +31,9 @@ pub(crate) struct PrefetchJob {
     pub(crate) group_page_nums: Vec<u64>,
     /// Phase Drift-c: override frames for this group.
     pub(crate) overrides: HashMap<usize, super::manifest::SubframeOverride>,
+    /// Manifest version when this job was submitted. If the manifest changed
+    /// (set_manifest eviction), the fetched data is stale and should be discarded.
+    pub(crate) manifest_version: u64,
 }
 
 #[cfg(feature = "cloud")]
@@ -54,6 +57,7 @@ impl PrefetchPool {
         page_count: Arc<AtomicU64>,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         encryption_key: Option<[u8; 32]>,
+        shared_manifest: Arc<RwLock<super::manifest::Manifest>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PrefetchJob>();
         let rx = Arc::new(Mutex::new(rx));
@@ -75,6 +79,7 @@ impl PrefetchPool {
             #[cfg(feature = "zstd")]
             let dictionary = dictionary.clone();
             let encryption_key = Arc::clone(&encryption_key);
+            let shared_manifest = Arc::clone(&shared_manifest);
 
             workers.push(std::thread::spawn(move || {
                 loop {
@@ -164,7 +169,22 @@ impl PrefetchPool {
                     };
                     let decompress_ms = decompress_start.elapsed().as_millis();
 
+                    // Check if manifest changed (set_manifest eviction) since this job
+                    // was submitted. If so, our page group data is stale (wrong overrides,
+                    // old page group keys). Discard to avoid overwriting correct data
+                    // written by the foreground read path with the newer manifest.
+                    let current_version = shared_manifest.read().version;
+                    if current_version != job.manifest_version {
+                        eprintln!("[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
+                            job.gid, job.manifest_version, current_version);
+                        cache.unclaim_group(job.gid);
+                        in_flight.fetch_sub(1, Ordering::Release);
+                        continue;
+                    }
+
                     // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
+                    eprintln!("[prefetch] gid={} writing {} pages (job_v={}, current_v={})",
+                        job.gid, pg_count, job.manifest_version, current_version);
                     let write_start = Instant::now();
                     let actual_pages = std::cmp::min(pg_count as usize, job.group_page_nums.len());
                     let write_result = if actual_pages > 0 {
@@ -213,7 +233,16 @@ impl PrefetchPool {
                         for (&frame_idx, ovr) in &job.overrides {
                             let ovr_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&ovr.key)) {
                                 Ok(Some(data)) => data,
-                                _ => continue,
+                                Ok(None) => {
+                                    eprintln!("[prefetch] gid={} override frame {} key '{}' not found in S3",
+                                        job.gid, frame_idx, ovr.key);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    eprintln!("[prefetch] gid={} override frame {} fetch error: {}",
+                                        job.gid, frame_idx, e);
+                                    continue;
+                                }
                             };
                             #[cfg(feature = "zstd")]
                             let ovr_decoder = dictionary.as_deref().map(|d| zstd::dict::DecoderDictionary::copy(d));
@@ -261,12 +290,13 @@ impl PrefetchPool {
     }
 
     /// Submit a prefetch job (non-blocking). Returns false if channel is closed.
-    pub(crate) fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>, overrides: HashMap<usize, super::manifest::SubframeOverride>) -> bool {
+    pub(crate) fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>, overrides: HashMap<usize, super::manifest::SubframeOverride>, manifest_version: u64) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
         match self.sender.send(PrefetchJob {
             gid,
             key,
             frame_table,
+            manifest_version,
             page_size,
             sub_pages_per_frame: sub_ppf,
             group_page_nums,

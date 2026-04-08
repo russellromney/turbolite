@@ -2,6 +2,161 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Zenith: S3-Primary Mode
+
+S3 is the database, local disk is disposable cache. Every committed transaction is immediately durable in S3 via subframe override uploads + manifest publish. No WAL, no journal, no checkpoint-as-replication-step. Combined with Phase Drift, per-transaction cost is small (~256KB per dirty frame + manifest publish).
+
+### a. S3Primary SyncMode + xSync override upload
+- `SyncMode::S3Primary` variant gated behind `#[cfg(feature = "cloud")]`
+- sync() S3Primary path: collects dirty frames, encodes as overrides (or full group rewrite for legacy format), uploads, publishes manifest, persists local manifest
+- WAL mode detection: returns error if page 0 journal mode byte = 2 (WAL)
+- Tests: single write + cold read, sequential version increments, empty sync no-op, bulk multi-row transaction
+
+### b. Cache validation on open
+- Fetch S3 manifest on open, compare with local manifest version
+- Version match: cache warm. Version mismatch: diff manifests, invalidate changed pages/groups
+- Crash recovery (local ahead of S3): discard local manifest, full cache invalidation
+- Tests: open after external write, cache partially invalidated, correct data read
+
+### c. Transaction failure / rollback handling
+- `dirty_since_sync` flag on TurboliteHandle, set true on write, false after sync
+- lock() detects downgrade from EXCLUSIVE/RESERVED to SHARED/NONE without sync (rollback)
+- On rollback: clears dirty_page_nums, evicts stale pages from disk cache
+- Works for all SyncMode variants
+- Tests: constraint violation, explicit BEGIN/ROLLBACK, repeated constraint violations
+
+### d. Migration path from WAL mode
+- `turbolite_migrate_to_s3_primary(conn)`: checkpoints WAL, attempts journal_mode=OFF
+- Handles WAL stub files that prevent PRAGMA journal_mode switching
+- Tests: WAL migration with data preservation, DELETE-to-OFF, already-OFF no-op
+
+### e. Integration with Shared mode (haqlite Phase Crest)
+- Shared mode + S3Primary: acquire lease, catch up from manifest, execute writes (journal_mode=OFF), commit via override upload + manifest publish, release lease
+- No checkpoint, no flush, no staging log in this path
+- Tests: two Shared mode nodes alternating writes, Lambda simulation (open, write, close, destroy cache, reopen, read back)
+
+---
+
+## Drift: Subframe Overrides (Write Amplification Reduction)
+
+Instead of rewriting an entire page group (~16MB) when a few pages change, upload only the dirty frame (~256KB) as an independent S3 object. Reduces checkpoint cost from O(group_size) to O(frame_size), a ~64x write amplification reduction for single-page changes.
+
+### a. Manifest + override tracking
+- `SubframeOverride` struct, `subframe_overrides` field on Manifest with serde backward compat
+- `dirty_frames_for_group()` helper, `normalize_overrides()` called on manifest load
+- Tests: serde roundtrip (JSON + msgpack), backward compat, dirty frame mapping (7 cases)
+
+### b. Override write path
+- Override-aware flush in both S3 and local paths
+- Auto-threshold: frames_per_group / 4 when override_threshold=0
+- Override key format: `pg/{gid}_f{frame_idx}_v{version}`
+- GC on full rewrite, VACUUM, Durable sync
+- Tests: threshold logic, key format, encode/decode roundtrip, compression
+
+### c. Override read path
+- S3 seekable: fetch from override key instead of range GET when override exists
+- Local read: apply overrides after base group decode
+- Prefetch pool: carries overrides per job, applies after base group fetch
+- Tests: write + cold read with overrides, override then full rewrite cold read
+
+### d. Compaction
+- `compact_override_group()`: fetch base + overrides, merge, re-encode
+- `auto_compact_overrides()`: scans for groups over compaction_threshold (default 8)
+- `compact_all_overrides()`: manual trigger, ignores threshold
+- Auto-compaction fires at end of flush_local_inner
+- Config: `compaction_threshold` (default 8), `TURBOLITE_COMPACTION_THRESHOLD` env var
+- Tests: accumulate overrides past threshold, compaction fires, cold read after compaction
+
+### e. Integration with Shared mode (haqlite Phase Crest)
+- Shared mode checkpoint defaults to override mode (optimize for small writes)
+- Compaction runs opportunistically when a Shared mode node acquires the lease
+- Tests: two Shared mode writers, each produces overrides, both readable by the other after manifest poll
+
+---
+
+## Borodino: Version Counter + Cross-Cutting Correctness
+
+Blocking bugs and untested interactions discovered during Kursk stress testing. Dual version counter separates S3 key uniqueness from WAL replay coordination. Cross-cutting correctness for encryption + staging, VACUUM + LocalThenFlush, compaction + pending staging, cache eviction + pending staging, multi-database VFS sharing, and tokio runtime contention.
+
+### a. Dual counter: manifest.version (S3 keys) + manifest.change_counter (walrust)
+- `manifest.version`: monotonic +1, used for S3 keys (never reused)
+- `manifest.change_counter`: SQLite file change counter from page 0, used by walrust for WAL replay window
+- Tests: version increments per checkpoint, GC does not delete current version
+
+### b. Walrust uses manifest.change_counter for WAL replay
+- `materialize_to_file()` returns `manifest.change_counter` (not `manifest.version`)
+- WAL recovery and WAL segment GC use `manifest.change_counter` for replay cutoff
+- Tests: change_counter survives manifest roundtrip, cold start replays correct segments
+
+### c. Encryption + staging log interaction
+- Staging log with encryption: flush produces correct S3 data, cold reader decrypts successfully
+- Staging log bytes are encrypted on disk
+- Tests: wrong encryption key on recovery VFS fails cleanly
+
+### d. VACUUM + LocalThenFlush interaction
+- Staging log pages assigned to correct groups after VACUUM re-walk
+- VACUUM detection fires in LocalThenFlush mode
+- Tests: INSERT, checkpoint, VACUUM, checkpoint, flush, cold reader sees correct data
+
+### e. Compaction between checkpoint and flush
+- Staging log references preserved through compaction (staging is self-contained)
+- Tests: checkpoint, compact, flush; checkpoint, compact, checkpoint, flush; compaction after flush
+
+### f. Cache eviction under memory pressure with pending staging
+- Pending pages protected from eviction with `max_cache_bytes` set low under heavy read load
+- Tests: write 5MB with 1MB cache limit, checkpoint, read, flush; same with clear_cache between checkpoint and flush
+
+### g. Multiple databases on same VFS with LocalThenFlush
+- Staging logs isolated per database, shared `staging_seq` counter prevents filename collisions
+- Tests: two databases checkpoint and flush independently, cold readers see correct data
+
+### h. Tokio runtime contention under parallel tests
+- Investigation and fix for intermittent test failures under 90 parallel integration tests
+- Tests: cache_truncation_after_vacuum, dictionary_roundtrip, custom_pages_per_group stabilized
+
+---
+
+## Unification: TurboliteVfs (merge CompressedVfs + TieredVfs)
+
+Merged CompressedVfs (local-only) and TieredVfs (S3-backed) into a single TurboliteVfs. Works locally by default. Cloud (S3) is an optional add-on controlled by `cloud` feature flag. No tokio, no AWS deps in local-only mode. On-disk format is manifest + page groups regardless of mode.
+
+### a. StorageClient abstraction + StorageBackend config
+- `StorageBackend` enum (Local / S3), `StorageClient` enum with get/put/delete for page groups and manifests
+- Local variant: page groups at `{base_dir}/pg/{key}`, manifest at `{base_dir}/manifest.msgpack`
+
+### b. VFS constructable without S3/tokio
+- `StorageClient` replaces `Arc<S3Client>`, `PrefetchPool` is `Option` (None in local mode)
+- No tokio runtime required for local-only operation
+
+### c. Local page group storage + local flush
+- `flush_local_groups()`: encode page groups, write to `{cache_dir}/pg/{gid}_v{version}` via atomic tmp+rename
+- Local GC deletes old page group files after manifest update
+- Cold open from local manifest + page groups
+
+### d. Gate cloud deps behind `#[cfg(feature = "cloud")]`
+- Renamed feature flag `tiered` to `cloud`
+- `cloud` feature: aws-sdk-s3, aws-config, aws-smithy-runtime, tokio
+- CI tests both `--features cloud,zstd` and `--features zstd` (no cloud)
+
+### e. Rename TieredVfs to TurboliteVfs
+- `TieredVfs` -> `TurboliteVfs`, `TieredHandle` -> `TurboliteHandle`, `TieredConfig` -> `TurboliteConfig`
+- Backward-compat type aliases, deprecated `tiered::register()` alias
+
+### f. FFI bindings
+- `turbolite_register_local()`, `turbolite_register_cloud()`, `turbolite_register()` (JSON config)
+- `Serialize`/`Deserialize` on TurboliteConfig, StorageBackend, SyncMode, ManifestSource
+- 16 new FFI tests, updated README with Rust examples and Go FFI example
+
+### g. Migration tool (skipped, no users)
+
+### h. Remove CompressedVfs
+- Migrated all integration tests to TurboliteVfs local mode
+- Removed CompressedVfs code (~2000 lines), CompressedHandle, SharedWriteState, FileHeader, PageIndex
+- Removed CompressedVfs FFI functions and CLI binary commands
+- Updated benchmarks and examples to TurboliteVfs
+
+---
+
 ## Somme: WAL Durability via walrust Integration
 
 Close the durability gap between checkpoints. walrust ships WAL frames to S3; turbolite page groups serve as the snapshot. The two layers compose through SQLite's file change counter (page 0, offset 24): both use it as their version/txid, staying synchronized with no coordination protocol.
@@ -469,15 +624,15 @@ Rotate, add, or remove encryption on all S3 data without decompressing/recompres
 
 ## Verdun: Tiered Encryption
 
-One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache metadata.
+One key, VFS encrypts everything: S3 objects, local cache, WAL/journal, cache metadata.
 
 ### Two-tier encryption model
 - **S3 path (GCM)**: AES-256-GCM with random 12-byte nonce per frame, prepended to ciphertext. Authenticated encryption with tamper detection. +28 bytes/frame overhead (negligible on ~256KB frames). Random nonces prevent catastrophic GCM nonce reuse across checkpoint re-encodes.
 - **Local path (CTR)**: AES-256-CTR for cache pages, WAL/journal files, and SubChunkTracker metadata. Zero size overhead, preserves 64KB OS page alignment.
 
 ### Encryption pipeline
-- Encode path: plaintext → zstd compress → GCM encrypt (S3) or CTR encrypt (local)
-- Decode path: GCM decrypt → zstd decompress (S3) or CTR decrypt → read (local)
+- Encode path: plaintext -> zstd compress -> GCM encrypt (S3) or CTR encrypt (local)
+- Decode path: GCM decrypt -> zstd decompress (S3) or CTR decrypt -> read (local)
 - `encryption_key: Option<[u8; 32]>` in `TieredConfig` threads through all paths
 
 ### What's encrypted
@@ -498,7 +653,7 @@ One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache
 3-7x improvement at cache level `none` through three compounding changes:
 
 ### Index bundles
-- Manifest field `index_chunk_keys: HashMap<u32, String>` — page-size-aware chunking via `bundle_chunk_range()` (~32MB target per chunk)
+- Manifest field `index_chunk_keys: HashMap<u32, String>` -- page-size-aware chunking via `bundle_chunk_range()` (~32MB target per chunk)
 - Index leaf pages (0x0A) detected at checkpoint, collected from dirty snapshot + cache's Index-tier sub-chunks
 - Reuses `encode_interior_bundle`/`decode_interior_bundle` format
 - Skip redundant page group uploads: groups where ALL dirty pages are interior (0x05/0x02) or index leaf (0x0A) are skipped
@@ -517,15 +672,15 @@ One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache
 
 ### Page-size-aware bundle chunking
 - `bundle_chunk_range()` targets ~32MB uncompressed per chunk instead of fixed 32768 page range
-- At 64KB pages: 512 page range per chunk (was 32768 — everything in 1 chunk for any DB under 2GB)
+- At 64KB pages: 512 page range per chunk (was 32768, everything in 1 chunk for any DB under 2GB)
 - 1M rows now produces 46 index chunks that interleave with data fetches
 
-### Results (1M rows, 1.46GB, Fly iad → Tigris, 8 vCPU, 16GB RAM)
-- Cache: none — point lookup: 468ms → 143ms (3.3x)
-- Cache: none — profile join: 822ms → 419ms (2.0x)
-- Cache: index — point lookup: 54ms → 23ms
-- Cache: index — mutual friends: 27ms → 11ms
-- Cache: data — point lookup: 98us
+### Results (1M rows, 1.46GB, Fly iad -> Tigris, 8 vCPU, 16GB RAM)
+- Cache: none, point lookup: 468ms -> 143ms (3.3x)
+- Cache: none, profile join: 822ms -> 419ms (2.0x)
+- Cache: index, point lookup: 54ms -> 23ms
+- Cache: index, mutual friends: 27ms -> 11ms
+- Cache: data, point lookup: 98us
 
 ---
 
@@ -535,15 +690,15 @@ Fundamental reframe: optimize for S3 request count, not data size.
 
 ### 64KB pages as default
 - Default `PRAGMA page_size=65536` for tiered VFS
-- 500k-post dataset: 11,569 pages (vs ~104,000 at 4KB) — 9x fewer
-- B-tree fan-out increases ~16x → shallower trees → fewer S3 hops
+- 500k-post dataset: 11,569 pages (vs ~104,000 at 4KB), 9x fewer
+- B-tree fan-out increases ~16x, shallower trees, fewer S3 hops
 - Default group size: 256 pages per group = 16MB uncompressed
 - Default sub-chunk frame: 4 pages per frame = 256KB per range GET
 
 ### Sub-chunk caching
 - `SubChunkId(group_id, frame_index)` + `SubChunkTier(Pinned/Index/Data)` + `SubChunkTracker` with tiered LRU eviction
 - DiskCache uses tracker alongside legacy PageBitmap for backward compat
-- Read path detects page types: 0x05/0x02 → Pinned, 0x0A → Index, else Data
+- Read path detects page types: 0x05/0x02 -> Pinned, 0x0A -> Index, else Data
 - Tracker persists to disk with tier info, reloads on restart
 - 25 unit tests for math, tier promotion, eviction order, LRU, persistence
 
@@ -552,14 +707,14 @@ Fundamental reframe: optimize for S3 request count, not data size.
 ## Normandy (early): C FFI + Build Infrastructure
 
 ### C FFI layer
-- `src/ffi.rs` — `extern "C"` functions for VFS registration + error handling
+- `src/ffi.rs`: `extern "C"` functions for VFS registration + error handling
 - `turbolite_register_compressed`, `turbolite_register_passthrough`, `turbolite_register_encrypted`, `turbolite_register_tiered`
-- `turbolite_last_error` — thread-local error string
+- `turbolite_last_error`: thread-local error string
 - `turbolite_clear_caches`, `turbolite_invalidate_cache`
 
 ### Build infrastructure
 - `Cargo.toml`: `crate-type = ["lib", "cdylib"]`, `bundled-sqlite` feature flag
-- `cbindgen.toml` + `make header` → generates `turbolite.h`
+- `cbindgen.toml` + `make header` -> generates `turbolite.h`
 - `Makefile`: `make lib` (system SQLite), `make lib-bundled` (self-contained), `make install`
 
 ---
@@ -587,15 +742,15 @@ Major architectural upgrade: page groups with seekable zstd encoding, S3 byte-ra
 Bug fixes and correctness improvements. 27 tests pass against Tigris.
 
 ### Bug fixes
-- Fixed `delete()` calling `destroy_s3()` unconditionally — SQLite calls delete for WAL/journal files during VACUUM and journal mode switch, which destroyed the entire S3 dataset
-- Fixed `exists()` returning true for WAL/journal/SHM files — caused SQLite to enter recovery mode in DELETE journal mode
-- Fixed chunk_size mismatch → silent corruption — `open()` now uses manifest's chunk_size for existing databases
-- Fixed cache serving stale pages after truncation — moved page_count bounds check before cache lookup
-- Fixed dirty chunks evicted during read-path — `put_chunk` now passes dirty chunk IDs to eviction
+- Fixed `delete()` calling `destroy_s3()` unconditionally: SQLite calls delete for WAL/journal files during VACUUM and journal mode switch, which destroyed the entire S3 dataset
+- Fixed `exists()` returning true for WAL/journal/SHM files: caused SQLite to enter recovery mode in DELETE journal mode
+- Fixed chunk_size mismatch -> silent corruption: `open()` now uses manifest's chunk_size for existing databases
+- Fixed cache serving stale pages after truncation: moved page_count bounds check before cache lookup
+- Fixed dirty chunks evicted during read-path: `put_chunk` now passes dirty chunk IDs to eviction
 - Fixed `Manifest::empty()` hardcoding chunk_size=128
 
 ### Improvements
-- Batch S3 deletes in `destroy_s3` — `DeleteObjects` in batches of 1000
+- Batch S3 deletes in `destroy_s3`: `DeleteObjects` in batches of 1000
 - LRU rebuild on restart uses file mtime instead of `Instant::now()`
 - DELETE journal mode support
 
@@ -615,7 +770,7 @@ Page-level tiered storage where S3 is source of truth and local disk is a cache.
 
 ## Client-Controlled Compaction Helpers
 
-- `compact_if_needed(path, threshold_pct)` — compact if dead_space exceeds threshold
+- `compact_if_needed(path, threshold_pct)`: compact if dead_space exceeds threshold
 
 ---
 
