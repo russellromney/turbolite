@@ -442,7 +442,7 @@ impl TurboliteSharedState {
                         self.prefetch_pool.submit(
                             gid, key.clone(), ft,
                             manifest.page_size, manifest.sub_pages_per_frame,
-                            gp, ovrs,
+                            gp, ovrs, manifest.version,
                         );
                         groups_submitted += 1;
                     }

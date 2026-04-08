@@ -764,7 +764,7 @@ impl TurboliteHandle {
                         let ft = manifest.frame_tables.get(*gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(*gid).into_owned();
                         let ovrs = manifest.subframe_overrides.get(*gid as usize).cloned().unwrap_or_default();
-                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
+                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(*gid);
@@ -824,7 +824,7 @@ impl TurboliteHandle {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
                     let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
                         submitted += 1;
                     } else {
                         cache.unclaim_group(gid);
@@ -873,7 +873,7 @@ impl TurboliteHandle {
                         let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                         let gp = manifest.group_page_nums(gid).into_owned();
                         let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
+                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
                             submitted += 1;
                         } else {
                             cache.unclaim_group(gid);
@@ -941,7 +941,7 @@ impl TurboliteHandle {
                     let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
                     let gp = manifest.group_page_nums(gid).into_owned();
                     let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs) {
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
                         *submitted += 1;
                         return true;
                     }
@@ -1277,7 +1277,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             let ft = manifest_snap.frame_tables.get(plan_gid as usize).cloned().unwrap_or_default();
                                             let gp = manifest_snap.group_page_nums(plan_gid).into_owned();
                                             let ovrs = manifest_snap.subframe_overrides.get(plan_gid as usize).cloned().unwrap_or_default();
-                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp, ovrs) {
+                                            if !pool.submit(plan_gid, key.clone(), ft, manifest_snap.page_size, sub_ppf, gp, ovrs, manifest_snap.version) {
                                                 cache_ref.unclaim_group(plan_gid);
                                             }
                                         } else {
@@ -1300,6 +1300,12 @@ impl DatabaseHandle for TurboliteHandle {
         if cache.is_present(page_num) {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
+            // Debug: log reads of first 5 pages to trace HA promotion data visibility
+            if page_num < 5 {
+                let nonzero = buf.iter().filter(|&&b| b != 0).count();
+                eprintln!("[read_exact_at] page {} CACHE HIT (gid={}, {}/{} nonzero bytes)",
+                    page_num, gid, nonzero, buf.len());
+            }
             self.detect_interior_page(buf, page_num, cache);
             self.try_leaf_chase(buf, page_num, &cache_arc);
             self.try_overflow_prefetch(buf, page_num, &cache_arc);
@@ -1310,6 +1316,20 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // 5. Cache miss - fetch from storage (S3 or local page groups).
+        if page_num < 5 {
+            let manifest_snap = self.manifest.read();
+            let has_overrides = manifest_snap.subframe_overrides
+                .get(gid as usize)
+                .map(|ovs| !ovs.is_empty())
+                .unwrap_or(false);
+            let override_count = manifest_snap.subframe_overrides
+                .get(gid as usize)
+                .map(|ovs| ovs.len())
+                .unwrap_or(0);
+            eprintln!("[read_exact_at] page {} CACHE MISS (gid={}, manifest_v={}, overrides_for_gid={}, has_overrides={})",
+                page_num, gid, manifest_snap.version, override_count, has_overrides);
+            drop(manifest_snap);
+        }
         cache.stat_misses.fetch_add(1, Ordering::Relaxed);
 
         // 5.local: For local-only mode, fetch the page group from local pg/ directory,
@@ -1457,7 +1477,7 @@ impl DatabaseHandle for TurboliteHandle {
                             if !key.is_empty() {
                                 let gp_owned = manifest.group_page_nums(gid).into_owned();
                                 let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned, ovrs) {
+                                if !pool.submit(gid, key.clone(), ft.to_vec(), manifest.page_size, sub_ppg, gp_owned, ovrs, manifest.version) {
                                     cache.unclaim_group(gid);
                                 }
                             } else {
@@ -1495,6 +1515,16 @@ impl DatabaseHandle for TurboliteHandle {
                         let page_offset_in_frame = page_in_group % sub_ppg as usize;
                         let src_start = page_offset_in_frame * ps;
                         let src_end = src_start + buf.len();
+
+                        // Debug: log foreground S3 fetch details for first pages
+                        if page_num < 5 {
+                            let is_override = override_entry.is_some();
+                            let nonzero_in_page = if src_end <= decompressed.len() {
+                                decompressed[src_start..src_end].iter().filter(|&&b| b != 0).count()
+                            } else { 0 };
+                            eprintln!("[read_exact_at] page {} S3 fetch: {}B compressed, {}B decompressed, override={}, page has {}/{} nonzero bytes",
+                                page_num, compressed_frame.len(), decompressed.len(), is_override, nonzero_in_page, ps);
+                        }
                         if src_end <= decompressed.len() {
                             buf.copy_from_slice(&decompressed[src_start..src_end]);
                         } else {

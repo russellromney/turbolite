@@ -208,6 +208,8 @@ impl TurboliteVfs {
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
+        let shared_manifest = Arc::new(RwLock::new(manifest));
+
         let prefetch_pool = Arc::new(PrefetchPool::new(
             config.prefetch_threads,
             Arc::clone(&s3),
@@ -217,9 +219,8 @@ impl TurboliteVfs {
             #[cfg(feature = "zstd")]
             config.dictionary.clone(),
             config.encryption_key,
+            Arc::clone(&shared_manifest),
         ));
-
-        let shared_manifest = Arc::new(RwLock::new(manifest));
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         if !initial_dirty.is_empty() {
             eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
