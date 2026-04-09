@@ -837,6 +837,35 @@ fn test_dirty_frames_empty_frame_table() {
     assert!(result.is_empty());
 }
 
+#[test]
+fn test_dirty_frames_beyond_frame_table() {
+    // Regression: pages assigned to a group beyond the base frame table bounds
+    // were silently dropped, causing data loss on S3 restore.
+    // Base was created with 3 pages (1 frame), then 4 more pages added.
+    let group_pages = vec![0, 1, 2, 3, 4, 5, 6];
+    let ft = vec![
+        // Only 1 frame entry from the original base (covers pages 0-4)
+        FrameEntry { offset: 0, len: 100 },
+    ];
+    // Pages 5 and 6 are at positions 5-6, frame_idx = 5/5 = 1 (beyond ft.len())
+    // Page 3 is at position 3, frame_idx = 3/5 = 0 (within ft.len())
+    let result = dirty_frames_for_group(&[3, 5, 6], &group_pages, &ft, 5);
+    // Must include frame 1 even though it's beyond the base frame table
+    assert_eq!(result, vec![0, 1]);
+}
+
+#[test]
+fn test_dirty_frames_all_beyond_frame_table() {
+    // All dirty pages are in frames beyond the frame table
+    let group_pages = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let ft = vec![
+        FrameEntry { offset: 0, len: 100 },
+    ];
+    // Pages 5-9 at positions 5-9, frame_idx = 1 and 2 (both beyond ft)
+    let result = dirty_frames_for_group(&[5, 6, 7, 8, 9], &group_pages, &ft, 5);
+    assert_eq!(result, vec![1]);
+}
+
 // =========================================================================
 // Phase Drift: SubframeOverride serde tests
 // =========================================================================

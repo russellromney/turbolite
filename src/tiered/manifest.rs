@@ -337,9 +337,11 @@ pub(crate) fn dirty_frames_for_group(
     for &dirty_pnum in dirty_page_nums {
         if let Some(pos) = group_pages.iter().position(|&p| p == dirty_pnum) {
             let frame_idx = pos / sub_pages_per_frame as usize;
-            if frame_idx < frame_table.len() {
-                dirty_frame_set.insert(frame_idx);
-            }
+            // Include frames beyond the base frame_table: new pages assigned
+            // to this group may land in frames that don't exist in the base
+            // page group yet. Override frames are standalone S3 objects, so
+            // they don't require a base frame_table entry.
+            dirty_frame_set.insert(frame_idx);
         }
     }
     let mut result: Vec<usize> = dirty_frame_set.into_iter().collect();
