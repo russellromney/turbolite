@@ -23,7 +23,7 @@ use super::*;
 pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
-    shared_manifest: &RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
     pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
     compression_level: i32,
@@ -80,7 +80,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 fn flush_inner(
     s3: &S3Client,
     cache: &DiskCache,
-    shared_manifest: &RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
@@ -113,7 +113,7 @@ fn flush_inner(
     );
 
     // 3. Snapshot manifest
-    let manifest_snap = shared_manifest.read().clone();
+    let manifest_snap = (**shared_manifest.load()).clone();
     let page_count = manifest_snap.page_count;
     let page_size = manifest_snap.page_size;
     let ppg = manifest_snap.pages_per_group;
@@ -611,9 +611,8 @@ fn flush_inner(
 
     // 11. Commit to shared manifest
     {
-        let mut m = shared_manifest.write();
         cache.set_group_pages(new_manifest.group_pages.clone());
-        *m = new_manifest;
+        shared_manifest.store(Arc::new(new_manifest));
     }
 
     // Persist bitmap
@@ -636,7 +635,7 @@ fn flush_inner(
 
     // Phase Gallipoli: persist local manifest with empty dirty_groups (flush complete)
     {
-        let m = shared_manifest.read().clone();
+        let m = (**shared_manifest.load()).clone();
         let local = super::manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
         if let Err(e) = local.persist(&cache.cache_dir) {
             eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
@@ -664,7 +663,7 @@ fn flush_inner(
 pub(crate) fn flush_local_groups(
     storage: &StorageClient,
     cache: &DiskCache,
-    shared_manifest: &RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
     pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
     compression_level: i32,
@@ -712,7 +711,7 @@ pub(crate) fn flush_local_groups(
 fn flush_local_inner(
     storage: &StorageClient,
     cache: &DiskCache,
-    shared_manifest: &RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
@@ -734,7 +733,7 @@ fn flush_local_inner(
     }
 
     // 3. Snapshot manifest
-    let manifest_snap = shared_manifest.read().clone();
+    let manifest_snap = (**shared_manifest.load()).clone();
     let page_count = manifest_snap.page_count;
     let page_size = manifest_snap.page_size;
 
@@ -927,9 +926,8 @@ fn flush_local_inner(
 
     // 9. Commit to shared manifest
     {
-        let mut m = shared_manifest.write();
         cache.set_group_pages(new_manifest.group_pages.clone());
-        *m = new_manifest;
+        shared_manifest.store(Arc::new(new_manifest));
     }
 
     // 10. Delete old page group versions

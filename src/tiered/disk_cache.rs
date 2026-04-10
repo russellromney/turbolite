@@ -133,9 +133,9 @@ pub(crate) struct DiskCache {
     pub(crate) cache_file: parking_lot::RwLock<File>,
     /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
     pub(crate) tracker: parking_lot::Mutex<SubChunkTracker>,
-    /// Legacy page bitmap — kept for backward compatibility during migration.
-    /// TODO: remove once all code paths use tracker exclusively.
-    pub(crate) bitmap: parking_lot::Mutex<PageBitmap>,
+    /// Page bitmap: AtomicU8-backed, lock-free for is_present/mark_present/clear.
+    /// RwLock only protects resize (Vec reallocation). Read lock is ~free.
+    pub(crate) bitmap: parking_lot::RwLock<PageBitmap>,
     /// Per-group state: 0=None, 1=Fetching, 2=Present
     pub(crate) group_states: parking_lot::Mutex<Vec<std::sync::atomic::AtomicU8>>,
     /// Condition variable for wait_for_group (replaces spin-wait)
@@ -310,7 +310,7 @@ impl DiskCache {
             cache_dir: cache_dir.to_path_buf(),
             cache_file: parking_lot::RwLock::new(cache_file),
             tracker: parking_lot::Mutex::new(tracker),
-            bitmap: parking_lot::Mutex::new(bitmap),
+            bitmap: parking_lot::RwLock::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
             group_condvar: parking_lot::Condvar::new(),
             group_condvar_mutex: parking_lot::Mutex::new(()),
@@ -470,7 +470,7 @@ impl DiskCache {
                 file.write_all_at(data, offset)?;
             }
         }
-        self.bitmap.lock().mark_present(page_num);
+        self.bitmap_mark(page_num);
         // Do NOT mark sub-chunk tracker here — write_page writes a single page,
         // not a complete sub-chunk. Sub-chunk tracker is only updated by
         // write_pages_bulk() which writes complete frames fetched from S3.
@@ -521,7 +521,7 @@ impl DiskCache {
             }
         }
 
-        self.bitmap.lock().mark_present(page_num);
+        self.bitmap_mark(page_num);
         Ok(())
     }
 
@@ -570,8 +570,17 @@ impl DiskCache {
             }
         }
 
-        // Mark all pages present in legacy bitmap
-        let mut bitmap = self.bitmap.lock();
+        // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
+        {
+            let last_page = start_page + num_pages - 1;
+            let needed = last_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(last_page);
+            }
+        }
+        let bitmap = self.bitmap.read();
         for i in 0..num_pages {
             bitmap.mark_present(start_page + i);
         }
@@ -653,8 +662,17 @@ impl DiskCache {
             }
         }
 
-        // Mark all pages present in legacy bitmap
-        let mut bitmap = self.bitmap.lock();
+        // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
+        {
+            let last_page = start_page + num_pages - 1;
+            let needed = last_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(last_page);
+            }
+        }
+        let bitmap = self.bitmap.read();
         for i in 0..num_pages {
             bitmap.mark_present(start_page + i);
         }
@@ -741,8 +759,16 @@ impl DiskCache {
             }
         }
 
-        // Mark bitmap for per-page presence
-        let mut bitmap = self.bitmap.lock();
+        // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
+        if let Some(&max_page) = written_pages.iter().max() {
+            let needed = max_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(max_page);
+            }
+        }
+        let bitmap = self.bitmap.read();
         for &pnum in written_pages {
             bitmap.mark_present(pnum);
         }
@@ -825,8 +851,16 @@ impl DiskCache {
             }
         }
 
-        // Mark bitmap for per-page presence
-        let mut bitmap = self.bitmap.lock();
+        // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
+        if let Some(&max_page) = written_pages.iter().max() {
+            let needed = max_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(max_page);
+            }
+        }
+        let bitmap = self.bitmap.read();
         for &pnum in written_pages {
             bitmap.mark_present(pnum);
         }
@@ -852,12 +886,29 @@ impl DiskCache {
         self.tracker.lock().set_sub_chunk_byte_size(scbs);
     }
 
+    /// Mark a page present, auto-growing the bitmap if needed.
+    /// Fast path (read lock) if capacity is sufficient; slow path (write lock) to grow.
+    pub(crate) fn bitmap_mark(&self, page_num: u64) {
+        let needed = page_num as usize / 8 + 1;
+        {
+            let bm = self.bitmap.read();
+            if needed <= bm.bits.len() {
+                bm.mark_present(page_num);
+                return;
+            }
+        }
+        // Need to grow
+        let mut bm = self.bitmap.write();
+        bm.ensure_capacity(page_num);
+        bm.mark_present(page_num);
+    }
+
     /// Check if a page is present in the local cache.
     /// Uses bitmap (per-page accurate). SubChunkTracker is not consulted here
     /// because it uses positional mapping which is wrong for B-tree-aware groups.
     /// In compressed mode, also verifies the page is in the cache index.
     pub(crate) fn is_present(&self, page_num: u64) -> bool {
-        let in_bitmap = self.bitmap.lock().is_present(page_num);
+        let in_bitmap = self.bitmap.read().is_present(page_num);
         if self.cache_compression && in_bitmap {
             // Double-check: bitmap says present, but index must also have it
             return self.cache_index.lock().contains(page_num);
@@ -1082,7 +1133,7 @@ impl DiskCache {
     /// Clear bitmap bits, remove from cache index, and hole-punch pages on Linux.
     pub(crate) fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
-            let mut bitmap = self.bitmap.lock();
+            let bitmap = self.bitmap.read();
             for &pnum in page_nums {
                 bitmap.clear(pnum);
             }
@@ -1234,7 +1285,7 @@ impl DiskCache {
     /// Called after an external process (walrust restore) writes pages directly
     /// to the cache file without going through the VFS.
     pub(crate) fn mark_all_pages_present(&self, page_count: u64) {
-        let mut bitmap = self.bitmap.lock();
+        let mut bitmap = self.bitmap.write();
         bitmap.resize(page_count);
         for p in 0..page_count {
             bitmap.mark_present(p);
@@ -1254,7 +1305,7 @@ impl DiskCache {
 
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
-        self.bitmap.lock().persist()?;
+        self.bitmap.read().persist()?;
         self.tracker.lock().persist()?;
         if self.cache_compression {
             self.cache_index.lock().persist()?;

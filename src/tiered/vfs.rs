@@ -36,7 +36,7 @@ pub struct TurboliteVfs {
     _runtime: Option<tokio::runtime::Runtime>,
     /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
-    shared_manifest: Arc<RwLock<Manifest>>,
+    shared_manifest: Arc<ArcSwap<Manifest>>,
     /// Shared pending S3 groups. Accumulated by TurboliteHandle during local-only
     /// checkpoints, drained by flush_to_s3(). Legacy path for global
     /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
@@ -131,7 +131,7 @@ impl TurboliteVfs {
 
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
-        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest));
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
@@ -209,7 +209,7 @@ impl TurboliteVfs {
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
-        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest));
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
 
@@ -301,7 +301,7 @@ impl TurboliteVfs {
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
-        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest));
 
         let prefetch_pool = Arc::new(PrefetchPool::new(
             config.prefetch_threads,
@@ -352,7 +352,7 @@ impl TurboliteVfs {
         // Phase Somme: WAL recovery on cold start
         #[cfg(feature = "wal")]
         if vfs.config.wal_replication {
-            let manifest_cc = vfs.shared_manifest.read().change_counter;
+            let manifest_cc = vfs.shared_manifest.load().change_counter;
             if manifest_cc > 0 {
                 if let Some(ref rt) = vfs.runtime_handle {
                     let wal_prefix = format!("{}/wal/", vfs.config.prefix);
@@ -361,7 +361,7 @@ impl TurboliteVfs {
                         &shared,
                         &vfs.cache,
                         manifest_cc,
-                        vfs.shared_manifest.read().page_size,
+                        vfs.shared_manifest.load().page_size,
                         &wal_prefix,
                         &vfs.config.bucket,
                         vfs.config.endpoint_url.as_deref(),
@@ -382,7 +382,7 @@ impl TurboliteVfs {
     /// Load manifest based on ManifestSource config.
     /// Returns (manifest, recovered_dirty_groups, was_warm_reconnect).
     fn load_manifest(&self) -> io::Result<(Manifest, Vec<u64>, bool)> {
-        let existing = self.shared_manifest.read();
+        let existing = self.shared_manifest.load();
         let has_loaded = existing.page_count > 0 || existing.version > 0;
         drop(existing);
 
@@ -390,7 +390,7 @@ impl TurboliteVfs {
             ManifestSource::Auto => {
                 // If VFS already has a manifest (warm reconnect), use it
                 if has_loaded {
-                    let m = self.shared_manifest.read().clone();
+                    let m = (**self.shared_manifest.load()).clone();
                     eprintln!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
                     return Ok((m, Vec::new(), true));
                 }
@@ -475,8 +475,10 @@ impl TurboliteVfs {
         {
             let index_pages = self.cache.index_pages.lock().clone();
             let gp = self.cache.group_pages.read();
-            let mut bitmap = self.cache.bitmap.lock();
-            bitmap.bits.fill(0);
+            let bitmap = self.cache.bitmap.read();
+            for b in &bitmap.bits {
+                b.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // Collect pages to keep
             let mut keep_pages: HashSet<u64> = HashSet::new();
@@ -580,7 +582,7 @@ impl TurboliteVfs {
         if pending.is_empty() {
             return HashMap::new();
         }
-        let manifest = self.shared_manifest.read();
+        let manifest = self.shared_manifest.load();
         let mut result = HashMap::new();
         for &gid in pending.iter() {
             let pages = manifest.group_page_nums(gid).into_owned();
@@ -736,7 +738,7 @@ impl TurboliteVfs {
 
     /// Return a clone of the current manifest state.
     pub fn manifest(&self) -> Manifest {
-        self.shared_manifest.read().clone()
+        (**self.shared_manifest.load()).clone()
     }
 
     /// Fetch the latest manifest from S3 and apply it via set_manifest.
@@ -775,7 +777,7 @@ impl TurboliteVfs {
         // A stale S3 read (e.g., from a follower poll loop that raced with the
         // leader's xSync) must not revert the in-memory manifest.
         {
-            let current = self.shared_manifest.read();
+            let current = self.shared_manifest.load();
             if manifest.version > 0 && current.version > 0 && manifest.version <= current.version {
                 if manifest.version < current.version {
                     eprintln!("[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
@@ -787,7 +789,7 @@ impl TurboliteVfs {
 
         // Snapshot old page_group_keys before swapping
         let old_keys: Vec<String> = {
-            let old = self.shared_manifest.read();
+            let old = self.shared_manifest.load();
             old.page_group_keys.clone()
         };
 
@@ -815,7 +817,7 @@ impl TurboliteVfs {
         // Also check subframe_overrides: S3Primary uploads overrides rather than
         // new page groups. If overrides changed, those groups need eviction too.
         let old_version = {
-            let old = self.shared_manifest.read();
+            let old = self.shared_manifest.load();
             old.version
         };
         if manifest.version != old_version && manifest.version > 0 {
@@ -858,7 +860,7 @@ impl TurboliteVfs {
         self.page_count.store(manifest.page_count, Ordering::Release);
 
         // Write manifest to shared state
-        *self.shared_manifest.write() = manifest.clone();
+        self.shared_manifest.store(Arc::new(manifest.clone()));
 
         // Persist to local disk so the next Connection::open -> load_manifest()
         // picks up the new manifest instead of reading a stale local copy.
@@ -919,7 +921,7 @@ impl Vfs for TurboliteVfs {
             // Compare loaded manifest with previous session's cached manifest.
             // Invalidate groups whose page_group_keys changed (another node wrote).
             {
-                let old_manifest = self.shared_manifest.read().clone();
+                let old_manifest = (**self.shared_manifest.load()).clone();
                 if old_manifest.version > 0 && old_manifest.version != manifest.version {
                     if old_manifest.version > manifest.version {
                         // Local ahead of S3 (crash recovery): full cache invalidation.
@@ -988,7 +990,7 @@ impl Vfs for TurboliteVfs {
             // already in shared state, and writing our clone back would race
             // with set_manifest calls from HA follower catch-up threads.
             if !warm_reconnect {
-                *self.shared_manifest.write() = manifest;
+                self.shared_manifest.store(Arc::new(manifest));
             }
 
             // Recover dirty groups from local manifest (LocalThenFlush crash recovery)
@@ -1035,7 +1037,7 @@ impl Vfs for TurboliteVfs {
                 if !wal.is_started() {
                     let db_path = self.config.cache_dir.join(db);
                     let wal_prefix = format!("{}/wal/", self.config.prefix);
-                    let manifest_cc = self.shared_manifest.read().change_counter;
+                    let manifest_cc = self.shared_manifest.load().change_counter;
                     if let Err(e) = wal.start(
                         db_path,
                         wal_prefix,

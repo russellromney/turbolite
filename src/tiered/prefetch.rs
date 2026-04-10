@@ -57,7 +57,7 @@ impl PrefetchPool {
         page_count: Arc<AtomicU64>,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         encryption_key: Option<[u8; 32]>,
-        shared_manifest: Arc<RwLock<super::manifest::Manifest>>,
+        shared_manifest: Arc<ArcSwap<super::manifest::Manifest>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PrefetchJob>();
         let rx = Arc::new(Mutex::new(rx));
@@ -173,7 +173,7 @@ impl PrefetchPool {
                     // was submitted. If so, our page group data is stale (wrong overrides,
                     // old page group keys). Discard to avoid overwriting correct data
                     // written by the foreground read path with the newer manifest.
-                    let current_version = shared_manifest.read().version;
+                    let current_version = shared_manifest.load().version;
                     if current_version != job.manifest_version {
                         eprintln!("[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
                             job.gid, job.manifest_version, current_version);

@@ -527,8 +527,10 @@ fn test_clear_cache_btree_aware_group0() {
     // Simulate clear_cache: clear bitmap, re-mark group 0 pages
     {
         let gp = cache.group_pages.read();
-        let mut bitmap = cache.bitmap.lock();
-        bitmap.bits.fill(0);
+        let bitmap = cache.bitmap.read();
+        for b in &bitmap.bits {
+            b.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(g0_pages) = gp.first() {
             for &p in g0_pages {
                 bitmap.mark_present(p);

@@ -2,6 +2,40 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Pelican: Lock-Free Manifest + Concurrent Read/Write Performance
+
+Eliminated severe write throughput regression under concurrent readers (55x -> 5x gap to plain SQLite). Three changes:
+
+### a. Atomic page bitmap
+- Replaced `Mutex<PageBitmap>` with `RwLock<PageBitmap>` backed by `Vec<AtomicU8>`
+- `is_present()` is now lock-free (atomic load), `mark_present()` uses atomic OR
+- `bitmap_mark()` helper auto-grows bitmap via read-then-upgrade pattern
+- Eliminates reader-reader and reader-writer contention on the cache bitmap hot path
+
+### b. ArcSwap manifest
+- Replaced `Arc<RwLock<Manifest>>` with `Arc<ArcSwap<Manifest>>` (arc-swap crate)
+- Readers call `manifest.load()` (lock-free atomic pointer load, never blocks)
+- Writers clone manifest, mutate clone, atomically swap via `manifest.store()`
+- sync() dirty page iteration no longer holds exclusive lock, readers continue unblocked
+- Changed across handle.rs, vfs.rs, flush.rs, compact.rs, prefetch.rs, bench.rs
+
+### c. Read fast path + AtomicU32 page_size
+- `read_exact_at()`: if page is in bitmap cache, read directly and return (skips dirty check, manifest lookup, prefetch heuristics, tree detection)
+- Replaced `page_size: RwLock<u32>` with `AtomicU32` (was acquired on every read/write)
+
+### Benchmark results (perf-compare, 4 concurrent reader threads)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| rdw-write-4t | 210/s | 1,600/s |
+| rdw-read-4t | ~2,000/s | 2,500/s |
+| conc-read-4t | 14,900/s | 15,400/s |
+| point-lookup (single) | 30,000/s | 30,000/s |
+
+Remaining gap to plain SQLite (~5x for writes) is inherent VFS page indirection cost, not lock contention.
+
+---
+
 ## Zenith: S3-Primary Mode
 
 S3 is the database, local disk is disposable cache. Every committed transaction is immediately durable in S3 via subframe override uploads + manifest publish. No WAL, no journal, no checkpoint-as-replication-step. Combined with Phase Drift, per-transaction cost is small (~256KB per dirty frame + manifest publish).
