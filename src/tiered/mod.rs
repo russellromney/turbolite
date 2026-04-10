@@ -55,6 +55,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};

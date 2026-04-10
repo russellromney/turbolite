@@ -867,8 +867,8 @@ fn test_write_pages_scattered_only_marks_written_pages() {
     assert!(cache.is_present(0), "page 0 should be present");
     assert!(cache.is_present(1), "page 1 should be present");
     // Pages 5 and 10 should NOT be present (data was too short)
-    assert!(!cache.bitmap.lock().is_present(5), "page 5 should NOT be present (no data)");
-    assert!(!cache.bitmap.lock().is_present(10), "page 10 should NOT be present (no data)");
+    assert!(!cache.bitmap.read().is_present(5), "page 5 should NOT be present (no data)");
+    assert!(!cache.bitmap.read().is_present(10), "page 10 should NOT be present (no data)");
 }
 
 #[test]
@@ -900,7 +900,7 @@ fn test_write_pages_scattered_no_tracker_pollution() {
     cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
 
     // Page 5 should be present (bitmap)
-    assert!(cache.bitmap.lock().is_present(5));
+    assert!(cache.bitmap.read().is_present(5));
 
     // Unwritten pages must not be present (bitmap is per-page accurate)
     assert!(!cache.is_present(4), "page 4 must not be present");
@@ -1037,7 +1037,7 @@ fn test_write_pages_scattered_partial_page_data() {
 
     // Only page 0 should be marked (page 1 had partial data)
     assert!(cache.is_present(0), "page 0 with full data should be present");
-    assert!(!cache.bitmap.lock().is_present(1), "page 1 with partial data should not be present");
+    assert!(!cache.bitmap.read().is_present(1), "page 1 with partial data should not be present");
 }
 
 #[test]

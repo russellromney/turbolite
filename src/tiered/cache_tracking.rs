@@ -1,80 +1,96 @@
 use super::*;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // ===== Page Bitmap =====
 
 /// 1-bit-per-page tracking of which pages are present in the local cache file.
 /// Persisted to disk for crash recovery.
+///
+/// Uses AtomicU8 storage so `is_present()` is lock-free. Readers never block
+/// writers and vice versa. Only `ensure_capacity()` (which reallocates) needs
+/// external synchronization, and that only happens during checkpoint when
+/// the page count grows.
 pub(crate) struct PageBitmap {
-    pub(crate) bits: Vec<u8>,
+    pub(crate) bits: Vec<AtomicU8>,
     pub(crate) path: PathBuf,
 }
 
+// Safety: AtomicU8 is Send+Sync, PathBuf is Send+Sync.
+unsafe impl Send for PageBitmap {}
+unsafe impl Sync for PageBitmap {}
+
 impl PageBitmap {
     pub(crate) fn new(path: PathBuf) -> Self {
-        // Try to load from disk
-        let bits = fs::read(&path).unwrap_or_default();
+        let raw = fs::read(&path).unwrap_or_default();
+        let bits = raw.into_iter().map(AtomicU8::new).collect();
         Self { bits, path }
     }
 
+    /// Lock-free read. Safe to call from any thread without holding a lock.
     pub(crate) fn is_present(&self, page: u64) -> bool {
         let byte_idx = page as usize / 8;
         let bit_idx = page as usize % 8;
         if byte_idx >= self.bits.len() {
             return false;
         }
-        self.bits[byte_idx] & (1 << bit_idx) != 0
+        self.bits[byte_idx].load(Ordering::Relaxed) & (1 << bit_idx) != 0
     }
 
-    pub(crate) fn mark_present(&mut self, page: u64) {
-        self.ensure_capacity(page);
+    /// Atomic set-bit. Safe to call concurrently (bit-OR is idempotent).
+    /// Caller must ensure capacity via `ensure_capacity()` first.
+    pub(crate) fn mark_present(&self, page: u64) {
         let byte_idx = page as usize / 8;
         let bit_idx = page as usize % 8;
-        self.bits[byte_idx] |= 1 << bit_idx;
+        if byte_idx < self.bits.len() {
+            self.bits[byte_idx].fetch_or(1 << bit_idx, Ordering::Relaxed);
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn mark_range(&mut self, start: u64, count: u64) {
+    pub(crate) fn mark_range(&self, start: u64, count: u64) {
         for p in start..start + count {
             self.mark_present(p);
         }
     }
 
-    pub(crate) fn clear(&mut self, page: u64) {
+    /// Atomic clear-bit.
+    pub(crate) fn clear(&self, page: u64) {
         let byte_idx = page as usize / 8;
         let bit_idx = page as usize % 8;
         if byte_idx < self.bits.len() {
-            self.bits[byte_idx] &= !(1 << bit_idx);
+            self.bits[byte_idx].fetch_and(!(1 << bit_idx), Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn clear_range(&mut self, start: u64, count: u64) {
+    pub(crate) fn clear_range(&self, start: u64, count: u64) {
         for p in start..start + count {
-            let byte_idx = p as usize / 8;
-            let bit_idx = p as usize % 8;
-            if byte_idx < self.bits.len() {
-                self.bits[byte_idx] &= !(1 << bit_idx);
-            }
+            self.clear(p);
         }
     }
 
+    /// Grow the bitmap if needed. NOT thread-safe for concurrent resize,
+    /// but safe to call while readers use `is_present()` on existing pages
+    /// (they only access indices < current len).
     pub(crate) fn resize(&mut self, page_count: u64) {
         let needed_bytes = (page_count as usize + 7) / 8;
         if self.bits.len() < needed_bytes {
-            self.bits.resize(needed_bytes, 0);
+            self.bits.resize_with(needed_bytes, || AtomicU8::new(0));
         }
     }
 
     pub(crate) fn persist(&self) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, &self.bits)?;
+        let raw: Vec<u8> = self.bits.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        fs::write(&tmp, &raw)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 
+    /// Grow if needed. Same caveats as `resize()`.
     pub(crate) fn ensure_capacity(&mut self, page: u64) {
         let needed = page as usize / 8 + 1;
         if self.bits.len() < needed {
-            self.bits.resize(needed, 0);
+            self.bits.resize_with(needed, || AtomicU8::new(0));
         }
     }
 }
