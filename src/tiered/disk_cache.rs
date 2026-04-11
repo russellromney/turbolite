@@ -128,9 +128,13 @@ pub(crate) struct DiskCache {
     #[allow(dead_code)] // retained for debugging
     pub(crate) cache_dir: PathBuf,
     /// Local cache file — uncompressed pages at offset page_num * page_size.
-    /// RwLock: read lock for concurrent pread/pwrite (thread-safe on Unix),
-    /// write lock only for set_len (extending the file).
-    pub(crate) cache_file: parking_lot::RwLock<File>,
+    /// pread/pwrite are thread-safe on Unix, no lock needed for I/O.
+    /// Only set_len (extending) is serialized via cache_file_extend.
+    pub(crate) cache_file: File,
+    /// Tracked file length to avoid metadata() syscall on every write.
+    pub(crate) cache_file_len: std::sync::atomic::AtomicU64,
+    /// Serializes set_len calls (rare: only when DB grows beyond current cache file).
+    pub(crate) cache_file_extend: parking_lot::Mutex<()>,
     /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
     pub(crate) tracker: parking_lot::Mutex<SubChunkTracker>,
     /// Page bitmap: AtomicU8-backed, lock-free for is_present/mark_present/clear.
@@ -308,7 +312,9 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
-            cache_file: parking_lot::RwLock::new(cache_file),
+            cache_file_len: std::sync::atomic::AtomicU64::new(cache_file.metadata().map(|m| m.len()).unwrap_or(0)),
+            cache_file,
+            cache_file_extend: parking_lot::Mutex::new(()),
             tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::RwLock::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
@@ -346,6 +352,22 @@ impl DiskCache {
         })
     }
 
+    /// Ensure the cache file is at least `needed` bytes. Lock-free fast path
+    /// when file is already large enough; mutex only for the rare set_len.
+    fn ensure_file_len(&self, needed: u64) -> io::Result<()> {
+        if self.cache_file_len.load(Ordering::Relaxed) >= needed {
+            return Ok(());
+        }
+        let _guard = self.cache_file_extend.lock();
+        // Re-check after lock
+        let current = self.cache_file_len.load(Ordering::Relaxed);
+        if current < needed {
+            self.cache_file.set_len(needed)?;
+            self.cache_file_len.store(needed, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Create a zstd decoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn decoder_dict(&self) -> Option<zstd::dict::DecoderDictionary<'static>> {
@@ -365,8 +387,7 @@ impl DiskCache {
         }
 
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-        let file = self.cache_file.read();
-        file.read_exact_at(buf, offset)?;
+        self.cache_file.read_exact_at(buf, offset)?;
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
             let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
@@ -392,8 +413,7 @@ impl DiskCache {
 
         // Read the compressed (and optionally encrypted) blob
         let mut compressed = vec![0u8; entry.compressed_len as usize];
-        let file = self.cache_file.read();
-        file.read_exact_at(&mut compressed, entry.offset)?;
+        self.cache_file.read_exact_at(&mut compressed, entry.offset)?;
 
         // Decrypt if encrypted (CTR, same size)
         #[cfg(feature = "encryption")]
@@ -455,21 +475,9 @@ impl DiskCache {
 
         let needed = offset + data.len() as u64;
 
-        // Extend file if needed (exclusive lock), then pwrite (shared lock)
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                // Re-check after acquiring write lock
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(data, offset)?;
-            } else {
-                file.write_all_at(data, offset)?;
-            }
-        }
+        // Extend file if needed (serialized via mutex), then pwrite (lock-free)
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
         self.bitmap_mark(page_num);
         // Do NOT mark sub-chunk tracker here — write_page writes a single page,
         // not a complete sub-chunk. Sub-chunk tracker is only updated by
@@ -507,19 +515,8 @@ impl DiskCache {
         };
 
         let needed = offset + blob_len as u64;
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, offset)?;
-            } else {
-                file.write_all_at(&blob, offset)?;
-            }
-        }
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, offset)?;
 
         self.bitmap_mark(page_num);
         Ok(())
@@ -555,20 +552,8 @@ impl DiskCache {
         let offset = start_page * page_sz as u64;
         let needed = offset + data.len() as u64;
 
-        // Try read lock first (concurrent pwrite). Only upgrade to write lock if file too small.
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(data, offset)?;
-            } else {
-                file.write_all_at(data, offset)?;
-            }
-        }
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
 
         // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
         {
@@ -648,19 +633,8 @@ impl DiskCache {
         };
 
         let needed = base_offset + blob.len() as u64;
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, base_offset)?;
-            } else {
-                file.write_all_at(&blob, base_offset)?;
-            }
-        }
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, base_offset)?;
 
         // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
         {
@@ -718,45 +692,20 @@ impl DiskCache {
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
         let needed = (max_page + 1) * page_sz as u64;
 
-        // Ensure file is large enough
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                for (i, &pnum) in written_pages.iter().enumerate() {
-                    let src_start = i * page_sz;
-                    let page_data = &data[src_start..src_start + page_sz];
-                    #[cfg(feature = "encryption")]
-                    let page_data = if let Some(ref key) = self.encryption_key {
-                        &compress::encrypt_ctr(page_data, pnum, key)?
-                    } else {
-                        page_data
-                    };
-                    #[cfg(not(feature = "encryption"))]
-                    let page_data = page_data;
-                    let offset = pnum * page_sz as u64;
-                    file.write_all_at(page_data, offset)?;
-                }
+        self.ensure_file_len(needed)?;
+        for (i, &pnum) in written_pages.iter().enumerate() {
+            let src_start = i * page_sz;
+            let page_data = &data[src_start..src_start + page_sz];
+            #[cfg(feature = "encryption")]
+            let page_data = if let Some(ref key) = self.encryption_key {
+                &compress::encrypt_ctr(page_data, pnum, key)?
             } else {
-                for (i, &pnum) in written_pages.iter().enumerate() {
-                    let src_start = i * page_sz;
-                    let page_data = &data[src_start..src_start + page_sz];
-                    #[cfg(feature = "encryption")]
-                    let page_data = if let Some(ref key) = self.encryption_key {
-                        &compress::encrypt_ctr(page_data, pnum, key)?
-                    } else {
-                        page_data
-                    };
-                    #[cfg(not(feature = "encryption"))]
-                    let page_data = page_data;
-                    let offset = pnum * page_sz as u64;
-                    file.write_all_at(page_data, offset)?;
-                }
-            }
+                page_data
+            };
+            #[cfg(not(feature = "encryption"))]
+            let page_data = page_data;
+            let offset = pnum * page_sz as u64;
+            self.cache_file.write_all_at(page_data, offset)?;
         }
 
         // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
@@ -837,19 +786,8 @@ impl DiskCache {
         };
 
         let needed = base_offset + blob.len() as u64;
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, base_offset)?;
-            } else {
-                file.write_all_at(&blob, base_offset)?;
-            }
-        }
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, base_offset)?;
 
         // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
         if let Some(&max_page) = written_pages.iter().max() {
@@ -1149,14 +1087,13 @@ impl DiskCache {
         #[cfg(target_os = "linux")]
         if !self.cache_compression {
             use std::os::unix::io::AsRawFd;
-            let file = self.cache_file.write();
             let ps = self.page_size.load(Ordering::Acquire) as u64;
             for &pnum in page_nums {
                 let offset = (pnum * ps) as libc::off_t;
                 let len = ps as libc::off_t;
                 unsafe {
                     libc::fallocate(
-                        file.as_raw_fd(),
+                        self.cache_file.as_raw_fd(),
                         libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                         offset,
                         len,

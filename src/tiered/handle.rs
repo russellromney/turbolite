@@ -3051,12 +3051,13 @@ impl DatabaseHandle for TurboliteHandle {
             let ps = self.page_size.load(Ordering::Relaxed) as u64;
             if current_page_count > 0 && ps > 0 {
                 let target_size = current_page_count * ps;
-                let file = cache.cache_file.write();
-                if let Ok(meta) = file.metadata() {
+                let _guard = cache.cache_file_extend.lock();
+                if let Ok(meta) = cache.cache_file.metadata() {
                     if meta.len() > target_size {
-                        if let Err(e) = file.set_len(target_size) {
+                        if let Err(e) = cache.cache_file.set_len(target_size) {
                             eprintln!("[sync] WARN: cache truncation failed: {}", e);
                         } else {
+                            cache.cache_file_len.store(target_size, Ordering::Relaxed);
                             eprintln!("[sync] cache truncated: {}B -> {}B ({} pages)",
                                 meta.len(), target_size, current_page_count);
                         }
