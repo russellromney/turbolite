@@ -1969,37 +1969,40 @@ impl DatabaseHandle for TurboliteHandle {
             eprintln!("[sync] local-only checkpoint: {} pages, {} interior total, {} dirty groups", n, total_interior, pending_groups_snapshot.len());
 
             let page_size = self.page_size.load(Ordering::Relaxed);
-            // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
-            // The staging log captured exact page contents during write_all_at(),
-            // immune to overwrite by subsequent checkpoints.
-            if let Some(writer) = self.staging_writer.take() {
+            // Combined staging log + manifest: one fsync instead of three.
+            // Append manifest to staging log before finalize, so a single fsync
+            // durably commits both page data and manifest state.
+            if let Some(mut writer) = self.staging_writer.take() {
+                // Serialize manifest + dirty groups into staging log trailer
+                let m = (**self.manifest.load()).clone();
+                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot.clone() };
+                let manifest_bytes = rmp_serde::to_vec(&local)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize manifest for staging: {e}")))?;
+                writer.append_manifest(&manifest_bytes)?;
+
                 let (staging_path, pages_written) = writer.finalize()?;
-                // Version from filename (seq counter assigned at open time)
                 let version = staging_path.file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
                 eprintln!(
-                    "[sync] staging log finalized: {} pages, version {}, path {}",
-                    pages_written, version, staging_path.display(),
+                    "[sync] staging log finalized: {} pages + manifest ({}B), version {}, path {}",
+                    pages_written, manifest_bytes.len(), version, staging_path.display(),
                 );
                 self.pending_flushes.lock().unwrap().push(staging::PendingFlush {
                     staging_path,
                     version,
                     page_size,
                 });
-            }
-
-            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery.
-            // Errors MUST propagate: if persist fails, SQLite must not discard the WAL.
-            {
+            } else {
+                // No staging writer (no dirty pages?) -- persist manifest separately
                 let m = (**self.manifest.load()).clone();
-                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot };
+                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot.clone() };
                 local.persist(&cache_dir)?;
             }
 
-            // Persist bitmap so cached pages survive process restart
-            cache.persist_bitmap()?;
+            // Bitmap persist deferred -- reconstructable from cache file on restart.
+            // Only persist periodically or on clean shutdown.
 
             // Local mode: flush dirty page groups to local pg/ directory.
             // Deferred to background -- staging log + cache file provide crash recovery.
