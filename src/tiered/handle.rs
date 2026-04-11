@@ -1075,14 +1075,15 @@ impl DatabaseHandle for TurboliteHandle {
         };
         let page_num = offset / page_size;
 
-        // FAST PATH: if page is cached and not dirty, read directly from cache.
-        // Skips manifest lookup, dirty check, prefetch heuristics, tree detection.
-        // This is the common case for warm local reads.
-        if let Some(cache) = &self.cache {
-            if cache.is_present(page_num) {
-                cache.read_page(page_num, buf)?;
-                cache.stat_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+        // FAST PATH: if page is cached, not dirty, and no dirty pages pending,
+        // read directly from cache. Skips manifest lookup, prefetch heuristics.
+        if !self.dirty_since_sync {
+            if let Some(cache) = &self.cache {
+                if cache.is_present(page_num) {
+                    cache.read_page(page_num, buf)?;
+                    cache.stat_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
             }
         }
 
