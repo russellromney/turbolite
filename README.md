@@ -42,27 +42,28 @@ Benchmarks are organized by **cache level** (what's already on local disk when t
 
 ### Warm cache (VFS overhead vs plain SQLite)
 
-50K rows, WAL mode, macOS (Apple Silicon):
+100K rows, Fly.io performance-2x (dedicated vCPU, NVMe, IAD):
 
 | Operation | SQLite | turbolite | Overhead |
 |-----------|--------|-----------|----------|
-| Point lookup | 460K/s | 246K/s | 1.9x |
-| Range scan | 35K/s | 30K/s | 1.2x |
-| Full table scan | 467/s | 468/s | **parity** |
-| INSERT | 36K/s | 32K/s | 1.1x |
-| Batch INSERT (in txn) | 4.3M/s | 4.9M/s | **faster** |
-| Read during write (4 readers) | 18K/s | 22K/s | **faster** |
+| Point lookup | 145K/s | 73K/s | 2.0x |
+| Range scan | 8.8K/s | 8.3K/s | **parity** |
+| Full table scan | 56/s | 60/s | **parity** |
+| INSERT | 19K/s | 23K/s | **faster** |
+| UPDATE by PK | 40K/s | 27K/s | 1.5x |
+| Batch INSERT (in txn) | 685K/s | 740K/s | **faster** |
 
-Per-page overhead is ~2x for point lookups, approaches parity for scans and batches. Lock-free cache architecture means concurrent reads never block writes.
+Point lookups have the highest per-page overhead (~2x). Everything else approaches or beats parity. Lock-free cache architecture means concurrent reads never block writes.
 
 ### Checkpoint cost
 
-| After | Local | S3 (~100ms RTT) |
-|-------|-------|------------------|
-| 500 inserts | 8ms | 240ms |
-| 5K batch | 13ms | 606ms |
+| After | Local | S3 (same-region RustFS) |
+|-------|-------|-------------------------|
+| 1K inserts | 19ms | 38ms |
+| 10K batch | 17ms | 114ms |
+| 1K updates | 9ms | 36ms |
 
-Writes are always local-speed. The S3 cost is only at checkpoint (page group compression + upload). S3 Express (~4ms RTT) would be proportionally faster.
+Writes are always local-speed. The S3 cost is at checkpoint only. Numbers with RustFS in same Fly region (~2ms RTT). S3 Express One Zone would be comparable.
 
 ## Quick Start
 
