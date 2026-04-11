@@ -7,8 +7,31 @@
 //! This binary is a placeholder for future CLI commands operating on the
 //! TurboliteVfs manifest + page group format.
 
+use clap::{CommandFactory, Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "turbolite", version, about = "turbolite CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Version,
+}
+
 fn main() {
-    eprintln!("turbolite CLI: no commands implemented yet.");
-    eprintln!("The legacy CompressedVfs commands were removed in Phase Unification-h.");
-    std::process::exit(1);
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Version) => {
+            println!("turbolite {}", env!("CARGO_PKG_VERSION"));
+        }
+        None => {
+            let mut command = Cli::command();
+            command.print_help().expect("failed to print help");
+            println!();
+        }
+    }
 }
