@@ -146,9 +146,9 @@ You can tune the prefetch schedule for *each query* via `SELECT turbolite_config
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
-### A note on precise prefetch (Phase Jena)
+### A note on precise prefetch
 
-turbolite includes an experimental "interior page introspection" system (Phase Jena, disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
+turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
 
 In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Jena's precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
 
