@@ -483,6 +483,8 @@ impl DiskCache {
         }
 
         // In-memory page cache: zero-lock read via AtomicPtr.
+        // Pages are promoted at decode time (write_pages_bulk/scattered), not on read miss.
+        // This avoids allocation + CAS overhead on every first access.
         if let Some(ref mc) = self.mem_cache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Acquire);
@@ -493,36 +495,7 @@ impl DiskCache {
                     return Ok(());
                 }
             }
-            // Miss: read from disk, then promote
-            let ps = self.page_size.load(Ordering::Acquire) as usize;
-            let offset = page_num * ps as u64;
-            self.cache_file.read_exact_at(buf, offset)?;
-            #[cfg(feature = "encryption")]
-            if let Some(ref key) = self.encryption_key {
-                let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
-                buf.copy_from_slice(&decrypted);
-            }
-            // Promote: allocate page buffer + store pointer atomically
-            if let Some(slot) = mc.get(page_num as usize) {
-                if slot.load(Ordering::Relaxed).is_null() {
-                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 <= self.mem_cache_budget {
-                        let page_buf = vec![0u8; ps].into_boxed_slice();
-                        let ptr = Box::into_raw(page_buf) as *mut u8;
-                        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, buf.len().min(ps)); }
-                        // CAS to avoid double-allocation on race
-                        if slot.compare_exchange(
-                            std::ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed
-                        ).is_err() {
-                            // Another thread beat us, free our allocation
-                            unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
-                        } else {
-                            self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-            return Ok(());
+            // Miss: fall through to pread (page not decoded yet or evicted)
         }
 
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
