@@ -40,6 +40,37 @@ Benchmarks are organized by **cache level** (what's already on local disk when t
 
 **interior** is the most realistic cold benchmark: interior pages load eagerly on connection open, so by the time you run your first query, they're cached. Index pages aggressively prefetch on first access in the background and may not be ready yet.
 
+### Local performance (warm cache, VFS overhead)
+
+When data is cached locally, turbolite adds minimal overhead vs plain SQLite. The VFS layer (page indirection, mmap WAL-index, lock-free cache) is nearly transparent for most workloads.
+
+50K rows, WAL mode, synchronous=NORMAL, macOS (Apple Silicon):
+
+| Operation | SQLite | turbolite | Overhead |
+|-----------|--------|-----------|----------|
+| Point lookup | 460K ops/s | 246K ops/s | 1.9x |
+| Range scan (100 rows) | 35K ops/s | 30K ops/s | 1.2x |
+| Full table scan | 467 ops/s | 468 ops/s | **parity** |
+| Single INSERT (autocommit) | 36K ops/s | 32K ops/s | 1.1x |
+| UPDATE by PK | 70K ops/s | 33K ops/s | 2.1x |
+| Batch INSERT (in txn) | 4.3M ops/s | 4.9M ops/s | **faster** |
+| Concurrent reads (4 threads) | 75K ops/s | 56K ops/s | 1.3x |
+| Read during write (4 readers) | 18K reads/s | 22K reads/s | **faster** |
+
+Point lookups have the highest overhead (~2x) because each lookup is a single-page VFS call. Full scans, range scans, and batch operations amortize the per-page cost and approach parity. Concurrent read-during-write scenarios can be faster than plain SQLite due to the lock-free cache architecture (Phase Pelican).
+
+### Checkpoint cost (local vs S3)
+
+turbolite checkpoint compresses dirty pages into page groups and writes them to local disk or S3. The cost depends on the number of dirty pages and the S3 backend latency.
+
+| Checkpoint after | Local | S3 (same-region) |
+|-----------------|-------|-------------------|
+| 500 inserts | 8ms | 240ms |
+| 5K batch insert | 13ms | 606ms |
+| 500 updates | 9ms | 1.4s |
+
+S3 numbers measured through fly proxy to RustFS (~100ms RTT). On Fly in the same region, expect 3-5x faster. S3 Express One Zone (~4ms RTT) would be faster still. Local checkpoint cost is dominated by staging log fsync + manifest serialization.
+
 ## Quick Start
 
 ### Python
