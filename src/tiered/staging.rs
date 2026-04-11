@@ -18,6 +18,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Magic value to identify manifest trailer in staging log.
+/// Chosen to be extremely unlikely as a valid page number.
+pub(crate) const MANIFEST_MAGIC: u64 = 0xCAFE_FACE_DEAD_BEEF;
+
 /// A single pending flush: staging log path + metadata recorded by sync().
 #[derive(Debug)]
 pub(crate) struct PendingFlush {
@@ -72,6 +76,16 @@ impl StagingWriter {
         Ok(())
     }
 
+    /// Append manifest bytes to the staging log before finalize.
+    /// Format: [MANIFEST_MAGIC: u64 LE][manifest_len: u64 LE][manifest_data: [u8; manifest_len]]
+    /// The magic value distinguishes manifest trailer from page records.
+    pub fn append_manifest(&mut self, manifest_bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(&MANIFEST_MAGIC.to_le_bytes())?;
+        self.writer.write_all(&(manifest_bytes.len() as u64).to_le_bytes())?;
+        self.writer.write_all(manifest_bytes)?;
+        Ok(())
+    }
+
     /// Flush buffers, fsync, and return the path for PendingFlush.
     pub fn finalize(mut self) -> io::Result<(PathBuf, u64)> {
         self.writer.flush()?;
@@ -114,19 +128,26 @@ pub(crate) fn read_staging_log(
         ));
     }
 
-    let num_records = (file_len / record_size) as usize;
-    let mut pages = HashMap::with_capacity(num_records);
+    let mut pages = HashMap::new();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut page_num_buf = [0u8; 8];
     let mut page_buf = vec![0u8; page_size as usize];
 
-    for _ in 0..num_records {
-        reader.read_exact(&mut page_num_buf)?;
-        reader.read_exact(&mut page_buf)?;
+    loop {
+        // Read page_num (or manifest magic)
+        match reader.read_exact(&mut page_num_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
         let page_num = u64::from_le_bytes(page_num_buf);
-        // Later writes for the same page_num win (HashMap::insert overwrites).
-        // This is correct: if the same page was written multiple times in one
-        // checkpoint, the last write is the committed state.
+
+        // Check for manifest trailer
+        if page_num == MANIFEST_MAGIC {
+            break; // manifest follows, but we only care about pages here
+        }
+
+        reader.read_exact(&mut page_buf)?;
         pages.insert(page_num, page_buf.clone());
     }
 
