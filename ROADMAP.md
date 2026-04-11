@@ -1,5 +1,46 @@
 # turbolite Roadmap
 
+## Valkyrie: io_uring VFS (Linux, faster than SQLite)
+> After: Pelican (CHANGELOG) · Before: Stalingrad
+
+Replace syscall-per-page I/O with batched io_uring submissions. On Linux, this makes turbolite's VFS **faster than SQLite's default VFS** because:
+
+1. SQLite's default VFS does one `pread` syscall per page read (even with mmap WAL-index, page I/O is syscall-based)
+2. With io_uring, turbolite can batch multiple page reads into a single submission queue drain, amortizing the kernel transition cost across pages
+3. SQLite reads 1 page at a time; turbolite knows (from the manifest + query plan) which pages are coming next, so it can submit multiple reads before SQLite asks for them
+
+**Why this is possible now:** Phase Pelican's mmap WAL-index + lock-free cache file removed all per-page locks. The remaining overhead is pure syscall cost. io_uring eliminates that.
+
+### a. io_uring cache file reads
+- Replace `pread` in `DiskCache::read_page()` with io_uring `Read` op
+- Batch: when prefetch submits N page reads, collect them into a single SQE batch
+- `read_exact_at` fast path: check if page is already completed in io_uring CQE ring, return immediately if so
+- Fallback: if io_uring unavailable (old kernel, macOS), use current pread path
+- Expected: point lookup from 5us to <1us (no kernel transition for cached pages)
+
+### b. io_uring prefetch pipeline
+- Prefetch pool submits page reads to io_uring instead of spawning threads
+- io_uring handles the kernel-level parallelism (no thread pool needed for I/O)
+- SQE chain: read page -> write to cache file -> mark bitmap (all in kernel)
+- Expected: cold query latency reduction from prefetch overlap
+
+### c. io_uring checkpoint
+- Batch cache file reads during page group encoding (currently one pread per page per group)
+- Async fsync for staging log (currently blocks ~2ms on macOS, ~0.5ms on Linux)
+- Parallel pg/ directory writes for background flush
+- Expected: local checkpoint from 8ms to <2ms
+
+### d. io_uring S3 upload pipeline
+- Encode group -> submit to io_uring for local write -> simultaneously start S3 PUT
+- io_uring handles the file I/O (cache reads for encoding) while tokio handles S3 network
+- True CPU/IO/network overlap without thread pool overhead
+
+**Crate:** `io-uring` (1.x) for raw ring access, or `tokio-uring` for async integration.
+**Gating:** Linux-only, kernel 5.6+. Feature flag `io-uring`. macOS/other: current pread path.
+**Risk:** io_uring API complexity, fixed-buffer registration lifetime management.
+
+---
+
 ## Stalingrad (remaining): Query Cost Estimation
 > After: Austerlitz (CHANGELOG) · Before: Jena
 
