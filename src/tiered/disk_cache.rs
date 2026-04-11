@@ -544,30 +544,14 @@ impl DiskCache {
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
         self.bitmap_mark(page_num);
-        // Update in-memory cache if active (keep dirty pages hot)
+        // Update in-memory cache if page is already cached (keep dirty data consistent).
+        // Don't promote on write -- read path handles promotion.
         if let Some(ref mc) = self.mem_cache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 if !ptr.is_null() {
-                    // Page already cached, update in place
                     let copy_len = data.len().min(self.page_size.load(Ordering::Relaxed) as usize);
                     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len); }
-                } else {
-                    // Not cached yet, allocate and store
-                    let ps = data.len();
-                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 <= self.mem_cache_budget {
-                        let mut page_buf = vec![0u8; ps].into_boxed_slice();
-                        page_buf.copy_from_slice(data);
-                        let ptr = Box::into_raw(page_buf) as *mut u8;
-                        if slot.compare_exchange(
-                            std::ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed
-                        ).is_err() {
-                            unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
-                        } else {
-                            self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
-                        }
-                    }
                 }
             }
         }
