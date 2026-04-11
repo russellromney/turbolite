@@ -116,17 +116,9 @@ pub(crate) fn read_staging_log(
         return Ok(HashMap::new());
     }
 
-    if file_len % record_size != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "staging log {} has invalid size {} (not a multiple of record_size {})",
-                path.display(),
-                file_len,
-                record_size,
-            ),
-        ));
-    }
+    // File may contain a manifest trailer (MANIFEST_MAGIC + length + data),
+    // so we can't validate total file size as a multiple of record_size.
+    // Instead, we read records until we hit MANIFEST_MAGIC or EOF.
 
     let mut pages = HashMap::new();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
