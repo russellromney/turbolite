@@ -1812,18 +1812,23 @@ impl DatabaseHandle for TurboliteHandle {
         // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
         if let Some(cache) = &self.cache {
             cache.write_page(page_num, buf)?;
-        }
-        self.dirty_page_nums.write().insert(page_num);
-        self.dirty_since_sync = true;
 
-        // Phase Jena: detect interior page writes for map rebuild (if enabled).
-        if self.jena_enabled {
+            // Detect interior pages at write time (avoids re-reading during sync).
             let hdr_off = if page_num == 0 { 100 } else { 0 };
             let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
             if type_byte == 0x05 || type_byte == 0x02 {
-                self.interior_writes_since_rebuild += 1;
+                // Look up group assignment. For new pages not yet assigned, this returns None
+                // and sync() will handle them after assign_new_pages_to_groups.
+                if let Some(loc) = self.manifest.load().page_location(page_num) {
+                    cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                }
+                if self.jena_enabled {
+                    self.interior_writes_since_rebuild += 1;
+                }
             }
         }
+        self.dirty_page_nums.write().insert(page_num);
+        self.dirty_since_sync = true;
 
         // Phase Kursk: append to staging log for LocalThenFlush mode.
         // Captures exact page contents at write time, immune to overwrite
@@ -1922,7 +1927,6 @@ impl DatabaseHandle for TurboliteHandle {
             let cache = &*cache_arc;
             let mut manifest = (**self.manifest.load()).clone();
             let mut pending = self.s3_dirty_groups.lock().unwrap();
-            let mut interior_found = 0usize;
             // Assign new pages (not in page_index) to new groups before recording dirty groups
             let unassigned: Vec<u64> = dirty_snapshot.iter()
                 .filter(|&&pn| manifest.page_location(pn).is_none())
@@ -1930,30 +1934,28 @@ impl DatabaseHandle for TurboliteHandle {
                 .collect();
             if !unassigned.is_empty() {
                 Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+                // Scan only newly-assigned pages for interior type (existing pages
+                // were already detected during write_all_at).
+                let page_size = self.page_size.load(Ordering::Relaxed);
+                let mut type_buf = vec![0u8; page_size as usize];
+                for &page_num in &unassigned {
+                    if let Some(loc) = manifest.page_location(page_num) {
+                        if cache.read_page(page_num, &mut type_buf).is_ok() {
+                            let type_byte = if page_num == 0 { type_buf.get(100) } else { type_buf.get(0) };
+                            if let Some(&b) = type_byte {
+                                if b == 0x05 || b == 0x02 {
+                                    cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            let page_size = self.page_size.load(Ordering::Relaxed);
-            let mut type_buf = vec![0u8; page_size as usize];
+            // Record dirty group IDs (no per-page pread -- interior detection done in write_all_at)
             for &page_num in &dirty_snapshot {
                 let loc = manifest.page_location(page_num)
                     .expect("page must have group assignment after new-page assignment");
                 pending.insert(loc.group_id);
-                // Track interior pages so final sync builds correct interior chunks.
-                // Phase Marne: read page type byte from cache instead of in-memory buffer.
-                match cache.read_page(page_num, &mut type_buf) {
-                    Ok(()) => {
-                        let type_byte = if page_num == 0 { type_buf.get(100) } else { type_buf.get(0) };
-                        if let Some(&b) = type_byte {
-                            if b == 0x05 || b == 0x02 {
-                                cache.mark_interior_group(loc.group_id, page_num, loc.index);
-                                interior_found += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other,
-                            format!("cache.read_page({}) failed during local checkpoint interior scan: {}", page_num, e)));
-                    }
-                }
             }
             self.manifest.store(Arc::new(manifest));
             let n = dirty_snapshot.len();
@@ -1964,8 +1966,9 @@ impl DatabaseHandle for TurboliteHandle {
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} dirty groups", n, interior_found, total_interior, pending_groups_snapshot.len());
+            eprintln!("[sync] local-only checkpoint: {} pages, {} interior total, {} dirty groups", n, total_interior, pending_groups_snapshot.len());
 
+            let page_size = self.page_size.load(Ordering::Relaxed);
             // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
             // The staging log captured exact page contents during write_all_at(),
             // immune to overwrite by subsequent checkpoints.
@@ -1998,10 +2001,43 @@ impl DatabaseHandle for TurboliteHandle {
             // Persist bitmap so cached pages survive process restart
             cache.persist_bitmap()?;
 
-            // Local mode: flush dirty page groups to local pg/ directory immediately.
-            // This encodes page groups from the cache and writes them alongside the manifest,
-            // so data can be recovered even if the cache file is deleted.
-            if let Some(ref storage) = self.storage {
+            // Local mode: flush dirty page groups to local pg/ directory.
+            // Deferred to background -- staging log + cache file provide crash recovery.
+            // The pg/ flush only matters for cold start from scratch (no cache).
+            if self.s3.is_none() {
+                // Pure local mode: spawn background flush (non-blocking)
+                if let Some(ref storage) = self.storage {
+                    let storage = storage.clone();
+                    let cache = cache_arc.clone();
+                    let manifest = Arc::clone(&self.manifest);
+                    let dirty_groups = Arc::clone(&self.s3_dirty_groups);
+                    let pending = Arc::clone(&self.pending_flushes);
+                    let comp_level = self.compression_level;
+                    #[cfg(feature = "zstd")]
+                    let dict = self.dictionary_bytes.clone();
+                    let enc_key = self.encryption_key;
+                    let override_thresh = self.override_threshold;
+                    let compact_thresh = self.compaction_threshold;
+                    std::thread::spawn(move || {
+                        if let Err(e) = flush::flush_local_groups(
+                            &storage,
+                            &cache,
+                            &manifest,
+                            &dirty_groups,
+                            &pending,
+                            comp_level,
+                            #[cfg(feature = "zstd")]
+                            dict.as_deref(),
+                            enc_key,
+                            override_thresh,
+                            compact_thresh,
+                        ) {
+                            eprintln!("[sync] background local flush failed: {}", e);
+                        }
+                    });
+                }
+            } else if let Some(ref storage) = self.storage {
+                // S3 mode with local storage: flush synchronously (needed before S3 upload)
                 flush::flush_local_groups(
                     storage,
                     cache,
