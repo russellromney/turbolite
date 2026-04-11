@@ -135,6 +135,14 @@ pub(crate) struct DiskCache {
     pub(crate) cache_file_len: std::sync::atomic::AtomicU64,
     /// Serializes set_len calls (rare: only when DB grows beyond current cache file).
     pub(crate) cache_file_extend: parking_lot::Mutex<()>,
+    /// In-memory page cache: flat array of page data indexed by page_num.
+    /// AtomicPtr per page: null = not cached, non-null = pointer to page_size bytes.
+    /// Zero-lock reads: just atomic load + memcpy.
+    pub(crate) mem_cache: Option<Vec<std::sync::atomic::AtomicPtr<u8>>>,
+    /// Memory budget in bytes (0 = disabled). User-controlled via TurboliteConfig.
+    pub(crate) mem_cache_budget: u64,
+    /// Current usage in bytes.
+    pub(crate) mem_cache_bytes: std::sync::atomic::AtomicU64,
     /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
     pub(crate) tracker: parking_lot::Mutex<SubChunkTracker>,
     /// Page bitmap: AtomicU8-backed, lock-free for is_present/mark_present/clear.
@@ -204,6 +212,7 @@ impl DiskCache {
             false, 3,
             #[cfg(feature = "zstd")]
             None,
+            0, // mem_cache_budget: disabled by default
         )
     }
 
@@ -212,6 +221,7 @@ impl DiskCache {
         page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>,
         cache_compression: bool, cache_compression_level: i32,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
+        mem_cache_budget: u64,
     ) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
@@ -315,6 +325,18 @@ impl DiskCache {
             cache_file_len: std::sync::atomic::AtomicU64::new(cache_file.metadata().map(|m| m.len()).unwrap_or(0)),
             cache_file,
             cache_file_extend: parking_lot::Mutex::new(()),
+            mem_cache: if mem_cache_budget > 0 && page_count > 0 && page_size > 0 {
+                let count = page_count as usize;
+                let mut v = Vec::with_capacity(count);
+                for _ in 0..count {
+                    v.push(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+                }
+                Some(v)
+            } else {
+                None
+            },
+            mem_cache_budget,
+            mem_cache_bytes: std::sync::atomic::AtomicU64::new(0),
             tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::RwLock::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
@@ -384,6 +406,49 @@ impl DiskCache {
 
         if self.cache_compression {
             return self.read_page_compressed(page_num, buf);
+        }
+
+        // In-memory page cache: zero-lock read via AtomicPtr.
+        if let Some(ref mc) = self.mem_cache {
+            if let Some(slot) = mc.get(page_num as usize) {
+                let ptr = slot.load(Ordering::Acquire);
+                if !ptr.is_null() {
+                    let ps = self.page_size.load(Ordering::Relaxed) as usize;
+                    let copy_len = buf.len().min(ps);
+                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len); }
+                    return Ok(());
+                }
+            }
+            // Miss: read from disk, then promote
+            let ps = self.page_size.load(Ordering::Acquire) as usize;
+            let offset = page_num * ps as u64;
+            self.cache_file.read_exact_at(buf, offset)?;
+            #[cfg(feature = "encryption")]
+            if let Some(ref key) = self.encryption_key {
+                let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
+                buf.copy_from_slice(&decrypted);
+            }
+            // Promote: allocate page buffer + store pointer atomically
+            if let Some(slot) = mc.get(page_num as usize) {
+                if slot.load(Ordering::Relaxed).is_null() {
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 <= self.mem_cache_budget {
+                        let page_buf = vec![0u8; ps].into_boxed_slice();
+                        let ptr = Box::into_raw(page_buf) as *mut u8;
+                        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, buf.len().min(ps)); }
+                        // CAS to avoid double-allocation on race
+                        if slot.compare_exchange(
+                            std::ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed
+                        ).is_err() {
+                            // Another thread beat us, free our allocation
+                            unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                        } else {
+                            self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            return Ok(());
         }
 
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
@@ -479,9 +544,33 @@ impl DiskCache {
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
         self.bitmap_mark(page_num);
-        // Do NOT mark sub-chunk tracker here — write_page writes a single page,
-        // not a complete sub-chunk. Sub-chunk tracker is only updated by
-        // write_pages_bulk() which writes complete frames fetched from S3.
+        // Update in-memory cache if active (keep dirty pages hot)
+        if let Some(ref mc) = self.mem_cache {
+            if let Some(slot) = mc.get(page_num as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                if !ptr.is_null() {
+                    // Page already cached, update in place
+                    let copy_len = data.len().min(self.page_size.load(Ordering::Relaxed) as usize);
+                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len); }
+                } else {
+                    // Not cached yet, allocate and store
+                    let ps = data.len();
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 <= self.mem_cache_budget {
+                        let mut page_buf = vec![0u8; ps].into_boxed_slice();
+                        page_buf.copy_from_slice(data);
+                        let ptr = Box::into_raw(page_buf) as *mut u8;
+                        if slot.compare_exchange(
+                            std::ptr::null_mut(), ptr, Ordering::Release, Ordering::Relaxed
+                        ).is_err() {
+                            unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                        } else {
+                            self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
