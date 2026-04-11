@@ -2643,125 +2643,125 @@ impl DatabaseHandle for TurboliteHandle {
         // with small pages_per_group values like ppg=8.)
         let groups_needing_upload: Vec<u64> = groups_dirty.keys().copied().collect();
 
-        // For each dirty page group that needs uploading: read all raw pages, encode as whole-group compressed
-        for &gid in &groups_needing_upload {
-            let mut need_s3_merge = false;
+        // Parallel encode: each group reads from cache, optionally merges from S3,
+        // compresses, and returns its upload data. rayon parallelizes across CPU cores.
+        struct GroupResult {
+            gid: u64,
+            key: String,
+            encoded: Vec<u8>,
+            frame_table: Option<Vec<FrameEntry>>,
+            old_key: Option<String>,
+        }
 
-            // Get explicit page list from B-tree-aware manifest (Phase Midway)
-            let pages_in_group = manifest_snap.group_page_nums(gid);
-            let group_size = pages_in_group.len();
+        let compression_level = self.compression_level;
+        #[cfg(feature = "zstd")]
+        let encoder_dict = &self.encoder_dict;
+        let encryption_key = self.encryption_key;
 
-            let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+        let group_results: Vec<io::Result<GroupResult>> = {
+            use rayon::prelude::*;
+            groups_needing_upload.par_iter().map(|&gid| {
+                let pages_in_group = manifest_snap.group_page_nums(gid);
+                let group_size = pages_in_group.len();
+                let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
+                let mut need_s3_merge = false;
 
-            // First, try to read all pages from local cache (raw, uncompressed)
-            for (i, &pnum) in pages_in_group.iter().enumerate() {
-                if pnum >= page_count {
-                    break;
-                }
-                if cache.is_present(pnum) {
-                    let mut page_buf = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut page_buf).is_ok() {
-                        pages[i] = Some(page_buf);
+                // Read all pages from local cache
+                for (i, &pnum) in pages_in_group.iter().enumerate() {
+                    if pnum >= page_count { break; }
+                    if cache.is_present(pnum) {
+                        let mut page_buf = vec![0u8; page_size as usize];
+                        if cache.read_page(pnum, &mut page_buf).is_ok() {
+                            pages[i] = Some(page_buf);
+                        }
+                    } else {
+                        need_s3_merge = true;
                     }
-                } else {
-                    need_s3_merge = true;
                 }
-            }
 
-            // If some pages aren't in cache, fetch existing group from S3 and merge
-            if need_s3_merge {
-                if let Some(existing_key) = new_keys.get(gid as usize) {
-                    if !existing_key.is_empty() {
-                        if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
-                            // Use seekable decode if the existing group has frame tables
-                            let existing_ft = manifest_snap.frame_tables.get(gid as usize);
-                            let has_ft = use_seekable
-                                && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
-                            if has_ft {
-                                let ft = existing_ft.unwrap();
-                                if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
-                                    &pg_data,
-                                    ft,
-                                    page_size,
-                                    pages_in_group.len() as u32,
-                                    page_count,
-                                    0, // B-tree groups: not positional offset
-                                    #[cfg(feature = "zstd")]
-                                    self.decoder_dict.as_ref(),
-                                    self.encryption_key.as_ref(),
-                                ) {
-                                    let ps = page_size as usize;
-                                    for j in 0..pages_in_group.len() {
-                                        if pages_in_group[j] >= page_count { break; }
-                                        if pages[j].is_none() {
-                                            let start = j * ps;
-                                            let end = start + ps;
-                                            if end <= bulk_data.len() {
-                                                pages[j] = Some(bulk_data[start..end].to_vec());
+                // S3 merge if needed
+                if need_s3_merge {
+                    if let Some(existing_key) = new_keys.get(gid as usize) {
+                        if !existing_key.is_empty() {
+                            if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                                let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+                                let has_ft = use_seekable
+                                    && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+                                if has_ft {
+                                    let ft = existing_ft.expect("checked");
+                                    if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
+                                        &pg_data, ft, page_size, pages_in_group.len() as u32,
+                                        page_count, 0,
+                                        #[cfg(feature = "zstd")]
+                                        None::<&zstd::dict::DecoderDictionary<'static>>,
+                                        encryption_key.as_ref(),
+                                    ) {
+                                        let ps = page_size as usize;
+                                        for j in 0..pages_in_group.len() {
+                                            if pages_in_group[j] >= page_count { break; }
+                                            if pages[j].is_none() {
+                                                let start = j * ps;
+                                                let end = start + ps;
+                                                if end <= bulk_data.len() {
+                                                    pages[j] = Some(bulk_data[start..end].to_vec());
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
-                                &pg_data,
-                                #[cfg(feature = "zstd")]
-                                self.decoder_dict.as_ref(),
-                                self.encryption_key.as_ref(),
-                            ) {
-                                for (j, existing_page) in existing_pages.into_iter().enumerate() {
-                                    if j >= pages_in_group.len() { break; }
-                                    if pages_in_group[j] >= page_count { break; }
-                                    if pages[j].is_none() {
-                                        pages[j] = Some(existing_page);
+                                } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
+                                    &pg_data,
+                                    #[cfg(feature = "zstd")]
+                                    None::<&zstd::dict::DecoderDictionary<'static>>,
+                                    encryption_key.as_ref(),
+                                ) {
+                                    for (j, existing_page) in existing_pages.into_iter().enumerate() {
+                                        if j >= pages_in_group.len() { break; }
+                                        if pages_in_group[j] >= page_count { break; }
+                                        if pages[j].is_none() { pages[j] = Some(existing_page); }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // Encode: use seekable format if the manifest has it, otherwise legacy
-            let key = s3.page_group_key(gid, next_version);
-            if use_seekable {
-                let (encoded, ft) = encode_page_group_seekable(
-                    &pages,
-                    page_size,
-                    old_sub_ppf,
-                    self.compression_level,
-                    #[cfg(feature = "zstd")]
-                    self.encoder_dict.as_ref(),
-                    self.encryption_key.as_ref(),
-                )?;
-                uploads.push((key.clone(), encoded));
-                // Update frame table for this group
-                while new_frame_tables.len() <= gid as usize {
-                    new_frame_tables.push(Vec::new());
-                }
-                new_frame_tables[gid as usize] = ft;
-            } else {
-                let encoded = encode_page_group(
-                    &pages,
-                    page_size,
-                    self.compression_level,
-                    #[cfg(feature = "zstd")]
-                    self.encoder_dict.as_ref(),
-                    self.encryption_key.as_ref(),
-                )?;
-                uploads.push((key.clone(), encoded));
-            }
+                // Encode
+                let key = s3.page_group_key(gid, next_version);
+                let old_key = new_keys.get(gid as usize)
+                    .filter(|k| !k.is_empty())
+                    .cloned();
 
-            // Extend keys vector if needed
-            while new_keys.len() <= gid as usize {
-                new_keys.push(String::new());
-            }
-            // Track the old key being replaced (for GC)
-            if let Some(old_key) = new_keys.get(gid as usize) {
-                if !old_key.is_empty() {
-                    replaced_keys.push(old_key.clone());
+                if use_seekable {
+                    let (encoded, ft) = encode_page_group_seekable(
+                        &pages, page_size, old_sub_ppf, compression_level,
+                        #[cfg(feature = "zstd")]
+                        encoder_dict.as_ref(),
+                        encryption_key.as_ref(),
+                    )?;
+                    Ok(GroupResult { gid, key, encoded, frame_table: Some(ft), old_key })
+                } else {
+                    let encoded = encode_page_group(
+                        &pages, page_size, compression_level,
+                        #[cfg(feature = "zstd")]
+                        encoder_dict.as_ref(),
+                        encryption_key.as_ref(),
+                    )?;
+                    Ok(GroupResult { gid, key, encoded, frame_table: None, old_key })
                 }
+            }).collect()
+        };
+
+        // Merge results back into uploads, keys, frame_tables
+        for result in group_results {
+            let r = result?;
+            uploads.push((r.key.clone(), r.encoded));
+            while new_keys.len() <= r.gid as usize { new_keys.push(String::new()); }
+            if let Some(old) = r.old_key { replaced_keys.push(old); }
+            new_keys[r.gid as usize] = r.key;
+            if let Some(ft) = r.frame_table {
+                while new_frame_tables.len() <= r.gid as usize { new_frame_tables.push(Vec::new()); }
+                new_frame_tables[r.gid as usize] = ft;
             }
-            new_keys[gid as usize] = key;
         }
 
         let page_group_count = uploads.len();

@@ -20,7 +20,7 @@ lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
-parallel = ["dep:rayon"]
+parallel = []
 cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:crc32fast"]
 # Backward compat alias
 tiered = ["cloud"]
@@ -48,7 +48,7 @@ sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 
 # Parallel compression (optional)
-rayon = { version = "1.10", optional = true }
+rayon = "1.10"
 
 # Tiered S3 storage (optional)
 aws-sdk-s3 = { version = "1", optional = true }
