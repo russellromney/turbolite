@@ -21,7 +21,7 @@ snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
 parallel = ["dep:rayon"]
-cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:crc32fast", "dep:libc"]
+cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:crc32fast"]
 # Backward compat alias
 tiered = ["cloud"]
 wal = ["cloud", "dep:walrust-core", "dep:hadb-io", "dep:async-trait"]
@@ -56,7 +56,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"], optional =
 aws-smithy-runtime = { version = "1", features = ["client"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 crc32fast = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"] }
