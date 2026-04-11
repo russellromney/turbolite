@@ -157,15 +157,20 @@ pub fn init_debug_locks() {
 
 // ── FileWalIndex (shared by TurboliteVfs) ─────────────────────────────
 
-/// WAL-index implementation backed by a -shm file on disk.
+/// WAL-index implementation backed by a memory-mapped -shm file on disk.
 /// Provides region-based shared memory and byte-range locking for SQLite WAL mode.
+///
+/// Uses mmap for WAL-index region access (map/pull/push). This matches SQLite's
+/// built-in VFS behavior: WAL-index reads are pointer dereferences, not syscalls.
 pub struct FileWalIndex {
     conn_id: u64,
     /// Path to the -shm file
     path: PathBuf,
-    /// Cached regions (region_id -> data)
-    regions: HashMap<u32, [u8; 32768]>,
-    /// File handle for data I/O
+    /// Memory-mapped regions (region_id -> mmap pointer + length).
+    /// Each region is 32KB. mmap is MAP_SHARED so changes from other processes
+    /// are visible immediately (no syscall needed for reads).
+    mmap_regions: HashMap<u32, *mut u8>,
+    /// File handle for mmap and extending
     file: Option<File>,
     /// Separate file handle for locking (Arc for multiple FileGuards)
     lock_file: Option<std::sync::Arc<File>>,
@@ -173,12 +178,21 @@ pub struct FileWalIndex {
     active_locks: HashMap<u8, Box<dyn std::any::Any + Send + Sync>>,
 }
 
+// Safety: mmap pointers are to MAP_SHARED memory backed by a file.
+// Access is serialized by SQLite's WAL protocol (read locks before reads,
+// write locks before writes). The pointers are valid for the lifetime of
+// the mapping (unmapped in Drop).
+unsafe impl Send for FileWalIndex {}
+unsafe impl Sync for FileWalIndex {}
+
+const WAL_REGION_SIZE: usize = 32768;
+
 impl FileWalIndex {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             conn_id: CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             path,
-            regions: HashMap::new(),
+            mmap_regions: HashMap::new(),
             file: None,
             lock_file: None,
             active_locks: HashMap::new(),
@@ -208,31 +222,68 @@ impl FileWalIndex {
         }
         Ok(std::sync::Arc::clone(self.lock_file.as_ref().expect("lock_file was just set")))
     }
+
+    /// Ensure region is mmap'd. Returns a pointer to the region's 32KB.
+    fn ensure_mmap_region(&mut self, region: u32) -> io::Result<*mut u8> {
+        if let Some(&ptr) = self.mmap_regions.get(&region) {
+            return Ok(ptr);
+        }
+
+        use std::os::unix::io::AsRawFd;
+
+        let offset = region as usize * WAL_REGION_SIZE;
+        let file = self.ensure_file()?;
+        let file_len = file.metadata()?.len() as usize;
+
+        // Extend file if needed
+        let needed = offset + WAL_REGION_SIZE;
+        if file_len < needed {
+            file.set_len(needed as u64)?;
+        }
+
+        let fd = file.as_raw_fd();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                WAL_REGION_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                offset as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        let ptr = ptr as *mut u8;
+        self.mmap_regions.insert(region, ptr);
+        Ok(ptr)
+    }
+}
+
+impl Drop for FileWalIndex {
+    fn drop(&mut self) {
+        // Unmap all regions
+        for (_, ptr) in self.mmap_regions.drain() {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, WAL_REGION_SIZE);
+            }
+        }
+        // Release in-process locks
+        unlock_all_inprocess(&self.path, self.conn_id);
+    }
 }
 
 impl sqlite_vfs::wip::WalIndex for FileWalIndex {
     fn map(&mut self, region: u32) -> Result<[u8; 32768], io::Error> {
-        let region_size = 32768u64;
-        let offset = region as u64 * region_size;
-
-        let file = self.ensure_file()?;
-        let file_len = file.metadata()?.len();
-
-        if file_len < offset + region_size {
-            file.set_len(offset + region_size)?;
-        }
-
-        use std::os::unix::fs::FileExt;
+        let ptr = self.ensure_mmap_region(region)?;
         let mut data = [0u8; 32768];
-        match file.read_exact_at(&mut data, offset) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // File was just created/extended, return zeros
-            }
-            Err(e) => return Err(e),
+        // Safety: ptr is a valid mmap'd region of 32KB, backed by MAP_SHARED file.
+        // SQLite's WAL protocol ensures no concurrent writes without proper locking.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
         }
-
-        self.regions.insert(region, data);
         Ok(data)
     }
 
@@ -342,30 +393,31 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
     }
 
     fn pull(&mut self, region: u32, data: &mut [u8; 32768]) -> Result<(), io::Error> {
-        let region_size = 32768u64;
-        let offset = region as u64 * region_size;
-        let file = self.ensure_file()?;
-        use std::os::unix::fs::FileExt;
-        match file.read_exact_at(data, offset) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return Err(e),
+        let ptr = self.ensure_mmap_region(region)?;
+        // Safety: mmap'd MAP_SHARED region, reads are always current.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
         }
-        self.regions.insert(region, *data);
         Ok(())
     }
 
     fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), io::Error> {
-        let region_size = 32768u64;
-        let offset = region as u64 * region_size;
-        let file = self.ensure_file()?;
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(data, offset)?;
-        self.regions.insert(region, *data);
+        let ptr = self.ensure_mmap_region(region)?;
+        // Safety: MAP_SHARED write. Immediately visible to other processes via mmap.
+        // SQLite holds EXCLUSIVE WAL lock before calling push.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, WAL_REGION_SIZE);
+        }
         Ok(())
     }
 
-    fn delete(self) -> Result<(), io::Error> {
+    fn delete(mut self) -> Result<(), io::Error> {
+        // Unmap all regions before removing the file
+        for (_, ptr) in self.mmap_regions.drain() {
+            unsafe {
+                libc::munmap(ptr as *mut libc::c_void, WAL_REGION_SIZE);
+            }
+        }
         unlock_all_inprocess(&self.path, self.conn_id);
         if self.path.exists() {
             std::fs::remove_file(&self.path)?;
