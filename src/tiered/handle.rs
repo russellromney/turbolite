@@ -12,7 +12,15 @@ pub struct TurboliteHandle {
     /// Unified storage client for local page group flush (local mode only).
     storage: Option<Arc<StorageClient>>,
     cache: Option<Arc<DiskCache>>,
-    /// Shared manifest (Arc'd so flush_to_s3 can read/update outside SQLite lock).
+    /// Shared manifest via ArcSwap (lock-free reads, atomic store on writes).
+    ///
+    /// Safety of clone-modify-store pattern: SQLite's EXCLUSIVE lock serializes all
+    /// writes within a process. Only one handle calls sync()/write_all_at() at a time.
+    /// flush_to_s3() runs outside the SQLite lock but is serialized by flush_lock.
+    /// set_manifest() from HA followers uses monotonic version checks to reject stale updates.
+    /// Readers (load()) see a consistent snapshot; they may briefly see an old version
+    /// during a store(), which is safe because page data in the cache file is immutable
+    /// once written (pages are never overwritten, only new versions are added).
     manifest: Arc<ArcSwap<Manifest>>,
     /// Dirty page numbers (data lives in disk cache, not in memory).
     /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
@@ -53,6 +61,9 @@ pub struct TurboliteHandle {
     /// successful sync. Used to detect transaction rollback (lock downgrade
     /// from EXCLUSIVE/RESERVED without sync having been called).
     dirty_since_sync: bool,
+    /// Cached generation from DiskCache. When this doesn't match cache.generation,
+    /// another handle has written pages and the fast path must be skipped.
+    cached_generation: u64,
 
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
@@ -360,6 +371,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool,
             dirty_since_sync: false,
+            cached_generation: 0,
             gc_enabled,
             override_threshold: 0,
             compaction_threshold: 0,
@@ -413,6 +425,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool: None,
             dirty_since_sync: false,
+            cached_generation: 0,
             gc_enabled: false,
             override_threshold: 0,
             compaction_threshold: 0,
@@ -1075,11 +1088,13 @@ impl DatabaseHandle for TurboliteHandle {
         };
         let page_num = offset / page_size;
 
-        // FAST PATH: if page is cached, not dirty, and no dirty pages pending,
-        // read directly from cache. Skips manifest lookup, prefetch heuristics.
+        // FAST PATH: if page is cached, this handle has no dirty pages, AND no other
+        // handle has written since we last synced (generation matches), read directly
+        // from cache. Skips manifest lookup, prefetch heuristics.
         if !self.dirty_since_sync {
             if let Some(cache) = &self.cache {
-                if cache.is_present(page_num) {
+                let current_gen = cache.generation.load(Ordering::Acquire);
+                if current_gen == self.cached_generation && cache.is_present(page_num) {
                     cache.read_page(page_num, buf)?;
                     cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -1963,6 +1978,7 @@ impl DatabaseHandle for TurboliteHandle {
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
             self.dirty_since_sync = false;
+            if let Some(c) = &self.cache { self.cached_generation = c.bump_generation(); }
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
@@ -2410,6 +2426,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
             }
             self.dirty_since_sync = false;
+            if let Some(c) = &self.cache { self.cached_generation = c.bump_generation(); }
 
             // Persist local manifest for crash recovery
             let local = manifest::LocalManifest {
@@ -3071,6 +3088,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
         self.dirty_since_sync = false;
+        if let Some(c) = &self.cache { self.cached_generation = c.bump_generation(); }
 
         // Persist bitmap
         let _ = cache.persist_bitmap();

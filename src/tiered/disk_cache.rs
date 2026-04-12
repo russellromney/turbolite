@@ -143,6 +143,9 @@ pub(crate) struct DiskCache {
     pub(crate) mem_cache_budget: u64,
     /// Current usage in bytes.
     pub(crate) mem_cache_bytes: std::sync::atomic::AtomicU64,
+    /// Generation counter: incremented on every sync/checkpoint. Handles compare
+    /// their cached generation to detect stale cache state (another handle wrote).
+    pub(crate) generation: std::sync::atomic::AtomicU64,
     /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
     pub(crate) tracker: parking_lot::Mutex<SubChunkTracker>,
     /// Page bitmap: AtomicU8-backed, lock-free for is_present/mark_present/clear.
@@ -337,6 +340,7 @@ impl DiskCache {
             },
             mem_cache_budget,
             mem_cache_bytes: std::sync::atomic::AtomicU64::new(0),
+            generation: std::sync::atomic::AtomicU64::new(0),
             tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::RwLock::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
@@ -372,6 +376,12 @@ impl DiskCache {
         self.dictionary.as_ref().map(|d| {
             zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level)
         })
+    }
+
+    /// Bump the generation counter. Called by sync() after writing dirty pages.
+    /// Readers compare their cached generation to detect stale state.
+    pub(crate) fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Release)
     }
 
     /// Promote contiguous decoded pages directly into mem_cache (zero extra I/O).
@@ -1194,12 +1204,25 @@ impl DiskCache {
         }
     }
 
-    /// Clear bitmap bits, remove from cache index, and hole-punch pages on Linux.
+    /// Clear bitmap bits, free mem_cache entries, remove from cache index, and hole-punch pages on Linux.
     pub(crate) fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
             let bitmap = self.bitmap.read();
             for &pnum in page_nums {
                 bitmap.clear(pnum);
+            }
+        }
+        // Free in-memory cache entries
+        if let Some(ref mc) = self.mem_cache {
+            let ps = self.page_size.load(Ordering::Relaxed) as u64;
+            for &pnum in page_nums {
+                if let Some(slot) = mc.get(pnum as usize) {
+                    let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                    if !old.is_null() && ps > 0 {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(old, ps as usize))); }
+                        self.mem_cache_bytes.fetch_sub(ps, Ordering::Relaxed);
+                    }
+                }
             }
         }
         // Remove from compressed cache index
@@ -1374,6 +1397,23 @@ impl DiskCache {
             self.cache_index.lock().persist()?;
         }
         Ok(())
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        // Free all mem_cache allocations
+        if let Some(ref mc) = self.mem_cache {
+            let ps = self.page_size.load(Ordering::Relaxed) as usize;
+            if ps > 0 {
+                for slot in mc.iter() {
+                    let ptr = slot.swap(std::ptr::null_mut(), Ordering::Relaxed);
+                    if !ptr.is_null() {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                    }
+                }
+            }
+        }
     }
 }
 

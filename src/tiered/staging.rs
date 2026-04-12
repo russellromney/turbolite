@@ -185,16 +185,9 @@ pub(crate) fn recover_staging_logs(
             let _ = fs::remove_file(&path);
             continue;
         }
-        let record_size = 8 + page_size as u64;
-        if meta.len() % record_size != 0 {
-            eprintln!(
-                "[staging] WARN: staging file {} has invalid size {} (record_size={}), skipping",
-                path.display(),
-                meta.len(),
-                record_size,
-            );
-            continue;
-        }
+        // Staging logs may include a manifest trailer (MANIFEST_MAGIC + data),
+        // so file size is NOT guaranteed to be a multiple of record_size.
+        // read_staging_log() correctly handles this by stopping at MANIFEST_MAGIC.
         pending.push(PendingFlush {
             staging_path: path,
             version,
