@@ -143,6 +143,10 @@ pub(crate) struct DiskCache {
     pub(crate) mem_cache_budget: u64,
     /// Current usage in bytes.
     pub(crate) mem_cache_bytes: std::sync::atomic::AtomicU64,
+    /// Deferred mem_cache frees from eviction. Freed in Drop or periodically.
+    /// Avoids UAF: eviction nulls the AtomicPtr instantly, defers actual
+    /// Box::drop so concurrent readers never see freed memory.
+    deferred_frees: parking_lot::Mutex<Vec<Box<[u8]>>>,
     /// Generation counter: incremented on every sync/checkpoint. Handles compare
     /// their cached generation to detect stale cache state (another handle wrote).
     pub(crate) generation: std::sync::atomic::AtomicU64,
@@ -340,6 +344,7 @@ impl DiskCache {
             },
             mem_cache_budget,
             mem_cache_bytes: std::sync::atomic::AtomicU64::new(0),
+            deferred_frees: parking_lot::Mutex::new(Vec::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
             tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::RwLock::new(bitmap),
@@ -1212,19 +1217,20 @@ impl DiskCache {
                 bitmap.clear(pnum);
             }
         }
-        // Free in-memory cache entries.
-        // Safety: clear_pages_from_disk is called during eviction, which happens during
-        // sync() under SQLite's EXCLUSIVE lock. Other handles cannot read during EXCLUSIVE
-        // because SQLite's WAL protocol blocks reader lock acquisition until checkpoint
-        // completes. Therefore no concurrent read_page can hold a pointer to these pages.
+        // Evict from in-memory cache: null the pointer (instant, lock-free),
+        // defer actual deallocation. Readers see null immediately and fall through
+        // to pread. No UAF risk because we don't free the old pointer here.
+        // Deferred frees are collected in deferred_frees and drained by Drop.
         if let Some(ref mc) = self.mem_cache {
-            let ps = self.page_size.load(Ordering::Relaxed) as u64;
+            let ps = self.page_size.load(Ordering::Relaxed) as usize;
             for &pnum in page_nums {
                 if let Some(slot) = mc.get(pnum as usize) {
-                    let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                    let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
                     if !old.is_null() && ps > 0 {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(old, ps as usize))); }
-                        self.mem_cache_bytes.fetch_sub(ps, Ordering::Relaxed);
+                        // Reconstruct the Box to defer its drop (no UAF risk)
+                        let boxed = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
+                        self.deferred_frees.lock().push(boxed);
+                        self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -1418,6 +1424,8 @@ impl Drop for DiskCache {
                 }
             }
         }
+        // Drain deferred frees from eviction (Box drops automatically)
+        self.deferred_frees.lock().clear();
     }
 }
 

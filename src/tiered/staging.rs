@@ -153,7 +153,8 @@ pub(crate) fn read_staging_manifest(
     page_size: u32,
 ) -> io::Result<Option<Vec<u8>>> {
     let file = File::open(path)?;
-    if file.metadata()?.len() == 0 {
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
         return Ok(None);
     }
     let mut reader = BufReader::with_capacity(256 * 1024, file);
@@ -168,19 +169,17 @@ pub(crate) fn read_staging_manifest(
         }
         let val = u64::from_le_bytes(page_num_buf);
         if val == MANIFEST_MAGIC {
-            // Read manifest length + data
             let mut len_buf = [0u8; 8];
             reader.read_exact(&mut len_buf)?;
             let manifest_len = u64::from_le_bytes(len_buf) as usize;
-            // Guard against corrupted length (partial crash during manifest write)
-            if manifest_len > 10_000_000 {
-                return Ok(None); // > 10MB manifest is clearly corrupt
+            // Corrupted length: can't exceed the staging file itself
+            if manifest_len as u64 > file_len {
+                return Ok(None);
             }
             let mut manifest_data = vec![0u8; manifest_len];
             reader.read_exact(&mut manifest_data)?;
             return Ok(Some(manifest_data));
         }
-        // Skip page data
         reader.read_exact(&mut page_buf)?;
     }
 }
