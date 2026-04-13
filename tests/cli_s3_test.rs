@@ -214,64 +214,6 @@ fn test_import_info_export_roundtrip() {
     assert!(has_index, "index should survive import/export roundtrip");
 }
 
-// ── gc on clean prefix ─────────────────────────────────────────────
-
-#[test]
-fn test_gc_clean_prefix() {
-    build_bin();
-
-    let tmpdir = tempfile::tempdir().expect("tmpdir");
-    let plain_db = create_plain_db(tmpdir.path(), "gc-source.db");
-    let bucket = test_bucket();
-    let endpoint = endpoint_url();
-    let prefix = unique_prefix();
-
-    // Import first to create S3 data
-    let output = run_cli(&[
-        "import",
-        "--input",
-        plain_db.to_str().expect("path"),
-        "--bucket",
-        &bucket,
-        "--prefix",
-        &prefix,
-        "--endpoint",
-        &endpoint,
-    ]);
-    assert!(output.status.success(), "import failed for gc test");
-
-    // Run GC on clean prefix (no orphans expected)
-    let cache_dir = tmpdir.path().join("gc-cache");
-    let db_path = tmpdir.path().join("gc.db");
-    let output = run_cli(&[
-        "gc",
-        "--db",
-        db_path.to_str().expect("path"),
-        "--bucket",
-        &bucket,
-        "--prefix",
-        &prefix,
-        "--endpoint",
-        &endpoint,
-        "--cache-dir",
-        cache_dir.to_str().expect("path"),
-    ]);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "gc failed.\nstdout: {}\nstderr: {}",
-        stdout,
-        stderr
-    );
-    assert!(
-        stdout.contains("no orphaned objects") || stdout.contains("deleted"),
-        "should report gc result: {}",
-        stdout
-    );
-}
-
 // ── shell against S3 database ──────────────────────────────────────
 
 #[test]

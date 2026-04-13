@@ -2,6 +2,23 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Mercury: CLI
+
+Replace placeholder CLI binary with management commands for turbolite databases.
+
+### Commands
+- `info` -- manifest summary: page count, groups, B-trees, storage type, seekable frames
+- `shell` -- interactive SQLite REPL through turbolite VFS (.tables, .schema, .quit)
+- `import` -- bulk import plain SQLite to turbolite S3 format (B-tree-aware grouping, seekable zstd)
+- `export` -- backup to plain SQLite via SQLite backup API
+- `download` -- pull entire database from S3 into local cache
+
+### Tests
+- 11 local integration tests (invoke compiled binary, check output/exit codes)
+- 2 Tigris S3 integration tests: import->info->export roundtrip with data verification, shell query against S3-backed database
+
+---
+
 ## Pelican: Lock-Free Architecture + Concurrent Performance
 
 Comprehensive performance overhaul: lock-free reads, mmap WAL-index, in-memory page

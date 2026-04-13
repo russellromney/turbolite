@@ -71,28 +71,6 @@ fn create_turbolite_db(dir: &std::path::Path, name: &str) -> PathBuf {
 // ── version ────────────────────────────────────────────────────────
 
 #[test]
-fn test_version_subcommand() {
-    build_bin();
-    let output = Command::new(turbolite_bin())
-        .arg("version")
-        .output()
-        .expect("failed to run turbolite version");
-
-    assert!(output.status.success(), "exit code was not 0");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("turbolite"),
-        "expected 'turbolite' in output, got: {}",
-        stdout
-    );
-    assert!(
-        stdout.contains('.'),
-        "expected version number with '.', got: {}",
-        stdout
-    );
-}
-
-#[test]
 fn test_version_flag() {
     build_bin();
     let output = Command::new(turbolite_bin())
@@ -119,13 +97,8 @@ fn test_help_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("info"), "help should mention info command");
     assert!(stdout.contains("shell"), "help should mention shell command");
-    assert!(stdout.contains("gc"), "help should mention gc command");
     assert!(stdout.contains("export"), "help should mention export command");
     assert!(stdout.contains("import"), "help should mention import command");
-    assert!(
-        stdout.contains("checkpoint"),
-        "help should mention checkpoint command"
-    );
     assert!(
         stdout.contains("download"),
         "help should mention download command"
@@ -375,21 +348,6 @@ fn test_info_missing_db_arg() {
         .expect("failed to run turbolite info");
 
     assert!(!output.status.success(), "should fail without --db");
-}
-
-#[test]
-fn test_gc_missing_bucket() {
-    build_bin();
-    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
-    let db_path = tmpdir.path().join("gc.db");
-
-    // gc requires --bucket, should fail without it
-    let output = Command::new(turbolite_bin())
-        .args(["gc", "--db", db_path.to_str().expect("path")])
-        .output()
-        .expect("failed to run turbolite gc");
-
-    assert!(!output.status.success(), "gc should fail without --bucket");
 }
 
 // ── no subcommand shows error ──────────────────────────────────────
