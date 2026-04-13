@@ -76,7 +76,6 @@ pip install turbolite
 ```python
 import turbolite
 
-# cloud database — serve cold queries from S3-compatible storage (Tigris)
 conn = turbolite.connect("my.db", mode="s3",
     bucket="my-bucket",
     endpoint="https://t3.storage.dev")
@@ -146,14 +145,6 @@ Each consecutive miss advances through a **prefetch schedule** that controls wha
 You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
-
-### A note on precise prefetch
-
-turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
-
-In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Jena's precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
-
-The code is there (`TURBOLITE_JENA=true` to enable) for future investigation. It may work better on lower-latency backends (S3 Express, ~4ms GETs) where the cost of an extra GET is cheap and precision matters more. For now, the hop schedule wins.
 
 ### Encryption & Compression
 
@@ -292,7 +283,7 @@ Checkpoint frequency controls the tradeoff: more frequent checkpoints = smaller 
 
 ### Checkpoint modes
 
-turbolite supports two checkpoint modes via `sync_mode` in `TieredConfig`:
+turbolite supports two checkpoint modes via `sync_mode` in `TurboliteConfig`:
 
 **`SyncMode::Durable`** (default). The checkpoint uploads page groups to S3 while holding SQLite's EXCLUSIVE lock. Simple, fully durable on every checkpoint. No writes or reads can proceed until the upload completes. Good for most workloads.
 
@@ -300,7 +291,7 @@ turbolite supports two checkpoint modes via `sync_mode` in `TieredConfig`:
 
 Between checkpoint and flush, data exists only in the local disk cache. A process crash is fine (data is on local disk, and staging logs capture the exact page contents for upload). Machine loss before flush means those writes are gone. Cache eviction is safe: turbolite protects pending pages from eviction automatically.
 
-**Crash recovery**: If the process crashes between checkpoint and flush, staging logs survive on disk. On the next `TieredVfs::new()`, they are automatically recovered and queued for the next `flush_to_s3()` call. Reads are served immediately from the local cache without waiting for the flush.
+**Crash recovery**: If the process crashes between checkpoint and flush, staging logs survive on disk. On the next `TurboliteVfs::new()`, they are automatically recovered and queued for the next `flush_to_s3()` call. Reads are served immediately from the local cache without waiting for the flush.
 
 ### WAL shipping (experimental)
 
@@ -308,11 +299,11 @@ With the `wal` feature flag enabled, turbolite ships WAL frames to S3 via [walru
 
 ```toml
 # Cargo.toml
-turbolite = { version = "0.2", features = ["cloud", "zstd", "wal"] }
+turbolite = { version = "0.4", features = ["cloud", "zstd", "wal"] }
 ```
 
 ```rust
-let config = TieredConfig {
+let config = TurboliteConfig {
     wal_replication: true,  // enable WAL shipping
     ..Default::default()
 };
@@ -365,9 +356,9 @@ conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs T
 **Rust**:
 ```toml
 [dependencies]
-turbolite = "0.2"                                              # local VFS
-turbolite = { version = "0.2", features = ["cloud"] }          # + S3 storage
-turbolite = { version = "0.2", features = ["encryption"] }     # + encryption
+turbolite = "0.4"                                              # local VFS
+turbolite = { version = "0.4", features = ["cloud"] }          # + S3 storage
+turbolite = { version = "0.4", features = ["encryption"] }     # + encryption
 ```
 
 **Go** (cgo, links the shared library):
@@ -557,6 +548,14 @@ cargo test --features zstd                    # local VFS tests
 cargo test --features zstd,cloud             # + S3 integration tests
 cargo test --features zstd,encryption         # + encryption tests
 ```
+
+## Experimental: precise prefetch
+
+turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
+
+In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
+
+The code is there (`TURBOLITE_JENA=true` to enable) for future investigation. It may work better on lower-latency backends (S3 Express, ~4ms GETs) where the cost of an extra GET is cheap and precision matters more. For now, the hop schedule wins.
 
 ## Notes
 
