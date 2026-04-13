@@ -589,6 +589,7 @@ impl S3Client {
     }
 
     /// List all S3 keys under an arbitrary prefix (not limited to self.prefix).
+    #[allow(dead_code)]
     pub(crate) async fn list_all_keys_with_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut all_keys = Vec::new();
         let mut continuation_token: Option<String> = None;

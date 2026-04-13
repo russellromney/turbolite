@@ -1,9 +1,6 @@
 //! Encryption key rotation: re-encrypt all S3 data with a new key.
 
-use std::io;
 
-use super::*;
-use crate::compress;
 
 /// Re-encrypt, encrypt, or decrypt all S3 data.
 ///

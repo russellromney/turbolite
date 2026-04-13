@@ -173,6 +173,7 @@ pub(crate) struct DiskCache {
     pub(crate) sub_pages_per_frame: u32,
     pub(crate) page_size: std::sync::atomic::AtomicU32,
     /// Encryption key for cache-at-rest. Uses CTR mode (no size overhead).
+    #[allow(dead_code)]
     pub(crate) encryption_key: Option<[u8; 32]>,
     /// B-tree-aware page-to-group mapping: group_pages[gid] = list of page numbers.
     /// Used by evict_group and clear_cache to clear the correct bitmap bits.
@@ -211,6 +212,7 @@ pub(crate) struct DiskCache {
 /// Counter for lazy eviction (every 64 group fetches).
 pub(crate) static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 impl DiskCache {
     pub(crate) fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>) -> io::Result<Self> {
         Self::new_with_compression(
@@ -591,7 +593,7 @@ impl DiskCache {
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
 
         // CTR encryption: same size, no overhead
-        let write_data: Vec<u8>;
+        let _write_data: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
             write_data = compress::encrypt_ctr(data, page_num, key)?;
@@ -627,7 +629,7 @@ impl DiskCache {
         // Compress (with dictionary if available)
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
-        let mut blob = compress::compress(
+        let blob = compress::compress(
             data, self.cache_compression_level,
             #[cfg(feature = "zstd")]
             ed.as_ref(),
@@ -741,7 +743,7 @@ impl DiskCache {
             let end = (start + page_sz).min(data.len());
             let page_data = &data[start..end];
 
-            let mut compressed = compress::compress(
+            let compressed = compress::compress(
                 page_data, self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
@@ -898,7 +900,7 @@ impl DiskCache {
             let src_start = i * page_sz;
             let page_data = &data[src_start..src_start + page_sz];
 
-            let mut compressed = compress::compress(
+            let compressed = compress::compress(
                 page_data, self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
@@ -1298,7 +1300,7 @@ impl DiskCache {
     pub(crate) fn evict_to_budget(&self, budget_bytes: u64, skip_groups: &HashSet<u64>) -> u32 {
         // Collect and sort victims in one tracker lock
         let victims: Vec<SubChunkId> = {
-            let mut tracker = self.tracker.lock();
+            let tracker = self.tracker.lock();
             if tracker.current_cache_bytes <= budget_bytes {
                 return 0;
             }

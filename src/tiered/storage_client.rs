@@ -65,6 +65,7 @@ impl StorageClient {
     }
 
     /// Fetch multiple page groups by key in parallel. Returns found groups.
+    #[allow(dead_code)]
     pub(crate) fn get_page_groups_by_key(&self, keys: &[String]) -> io::Result<HashMap<String, Vec<u8>>> {
         match self {
             StorageClient::Local { base_dir } => {
@@ -204,11 +205,13 @@ impl StorageClient {
     }
 
     /// Generate an interior bundle key: `p/it/{chunk_id}_v{version}`
+    #[allow(dead_code)]
     pub(crate) fn interior_chunk_key(chunk_id: u32, version: u64) -> String {
         format!("p/it/{}_v{}", chunk_id, version)
     }
 
     /// Generate an index leaf bundle key: `p/ix/{chunk_id}_v{version}`
+    #[allow(dead_code)]
     pub(crate) fn index_chunk_key(chunk_id: u32, version: u64) -> String {
         format!("p/ix/{}_v{}", chunk_id, version)
     }
@@ -221,6 +224,7 @@ impl StorageClient {
     // ── S3-specific operations (no-op for local) ──
 
     /// Byte-range GET (S3 only). Local mode reads the full file.
+    #[allow(dead_code)]
     pub(crate) fn range_get(&self, key: &str, start: u64, len: u32) -> io::Result<Option<Vec<u8>>> {
         match self {
             StorageClient::Local { base_dir } => {
@@ -243,6 +247,7 @@ impl StorageClient {
     }
 
     /// Diagnostics: number of GETs performed.
+    #[allow(dead_code)]
     pub(crate) fn fetch_count(&self) -> u64 {
         match self {
             StorageClient::Local { .. } => 0,
@@ -253,6 +258,7 @@ impl StorageClient {
     }
 
     /// Diagnostics: bytes fetched.
+    #[allow(dead_code)]
     pub(crate) fn fetch_bytes(&self) -> u64 {
         match self {
             StorageClient::Local { .. } => 0,

@@ -62,6 +62,7 @@ impl PageBitmap {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn clear_range(&self, start: u64, count: u64) {
         for p in start..start + count {
             self.clear(p);
@@ -198,6 +199,7 @@ impl SubChunkTracker {
 
     /// Compute which sub-chunk a page belongs to (LEGACY: positional mapping).
     /// Only valid for positional groups. For B-tree-aware groups, use sub_chunk_id_for().
+    #[allow(dead_code)]
     pub(crate) fn sub_chunk_for_page(&self, page_num: u64) -> SubChunkId {
         let ppg = self.pages_per_group;
         let spf = self.sub_pages_per_frame;
@@ -219,6 +221,7 @@ impl SubChunkTracker {
     }
 
     /// Check if the sub-chunk containing this page is cached.
+    #[allow(dead_code)]
     pub(crate) fn is_present(&self, page_num: u64) -> bool {
         let id = self.sub_chunk_for_page(page_num);
         self.present.contains(&id)
@@ -293,6 +296,7 @@ impl SubChunkTracker {
     }
 
     /// Touch the sub-chunk containing a page.
+    #[allow(dead_code)]
     pub(crate) fn touch_page(&mut self, page_num: u64) {
         let id = self.sub_chunk_for_page(page_num);
         self.touch(id);
@@ -301,6 +305,7 @@ impl SubChunkTracker {
     /// Evict one sub-chunk: pick the lowest-priority (highest tier number),
     /// least-recently-used sub-chunk. Returns the evicted sub-chunk or None if empty.
     /// Never evicts Pinned (tier 0) sub-chunks.
+    #[allow(dead_code)]
     pub(crate) fn evict_one(&mut self) -> Option<SubChunkId> {
         self.evict_one_skipping(&HashSet::new())
     }
@@ -317,6 +322,7 @@ impl SubChunkTracker {
     /// Data scores range [0.0, 2.0]. Index scores range [10.0, 12.0].
     /// Tier always dominates: the hottest Data (2.0) is evicted before the coldest Index (10.0).
     /// Within a tier, frequency + recency break ties.
+    #[allow(dead_code)]
     pub(crate) fn evict_one_skipping(&mut self, skip_groups: &HashSet<u64>) -> Option<SubChunkId> {
         let now = Instant::now();
         let max_age = Duration::from_secs(RECENCY_WINDOW_SECS);
@@ -402,6 +408,7 @@ impl SubChunkTracker {
     }
 
     /// Evict all sub-chunks in a specific tier that are older than `ttl`.
+    #[allow(dead_code)]
     pub(crate) fn evict_expired_in_tier(&mut self, tier: SubChunkTier, ttl: Duration) -> Vec<SubChunkId> {
         let now = Instant::now();
         let expired: Vec<SubChunkId> = self.present.iter()
@@ -441,6 +448,7 @@ impl SubChunkTracker {
     }
 
     /// Clear all non-pinned sub-chunks (for cold benchmarks).
+    #[allow(dead_code)]
     pub(crate) fn clear_data(&mut self) {
         let to_remove: Vec<SubChunkId> = self.present.iter()
             .filter(|id| {
@@ -492,6 +500,7 @@ impl SubChunkTracker {
     }
 
     /// Number of tracked sub-chunks.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.present.len()
     }
