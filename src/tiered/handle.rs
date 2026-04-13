@@ -2017,14 +2017,25 @@ impl DatabaseHandle for TurboliteHandle {
                 local.persist(&cache_dir)?;
             }
 
-            // Bitmap persist deferred -- reconstructable from cache file on restart.
-            // Only persist periodically or on clean shutdown.
+            // Persist bitmap so reopened sessions see which pages are cached.
+            let _ = cache.persist_bitmap();
 
             // Local mode: flush dirty page groups to local pg/ directory.
             // Deferred to background -- staging log + cache file provide crash recovery.
             // The pg/ flush only matters for cold start from scratch (no cache).
             if self.s3.is_none() {
-                // Pure local mode: spawn background flush (non-blocking)
+                // Pure local mode: persist manifest and spawn background flush.
+                // Manifest is persisted synchronously so cold reopens see the
+                // correct version. Page group flush is deferred to a background
+                // thread (staging log replay populates the cache on reopen).
+                {
+                    let m = (**self.manifest.load()).clone();
+                    let local = manifest::LocalManifest {
+                        manifest: m,
+                        dirty_groups: pending_groups_snapshot.clone(),
+                    };
+                    let _ = local.persist(&cache_dir);
+                }
                 if let Some(ref storage) = self.storage {
                     let storage = storage.clone();
                     let cache = cache_arc.clone();

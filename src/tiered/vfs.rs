@@ -192,6 +192,36 @@ impl TurboliteVfs {
                 (Manifest::empty(), Vec::new())
             }
         };
+
+        // Phase Kursk: recover staging logs and check for newer manifests
+        // embedded in staging log trailers (the background flush may not have
+        // run yet, leaving manifest.msgpack stale).
+        let page_size_hint = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size_hint)?;
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        if !recovered_staging.is_empty() {
+            eprintln!("[local] recovered {} staging logs (max version {})", recovered_staging.len(), max_recovered_version);
+        }
+
+        // Extract the newest manifest from staging logs (if newer than manifest.msgpack)
+        for flush_entry in recovered_staging.iter().rev() {
+            if let Ok(Some(manifest_bytes)) = staging::read_staging_manifest(
+                &flush_entry.staging_path, flush_entry.page_size,
+            ) {
+                if let Ok(local) = rmp_serde::from_slice::<manifest::LocalManifest>(&manifest_bytes) {
+                    if local.manifest.version > manifest.version {
+                        eprintln!(
+                            "[local] staging log v{} has newer manifest (v{}, {} pages), upgrading from v{}",
+                            flush_entry.version, local.manifest.version,
+                            local.manifest.page_count, manifest.version,
+                        );
+                        manifest = local.manifest;
+                    }
+                }
+            }
+        }
+
         manifest.detect_and_normalize_strategy();
 
         let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
@@ -208,6 +238,23 @@ impl TurboliteVfs {
         )?;
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
+
+        // Replay staging log pages into cache so cold reopens (cache deleted)
+        // can serve reads immediately, without waiting for the background flush
+        // to write page groups to pg/.
+        for flush_entry in &recovered_staging {
+            if let Ok(pages) = staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size) {
+                for (page_num, data) in &pages {
+                    let _ = cache.write_page(*page_num, data);
+                }
+            }
+        }
+
+        // Clean up staging logs after replay (safe now that pages are in cache)
+        for flush_entry in &recovered_staging {
+            staging::remove_staging_log(&flush_entry.staging_path);
+        }
+
         let cache = Arc::new(cache);
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
@@ -215,10 +262,6 @@ impl TurboliteVfs {
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
 
-        // Phase Kursk: recover staging logs
-        let staging_dir = config.cache_dir.join("staging");
-        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
-        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
         let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
         let pending_flushes = Arc::new(Mutex::new(recovered_staging));
 
@@ -619,7 +662,8 @@ impl TurboliteVfs {
         (0, 0)
     }
 
-    /// Garbage collect orphaned S3 objects not referenced by the current manifest.
+    /// Garbage collect orphaned S3 objects not referenced by the current manifest
+    /// or any snapshot manifests (`manifest-snap-*.msgpack`).
     /// Lists all objects under the prefix, compares against manifest keys, and
     /// deletes unreferenced page groups and interior chunks.
     /// Returns the number of objects deleted.
@@ -631,24 +675,42 @@ impl TurboliteVfs {
         let manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
         let all_keys = s3.list_all_keys()?;
 
-        // Build set of live keys from manifest
+        // Build set of live keys from current manifest
         let mut live_keys: HashSet<String> = HashSet::new();
         // Phase Thermopylae: msgpack manifest is the live one.
         // Old manifest.json is an orphan and will be GC'd.
         live_keys.insert(s3.manifest_key_msgpack());
-        for key in &manifest.page_group_keys {
-            if !key.is_empty() {
+        Self::add_manifest_keys_to_set(&manifest, &mut live_keys);
+
+        // Phase Recall: load snapshot manifests and protect their page groups.
+        // Snapshot manifests are named `manifest-snap-{id}.msgpack` in the prefix.
+        let snap_prefix = "manifest-snap-";
+        let snap_suffix = ".msgpack";
+        for key in &all_keys {
+            // Extract the filename portion after the prefix
+            let filename = key.rsplit('/').next().unwrap_or(key);
+            if filename.starts_with(snap_prefix) && filename.ends_with(snap_suffix) {
+                // This is a snapshot manifest; keep the manifest file itself alive
                 live_keys.insert(key.clone());
+                // Load and protect its page groups
+                match s3.get_manifest_at_key(key) {
+                    Ok(Some(snap_manifest)) => {
+                        Self::add_manifest_keys_to_set(&snap_manifest, &mut live_keys);
+                    }
+                    Ok(None) => {
+                        // Manifest disappeared between list and get (race with snapshot delete).
+                        // Safe to ignore: if it was deleted, we don't need to protect its pages.
+                        eprintln!("[gc] snapshot manifest {} disappeared during gc, skipping", key);
+                    }
+                    Err(e) => {
+                        // Corrupt or partial snapshot manifest. Skip with warning, don't crash gc.
+                        eprintln!("[gc] WARNING: failed to load snapshot manifest {}: {}. Skipping (page groups may be unprotected).", key, e);
+                    }
+                }
             }
         }
-        for key in manifest.interior_chunk_keys.values() {
-            live_keys.insert(key.clone());
-        }
-        for key in manifest.index_chunk_keys.values() {
-            live_keys.insert(key.clone());
-        }
 
-        // Find orphans (keys in S3 but not in manifest)
+        // Find orphans (keys in S3 but not in any manifest)
         let orphans: Vec<String> = all_keys
             .into_iter()
             .filter(|k| !live_keys.contains(k))
@@ -661,6 +723,68 @@ impl TurboliteVfs {
             eprintln!("[gc] deleted {} orphaned objects", count);
         }
         Ok(count)
+    }
+
+    /// Add all page group, interior chunk, and index chunk keys from a manifest
+    /// to a live key set (used by gc to protect referenced objects).
+    fn add_manifest_keys_to_set(manifest: &Manifest, live_keys: &mut HashSet<String>) {
+        for key in &manifest.page_group_keys {
+            if !key.is_empty() {
+                live_keys.insert(key.clone());
+            }
+        }
+        for key in manifest.interior_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+        for key in manifest.index_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+    }
+
+    /// Phase Recall: Copy the current manifest to a snapshot key.
+    /// Returns the S3 key of the snapshot manifest copy.
+    /// Called by the control plane at snapshot time to protect page groups from GC.
+    #[cfg(feature = "cloud")]
+    pub fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "copy_manifest_to_snapshot requires S3 backend")
+        })?;
+        s3.copy_manifest_to_snapshot(snap_id)
+    }
+
+    /// Phase Recall: Delete a snapshot manifest copy from S3.
+    /// After deletion, the next gc() pass will clean up any page groups
+    /// that are no longer referenced by any manifest (current or snapshot).
+    #[cfg(feature = "cloud")]
+    pub fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "delete_snapshot_manifest requires S3 backend")
+        })?;
+        s3.delete_snapshot_manifest(snap_id)
+    }
+
+    /// Phase Recall: Load a manifest from a snapshot manifest S3 key.
+    /// Returns None if the key does not exist.
+    #[cfg(feature = "cloud")]
+    pub fn get_snapshot_manifest(&self, snap_id: &str) -> io::Result<Option<Manifest>> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "get_snapshot_manifest requires S3 backend")
+        })?;
+        let key = s3.snapshot_manifest_key(snap_id);
+        s3.get_manifest_at_key(&key)
+    }
+
+    /// Phase Recall: Seed this VFS's S3 prefix with a manifest from another source.
+    /// Used by fork: the control plane creates a new TurboliteVfs with a new prefix,
+    /// then calls this method to write the snapshot manifest as the new prefix's
+    /// `manifest.msgpack`. The new VFS can then read from the source's page groups
+    /// (keys are absolute S3 paths), and writes create new page groups under the new prefix (COW).
+    #[cfg(feature = "cloud")]
+    pub fn seed_manifest(&self, manifest: &Manifest) -> io::Result<()> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "seed_manifest requires S3 backend")
+        })?;
+        s3.put_manifest(manifest)
     }
 
     /// Helper to destroy all S3 data for a prefix.

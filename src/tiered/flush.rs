@@ -759,8 +759,10 @@ fn flush_local_inner(
     }
 
     if dirty_groups.is_empty() {
-        for path in &staging_paths {
-            staging::remove_staging_log(path);
+        if !storage.is_local() {
+            for path in &staging_paths {
+                staging::remove_staging_log(path);
+            }
         }
         return Ok(());
     }
@@ -936,9 +938,15 @@ fn flush_local_inner(
         let _ = storage.delete_page_groups(&replaced_keys);
     }
 
-    // 11. Clean up staging logs
-    for path in &staging_paths {
-        staging::remove_staging_log(path);
+    // 11. Clean up staging logs.
+    // For local-only mode, staging log cleanup is deferred to VFS open
+    // (after staging log replay populates the cache). This prevents a race
+    // where the background flush deletes staging logs before a cold-reopen
+    // VFS has a chance to replay them.
+    if !storage.is_local() {
+        for path in &staging_paths {
+            staging::remove_staging_log(path);
+        }
     }
 
     // Phase Drift-d: auto-compact overrides if threshold reached

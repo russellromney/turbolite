@@ -27,6 +27,7 @@ fn positional_group_pages(pages_per_group: u32, page_count: u64) -> Vec<Vec<u64>
 fn test_bitmap_set_and_check() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
+    bm.ensure_capacity(100);
     assert!(!bm.is_present(0));
     assert!(!bm.is_present(100));
     bm.mark_present(0);
@@ -41,6 +42,7 @@ fn test_bitmap_set_and_check() {
 fn test_bitmap_range() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
+    bm.ensure_capacity(14); // mark_range(10, 5) covers pages 10..15
     bm.mark_range(10, 5);
     for p in 10..15 {
         assert!(bm.is_present(p), "page {} should be present", p);
@@ -60,6 +62,7 @@ fn test_bitmap_persist_and_reload() {
     let path = dir.path().join("bm");
     {
         let mut bm = PageBitmap::new(path.clone());
+        bm.ensure_capacity(1000);
         bm.mark_present(42);
         bm.mark_present(1000);
         bm.persist().unwrap();
@@ -74,6 +77,7 @@ fn test_bitmap_persist_and_reload() {
 fn test_bitmap_byte_boundaries() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
+    bm.ensure_capacity(15); // max page checked is 15 (bit + 8 where bit=7)
     // Test at every bit in a byte
     for bit in 0..8 {
         bm.mark_present(bit);
@@ -93,6 +97,7 @@ fn test_bitmap_large_page_numbers() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
     let big = 1_000_000u64;
+    bm.ensure_capacity(big);
     bm.mark_present(big);
     assert!(bm.is_present(big));
     assert!(!bm.is_present(big - 1));
@@ -106,10 +111,14 @@ fn test_bitmap_ensure_capacity_auto_extends() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
     assert_eq!(bm.bits.len(), 0);
-    bm.mark_present(0);
+    bm.ensure_capacity(0);
     assert!(bm.bits.len() >= 1);
-    bm.mark_present(255);
+    bm.mark_present(0);
+    assert!(bm.is_present(0));
+    bm.ensure_capacity(255);
     assert!(bm.bits.len() >= 32);
+    bm.mark_present(255);
+    assert!(bm.is_present(255));
 }
 
 #[test]
@@ -128,6 +137,7 @@ fn test_bitmap_resize_explicit() {
 fn test_bitmap_clear_range_beyond_capacity() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
+    bm.ensure_capacity(5);
     bm.mark_present(5);
     // Clear range far beyond capacity — should not panic
     bm.clear_range(100000, 500);
@@ -146,6 +156,7 @@ fn test_bitmap_mark_range_zero_count() {
 fn test_bitmap_clear_range_within_single_byte() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
+    bm.ensure_capacity(7);
     // Set all 8 bits in first byte
     for i in 0..8 {
         bm.mark_present(i);
@@ -173,6 +184,7 @@ fn test_bitmap_persist_creates_file_atomic() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("bm");
     let mut bm = PageBitmap::new(path.clone());
+    bm.ensure_capacity(7);
     bm.mark_present(7);
     bm.persist().unwrap();
     assert!(path.exists());
@@ -1348,7 +1360,8 @@ fn compressed_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
         true, 3,
         #[cfg(feature = "zstd")]
         None,
-    ).expect("compressed cache creation failed")
+            0,
+        ).expect("compressed cache creation failed")
 }
 
 #[test]
@@ -1752,7 +1765,8 @@ fn compressed_encrypted_cache(dir: &Path, page_size: u32, page_count: u64) -> Di
         true, 3,
         #[cfg(feature = "zstd")]
         None,
-    ).expect("compressed+encrypted cache creation failed")
+            0,
+        ).expect("compressed+encrypted cache creation failed")
 }
 
 #[test]
@@ -1852,7 +1866,8 @@ fn test_compressed_encrypted_wrong_key_fails() {
         true, 3,
         #[cfg(feature = "zstd")]
         None,
-    ).unwrap();
+            0,
+        ).unwrap();
 
     let mut buf = vec![0u8; 64];
     // With wrong key, either read fails or returns garbage (CTR mode returns garbage, not error)
@@ -1876,6 +1891,7 @@ fn test_compressed_encrypted_persistence_roundtrip() {
             true, 3,
             #[cfg(feature = "zstd")]
             None,
+            0,
         ).unwrap();
         for p in 0..4u64 {
             let data: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
@@ -1892,6 +1908,7 @@ fn test_compressed_encrypted_persistence_roundtrip() {
             true, 3,
             #[cfg(feature = "zstd")]
             None,
+            0,
         ).unwrap();
         for p in 0..4u64 {
             assert!(cache.is_present(p), "page {} should be present after reopen", p);
@@ -1957,4 +1974,142 @@ fn test_prune_noop_when_uncompressed() {
     let keep = HashSet::new();
     cache.prune_cache_index(&keep);
     cache.clear_cache_index();
+}
+
+// =========================================================================
+// Phase Pelican: mem_cache tests
+// =========================================================================
+
+fn cache_with_mem_budget(dir: &std::path::Path, page_size: u32, page_count: u64, budget: u64) -> DiskCache {
+    let gp = positional_group_pages(256, page_count);
+    DiskCache::new_with_compression(
+        dir, 3600, 256, 4, page_size, page_count, None, gp,
+        false, 3,
+        #[cfg(feature = "zstd")]
+        None,
+        budget,
+    ).expect("cache with mem budget")
+}
+
+#[test]
+fn test_mem_cache_promote_on_bulk_write() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+
+    // Write 4 pages via bulk write (simulates S3 decode)
+    let data: Vec<u8> = (0..4).flat_map(|p| vec![p as u8; 64]).collect();
+    cache.write_pages_bulk(0, &data, 4).expect("bulk write");
+
+    // Pages should be in mem_cache (no pread needed)
+    for p in 0..4u64 {
+        let mut buf = vec![0u8; 64];
+        cache.read_page(p, &mut buf).expect("read");
+        assert_eq!(buf, vec![p as u8; 64], "page {} content mismatch", p);
+    }
+
+    // Verify mem_cache_bytes is tracked
+    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 4 * 64);
+}
+
+#[test]
+fn test_mem_cache_eviction_frees_memory() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+
+    // Write 4 pages
+    let data: Vec<u8> = (0..4).flat_map(|p| vec![p as u8; 64]).collect();
+    cache.write_pages_bulk(0, &data, 4).expect("bulk write");
+    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 4 * 64);
+
+    // Evict pages 0-3 via clear_pages_from_disk
+    cache.clear_pages_from_disk(&[0, 1, 2, 3]);
+
+    // mem_cache_bytes should be decremented
+    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 0, "mem_cache_bytes should be 0 after eviction");
+
+    // Verify AtomicPtr slots are null
+    if let Some(ref mc) = cache.mem_cache {
+        for p in 0..4 {
+            assert!(mc[p].load(Ordering::Relaxed).is_null(), "slot {} should be null after eviction", p);
+        }
+    }
+}
+
+#[test]
+fn test_mem_cache_budget_respected() {
+    let dir = TempDir::new().unwrap();
+    // Budget for only 2 pages (128 bytes at 64 bytes/page)
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 128);
+
+    // Write 4 pages, only first 2 should be promoted
+    let data: Vec<u8> = (0..4).flat_map(|p| vec![p as u8; 64]).collect();
+    cache.write_pages_bulk(0, &data, 4).expect("bulk write");
+
+    // Should have promoted exactly 2 pages (budget = 128 = 2 * 64)
+    assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) <= 128,
+        "mem_cache_bytes {} exceeds budget 128", cache.mem_cache_bytes.load(Ordering::Relaxed));
+}
+
+#[test]
+fn test_mem_cache_disabled_when_budget_zero() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 0);
+
+    assert!(cache.mem_cache.is_none(), "mem_cache should be None when budget=0");
+
+    // Write and read should still work via pread
+    let data = vec![42u8; 64];
+    cache.write_page(0, &data).expect("write");
+    let mut buf = vec![0u8; 64];
+    cache.read_page(0, &mut buf).expect("read");
+    assert_eq!(buf, data);
+}
+
+#[test]
+fn test_mem_cache_write_page_updates_existing() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+
+    // Promote page 0 via bulk write
+    let data = vec![1u8; 64];
+    cache.write_pages_bulk(0, &data, 1).expect("bulk write");
+
+    // Overwrite via write_page (dirty write)
+    let new_data = vec![99u8; 64];
+    cache.write_page(0, &new_data).expect("write page");
+
+    // Read should return the updated data
+    let mut buf = vec![0u8; 64];
+    cache.read_page(0, &mut buf).expect("read");
+    assert_eq!(buf, new_data, "mem_cache should reflect dirty write");
+}
+
+#[test]
+fn test_generation_counter_increments_on_sync_simulation() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 0);
+
+    assert_eq!(cache.generation.load(Ordering::Relaxed), 0);
+
+    let g1 = cache.bump_generation();
+    assert_eq!(g1, 0); // returns old value
+    assert_eq!(cache.generation.load(Ordering::Relaxed), 1);
+
+    let g2 = cache.bump_generation();
+    assert_eq!(g2, 1);
+    assert_eq!(cache.generation.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn test_drop_frees_all_mem_cache_pages() {
+    let dir = TempDir::new().unwrap();
+    {
+        let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+        let data: Vec<u8> = (0..8).flat_map(|p| vec![p as u8; 64]).collect();
+        cache.write_pages_bulk(0, &data, 8).expect("bulk write");
+        assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) > 0);
+        // cache dropped here -- Drop should free all allocations without leak
+    }
+    // If Drop didn't free, this would be caught by miri/valgrind, not by assertion.
+    // This test just ensures Drop doesn't panic.
 }

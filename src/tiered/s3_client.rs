@@ -534,6 +534,60 @@ impl S3Client {
         Ok(all_keys)
     }
 
+    // --- Phase Recall: snapshot manifest helpers ---
+
+    /// S3 key for a snapshot manifest copy: `{prefix}/manifest-snap-{snap_id}.msgpack`
+    pub(crate) fn snapshot_manifest_key(&self, snap_id: &str) -> String {
+        self.s3_key(&format!("manifest-snap-{}.msgpack", snap_id))
+    }
+
+    /// Copy the current manifest to a snapshot key. Returns the S3 key of the copy.
+    /// Used by the control plane at snapshot time to protect page groups from GC.
+    pub(crate) fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
+        S3Client::block_on(&self.runtime, self.copy_manifest_to_snapshot_async(snap_id))
+    }
+
+    pub(crate) async fn copy_manifest_to_snapshot_async(&self, snap_id: &str) -> io::Result<String> {
+        let current_key = self.manifest_key_msgpack();
+        let snap_key = self.snapshot_manifest_key(snap_id);
+
+        // Read-then-write instead of S3 CopyObject for portability across S3 providers.
+        let data = self.get_object_async(&current_key).await?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no manifest.msgpack to snapshot")
+        })?;
+        self.put_object_async(&snap_key, data, Some("application/msgpack")).await?;
+        Ok(snap_key)
+    }
+
+    /// Load a manifest from an arbitrary S3 key (e.g. a snapshot manifest copy).
+    /// Returns None if the key does not exist.
+    /// On deserialization error, returns Err (caller decides whether to skip or propagate).
+    pub(crate) fn get_manifest_at_key(&self, key: &str) -> io::Result<Option<Manifest>> {
+        S3Client::block_on(&self.runtime, self.get_manifest_at_key_async(key))
+    }
+
+    pub(crate) async fn get_manifest_at_key_async(&self, key: &str) -> io::Result<Option<Manifest>> {
+        match self.get_object_async(key).await? {
+            Some(bytes) => {
+                let mut manifest: Manifest = rmp_serde::from_slice(&bytes).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid snapshot manifest msgpack at {}: {}", key, e),
+                    )
+                })?;
+                manifest.build_page_index();
+                Ok(Some(manifest))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a snapshot manifest copy from S3.
+    pub(crate) fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
+        let key = self.snapshot_manifest_key(snap_id);
+        self.delete_objects(&[key])
+    }
+
     /// List all S3 keys under an arbitrary prefix (not limited to self.prefix).
     pub(crate) async fn list_all_keys_with_prefix(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut all_keys = Vec::new();
