@@ -352,6 +352,7 @@ pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Er
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
 }
 
+#[cfg(feature = "bundled-sqlite")]
 /// Migrate a database to S3Primary mode (journal_mode=OFF).
 ///
 /// This function handles the full migration regardless of the current journal mode:
