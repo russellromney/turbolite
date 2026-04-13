@@ -31,28 +31,28 @@ pub(crate) struct S3Client {
 impl S3Client {
     /// Create a new S3 client.
     pub(crate) async fn new_async(config: &TurboliteConfig) -> io::Result<Self> {
-        eprintln!("[s3] new_async: loading aws_config...");
+        turbolite_debug!("[s3] new_async: loading aws_config...");
         let mut aws_config = aws_config::from_env();
 
         if let Some(region) = &config.region {
-            eprintln!("[s3] setting region: {}", region);
+            turbolite_debug!("[s3] setting region: {}", region);
             aws_config =
                 aws_config.region(aws_sdk_s3::config::Region::new(region.clone()));
         }
 
         let aws_config = aws_config.load().await;
-        eprintln!("[s3] aws_config loaded");
+        turbolite_debug!("[s3] aws_config loaded");
 
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
         if let Some(endpoint) = &config.endpoint_url {
-            eprintln!("[s3] setting endpoint: {}", endpoint);
+            turbolite_debug!("[s3] setting endpoint: {}", endpoint);
             s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
         } else {
-            eprintln!("[s3] using default AWS S3 endpoint");
+            turbolite_debug!("[s3] using default AWS S3 endpoint");
         }
 
         let client = aws_sdk_s3::Client::from_conf(s3_config.build());
-        eprintln!("[s3] S3 client created");
+        turbolite_debug!("[s3] S3 client created");
 
         let runtime = config
             .runtime_handle
@@ -497,7 +497,7 @@ impl S3Client {
         if let Err(e) = self.delete_objects_async(&keys).await {
             eprintln!("[gc] ERROR: background delete of {} objects failed: {}", count, e);
         } else {
-            eprintln!("[gc] deleted {} old versions", count);
+            turbolite_debug!("[gc] deleted {} old versions", count);
         }
     }
 

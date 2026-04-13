@@ -47,7 +47,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
     let has_legacy = !legacy_dirty_groups.is_empty();
 
     if !has_staging && !has_legacy {
-        eprintln!("[flush] no pending groups to upload");
+        turbolite_debug!("[flush] no pending groups to upload");
         return Ok(());
     }
 
@@ -99,7 +99,7 @@ fn flush_inner(
             &flush_entry.staging_path,
             flush_entry.page_size,
         )?;
-        eprintln!(
+        turbolite_debug!(
             "[flush] read staging log v{}: {} pages from {}",
             flush_entry.version, pages.len(), flush_entry.staging_path.display(),
         );
@@ -107,7 +107,7 @@ fn flush_inner(
         staged_pages.extend(pages);
     }
 
-    eprintln!(
+    turbolite_debug!(
         "[flush] {} staged pages from {} logs, {} legacy dirty groups",
         staged_pages.len(), flushes.len(), legacy_dirty_groups.len(),
     );
@@ -142,7 +142,7 @@ fn flush_inner(
     }
 
     if dirty_groups.is_empty() {
-        eprintln!("[flush] no dirty groups after manifest lookup");
+        turbolite_debug!("[flush] no dirty groups after manifest lookup");
         // Clean up staging logs even if no groups (edge case: empty checkpoint)
         for path in &staging_paths {
             staging::remove_staging_log(path);
@@ -150,7 +150,7 @@ fn flush_inner(
         return Ok(());
     }
 
-    eprintln!(
+    turbolite_debug!(
         "[flush] uploading {} dirty groups to S3...",
         dirty_groups.len(),
     );
@@ -337,7 +337,7 @@ fn flush_inner(
 
     // 7-9. Build interior + index chunks BEFORE uploading anything,
     // then upload page groups + interior + index in a single parallel batch.
-    eprintln!("[flush] building interior + index chunks in parallel with page group encoding...");
+    turbolite_debug!("[flush] building interior + index chunks in parallel with page group encoding...");
     let page_group_upload_count = uploads.len();
     let chunk_range = bundle_chunk_range(page_size);
     let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -359,7 +359,7 @@ fn flush_inner(
                 }
             }
         }
-        eprintln!(
+        turbolite_debug!(
             "[flush] interior collection: {} pages",
             all_interior.len(),
         );
@@ -397,7 +397,7 @@ fn flush_inner(
                 encryption_key.as_ref(),
             )?;
             let key = s3.interior_chunk_key(chunk_id, next_version);
-            eprintln!(
+            turbolite_debug!(
                 "[flush] interior chunk {}: {} pages, {:.1}KB compressed",
                 chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
             );
@@ -415,7 +415,7 @@ fn flush_inner(
     for (old_chunk_id, old_key) in &old_chunk_keys {
         if !chunks.contains_key(old_chunk_id) {
             replaced_keys.push(old_key.clone());
-            eprintln!("[flush] orphaned interior chunk {} scheduled for GC", old_chunk_id);
+            turbolite_debug!("[flush] orphaned interior chunk {} scheduled for GC", old_chunk_id);
         }
     }
 
@@ -425,7 +425,7 @@ fn flush_inner(
     // 9. Index leaf bundles (same pattern as interior)
     // Two sources: (a) staged/cache dirty group pages that are index leaves,
     // (b) previously-fetched index pages from the tracker's Index tier.
-    eprintln!("[flush] building index leaf bundles...");
+    turbolite_debug!("[flush] building index leaf bundles...");
     let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
     {
         // (a) Scan dirty group pages for index leaves (type 0x0A + valid header).
@@ -492,7 +492,7 @@ fn flush_inner(
                 }
             }
         }
-        eprintln!(
+        turbolite_debug!(
             "[flush] index leaf collection: dirty_groups={}, tracker={}, total={}",
             dirty_index_count, tracker_index_count, all_index_leaves.len(),
         );
@@ -530,7 +530,7 @@ fn flush_inner(
                 encryption_key.as_ref(),
             )?;
             let key = s3.index_chunk_key(chunk_id, next_version);
-            eprintln!(
+            turbolite_debug!(
                 "[flush] index chunk {}: {} pages, {:.1}KB compressed",
                 chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
             );
@@ -548,7 +548,7 @@ fn flush_inner(
     for (old_chunk_id, old_key) in &old_index_chunk_keys {
         if !index_chunks.contains_key(old_chunk_id) {
             replaced_keys.push(old_key.clone());
-            eprintln!("[flush] orphaned index chunk {} scheduled for GC", old_chunk_id);
+            turbolite_debug!("[flush] orphaned index chunk {} scheduled for GC", old_chunk_id);
         }
     }
 
@@ -558,12 +558,12 @@ fn flush_inner(
 
     // 7-9 combined: single parallel upload of ALL objects (page groups + interior + index)
     let interior_count = uploads.len() - page_group_upload_count - index_chunk_count;
-    eprintln!(
+    turbolite_debug!(
         "[flush] uploading {} objects ({} page groups + {} interior + {} index)...",
         uploads.len(), page_group_upload_count, interior_count, index_chunk_count,
     );
     s3.put_page_groups(&uploads)?;
-    eprintln!("[flush] all {} objects uploaded", uploads.len());
+    turbolite_debug!("[flush] all {} objects uploaded", uploads.len());
 
     // 10. Update manifest atomically
     // Phase Drift: GC overrides for fully-rewritten groups before manifest construction
@@ -605,7 +605,7 @@ fn flush_inner(
         m
     };
     s3.put_manifest(&new_manifest)?;
-    eprintln!(
+    turbolite_debug!(
         "[flush] manifest v{} uploaded (page_count={}, {} groups)",
         new_manifest.version, new_manifest.page_count, new_manifest.page_group_keys.len(),
     );
@@ -621,11 +621,11 @@ fn flush_inner(
 
     // 12. Post-flush GC: delete old page group/interior chunk versions.
     if gc_enabled && !replaced_keys.is_empty() {
-        eprintln!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
+        turbolite_debug!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
         if let Err(e) = s3.delete_objects(&replaced_keys) {
             eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
         } else {
-            eprintln!("[gc] deleted {} old versions", replaced_keys.len());
+            turbolite_debug!("[gc] deleted {} old versions", replaced_keys.len());
         }
     }
 
@@ -649,7 +649,7 @@ fn flush_inner(
     // matters less (overrides are merged on read).
     let _ = (override_threshold, compaction_threshold);
 
-    eprintln!("[flush] complete");
+    turbolite_debug!("[flush] complete");
     Ok(())
 }
 

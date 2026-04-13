@@ -216,7 +216,7 @@ pub(crate) fn recover_staging_logs(
         // Validate file is non-empty and well-formed
         let meta = entry.metadata()?;
         if meta.len() == 0 {
-            eprintln!(
+            turbolite_debug!(
                 "[staging] removing empty staging file: {}",
                 path.display()
             );

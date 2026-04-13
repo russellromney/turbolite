@@ -22,6 +22,34 @@
 //! turbolite::tiered::register("mydb", vfs)?;
 //! ```
 
+/// Debug logging macro, gated behind TURBOLITE_DEBUG=1 env var.
+/// Silent by default. Set TURBOLITE_DEBUG=1 to enable debug output to stderr.
+/// Error-level messages use eprintln! directly and are always visible.
+#[macro_export]
+macro_rules! turbolite_debug {
+    ($($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Check if debug logging is enabled (cached after first check).
+pub fn debug_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unchecked, 1 = disabled, 2 = enabled
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let enabled = std::env::var("TURBOLITE_DEBUG").map_or(false, |v| v == "1" || v == "true");
+            STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+            enabled
+        }
+    }
+}
+
 pub mod compress;
 pub mod dict;
 #[cfg(not(feature = "loadable-extension"))]
@@ -151,7 +179,7 @@ static DEBUG_LOCKS: AtomicBool = AtomicBool::new(false);
 pub fn init_debug_locks() {
     if std::env::var("TURBOLITE_DEBUG_LOCKS").map(|v| v == "1").unwrap_or(false) {
         DEBUG_LOCKS.store(true, Ordering::Relaxed);
-        eprintln!("[LOCK DEBUG] Lock tracing enabled");
+        turbolite_debug!("[LOCK DEBUG] Lock tracing enabled");
     }
 }
 
@@ -322,7 +350,7 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                             unlock_inprocess(&self.path, prev_offset as usize, 1, conn_id);
                         }
                         if DEBUG_LOCKS.load(Ordering::Relaxed) {
-                            eprintln!(
+                            turbolite_debug!(
                                 "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY (in-process)",
                                 std::thread::current().id(),
                                 self.path.display(),
@@ -380,7 +408,7 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
         }
 
         if DEBUG_LOCKS.load(Ordering::Relaxed) {
-            eprintln!(
+            turbolite_debug!(
                 "[LOCK DEBUG] {:?} WAL_INDEX {} locks {:?}..{:?} {:?} => OK",
                 std::thread::current().id(),
                 self.path.display(),

@@ -224,13 +224,13 @@ impl TurboliteHandle {
             // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
             let interior_already_cached = !cache.interior_pages.lock().is_empty();
             if interior_already_cached {
-                eprintln!(
+                turbolite_debug!(
                     "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
                     cache.interior_pages.lock().len(),
                 );
             } else if !manifest.interior_chunk_keys.is_empty() {
                 let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
-                eprintln!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
+                turbolite_debug!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
                 match s3_ref.get_page_groups_by_key(&chunk_keys) {
                     Ok(results) => {
                         #[cfg(feature = "zstd")]
@@ -260,7 +260,7 @@ impl TurboliteHandle {
                                 }
                             }
                         }
-                        eprintln!(
+                        turbolite_debug!(
                             "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
                             total_pages, results.len(), total_bytes as f64 / 1024.0,
                         );
@@ -277,7 +277,7 @@ impl TurboliteHandle {
             if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
                 let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
                 let n_chunks = chunk_keys.len();
-                eprintln!("[tiered] fetching {} index leaf chunks...", n_chunks);
+                turbolite_debug!("[tiered] fetching {} index leaf chunks...", n_chunks);
                 match s3_ref.get_page_groups_by_key(&chunk_keys) {
                     Ok(results) => {
                         #[cfg(feature = "zstd")]
@@ -305,7 +305,7 @@ impl TurboliteHandle {
                                 }
                             }
                         }
-                        eprintln!(
+                        turbolite_debug!(
                             "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
                             total_pages, results.len(), total_bytes as f64 / 1024.0,
                         );
@@ -316,7 +316,7 @@ impl TurboliteHandle {
                     }
                 }
             } else if index_already_cached {
-                eprintln!(
+                turbolite_debug!(
                     "[tiered] index pages already cached ({} pages), skipping chunk fetch",
                     cache.index_pages.lock().len(),
                 );
@@ -342,7 +342,7 @@ impl TurboliteHandle {
             let m = shared_manifest.load();
             let map = interior_map::InteriorMap::build(&cache, &m);
             if !map.is_empty() {
-                eprintln!(
+                turbolite_debug!(
                     "[tiered] Jena: built interior map ({} interior pages, {} children)",
                     map.interior_count(),
                     map.child_count(),
@@ -566,7 +566,7 @@ impl TurboliteHandle {
             let offset = i * ps;
             let end = offset + ps;
             if end > page_data.len() {
-                eprintln!(
+                turbolite_debug!(
                     "[decode_and_cache_group_static] short data: group has {} page_nums, decoded {} bytes ({} pages), breaking at i={}",
                     group_page_nums.len(), page_data.len(), page_data.len() / ps, i,
                 );
@@ -699,7 +699,7 @@ impl TurboliteHandle {
             manifest.group_pages.push(chunk.to_vec());
         }
 
-        eprintln!(
+        turbolite_debug!(
             "[sync] assigned {} new pages to groups (total groups: {})",
             unassigned.len(),
             manifest.group_pages.len(),
@@ -791,7 +791,7 @@ impl TurboliteHandle {
             }
 
             if submitted > 0 && self.bench_verbose {
-                eprintln!(
+                turbolite_debug!(
                     "  [jena-chase] {} -> {}: {} keys, {} groups predicted, {} submitted",
                     rule.source_tree, rule.target_tree, keys.len(), groups.len(), submitted,
                 );
@@ -851,7 +851,7 @@ impl TurboliteHandle {
         }
 
         if submitted > 0 && self.bench_verbose {
-            eprintln!(
+            turbolite_debug!(
                 "  [jena-lookahead] interior page={} prefetched {} sibling interior groups",
                 page_num, submitted,
             );
@@ -901,7 +901,7 @@ impl TurboliteHandle {
         }
 
         if submitted > 0 && self.bench_verbose {
-            eprintln!(
+            turbolite_debug!(
                 "  [jena-overflow] page={} detected {} overflow pages, submitted {} groups",
                 page_num, overflow_pages.len(), submitted,
             );
@@ -997,7 +997,7 @@ impl TurboliteHandle {
             }
 
             if std::env::var("BENCH_VERBOSE").is_ok() {
-                eprintln!(
+                turbolite_debug!(
                     "  [jena-prefetch] page={} gid={} siblings={} submitted={} mode={}",
                     page_num, current_gid, sibling_groups.len(), submitted,
                     if is_search { "search" } else { "lookup" },
@@ -1267,7 +1267,7 @@ impl DatabaseHandle for TurboliteHandle {
                         &schema.table_columns,
                     );
                     if !self.chase_rules.is_empty() && self.bench_verbose {
-                        eprintln!(
+                        turbolite_debug!(
                             "  [jena-chase] built {} chase rules from {} planned accesses",
                             self.chase_rules.len(), planned.len(),
                         );
@@ -1278,7 +1278,7 @@ impl DatabaseHandle for TurboliteHandle {
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> = planned.iter().map(|a| a.tree_name.as_str()).collect();
                     let search_names: Vec<&String> = self.search_trees.iter().collect();
-                    eprintln!(
+                    turbolite_debug!(
                         "  [plan-drain] planned={:?} search_trees={:?} manifest_trees={:?}",
                         planned_names, search_names, tree_names,
                     );
@@ -1330,7 +1330,7 @@ impl DatabaseHandle for TurboliteHandle {
             // Debug: log reads of first 5 pages to trace HA promotion data visibility
             if page_num < 5 {
                 let nonzero = buf.iter().filter(|&&b| b != 0).count();
-                eprintln!("[read_exact_at] page {} CACHE HIT (gid={}, {}/{} nonzero bytes)",
+                turbolite_debug!("[read_exact_at] page {} CACHE HIT (gid={}, {}/{} nonzero bytes)",
                     page_num, gid, nonzero, buf.len());
             }
             self.detect_interior_page(buf, page_num, cache);
@@ -1353,7 +1353,7 @@ impl DatabaseHandle for TurboliteHandle {
                 .get(gid as usize)
                 .map(|ovs| ovs.len())
                 .unwrap_or(0);
-            eprintln!("[read_exact_at] page {} CACHE MISS (gid={}, manifest_v={}, overrides_for_gid={}, has_overrides={})",
+            turbolite_debug!("[read_exact_at] page {} CACHE MISS (gid={}, manifest_v={}, overrides_for_gid={}, has_overrides={})",
                 page_num, gid, manifest_snap.version, override_count, has_overrides);
             drop(manifest_snap);
         }
@@ -1549,7 +1549,7 @@ impl DatabaseHandle for TurboliteHandle {
                             let nonzero_in_page = if src_end <= decompressed.len() {
                                 decompressed[src_start..src_end].iter().filter(|&&b| b != 0).count()
                             } else { 0 };
-                            eprintln!("[read_exact_at] page {} S3 fetch: {}B compressed, {}B decompressed, override={}, page has {}/{} nonzero bytes",
+                            turbolite_debug!("[read_exact_at] page {} S3 fetch: {}B compressed, {}B decompressed, override={}, page has {}/{} nonzero bytes",
                                 page_num, compressed_frame.len(), decompressed.len(), is_override, nonzero_in_page, ps);
                         }
                         if src_end <= decompressed.len() {
@@ -1604,7 +1604,7 @@ impl DatabaseHandle for TurboliteHandle {
                         self.reset_misses(current_tree_name.as_ref());
 
                         if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!(
+                            turbolite_debug!(
                                 "  [range-get] page={} gid={} frame={}/{} s3={}ms decode={}ms total={}ms ({:.1}KB)",
                                 page_num, gid, frame_idx, ft.len(), s3_ms, decode_ms,
                                 miss_start.elapsed().as_millis(),
@@ -1633,7 +1633,7 @@ impl DatabaseHandle for TurboliteHandle {
             let wait_start = Instant::now();
             cache.wait_for_group(gid);
             if std::env::var("BENCH_VERBOSE").is_ok() {
-                eprintln!(
+                turbolite_debug!(
                     "  [inline] page={} gid={} WAITED for prefetch worker {}ms",
                     page_num, gid, wait_start.elapsed().as_millis(),
                 );
@@ -1703,7 +1703,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 cache.mark_group_present(gid);
                                 cache.touch_group(gid);
                                 if std::env::var("BENCH_VERBOSE").is_ok() {
-                                    eprintln!(
+                                    turbolite_debug!(
                                         "  [inline] page={} gid={} s3={}ms decode={}ms write={}ms total={}ms ({:.1}KB)",
                                         page_num, gid, s3_ms, decode_ms, write_ms,
                                         miss_start.elapsed().as_millis(),
@@ -1736,7 +1736,7 @@ impl DatabaseHandle for TurboliteHandle {
                 let wait_start = Instant::now();
                 cache.wait_for_group(gid);
                 if std::env::var("BENCH_VERBOSE").is_ok() {
-                    eprintln!(
+                    turbolite_debug!(
                         "  [inline] page={} gid={} WAITED (race) {}ms",
                         page_num, gid, wait_start.elapsed().as_millis(),
                     );
@@ -1905,7 +1905,7 @@ impl DatabaseHandle for TurboliteHandle {
 
     fn sync(&mut self, _data_only: bool) -> Result<(), io::Error> {
         let dirty_count = self.dirty_page_nums.read().len();
-        eprintln!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
+        turbolite_debug!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
         if self.is_passthrough() {
             return self
                 .passthrough_file
@@ -1925,10 +1925,10 @@ impl DatabaseHandle for TurboliteHandle {
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
                 self.dirty_since_sync = false;
-                eprintln!("[sync] early return: 0 dirty pages, 0 pending groups (sync_mode={:?})", self.sync_mode);
+                turbolite_debug!("[sync] early return: 0 dirty pages, 0 pending groups (sync_mode={:?})", self.sync_mode);
                 return Ok(());
             }
-            eprintln!("[sync] dirty={}, pending={}, sync_mode={:?}", dirty.len(), has_pending_groups, self.sync_mode);
+            turbolite_debug!("[sync] dirty={}, pending={}, sync_mode={:?}", dirty.len(), has_pending_groups, self.sync_mode);
             dirty.clone()
         };
 
@@ -1982,7 +1982,7 @@ impl DatabaseHandle for TurboliteHandle {
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior total, {} dirty groups", n, total_interior, pending_groups_snapshot.len());
+            turbolite_debug!("[sync] local-only checkpoint: {} pages, {} interior total, {} dirty groups", n, total_interior, pending_groups_snapshot.len());
 
             let page_size = self.page_size.load(Ordering::Relaxed);
             // Combined staging log + manifest: one fsync instead of three.
@@ -2001,7 +2001,7 @@ impl DatabaseHandle for TurboliteHandle {
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
-                eprintln!(
+                turbolite_debug!(
                     "[sync] staging log finalized: {} pages + manifest ({}B), version {}, path {}",
                     pages_written, manifest_bytes.len(), version, staging_path.display(),
                 );
@@ -2130,7 +2130,7 @@ impl DatabaseHandle for TurboliteHandle {
             let next_version = manifest_snap.version + 1;
             let ovr_count: usize = manifest_snap.subframe_overrides.iter()
                 .map(|ovs| ovs.len()).sum();
-            eprintln!("[sync:s3primary] building v{} from v{} (page_count={}, dirty={}, overrides={}, pg_keys={})",
+            turbolite_debug!("[sync:s3primary] building v{} from v{} (page_count={}, dirty={}, overrides={}, pg_keys={})",
                 next_version, manifest_snap.version, page_count, dirty_snapshot.len(),
                 ovr_count, manifest_snap.page_group_keys.len());
             let change_counter = read_change_counter_from_cache(&cache, page_size);
@@ -2166,7 +2166,7 @@ impl DatabaseHandle for TurboliteHandle {
 
                 if has_frame_table {
                     // Override path: encode only dirty frames
-                    eprintln!("[sync:s3primary] gid={}: override path (frame_table has {} entries)", gid, frame_table_ref.map(|ft| ft.len()).unwrap_or(0));
+                    turbolite_debug!("[sync:s3primary] gid={}: override path (frame_table has {} entries)", gid, frame_table_ref.map(|ft| ft.len()).unwrap_or(0));
                     let dirty_frames = manifest::dirty_frames_for_group(
                         dirty_pnums,
                         &pages_in_group,
@@ -2279,9 +2279,9 @@ impl DatabaseHandle for TurboliteHandle {
                     // No frame table (legacy format or new group): full group rewrite
                     let existing_ovrs = new_subframe_overrides.get(gid as usize).map(|o| o.len()).unwrap_or(0);
                     if existing_ovrs > 0 {
-                        eprintln!("[sync:s3primary] gid={}: FULL REWRITE draining {} overrides!", gid, existing_ovrs);
+                        turbolite_debug!("[sync:s3primary] gid={}: FULL REWRITE draining {} overrides!", gid, existing_ovrs);
                     } else {
-                        eprintln!("[sync:s3primary] gid={}: full rewrite (no overrides to drain)", gid);
+                        turbolite_debug!("[sync:s3primary] gid={}: full rewrite (no overrides to drain)", gid);
                     }
                     let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
                     let mut need_s3_merge = false;
@@ -2381,7 +2381,7 @@ impl DatabaseHandle for TurboliteHandle {
 
             // Upload all overrides + page groups
             if !uploads.is_empty() {
-                eprintln!("[sync:s3primary] uploading {} objects...", uploads.len());
+                turbolite_debug!("[sync:s3primary] uploading {} objects...", uploads.len());
                 s3.put_page_groups(&uploads)?;
             }
 
@@ -2456,7 +2456,7 @@ impl DatabaseHandle for TurboliteHandle {
                 });
             }
 
-            eprintln!(
+            turbolite_debug!(
                 "[sync:s3primary] committed v{} ({} dirty pages, {} uploads)",
                 next_version, dirty_snapshot.len(), uploads.len(),
             );
@@ -2492,7 +2492,7 @@ impl DatabaseHandle for TurboliteHandle {
                             let manifest = self.manifest.load();
                             let dirty_ratio = dirty_snapshot.len() as f64 / manifest.page_count.max(1) as f64;
                             if dirty_ratio > 0.5 {
-                                eprintln!(
+                                turbolite_debug!(
                                     "[sync] VACUUM detected: schema cookie {} -> {}, {:.0}% pages dirty, re-walking B-trees",
                                     prev, cookie, dirty_ratio * 100.0,
                                 );
@@ -2512,7 +2512,7 @@ impl DatabaseHandle for TurboliteHandle {
                             Some(buf)
                         });
 
-                        eprintln!(
+                        turbolite_debug!(
                             "[sync] VACUUM re-walk: {} B-trees, {} unowned pages",
                             walk.btrees.len(), walk.unowned_pages.len(),
                         );
@@ -2571,7 +2571,7 @@ impl DatabaseHandle for TurboliteHandle {
                             });
                         }
 
-                        eprintln!(
+                        turbolite_debug!(
                             "[sync] VACUUM: repacked {} pages into {} groups (was {} groups)",
                             page_count, new_group_pages.len(), manifest.group_pages.len(),
                         );
@@ -2793,7 +2793,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         let page_group_count = uploads.len();
-        eprintln!("[sync] encoded {} page groups, building interior + index chunks...", page_group_count);
+        turbolite_debug!("[sync] encoded {} page groups, building interior + index chunks...", page_group_count);
         // Build chunked interior bundles: group interior pages by fixed page-number ranges.
         // Only re-upload chunks that contain dirty interior pages.
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new(); // pnum → data
@@ -2843,7 +2843,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
             }
-            eprintln!(
+            turbolite_debug!(
                 "[sync] interior collection: known_interior={}, dirty_snapshot_interior={}, cache_read_ok={}, cache_read_fail={}, skipped_dup={}, skipped_bounds={}, total={}",
                 known_interior.len(), dirty_interior_count, cache_read_ok, cache_read_fail, cache_skipped_dup, cache_skipped_bounds, all_interior.len(),
             );
@@ -2884,7 +2884,7 @@ impl DatabaseHandle for TurboliteHandle {
                     self.encryption_key.as_ref(),
                 )?;
                 let key = s3.interior_chunk_key(chunk_id, next_version);
-                eprintln!(
+                turbolite_debug!(
                     "[sync] interior chunk {}: {} pages, {:.1}KB compressed",
                     chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
                 );
@@ -2905,7 +2905,7 @@ impl DatabaseHandle for TurboliteHandle {
             if !chunks.contains_key(old_chunk_id) {
                 // This chunk had interior pages before but has none now (e.g., after VACUUM/REINDEX)
                 replaced_keys.push(old_key.clone());
-                eprintln!("[sync] orphaned interior chunk {} scheduled for GC", old_chunk_id);
+                turbolite_debug!("[sync] orphaned interior chunk {} scheduled for GC", old_chunk_id);
             }
         }
 
@@ -2966,7 +2966,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
             }
-            eprintln!(
+            turbolite_debug!(
                 "[sync] index leaf collection: dirty={}, cache_read_ok={}, total={}",
                 dirty_index_count, cache_read_ok, all_index_leaves.len(),
             );
@@ -3004,7 +3004,7 @@ impl DatabaseHandle for TurboliteHandle {
                     self.encryption_key.as_ref(),
                 )?;
                 let key = s3.index_chunk_key(chunk_id, next_version);
-                eprintln!(
+                turbolite_debug!(
                     "[sync] index chunk {}: {} pages, {:.1}KB compressed",
                     chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
                 );
@@ -3022,16 +3022,16 @@ impl DatabaseHandle for TurboliteHandle {
         for (old_chunk_id, old_key) in &old_index_chunk_keys {
             if !index_chunks.contains_key(old_chunk_id) {
                 replaced_keys.push(old_key.clone());
-                eprintln!("[sync] orphaned index chunk {} scheduled for GC", old_chunk_id);
+                turbolite_debug!("[sync] orphaned index chunk {} scheduled for GC", old_chunk_id);
             }
         }
 
         uploads.extend(index_chunk_uploads);
 
         // Single parallel upload: page groups + interior + index chunks
-        eprintln!("[sync] uploading {} objects to S3...", uploads.len());
+        turbolite_debug!("[sync] uploading {} objects to S3...", uploads.len());
         s3.put_page_groups(&uploads)?;
-        eprintln!("[sync] all {} objects uploaded", uploads.len());
+        turbolite_debug!("[sync] all {} objects uploaded", uploads.len());
 
         // Update manifest atomically
         let old_manifest = (**self.manifest.load()).clone();
@@ -3118,7 +3118,7 @@ impl DatabaseHandle for TurboliteHandle {
                             eprintln!("[sync] WARN: cache truncation failed: {}", e);
                         } else {
                             cache.cache_file_len.store(target_size, Ordering::Relaxed);
-                            eprintln!("[sync] cache truncated: {}B -> {}B ({} pages)",
+                            turbolite_debug!("[sync] cache truncated: {}B -> {}B ({} pages)",
                                 meta.len(), target_size, current_page_count);
                         }
                     }
@@ -3131,7 +3131,7 @@ impl DatabaseHandle for TurboliteHandle {
         if self.gc_enabled && !replaced_keys.is_empty() {
             let gc_s3 = Arc::clone(self.s3.as_ref().expect("s3 client required"));
             let runtime = gc_s3.runtime.clone();
-            eprintln!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
+            turbolite_debug!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
             runtime.spawn(async move {
                 gc_s3.delete_objects_async_owned(replaced_keys).await;
             });
@@ -3168,7 +3168,7 @@ impl DatabaseHandle for TurboliteHandle {
                     })
                     .collect();
                 if !to_delete.is_empty() {
-                    eprintln!("[wal-gc] deleting {} WAL segments with txid <= {}", to_delete.len(), version);
+                    turbolite_debug!("[wal-gc] deleting {} WAL segments with txid <= {}", to_delete.len(), version);
                     gc_s3.delete_objects_async_owned(to_delete).await;
                 }
             });
@@ -3197,7 +3197,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
                 cache.stat_evictions.fetch_add(count as u64, Ordering::Relaxed);
                 cache.stat_bytes_evicted.fetch_add(count as u64 * scbs, Ordering::Relaxed);
-                eprintln!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
+                turbolite_debug!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
             }
         }
 
@@ -3266,7 +3266,7 @@ impl DatabaseHandle for TurboliteHandle {
             let mut dirty = self.dirty_page_nums.write();
             if !dirty.is_empty() {
                 let stale_pages: Vec<u64> = dirty.iter().copied().collect();
-                eprintln!(
+                turbolite_debug!(
                     "[turbolite] lock downgrade without sync: clearing {} dirty pages (transaction rollback)",
                     stale_pages.len(),
                 );

@@ -102,7 +102,7 @@ impl PrefetchPool {
                         }
                     } else if current != GroupState::Fetching {
                         if std::env::var("BENCH_VERBOSE").is_ok() {
-                            eprintln!("  [prefetch-skip] gid={} state={:?}", job.gid, current);
+                            turbolite_debug!("  [prefetch-skip] gid={} state={:?}", job.gid, current);
                         }
                         in_flight.fetch_sub(1, Ordering::Release);
                         continue;
@@ -175,7 +175,7 @@ impl PrefetchPool {
                     // written by the foreground read path with the newer manifest.
                     let current_version = shared_manifest.load().version;
                     if current_version != job.manifest_version {
-                        eprintln!("[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
+                        turbolite_debug!("[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
                             job.gid, job.manifest_version, current_version);
                         cache.unclaim_group(job.gid);
                         in_flight.fetch_sub(1, Ordering::Release);
@@ -183,7 +183,7 @@ impl PrefetchPool {
                     }
 
                     // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
-                    eprintln!("[prefetch] gid={} writing {} pages (job_v={}, current_v={})",
+                    turbolite_debug!("[prefetch] gid={} writing {} pages (job_v={}, current_v={})",
                         job.gid, pg_count, job.manifest_version, current_version);
                     let write_start = Instant::now();
                     let actual_pages = std::cmp::min(pg_count as usize, job.group_page_nums.len());
@@ -234,7 +234,7 @@ impl PrefetchPool {
                             let ovr_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&ovr.key)) {
                                 Ok(Some(data)) => data,
                                 Ok(None) => {
-                                    eprintln!("[prefetch] gid={} override frame {} key '{}' not found in S3",
+                                    turbolite_debug!("[prefetch] gid={} override frame {} key '{}' not found in S3",
                                         job.gid, frame_idx, ovr.key);
                                     continue;
                                 }
@@ -269,7 +269,7 @@ impl PrefetchPool {
                     cache.mark_group_present(job.gid);
                     cache.touch_group(job.gid);
                     if std::env::var("BENCH_VERBOSE").is_ok() {
-                        eprintln!(
+                        turbolite_debug!(
                             "  [prefetch-done] gid={} ({:.1}KB) fetch={}ms decompress={}ms write={}ms total={}ms",
                             job.gid,
                             pg_data.len() as f64 / 1024.0,
