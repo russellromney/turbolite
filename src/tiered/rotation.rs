@@ -100,7 +100,7 @@ pub fn rotate_encryption_key(
         (None, Some(_)) => "adding encryption",
         (None, None) => unreachable!(),
     };
-    eprintln!(
+    turbolite_debug!(
         "[rotate] starting {}: {} page groups, {} interior chunks, {} index chunks",
         mode,
         pg_count,
@@ -182,7 +182,7 @@ pub fn rotate_encryption_key(
         }
     }
 
-    eprintln!(
+    turbolite_debug!(
         "[rotate] processed {} page groups",
         manifest
             .page_group_keys
@@ -216,7 +216,7 @@ pub fn rotate_encryption_key(
             .insert(*chunk_id, new_s3_key);
     }
 
-    eprintln!("[rotate] processed {} interior chunks", interior_keys.len());
+    turbolite_debug!("[rotate] processed {} interior chunks", interior_keys.len());
 
     // Re-encrypt index bundles
     let index_keys: Vec<(u32, String)> = manifest
@@ -243,7 +243,7 @@ pub fn rotate_encryption_key(
             .insert(*chunk_id, new_s3_key);
     }
 
-    eprintln!("[rotate] processed {} index chunks", index_keys.len());
+    turbolite_debug!("[rotate] processed {} index chunks", index_keys.len());
 
     // VERIFY: re-download and decode one new page group before committing.
     // Guards against silent S3 corruption or encode bugs.
@@ -304,17 +304,17 @@ pub fn rotate_encryption_key(
                 )
             })?;
         }
-        eprintln!("[rotate] verification passed: new data is readable");
+        turbolite_debug!("[rotate] verification passed: new data is readable");
     }
 
     // COMMIT POINT: upload new manifest
     s3.put_manifest(&new_manifest)?;
-    eprintln!("[rotate] manifest uploaded (version {})", new_version);
+    turbolite_debug!("[rotate] manifest uploaded (version {})", new_version);
 
     // GC old objects
     if !replaced_keys.is_empty() {
         s3.delete_objects(&replaced_keys)?;
-        eprintln!("[rotate] deleted {} old S3 objects", replaced_keys.len());
+        turbolite_debug!("[rotate] deleted {} old S3 objects", replaced_keys.len());
     }
 
     // Clear local cache (simpler than re-encrypting, cache repopulates on next open)
@@ -322,9 +322,9 @@ pub fn rotate_encryption_key(
     let _ = std::fs::remove_file(config.cache_dir.join("sub_chunk_tracker"));
     let _ = std::fs::remove_file(config.cache_dir.join("page_bitmap"));
     let _ = std::fs::remove_file(config.cache_dir.join("cache_index.json"));
-    eprintln!("[rotate] cleared local cache");
+    turbolite_debug!("[rotate] cleared local cache");
 
-    eprintln!("[rotate] {} complete", mode);
+    turbolite_debug!("[rotate] {} complete", mode);
     Ok(())
 }
 

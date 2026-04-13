@@ -396,7 +396,7 @@ pub unsafe extern "C" fn turbolite_discover_schema(db: *mut std::ffi::c_void) {
     if !rows.is_empty() {
         let info = super::schema::build_schema_info(&rows);
         if std::env::var("BENCH_VERBOSE").is_ok() {
-            eprintln!(
+            turbolite_debug!(
                 "[jena] schema discovered: {} tables, {} indexes",
                 info.table_columns.len(), info.index_columns.len(),
             );

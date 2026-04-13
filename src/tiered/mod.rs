@@ -401,7 +401,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     // it back. SQLite won't recognize this until the connection is reopened.
     // We use DELETE (not OFF=0,0) because SQLite interprets 0,0 as "no format
     // version" and may override it. DELETE mode on reopen allows PRAGMA journal_mode=OFF.
-    eprintln!(
+    turbolite_debug!(
         "[migrate] PRAGMA journal_mode=OFF returned '{}', patching database header directly",
         mode,
     );

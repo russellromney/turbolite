@@ -175,12 +175,12 @@ impl TurboliteVfs {
         let (mut manifest, recovered_dirty_groups) = match storage.get_manifest_with_dirty_groups()? {
             (Some(m), dirty) => {
                 if !dirty.is_empty() {
-                    eprintln!(
+                    turbolite_debug!(
                         "[local] loaded manifest (v{}, {} pages, {} dirty groups pending flush)",
                         m.version, m.page_count, dirty.len(),
                     );
                 } else {
-                    eprintln!(
+                    turbolite_debug!(
                         "[local] loaded manifest (v{}, {} pages)",
                         m.version, m.page_count,
                     );
@@ -188,7 +188,7 @@ impl TurboliteVfs {
                 (m, dirty)
             }
             (None, _) => {
-                eprintln!("[local] no manifest found, starting empty database");
+                turbolite_debug!("[local] no manifest found, starting empty database");
                 (Manifest::empty(), Vec::new())
             }
         };
@@ -201,7 +201,7 @@ impl TurboliteVfs {
         let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size_hint)?;
         let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
         if !recovered_staging.is_empty() {
-            eprintln!("[local] recovered {} staging logs (max version {})", recovered_staging.len(), max_recovered_version);
+            turbolite_debug!("[local] recovered {} staging logs (max version {})", recovered_staging.len(), max_recovered_version);
         }
 
         // Extract the newest manifest from staging logs (if newer than manifest.msgpack)
@@ -211,7 +211,7 @@ impl TurboliteVfs {
             ) {
                 if let Ok(local) = rmp_serde::from_slice::<manifest::LocalManifest>(&manifest_bytes) {
                     if local.manifest.version > manifest.version {
-                        eprintln!(
+                        turbolite_debug!(
                             "[local] staging log v{} has newer manifest (v{}, {} pages), upgrading from v{}",
                             flush_entry.version, local.manifest.version,
                             local.manifest.page_count, manifest.version,
@@ -305,27 +305,27 @@ impl TurboliteVfs {
                 (handle, Some(rt))
             };
 
-        eprintln!("[tiered] creating S3 client...");
+        turbolite_debug!("[tiered] creating S3 client...");
         let s3 = S3Client::new_blocking(&config, &runtime_handle)?;
-        eprintln!("[tiered] S3 client created, fetching manifest...");
+        turbolite_debug!("[tiered] S3 client created, fetching manifest...");
 
         // Phase Gallipoli: try local manifest first for cache initialization.
         let (mut manifest, recovered_dirty_groups) = match manifest::LocalManifest::load(&config.cache_dir) {
             Ok(Some(local)) => {
-                eprintln!(
+                turbolite_debug!(
                     "[tiered] loaded local manifest for cache init (v{}, {} pages, {} dirty groups)",
                     local.manifest.version, local.manifest.page_count, local.dirty_groups.len(),
                 );
                 (local.manifest, local.dirty_groups)
             }
             _ => {
-                eprintln!("[tiered] no local manifest, fetching from S3 for cache init...");
+                turbolite_debug!("[tiered] no local manifest, fetching from S3 for cache init...");
                 (s3.get_manifest()?.unwrap_or_else(Manifest::empty), Vec::new())
             }
         };
         manifest.detect_and_normalize_strategy();
 
-        eprintln!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
+        turbolite_debug!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
         let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
         let ppg = if manifest.pages_per_group > 0 { manifest.pages_per_group } else { config.pages_per_group };
 
@@ -362,7 +362,7 @@ impl TurboliteVfs {
         ));
         let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
         if !initial_dirty.is_empty() {
-            eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
+            turbolite_debug!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", initial_dirty.len());
         }
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
@@ -371,7 +371,7 @@ impl TurboliteVfs {
         let staging_dir = config.cache_dir.join("staging");
         let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
         if !recovered_staging.is_empty() {
-            eprintln!("[tiered] recovered {} staging logs from interrupted flush", recovered_staging.len());
+            turbolite_debug!("[tiered] recovered {} staging logs from interrupted flush", recovered_staging.len());
         }
         let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
         let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
@@ -437,13 +437,13 @@ impl TurboliteVfs {
                 // If VFS already has a manifest (warm reconnect), use it
                 if has_loaded {
                     let m = (**self.shared_manifest.load()).clone();
-                    eprintln!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
+                    turbolite_debug!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
                     return Ok((m, Vec::new(), true));
                 }
                 // Try local manifest first
                 if let Some(local) = manifest::LocalManifest::load(&self.config.cache_dir)? {
                     let dirty = local.dirty_groups.clone();
-                    eprintln!(
+                    turbolite_debug!(
                         "[tiered] loaded local manifest (v{}, {} pages, {} dirty groups)",
                         local.manifest.version, local.manifest.page_count, dirty.len(),
                     );
@@ -452,15 +452,15 @@ impl TurboliteVfs {
                     return Ok((m, dirty, false));
                 }
                 // Fall back to storage (S3 or local)
-                eprintln!("[tiered] no local manifest, fetching from storage...");
+                turbolite_debug!("[tiered] no local manifest, fetching from storage...");
                 let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
-                eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
+                turbolite_debug!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
                 Ok((m, Vec::new(), false))
             }
             ManifestSource::S3 => {
-                eprintln!("[tiered] fetching manifest from storage (manifest_source=S3)...");
+                turbolite_debug!("[tiered] fetching manifest from storage (manifest_source=S3)...");
                 let m = self.storage.get_manifest()?.unwrap_or_else(Manifest::empty);
-                eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
+                turbolite_debug!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
                 Ok((m, Vec::new(), false))
             }
         }
@@ -700,7 +700,7 @@ impl TurboliteVfs {
                     Ok(None) => {
                         // Manifest disappeared between list and get (race with snapshot delete).
                         // Safe to ignore: if it was deleted, we don't need to protect its pages.
-                        eprintln!("[gc] snapshot manifest {} disappeared during gc, skipping", key);
+                        turbolite_debug!("[gc] snapshot manifest {} disappeared during gc, skipping", key);
                     }
                     Err(e) => {
                         // Corrupt or partial snapshot manifest. Skip with warning, don't crash gc.
@@ -718,9 +718,9 @@ impl TurboliteVfs {
 
         let count = orphans.len();
         if count > 0 {
-            eprintln!("[gc] deleting {} orphaned S3 objects...", count);
+            turbolite_debug!("[gc] deleting {} orphaned S3 objects...", count);
             s3.delete_objects(&orphans)?;
-            eprintln!("[gc] deleted {} orphaned objects", count);
+            turbolite_debug!("[gc] deleted {} orphaned objects", count);
         }
         Ok(count)
     }
@@ -907,7 +907,7 @@ impl TurboliteVfs {
             let current = self.shared_manifest.load();
             if manifest.version > 0 && current.version > 0 && manifest.version <= current.version {
                 if manifest.version < current.version {
-                    eprintln!("[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
+                    turbolite_debug!("[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
                         manifest.version, current.version);
                 }
                 return;
@@ -957,7 +957,7 @@ impl TurboliteVfs {
         }
 
         if !changed_groups.is_empty() {
-            eprintln!("[set_manifest] evicting {} changed groups (old_keys={}, new_keys={}): {:?}",
+            turbolite_debug!("[set_manifest] evicting {} changed groups (old_keys={}, new_keys={}): {:?}",
                 changed_groups.len(), old_keys.len(), new_keys.len(), changed_groups);
         }
         for gid in &changed_groups {
@@ -969,7 +969,7 @@ impl TurboliteVfs {
                 .filter(|&p| self.cache.is_present(p))
                 .collect();
             if !present.is_empty() {
-                eprintln!("[set_manifest] BUG: after evicting groups {:?}, {} pages still present: {:?}",
+                turbolite_debug!("[set_manifest] BUG: after evicting groups {:?}, {} pages still present: {:?}",
                     changed_groups, present.len(), &present[..std::cmp::min(20, present.len())]);
             }
         }
@@ -1053,7 +1053,7 @@ impl Vfs for TurboliteVfs {
                     if old_manifest.version > manifest.version {
                         // Local ahead of S3 (crash recovery): full cache invalidation.
                         // Local writes were not published; S3 is authoritative.
-                        eprintln!(
+                        turbolite_debug!(
                             "[cache-validate] local v{} ahead of manifest v{}, full cache invalidation",
                             old_manifest.version, manifest.version,
                         );
@@ -1093,12 +1093,12 @@ impl Vfs for TurboliteVfs {
                         }
                         if invalidated > 0 {
                             self.cache.group_condvar.notify_all();
-                            eprintln!(
+                            turbolite_debug!(
                                 "[cache-validate] manifest v{} -> v{}: invalidated {} groups",
                                 old_manifest.version, manifest.version, invalidated,
                             );
                         } else {
-                            eprintln!(
+                            turbolite_debug!(
                                 "[cache-validate] manifest v{} -> v{}: no groups changed",
                                 old_manifest.version, manifest.version,
                             );
@@ -1125,7 +1125,7 @@ impl Vfs for TurboliteVfs {
                 let mut pending = self.shared_dirty_groups.lock().unwrap();
                 let count = recovered_dirty_groups.len();
                 pending.extend(recovered_dirty_groups);
-                eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", count);
+                turbolite_debug!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", count);
             }
 
             let lock_dir = self.config.cache_dir.join("locks");

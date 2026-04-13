@@ -93,7 +93,7 @@ impl WalReplicationState {
                 }
             };
 
-            eprintln!(
+            turbolite_debug!(
                 "[wal-replication] starting (db={}, txid={}, interval={}ms)",
                 state.name, initial_txid, sync_interval_ms,
             );
@@ -103,7 +103,7 @@ impl WalReplicationState {
             ).await {
                 eprintln!("[wal-replication] ERROR: {}", e);
             } else {
-                eprintln!("[wal-replication] stopped (final txid={})", state.current_txid);
+                turbolite_debug!("[wal-replication] stopped (final txid={})", state.current_txid);
             }
         });
 
@@ -114,7 +114,7 @@ impl WalReplicationState {
     pub(crate) fn stop(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(true);
-            eprintln!("[wal-replication] shutdown signal sent");
+            turbolite_debug!("[wal-replication] shutdown signal sent");
         }
     }
 
@@ -167,11 +167,11 @@ pub(crate) fn recover_wal_from_shared_state(
     })?;
 
     if incr_keys.is_empty() {
-        eprintln!("[wal-recovery] no WAL segments newer than version {}", manifest_version);
+        turbolite_debug!("[wal-recovery] no WAL segments newer than version {}", manifest_version);
         return Ok(0);
     }
 
-    eprintln!("[wal-recovery] found {} WAL segments to replay", incr_keys.len());
+    turbolite_debug!("[wal-recovery] found {} WAL segments to replay", incr_keys.len());
 
     // Step 2: materialize page groups to temp file
     let recovery_path = cache_dir.join("recovery.db");
@@ -192,10 +192,10 @@ pub(crate) fn recover_wal_from_shared_state(
                 Ok(result) => {
                     prev_checksum = result.checksum;
                     count += 1;
-                    eprintln!("[wal-recovery] applied {}", key);
+                    turbolite_debug!("[wal-recovery] applied {}", key);
                 }
                 Err(e) if e.to_string().contains("checksum") || e.to_string().contains("Checksum") => {
-                    eprintln!("[wal-recovery] stopping at stale lineage: {}", e);
+                    turbolite_debug!("[wal-recovery] stopping at stale lineage: {}", e);
                     break;
                 }
                 Err(e) => {
@@ -212,7 +212,7 @@ pub(crate) fn recover_wal_from_shared_state(
     }
 
     // Step 4: read recovered pages into VFS cache
-    eprintln!("[wal-recovery] loading {} WAL-recovered pages into cache...", applied);
+    turbolite_debug!("[wal-recovery] loading {} WAL-recovered pages into cache...", applied);
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(&recovery_path)?;
     let file_size = file.metadata()?.len();
@@ -229,6 +229,6 @@ pub(crate) fn recover_wal_from_shared_state(
     }
 
     let _ = std::fs::remove_file(&recovery_path);
-    eprintln!("[wal-recovery] loaded {} pages from WAL recovery", pages_loaded);
+    turbolite_debug!("[wal-recovery] loaded {} pages from WAL recovery", pages_loaded);
     Ok(pages_loaded)
 }
