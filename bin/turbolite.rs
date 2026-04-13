@@ -1,7 +1,7 @@
 //! turbolite CLI
 //!
-//! Management commands for turbolite databases: inspect manifests, run GC,
-//! import/export, interactive shell, cache warming, and more.
+//! Management commands for turbolite databases: inspect manifests,
+//! import/export, interactive shell, and cache download.
 
 use std::io::{self, BufRead, Write as _};
 use std::path::PathBuf;
@@ -18,9 +18,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Print version
-    Version,
-
     /// Print manifest summary for a turbolite database
     Info {
         /// Path to the database file
@@ -77,60 +74,6 @@ enum Commands {
         /// Open in read-only mode
         #[arg(long)]
         read_only: bool,
-    },
-
-    /// Run garbage collection on old S3 page group versions
-    Gc {
-        /// Path to the database file
-        #[arg(long)]
-        db: PathBuf,
-
-        /// S3 bucket (required, or set TURBOLITE_BUCKET)
-        #[arg(long, env = "TURBOLITE_BUCKET")]
-        bucket: String,
-
-        /// S3 key prefix (or set TURBOLITE_PREFIX)
-        #[arg(long, env = "TURBOLITE_PREFIX")]
-        prefix: Option<String>,
-
-        /// S3 endpoint URL (or set AWS_ENDPOINT_URL)
-        #[arg(long, env = "AWS_ENDPOINT_URL")]
-        endpoint: Option<String>,
-
-        /// AWS region (or set AWS_REGION)
-        #[arg(long, env = "AWS_REGION")]
-        region: Option<String>,
-
-        /// Local cache directory
-        #[arg(long, default_value = "/tmp/turbolite-cache")]
-        cache_dir: PathBuf,
-    },
-
-    /// Force a checkpoint and S3 upload
-    Checkpoint {
-        /// Path to the database file
-        #[arg(long)]
-        db: PathBuf,
-
-        /// S3 bucket (required, or set TURBOLITE_BUCKET)
-        #[arg(long, env = "TURBOLITE_BUCKET")]
-        bucket: String,
-
-        /// S3 key prefix (or set TURBOLITE_PREFIX)
-        #[arg(long, env = "TURBOLITE_PREFIX")]
-        prefix: Option<String>,
-
-        /// S3 endpoint URL (or set AWS_ENDPOINT_URL)
-        #[arg(long, env = "AWS_ENDPOINT_URL")]
-        endpoint: Option<String>,
-
-        /// AWS region (or set AWS_REGION)
-        #[arg(long, env = "AWS_REGION")]
-        region: Option<String>,
-
-        /// Local cache directory
-        #[arg(long, default_value = "/tmp/turbolite-cache")]
-        cache_dir: PathBuf,
     },
 
     /// Download the entire database from S3 into local cache
@@ -518,50 +461,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn cmd_gc(
-    db: PathBuf,
-    bucket: String,
-    prefix: Option<String>,
-    endpoint: Option<String>,
-    region: Option<String>,
-    cache_dir: PathBuf,
-) -> Result<()> {
-    let config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, false);
-    let vfs_name = format!("turbolite-gc-{}", std::process::id());
-    let (shared, _conn) = open_shared(&db, config, &vfs_name)?;
-
-    let deleted = shared.gc()
-        .map_err(|e| anyhow!("gc failed: {}", e))?;
-
-    if deleted > 0 {
-        println!("gc: deleted {} orphaned S3 objects", deleted);
-    } else {
-        println!("gc: no orphaned objects found");
-    }
-
-    Ok(())
-}
-
-fn cmd_checkpoint(
-    db: PathBuf,
-    bucket: String,
-    prefix: Option<String>,
-    endpoint: Option<String>,
-    region: Option<String>,
-    cache_dir: PathBuf,
-) -> Result<()> {
-    let config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, false);
-    let vfs_name = format!("turbolite-ckpt-{}", std::process::id());
-    let (_shared, conn) = open_shared(&db, config, &vfs_name)?;
-
-    // Force a WAL checkpoint (TRUNCATE mode flushes all WAL frames and resets the WAL)
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-        .context("checkpoint failed")?;
-
-    println!("checkpoint: complete");
-    Ok(())
-}
-
 fn cmd_download(
     db: PathBuf,
     bucket: String,
@@ -710,20 +609,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Version => {
-            println!("turbolite {}", env!("CARGO_PKG_VERSION"));
-        }
         Commands::Info { db, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_info(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
         Commands::Shell { db, bucket, prefix, endpoint, region, cache_dir, read_only } => {
             cmd_shell(db, bucket, prefix, endpoint, region, cache_dir, read_only)?;
-        }
-        Commands::Gc { db, bucket, prefix, endpoint, region, cache_dir } => {
-            cmd_gc(db, bucket, prefix, endpoint, region, cache_dir)?;
-        }
-        Commands::Checkpoint { db, bucket, prefix, endpoint, region, cache_dir } => {
-            cmd_checkpoint(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
         Commands::Download { db, bucket, prefix, endpoint, region, cache_dir, threads } => {
             cmd_download(db, bucket, prefix, endpoint, region, cache_dir, threads)?;

@@ -477,12 +477,6 @@ turbolite info --db my.db --bucket my-bucket --endpoint https://t3.storage.dev
 turbolite shell --db my.db
 turbolite shell --db my.db --bucket my-bucket --read-only
 
-# Garbage collection (delete orphaned S3 objects)
-turbolite gc --db my.db --bucket my-bucket
-
-# Force checkpoint + S3 upload
-turbolite checkpoint --db my.db --bucket my-bucket
-
 # Download entire database from S3 into local cache
 turbolite download --db my.db --bucket my-bucket --threads 8
 
