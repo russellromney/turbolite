@@ -113,8 +113,11 @@ pub struct TurboliteHandle {
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
+    // --- WAL-index SHM state ---
+    pub(crate) wal_index: Option<FileWalIndex>,
+
     // --- Shared ---
-    lock: RwLock<LockKind>,
+    lock: RwLock<LockLevel>,
     db_path: PathBuf,
     /// Separate file handle for byte-range locking
     lock_file: Option<std::sync::Arc<File>>,
@@ -398,7 +401,8 @@ impl TurboliteHandle {
             schema_info: None,
             bench_verbose: std::env::var("BENCH_VERBOSE").is_ok(),
             passthrough_file: None,
-            lock: RwLock::new(LockKind::None),
+            wal_index: None,
+            lock: RwLock::new(LockLevel::Unlocked),
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
@@ -452,7 +456,8 @@ impl TurboliteHandle {
             schema_info: None,
             bench_verbose: false,
             passthrough_file: Some(RwLock::new(file)),
-            lock: RwLock::new(LockKind::None),
+            wal_index: None,
+            lock: RwLock::new(LockLevel::Unlocked),
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
@@ -1051,10 +1056,20 @@ impl TurboliteHandle {
 
 }
 
-impl DatabaseHandle for TurboliteHandle {
-    type WalIndex = FileWalIndex;
+// VfsHandle implementation for sqlite-plugin
+impl VfsHandle for TurboliteHandle {
+    fn readonly(&self) -> bool {
+        self.read_only
+    }
+    fn in_memory(&self) -> bool {
+        false
+    }
+}
 
-    fn size(&self) -> Result<u64, io::Error> {
+// Database operations (formerly impl DatabaseHandle, now inherent methods).
+// Called by the Vfs trait impl on TurboliteVfs.
+impl TurboliteHandle {
+    pub(crate) fn file_size_impl(&self) -> Result<u64, io::Error> {
         if self.is_passthrough() {
             let file = self.passthrough_file.as_ref().unwrap().read();
             return file.metadata().map(|m| m.len());
@@ -1068,7 +1083,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
     }
 
-    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), io::Error> {
+    pub(crate) fn read_impl(&mut self, buf: &mut [u8], offset: u64) -> Result<(), io::Error> {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
             let file = self.passthrough_file.as_ref().unwrap().read();
@@ -1773,7 +1788,7 @@ impl DatabaseHandle for TurboliteHandle {
         Ok(())
     }
 
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error> {
+    pub(crate) fn write_impl(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error> {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
             let file = self.passthrough_file.as_ref().unwrap().read();
@@ -1903,7 +1918,7 @@ impl DatabaseHandle for TurboliteHandle {
         Ok(())
     }
 
-    fn sync(&mut self, _data_only: bool) -> Result<(), io::Error> {
+    pub(crate) fn sync_impl(&mut self, _data_only: bool) -> Result<(), io::Error> {
         let dirty_count = self.dirty_page_nums.read().len();
         eprintln!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
         if self.is_passthrough() {
@@ -3215,7 +3230,7 @@ impl DatabaseHandle for TurboliteHandle {
         } // end #[cfg(feature = "cloud")] durable sync block
     }
 
-    fn set_len(&mut self, size: u64) -> Result<(), io::Error> {
+    pub(crate) fn truncate_impl(&mut self, size: u64) -> Result<(), io::Error> {
         if self.is_passthrough() {
             return self
                 .passthrough_file
@@ -3247,7 +3262,7 @@ impl DatabaseHandle for TurboliteHandle {
         Ok(())
     }
 
-    fn lock(&mut self, lock: LockKind) -> Result<bool, io::Error> {
+    pub(crate) fn lock_impl(&mut self, lock: LockLevel) -> Result<bool, io::Error> {
         let current = *self.lock.read();
 
         if current == lock {
@@ -3259,8 +3274,8 @@ impl DatabaseHandle for TurboliteHandle {
         // pages, the transaction was rolled back. Clear dirty pages and evict
         // them from the disk cache so subsequent reads re-fetch from the source
         // of truth (S3 or local pg/).
-        if (current == LockKind::Exclusive || current == LockKind::Reserved)
-            && (lock == LockKind::Shared || lock == LockKind::None)
+        if (current == LockLevel::Exclusive || current == LockLevel::Reserved)
+            && (lock == LockLevel::Shared || lock == LockLevel::Unlocked)
             && self.dirty_since_sync
         {
             let mut dirty = self.dirty_page_nums.write();
@@ -3283,10 +3298,10 @@ impl DatabaseHandle for TurboliteHandle {
         let lock_file = self.ensure_lock_file()?;
 
         match lock {
-            LockKind::None => {
+            LockLevel::Unlocked => {
                 self.active_db_locks.clear();
             }
-            LockKind::Shared => {
+            LockLevel::Shared => {
                 self.active_db_locks.clear();
 
                 match file_guard::try_lock(
@@ -3318,13 +3333,13 @@ impl DatabaseHandle for TurboliteHandle {
                     Err(e) => return Err(e),
                 }
             }
-            LockKind::Reserved => {
+            LockLevel::Reserved => {
                 if !matches!(
                     current,
-                    LockKind::Shared
-                        | LockKind::Reserved
-                        | LockKind::Pending
-                        | LockKind::Exclusive
+                    LockLevel::Shared
+                        | LockLevel::Reserved
+                        | LockLevel::Pending
+                        | LockLevel::Exclusive
                 ) {
                     return Ok(false);
                 }
@@ -3344,10 +3359,10 @@ impl DatabaseHandle for TurboliteHandle {
                     Err(e) => return Err(e),
                 }
             }
-            LockKind::Pending => {
+            LockLevel::Pending => {
                 if !matches!(
                     current,
-                    LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
+                    LockLevel::Reserved | LockLevel::Pending | LockLevel::Exclusive
                 ) {
                     return Ok(false);
                 }
@@ -3367,10 +3382,10 @@ impl DatabaseHandle for TurboliteHandle {
                     Err(e) => return Err(e),
                 }
             }
-            LockKind::Exclusive => {
+            LockLevel::Exclusive => {
                 if !matches!(
                     current,
-                    LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
+                    LockLevel::Reserved | LockLevel::Pending | LockLevel::Exclusive
                 ) {
                     return Ok(false);
                 }
@@ -3433,21 +3448,25 @@ impl DatabaseHandle for TurboliteHandle {
         Ok(true)
     }
 
-    fn reserved(&mut self) -> Result<bool, io::Error> {
+    pub(crate) fn check_reserved_impl(&mut self) -> Result<bool, io::Error> {
         let lock = *self.lock.read();
         Ok(matches!(
             lock,
-            LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
+            LockLevel::Reserved | LockLevel::Pending | LockLevel::Exclusive
         ))
     }
 
-    fn current_lock(&self) -> Result<LockKind, io::Error> {
+    pub(crate) fn current_lock_impl(&self) -> Result<LockLevel, io::Error> {
         Ok(*self.lock.read())
     }
 
-    fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, io::Error> {
-        let shm_path = self.db_path.with_extension("db-shm");
-        Ok(FileWalIndex::new(shm_path))
+    /// Lazily initialize the WAL-index SHM state and return a mutable reference.
+    pub(crate) fn ensure_wal_index(&mut self) -> &mut FileWalIndex {
+        if self.wal_index.is_none() {
+            let shm_path = self.db_path.with_extension("db-shm");
+            self.wal_index = Some(FileWalIndex::new(shm_path));
+        }
+        self.wal_index.as_mut().expect("wal_index was just set")
     }
 }
 

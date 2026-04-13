@@ -1030,10 +1030,123 @@ impl TurboliteVfs {
 impl Vfs for TurboliteVfs {
     type Handle = TurboliteHandle;
 
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
+    fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<Self::Handle> {
+        self.open_inner(path.unwrap_or("temp.db"), opts)
+            .map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn delete(&self, db: &str) -> VfsResult<()> {
+        self.delete_inner(db).map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn access(&self, db: &str, flags: AccessFlags) -> VfsResult<bool> {
+        let exists = self.exists_inner(db).map_err(super::sqlite_err::io_to_sqlite)?;
+        match flags {
+            AccessFlags::Exists => Ok(exists),
+            AccessFlags::Read => Ok(exists),
+            AccessFlags::ReadWrite => Ok(exists),
+        }
+    }
+
+    fn file_size(&self, handle: &mut Self::Handle) -> VfsResult<usize> {
+        handle.file_size_impl()
+            .map(|sz| sz as usize)
+            .map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn truncate(&self, handle: &mut Self::Handle, size: usize) -> VfsResult<()> {
+        handle.truncate_impl(size as u64)
+            .map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn write(&self, handle: &mut Self::Handle, offset: usize, data: &[u8]) -> VfsResult<usize> {
+        handle.write_impl(data, offset as u64)
+            .map_err(super::sqlite_err::io_to_sqlite)?;
+        Ok(data.len())
+    }
+
+    fn read(&self, handle: &mut Self::Handle, offset: usize, data: &mut [u8]) -> VfsResult<usize> {
+        handle.read_impl(data, offset as u64)
+            .map_err(super::sqlite_err::io_to_sqlite)?;
+        Ok(data.len())
+    }
+
+    fn lock(&self, handle: &mut Self::Handle, level: LockLevel) -> VfsResult<()> {
+        handle.lock_impl(level)
+            .map_err(super::sqlite_err::io_to_sqlite)
+            .and_then(|ok| if ok { Ok(()) } else { Err(sqlite_plugin::vars::SQLITE_BUSY) })
+    }
+
+    fn unlock(&self, handle: &mut Self::Handle, level: LockLevel) -> VfsResult<()> {
+        handle.lock_impl(level)
+            .map_err(super::sqlite_err::io_to_sqlite)
+            .map(|_| ())
+    }
+
+    fn check_reserved_lock(&self, handle: &mut Self::Handle) -> VfsResult<bool> {
+        handle.check_reserved_impl()
+            .map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn sync(&self, handle: &mut Self::Handle) -> VfsResult<()> {
+        handle.sync_impl(false)
+            .map_err(super::sqlite_err::io_to_sqlite)
+    }
+
+    fn close(&self, _handle: Self::Handle) -> VfsResult<()> {
+        // Handle is dropped, which cleans up SHM regions via FileWalIndex::Drop
+        Ok(())
+    }
+
+    fn shm_map(
+        &self,
+        handle: &mut Self::Handle,
+        region_idx: usize,
+        _region_size: usize,
+        _extend: bool,
+    ) -> VfsResult<Option<std::ptr::NonNull<u8>>> {
+        let wal = handle.ensure_wal_index();
+        let ptr = wal.ensure_mmap_region(region_idx as u32)
+            .map_err(super::sqlite_err::io_to_sqlite)?;
+        Ok(std::ptr::NonNull::new(ptr))
+    }
+
+    fn shm_lock(
+        &self,
+        handle: &mut Self::Handle,
+        offset: u32,
+        count: u32,
+        mode: ShmLockMode,
+    ) -> VfsResult<()> {
+        let wal = handle.ensure_wal_index();
+        wal.shm_lock(offset, count, mode)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    sqlite_plugin::vars::SQLITE_BUSY
+                } else {
+                    super::sqlite_err::io_to_sqlite(e)
+                }
+            })
+    }
+
+    fn shm_barrier(&self, _handle: &mut Self::Handle) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn shm_unmap(&self, handle: &mut Self::Handle, delete: bool) -> VfsResult<()> {
+        if let Some(ref mut wal) = handle.wal_index {
+            wal.unmap(delete).map_err(super::sqlite_err::io_to_sqlite)?;
+        }
+        Ok(())
+    }
+}
+
+// Inner methods that return io::Result (avoids .map_err on every ? in the body)
+impl TurboliteVfs {
+    fn open_inner(&self, db: &str, opts: OpenOpts) -> Result<TurboliteHandle, io::Error> {
         let path = self.config.cache_dir.join(db);
 
-        if matches!(opts.kind, OpenKind::MainDb) {
+        if opts.kind() == OpenKind::MainDb {
             // Phase Gallipoli: load manifest from local disk or S3 based on config.
             let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
@@ -1219,7 +1332,7 @@ impl Vfs for TurboliteVfs {
         }
     }
 
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
+    fn delete_inner(&self, db: &str) -> Result<(), io::Error> {
         let path = self.config.cache_dir.join(db);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -1229,7 +1342,7 @@ impl Vfs for TurboliteVfs {
         Ok(())
     }
 
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+    fn exists_inner(&self, db: &str) -> Result<bool, io::Error> {
         let path = self.config.cache_dir.join(db);
         if path.exists() {
             return Ok(true);
@@ -1240,27 +1353,6 @@ impl Vfs for TurboliteVfs {
         }
 
         Ok(self.storage.exists()?)
-    }
-
-    fn temporary_name(&self) -> String {
-        format!("temp_{}", std::process::id())
-    }
-
-    fn random(&self, buffer: &mut [i8]) {
-        use std::time::SystemTime;
-        let mut seed = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        for b in buffer.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (seed >> 33) as i8;
-        }
-    }
-
-    fn sleep(&self, duration: Duration) -> Duration {
-        std::thread::sleep(duration);
-        duration
     }
 }
 

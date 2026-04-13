@@ -58,13 +58,17 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
+use sqlite_plugin::flags::{LockLevel, OpenKind, OpenOpts, AccessFlags, ShmLockMode};
+use sqlite_plugin::vfs::{Vfs, VfsResult, RegisterOpts, VfsHandle};
 use tokio::runtime::Handle as TokioHandle;
 
 use crate::compress;
 
 // Re-use the FileWalIndex from the main lib
 use crate::FileWalIndex;
+
+mod sqlite_err;
+pub(crate) use sqlite_err::IntoVfsResult;
 
 // --- Extracted submodules ---
 #[cfg(feature = "cloud")]
@@ -271,8 +275,15 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
 
 /// Register a TurboliteVfs with SQLite under the given name.
 pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
-    sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+    let cname = std::ffi::CString::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let _logger = sqlite_plugin::vfs::register_static(
+        cname,
+        vfs,
+        RegisterOpts { make_default: false },
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::Other, format!("sqlite register error: {code}")))?;
+    Ok(())
 }
 
 /// Shared VFS wrapper: holds the VFS behind an Arc so it can be registered
@@ -309,36 +320,53 @@ impl std::ops::Deref for SharedTurboliteVfs {
 impl Vfs for SharedTurboliteVfs {
     type Handle = TurboliteHandle;
 
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<TurboliteHandle, io::Error> {
-        self.0.open(db, opts)
+    fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<Self::Handle> {
+        self.0.open(path, opts)
     }
-
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
-        self.0.delete(db)
+    fn delete(&self, path: &str) -> VfsResult<()> {
+        self.0.delete(path)
     }
-
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
-        self.0.exists(db)
+    fn access(&self, path: &str, flags: AccessFlags) -> VfsResult<bool> {
+        self.0.access(path, flags)
     }
-
-    fn temporary_name(&self) -> String {
-        self.0.temporary_name()
+    fn file_size(&self, handle: &mut Self::Handle) -> VfsResult<usize> {
+        self.0.file_size(handle)
     }
-
-    fn random(&self, buffer: &mut [i8]) {
-        self.0.random(buffer)
+    fn truncate(&self, handle: &mut Self::Handle, size: usize) -> VfsResult<()> {
+        self.0.truncate(handle, size)
     }
-
-    fn sleep(&self, duration: Duration) -> Duration {
-        self.0.sleep(duration)
+    fn write(&self, handle: &mut Self::Handle, offset: usize, data: &[u8]) -> VfsResult<usize> {
+        self.0.write(handle, offset, data)
     }
-
-    fn access(&self, db: &str, write: bool) -> Result<bool, io::Error> {
-        self.0.access(db, write)
+    fn read(&self, handle: &mut Self::Handle, offset: usize, data: &mut [u8]) -> VfsResult<usize> {
+        self.0.read(handle, offset, data)
     }
-
-    fn full_pathname<'a>(&self, db: &'a str) -> Result<std::borrow::Cow<'a, str>, io::Error> {
-        self.0.full_pathname(db)
+    fn lock(&self, handle: &mut Self::Handle, level: LockLevel) -> VfsResult<()> {
+        self.0.lock(handle, level)
+    }
+    fn unlock(&self, handle: &mut Self::Handle, level: LockLevel) -> VfsResult<()> {
+        self.0.unlock(handle, level)
+    }
+    fn check_reserved_lock(&self, handle: &mut Self::Handle) -> VfsResult<bool> {
+        self.0.check_reserved_lock(handle)
+    }
+    fn sync(&self, handle: &mut Self::Handle) -> VfsResult<()> {
+        self.0.sync(handle)
+    }
+    fn close(&self, handle: Self::Handle) -> VfsResult<()> {
+        self.0.close(handle)
+    }
+    fn shm_map(&self, handle: &mut Self::Handle, region_idx: usize, region_size: usize, extend: bool) -> VfsResult<Option<std::ptr::NonNull<u8>>> {
+        self.0.shm_map(handle, region_idx, region_size, extend)
+    }
+    fn shm_lock(&self, handle: &mut Self::Handle, offset: u32, count: u32, mode: ShmLockMode) -> VfsResult<()> {
+        self.0.shm_lock(handle, offset, count, mode)
+    }
+    fn shm_barrier(&self, handle: &mut Self::Handle) {
+        self.0.shm_barrier(handle)
+    }
+    fn shm_unmap(&self, handle: &mut Self::Handle, delete: bool) -> VfsResult<()> {
+        self.0.shm_unmap(handle, delete)
     }
 }
 
@@ -348,8 +376,15 @@ impl Vfs for SharedTurboliteVfs {
 /// so you can call `manifest()` and `set_manifest()` on it after registration.
 /// This is required for haqlite's shared-mode turbolite integration.
 pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
-    sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+    let cname = std::ffi::CString::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let _logger = sqlite_plugin::vfs::register_static(
+        cname,
+        vfs,
+        RegisterOpts { make_default: false },
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::Other, format!("sqlite register error: {code}")))?;
+    Ok(())
 }
 
 /// Migrate a database to S3Primary mode (journal_mode=OFF).

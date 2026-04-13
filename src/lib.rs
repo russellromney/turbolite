@@ -36,7 +36,6 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -155,21 +154,21 @@ pub fn init_debug_locks() {
     }
 }
 
-// ── FileWalIndex (shared by TurboliteVfs) ─────────────────────────────
+// ── FileWalIndex (SHM state for WAL-index) ──────────────────────────
 
-/// WAL-index implementation backed by a memory-mapped -shm file on disk.
+/// WAL-index state backed by a memory-mapped -shm file on disk.
 /// Provides region-based shared memory and byte-range locking for SQLite WAL mode.
 ///
-/// Uses mmap for WAL-index region access (map/pull/push). This matches SQLite's
-/// built-in VFS behavior: WAL-index reads are pointer dereferences, not syscalls.
+/// With sqlite-plugin, shm_map returns a direct mmap pointer to SQLite.
+/// No copy layer, no push/pull. Memory barriers are just atomic fences.
 pub struct FileWalIndex {
-    conn_id: u64,
+    pub(crate) conn_id: u64,
     /// Path to the -shm file
-    path: PathBuf,
-    /// Memory-mapped regions (region_id -> mmap pointer + length).
+    pub(crate) path: PathBuf,
+    /// Memory-mapped regions (region_id -> mmap pointer).
     /// Each region is 32KB. mmap is MAP_SHARED so changes from other processes
-    /// are visible immediately (no syscall needed for reads).
-    mmap_regions: HashMap<u32, *mut u8>,
+    /// are visible immediately (pointer dereference, no syscall).
+    pub(crate) mmap_regions: HashMap<u32, *mut u8>,
     /// File handle for mmap and extending
     file: Option<File>,
     /// Separate file handle for locking (Arc for multiple FileGuards)
@@ -185,7 +184,7 @@ pub struct FileWalIndex {
 unsafe impl Send for FileWalIndex {}
 unsafe impl Sync for FileWalIndex {}
 
-const WAL_REGION_SIZE: usize = 32768;
+pub(crate) const WAL_REGION_SIZE: usize = 32768;
 
 impl FileWalIndex {
     pub(crate) fn new(path: PathBuf) -> Self {
@@ -223,8 +222,9 @@ impl FileWalIndex {
         Ok(std::sync::Arc::clone(self.lock_file.as_ref().expect("lock_file was just set")))
     }
 
-    /// Ensure region is mmap'd. Returns a pointer to the region's 32KB.
-    fn ensure_mmap_region(&mut self, region: u32) -> io::Result<*mut u8> {
+    /// Ensure region is mmap'd. Returns a direct pointer to the region's memory.
+    /// sqlite-plugin returns this pointer to SQLite via shm_map (no copy).
+    pub(crate) fn ensure_mmap_region(&mut self, region: u32) -> io::Result<*mut u8> {
         if let Some(&ptr) = self.mmap_regions.get(&region) {
             return Ok(ptr);
         }
@@ -260,66 +260,45 @@ impl FileWalIndex {
         self.mmap_regions.insert(region, ptr);
         Ok(ptr)
     }
-}
 
-impl Drop for FileWalIndex {
-    fn drop(&mut self) {
-        // Unmap all regions
-        for (_, ptr) in self.mmap_regions.drain() {
-            unsafe {
-                libc::munmap(ptr as *mut libc::c_void, WAL_REGION_SIZE);
-            }
-        }
-        // Release in-process locks
-        unlock_all_inprocess(&self.path, self.conn_id);
-    }
-}
-
-impl sqlite_vfs::wip::WalIndex for FileWalIndex {
-    fn map(&mut self, region: u32) -> Result<[u8; 32768], io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        let mut data = [0u8; 32768];
-        // Safety: ptr is a valid mmap'd region of 32KB, backed by MAP_SHARED file.
-        // SQLite's WAL protocol ensures no concurrent writes without proper locking.
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
-        }
-        Ok(data)
-    }
-
-    fn lock(
+    /// Handle SHM lock operations using sqlite-plugin's ShmLockMode.
+    /// Two-phase locking: in-process coordination + fcntl file locks.
+    pub(crate) fn shm_lock(
         &mut self,
-        locks: Range<u8>,
-        lock: sqlite_vfs::wip::WalIndexLock,
-    ) -> Result<bool, io::Error> {
-        use sqlite_vfs::wip::WalIndexLock;
+        offset: u32,
+        count: u32,
+        mode: sqlite_plugin::flags::ShmLockMode,
+    ) -> Result<(), io::Error> {
+        use sqlite_plugin::flags::ShmLockMode;
 
         let conn_id = self.conn_id;
-        let lock_file = self.ensure_lock_file()?;
 
-        match lock {
-            WalIndexLock::None => {
-                for slot in locks.clone() {
-                    let offset = WAL_LOCK_OFFSET + slot as u64;
-                    unlock_inprocess(&self.path, offset as usize, 1, conn_id);
-                    self.active_locks.remove(&slot);
+        match mode {
+            ShmLockMode::UnlockShared | ShmLockMode::UnlockExclusive => {
+                for slot in offset..offset + count {
+                    let byte = WAL_LOCK_OFFSET + slot as u64;
+                    unlock_inprocess(&self.path, byte as usize, 1, conn_id);
+                    self.active_locks.remove(&(slot as u8));
                 }
+                Ok(())
             }
-            WalIndexLock::Shared | WalIndexLock::Exclusive => {
-                let exclusive = matches!(lock, WalIndexLock::Exclusive);
+            ShmLockMode::LockShared | ShmLockMode::LockExclusive => {
+                let exclusive = matches!(mode, ShmLockMode::LockExclusive);
                 let lock_type = if exclusive {
                     file_guard::Lock::Exclusive
                 } else {
                     file_guard::Lock::Shared
                 };
+                let lock_file = self.ensure_lock_file()?;
 
                 // Phase 1: check all in-process locks first
-                for slot in locks.clone() {
-                    let offset = WAL_LOCK_OFFSET + slot as u64;
-                    if !try_lock_inprocess(&self.path, offset as usize, 1, exclusive, conn_id) {
-                        for prev_slot in locks.start..slot {
-                            let prev_offset = WAL_LOCK_OFFSET + prev_slot as u64;
-                            unlock_inprocess(&self.path, prev_offset as usize, 1, conn_id);
+                for slot in offset..offset + count {
+                    let byte = WAL_LOCK_OFFSET + slot as u64;
+                    if !try_lock_inprocess(&self.path, byte as usize, 1, exclusive, conn_id) {
+                        // Roll back any in-process locks we just acquired
+                        for prev in offset..slot {
+                            let prev_byte = WAL_LOCK_OFFSET + prev as u64;
+                            unlock_inprocess(&self.path, prev_byte as usize, 1, conn_id);
                         }
                         if DEBUG_LOCKS.load(Ordering::Relaxed) {
                             eprintln!(
@@ -327,44 +306,45 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                                 std::thread::current().id(),
                                 self.path.display(),
                                 slot,
-                                lock
+                                mode
                             );
                         }
-                        return Ok(false);
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "shm lock busy (in-process)"));
                     }
                 }
 
                 // Phase 2: acquire file locks
                 let mut new_guards: Vec<(u8, Box<dyn std::any::Any + Send + Sync>)> = Vec::new();
 
-                for slot in locks.clone() {
-                    let offset = WAL_LOCK_OFFSET + slot as u64;
-                    let old_guard = self.active_locks.remove(&slot);
+                for slot in offset..offset + count {
+                    let byte = WAL_LOCK_OFFSET + slot as u64;
+                    let old_guard = self.active_locks.remove(&(slot as u8));
 
                     match file_guard::try_lock(
                         std::sync::Arc::clone(&lock_file),
                         lock_type,
-                        offset as usize,
+                        byte as usize,
                         1,
                     ) {
                         Ok(guard) => {
-                            new_guards.push((slot, Box::new(guard)));
+                            new_guards.push((slot as u8, Box::new(guard)));
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             if let Some(guard) = old_guard {
-                                self.active_locks.insert(slot, guard);
+                                self.active_locks.insert(slot as u8, guard);
                             }
-                            for s in locks.clone() {
+                            // Roll back all in-process locks
+                            for s in offset..offset + count {
                                 let o = WAL_LOCK_OFFSET + s as u64;
                                 unlock_inprocess(&self.path, o as usize, 1, conn_id);
                             }
-                            return Ok(false);
+                            return Err(e);
                         }
                         Err(e) => {
                             if let Some(guard) = old_guard {
-                                self.active_locks.insert(slot, guard);
+                                self.active_locks.insert(slot as u8, guard);
                             }
-                            for s in locks.clone() {
+                            for s in offset..offset + count {
                                 let o = WAL_LOCK_OFFSET + s as u64;
                                 unlock_inprocess(&self.path, o as usize, 1, conn_id);
                             }
@@ -376,53 +356,56 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                 for (slot, guard) in new_guards {
                     self.active_locks.insert(slot, guard);
                 }
+
+                if DEBUG_LOCKS.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "[LOCK DEBUG] {:?} WAL_INDEX {} shm_lock offset={} count={} {:?} => OK",
+                        std::thread::current().id(),
+                        self.path.display(),
+                        offset,
+                        count,
+                        mode
+                    );
+                }
+                Ok(())
             }
         }
-
-        if DEBUG_LOCKS.load(Ordering::Relaxed) {
-            eprintln!(
-                "[LOCK DEBUG] {:?} WAL_INDEX {} locks {:?}..{:?} {:?} => OK",
-                std::thread::current().id(),
-                self.path.display(),
-                locks.start,
-                locks.end,
-                lock
-            );
-        }
-        Ok(true)
     }
 
-    fn pull(&mut self, region: u32, data: &mut [u8; 32768]) -> Result<(), io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        // Safety: mmap'd MAP_SHARED region, reads are always current.
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
-        }
-        Ok(())
-    }
-
-    fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        // Safety: MAP_SHARED write. Immediately visible to other processes via mmap.
-        // SQLite holds EXCLUSIVE WAL lock before calling push.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, WAL_REGION_SIZE);
-        }
-        Ok(())
-    }
-
-    fn delete(mut self) -> Result<(), io::Error> {
-        // Unmap all regions before removing the file
+    /// Unmap all regions and release all in-process locks.
+    pub(crate) fn cleanup(&mut self) {
         for (_, ptr) in self.mmap_regions.drain() {
             unsafe {
                 libc::munmap(ptr as *mut libc::c_void, WAL_REGION_SIZE);
             }
         }
         unlock_all_inprocess(&self.path, self.conn_id);
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
+        self.active_locks.clear();
+    }
+
+    /// Unmap SHM regions and optionally delete the -shm file.
+    /// When delete=false, only release locks but keep mmap regions alive
+    /// (other connections may still be using their pointers).
+    /// When delete=true, full cleanup + file removal.
+    pub(crate) fn unmap(&mut self, delete: bool) -> io::Result<()> {
+        if delete {
+            self.cleanup();
+            if self.path.exists() {
+                std::fs::remove_file(&self.path)?;
+            }
+        } else {
+            // Release in-process locks but keep mmap regions alive.
+            // SQLite may still reference the pointers between shm_unmap and close.
+            unlock_all_inprocess(&self.path, self.conn_id);
+            self.active_locks.clear();
         }
         Ok(())
+    }
+}
+
+impl Drop for FileWalIndex {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -597,18 +580,16 @@ mod tests {
         assert!(id2 > id1);
     }
 
-    // ── FileWalIndex tests ────────────────────────────────────────────
-
-    use sqlite_vfs::wip::{WalIndex, WalIndexLock};
+    // ── FileWalIndex mmap tests ────────────────────────────────────────
 
     #[test]
-    fn test_wal_index_region_map_returns_zeroed_data() {
+    fn test_wal_index_region_returns_valid_pointer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
         let mut idx = FileWalIndex::new(shm_path.clone());
 
-        let data = idx.map(0).expect("map region 0");
-        assert_eq!(data, [0u8; 32768]);
+        let ptr = idx.ensure_mmap_region(0).expect("map region 0");
+        assert!(!ptr.is_null());
 
         // File should exist and be at least 32KB
         let meta = std::fs::metadata(&shm_path).expect("shm file metadata");
@@ -616,203 +597,142 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_index_push_pull_roundtrip() {
+    fn test_wal_index_mmap_shared_visibility() {
+        // Two FileWalIndex instances on the same file see each other's writes
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm_path = dir.path().join("test.db-shm");
+
+        let mut idx_a = FileWalIndex::new(shm_path.clone());
+        let mut idx_b = FileWalIndex::new(shm_path);
+
+        let ptr_a = idx_a.ensure_mmap_region(0).expect("map a");
+        let ptr_b = idx_b.ensure_mmap_region(0).expect("map b");
+
+        // Write via A, read via B
+        unsafe { *ptr_a = 0x42; }
+        let val = unsafe { *ptr_b };
+        assert_eq!(val, 0x42, "MAP_SHARED should make writes visible across mappings");
+    }
+
+    #[test]
+    fn test_wal_index_multiple_regions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
         let mut idx = FileWalIndex::new(shm_path);
 
-        // Map first to ensure file exists
-        let _ = idx.map(0).expect("map region 0");
+        let p0 = idx.ensure_mmap_region(0).expect("region 0");
+        let p1 = idx.ensure_mmap_region(1).expect("region 1");
+        let p2 = idx.ensure_mmap_region(2).expect("region 2");
 
-        // Write known data
-        let mut write_buf = [0u8; 32768];
-        for i in 0..32768 {
-            write_buf[i] = (i % 256) as u8;
-        }
-        idx.push(0, &write_buf).expect("push region 0");
-
-        // Read it back
-        let mut read_buf = [0u8; 32768];
-        idx.pull(0, &mut read_buf).expect("pull region 0");
-        assert_eq!(read_buf, write_buf);
+        // All should be valid, non-null, distinct pointers
+        assert!(!p0.is_null());
+        assert!(!p1.is_null());
+        assert!(!p2.is_null());
+        assert_ne!(p0, p1);
+        assert_ne!(p1, p2);
     }
 
-    #[test]
-    fn test_wal_index_multiple_regions_independent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shm_path = dir.path().join("test.db-shm");
-        let mut idx = FileWalIndex::new(shm_path);
+    // ── SHM lock tests (using sqlite-plugin ShmLockMode) ──────────────
 
-        // Map three regions
-        let _ = idx.map(0).expect("map 0");
-        let _ = idx.map(1).expect("map 1");
-        let _ = idx.map(2).expect("map 2");
-
-        // Write distinct data to each
-        let mut buf0 = [0xAAu8; 32768];
-        let mut buf1 = [0xBBu8; 32768];
-        let mut buf2 = [0xCCu8; 32768];
-        idx.push(0, &buf0).expect("push 0");
-        idx.push(1, &buf1).expect("push 1");
-        idx.push(2, &buf2).expect("push 2");
-
-        // Read back and verify independence
-        let mut read = [0u8; 32768];
-        idx.pull(0, &mut read).expect("pull 0");
-        assert_eq!(read, buf0);
-
-        idx.pull(1, &mut read).expect("pull 1");
-        assert_eq!(read, buf1);
-
-        idx.pull(2, &mut read).expect("pull 2");
-        assert_eq!(read, buf2);
-
-        // File should be at least 3 * 32KB
-        let _ = buf0;
-        let _ = buf1;
-        let _ = buf2;
-    }
+    use sqlite_plugin::flags::ShmLockMode;
 
     #[test]
-    fn test_wal_index_lock_two_shared_same_slot() {
-        // Two FileWalIndex instances on the same -shm file can both hold shared locks
+    fn test_shm_lock_two_shared_same_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx_a = FileWalIndex::new(shm_path.clone());
-        let mut idx_b = FileWalIndex::new(shm_path.clone());
+        let mut idx_b = FileWalIndex::new(shm_path);
 
-        // Ensure files exist
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.ensure_mmap_region(0).expect("map a");
+        let _ = idx_b.ensure_mmap_region(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Shared).expect("lock a shared");
-        assert!(ok_a);
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Shared).expect("lock b shared");
-        assert!(ok_b);
+        idx_a.shm_lock(0, 1, ShmLockMode::LockShared).expect("lock a shared");
+        idx_b.shm_lock(0, 1, ShmLockMode::LockShared).expect("lock b shared");
 
-        // Cleanup
-        idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
-        idx_b.lock(0..1, WalIndexLock::None).expect("unlock b");
+        idx_a.shm_lock(0, 1, ShmLockMode::UnlockShared).expect("unlock a");
+        idx_b.shm_lock(0, 1, ShmLockMode::UnlockShared).expect("unlock b");
     }
 
     #[test]
-    fn test_wal_index_lock_exclusive_blocks_shared() {
+    fn test_shm_lock_exclusive_blocks_shared() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx_a = FileWalIndex::new(shm_path.clone());
-        let mut idx_b = FileWalIndex::new(shm_path.clone());
+        let mut idx_b = FileWalIndex::new(shm_path);
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.ensure_mmap_region(0).expect("map a");
+        let _ = idx_b.ensure_mmap_region(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
-        assert!(ok_a);
+        idx_a.shm_lock(0, 1, ShmLockMode::LockExclusive).expect("lock a excl");
+        let result = idx_b.shm_lock(0, 1, ShmLockMode::LockShared);
+        assert!(result.is_err(), "shared lock should fail when another holds exclusive");
 
-        // B should fail to get shared
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Shared).expect("lock b shared");
-        assert!(!ok_b, "shared lock should fail when another holds exclusive");
-
-        idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
+        idx_a.shm_lock(0, 1, ShmLockMode::UnlockExclusive).expect("unlock a");
     }
 
     #[test]
-    fn test_wal_index_lock_exclusive_blocks_exclusive() {
+    fn test_shm_lock_exclusive_blocks_exclusive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx_a = FileWalIndex::new(shm_path.clone());
-        let mut idx_b = FileWalIndex::new(shm_path.clone());
+        let mut idx_b = FileWalIndex::new(shm_path);
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.ensure_mmap_region(0).expect("map a");
+        let _ = idx_b.ensure_mmap_region(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
-        assert!(ok_a);
+        idx_a.shm_lock(0, 1, ShmLockMode::LockExclusive).expect("lock a excl");
+        let result = idx_b.shm_lock(0, 1, ShmLockMode::LockExclusive);
+        assert!(result.is_err(), "exclusive lock should fail when another holds exclusive");
 
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
-        assert!(!ok_b, "exclusive lock should fail when another holds exclusive");
-
-        idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
+        idx_a.shm_lock(0, 1, ShmLockMode::UnlockExclusive).expect("unlock a");
     }
 
     #[test]
-    fn test_wal_index_lock_shared_blocks_exclusive() {
+    fn test_shm_lock_unlock_then_acquire() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx_a = FileWalIndex::new(shm_path.clone());
-        let mut idx_b = FileWalIndex::new(shm_path.clone());
+        let mut idx_b = FileWalIndex::new(shm_path);
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.ensure_mmap_region(0).expect("map a");
+        let _ = idx_b.ensure_mmap_region(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Shared).expect("lock a shared");
-        assert!(ok_a);
+        idx_a.shm_lock(0, 1, ShmLockMode::LockExclusive).expect("lock a excl");
+        assert!(idx_b.shm_lock(0, 1, ShmLockMode::LockExclusive).is_err());
 
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
-        assert!(!ok_b, "exclusive lock should fail when another holds shared");
+        idx_a.shm_lock(0, 1, ShmLockMode::UnlockExclusive).expect("unlock a");
+        idx_b.shm_lock(0, 1, ShmLockMode::LockExclusive).expect("lock b excl after unlock");
 
-        idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
+        idx_b.shm_lock(0, 1, ShmLockMode::UnlockExclusive).expect("unlock b");
     }
 
     #[test]
-    fn test_wal_index_lock_unlock_then_acquire() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shm_path = dir.path().join("test.db-shm");
-
-        let mut idx_a = FileWalIndex::new(shm_path.clone());
-        let mut idx_b = FileWalIndex::new(shm_path.clone());
-
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
-
-        // A takes exclusive
-        let ok = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
-        assert!(ok);
-
-        // B blocked
-        let ok = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
-        assert!(!ok);
-
-        // A releases
-        idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
-
-        // B succeeds now
-        let ok = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl after unlock");
-        assert!(ok);
-
-        idx_b.lock(0..1, WalIndexLock::None).expect("unlock b");
-    }
-
-    #[test]
-    fn test_wal_index_lock_upgrade_shared_to_exclusive() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shm_path = dir.path().join("test.db-shm");
-
-        let mut idx = FileWalIndex::new(shm_path);
-        let _ = idx.map(0).expect("map");
-
-        let ok = idx.lock(0..1, WalIndexLock::Shared).expect("shared");
-        assert!(ok);
-
-        let ok = idx.lock(0..1, WalIndexLock::Exclusive).expect("upgrade to exclusive");
-        assert!(ok);
-
-        idx.lock(0..1, WalIndexLock::None).expect("unlock");
-    }
-
-    #[test]
-    fn test_wal_index_delete_removes_shm_file() {
+    fn test_shm_unmap_removes_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx = FileWalIndex::new(shm_path.clone());
-        let _ = idx.map(0).expect("map");
+        let _ = idx.ensure_mmap_region(0).expect("map");
         assert!(shm_path.exists(), "shm file should exist after map");
 
-        idx.delete().expect("delete");
-        assert!(!shm_path.exists(), "shm file should be removed after delete");
+        idx.unmap(true).expect("unmap with delete");
+        assert!(!shm_path.exists(), "shm file should be removed after unmap(true)");
+    }
+
+    #[test]
+    fn test_shm_unmap_preserves_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm_path = dir.path().join("test.db-shm");
+
+        let mut idx = FileWalIndex::new(shm_path.clone());
+        let _ = idx.ensure_mmap_region(0).expect("map");
+        assert!(shm_path.exists());
+
+        idx.unmap(false).expect("unmap without delete");
+        assert!(shm_path.exists(), "shm file should be preserved after unmap(false)");
     }
 }
