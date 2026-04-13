@@ -742,6 +742,129 @@ impl TurboliteVfs {
         }
     }
 
+    /// Validate the database against S3.
+    /// Checks manifest consistency (all keys present, no orphans),
+    /// data decodability (every page group decodes), and returns
+    /// results for the caller to run integrity_check separately.
+    #[cfg(feature = "cloud")]
+    pub fn validate(&self) -> io::Result<super::ValidateResult> {
+        let s3 = self.s3.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "validate requires S3 backend")
+        })?;
+        let manifest = (**self.shared_manifest.load()).clone();
+        let all_keys: std::collections::HashSet<String> = s3.list_all_keys()?.into_iter().collect();
+
+        let mut live_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Check page group keys
+        let mut pg_missing = Vec::new();
+        for key in &manifest.page_group_keys {
+            live_keys.insert(key.clone());
+            if !all_keys.contains(key) {
+                pg_missing.push(key.clone());
+            }
+        }
+        let pg_present = manifest.page_group_keys.len() - pg_missing.len();
+
+        // Check interior chunk keys
+        let mut int_missing = Vec::new();
+        for key in manifest.interior_chunk_keys.values() {
+            live_keys.insert(key.clone());
+            if !all_keys.contains(key) {
+                int_missing.push(key.clone());
+            }
+        }
+        let int_present = manifest.interior_chunk_keys.len() - int_missing.len();
+
+        // Check index chunk keys
+        let mut idx_missing = Vec::new();
+        for key in manifest.index_chunk_keys.values() {
+            live_keys.insert(key.clone());
+            if !all_keys.contains(key) {
+                idx_missing.push(key.clone());
+            }
+        }
+        let idx_present = manifest.index_chunk_keys.len() - idx_missing.len();
+
+        // Subframe override keys are also live
+        for overrides in &manifest.subframe_overrides {
+            for ovr in overrides.values() {
+                live_keys.insert(ovr.key.clone());
+            }
+        }
+
+        // Manifest key itself
+        live_keys.insert(s3.manifest_key_msgpack());
+
+        // Snapshot manifests are also live
+        for key in &all_keys {
+            if key.contains("manifest-snap-") {
+                live_keys.insert(key.clone());
+            }
+        }
+
+        let orphaned: Vec<String> = all_keys.difference(&live_keys).cloned().collect();
+
+        // Data decode check: download and decode each present page group
+        let mut decode_errors = Vec::new();
+        let page_size = manifest.page_size;
+        let page_count = manifest.page_count;
+        let sub_ppf = manifest.sub_pages_per_frame;
+
+        for (gid, key) in manifest.page_group_keys.iter().enumerate() {
+            if pg_missing.contains(key) {
+                continue;
+            }
+            match s3.get_page_group(key) {
+                Ok(Some(data)) => {
+                    let ft = manifest.frame_tables.get(gid);
+                    let pages_in_group = manifest.group_page_nums(gid as u64).len() as u32;
+                    if sub_ppf > 0 {
+                        if let Some(ft) = ft {
+                            if !ft.is_empty() {
+                                if let Err(e) = decode_page_group_seekable_full(
+                                    &data, ft, page_size, pages_in_group, page_count, 0,
+                                    #[cfg(feature = "zstd")] None,
+                                    self.config.encryption_key.as_ref(),
+                                ) {
+                                    decode_errors.push((key.clone(), format!("{}", e)));
+                                }
+                            }
+                        }
+                    } else if let Err(e) = decode_page_group(
+                        &data,
+                        #[cfg(feature = "zstd")] None,
+                        self.config.encryption_key.as_ref(),
+                    ) {
+                        decode_errors.push((key.clone(), format!("{}", e)));
+                    }
+                }
+                Ok(None) => {
+                    decode_errors.push((key.clone(), "object returned empty".to_string()));
+                }
+                Err(e) => {
+                    decode_errors.push((key.clone(), format!("fetch: {}", e)));
+                }
+            }
+        }
+
+        Ok(super::ValidateResult {
+            manifest_version: manifest.version,
+            page_groups_total: manifest.page_group_keys.len(),
+            page_groups_present: pg_present,
+            page_groups_missing: pg_missing,
+            interior_chunks_total: manifest.interior_chunk_keys.len(),
+            interior_chunks_present: int_present,
+            interior_chunks_missing: int_missing,
+            index_chunks_total: manifest.index_chunk_keys.len(),
+            index_chunks_present: idx_present,
+            index_chunks_missing: idx_missing,
+            orphaned_keys: orphaned,
+            decode_errors,
+            integrity_check: None, // caller runs PRAGMA integrity_check separately
+        })
+    }
+
     /// Phase Recall: Copy the current manifest to a snapshot key.
     /// Returns the S3 key of the snapshot manifest copy.
     /// Called by the control plane at snapshot time to protect page groups from GC.
