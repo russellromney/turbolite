@@ -1,7 +1,7 @@
 # turbolite Roadmap
 
 ## Soyuz: Migrate from sqlite-vfs to sqlite-plugin
-> After: Pelican (CHANGELOG) · Before: Valkyrie
+> After: Mercury (CHANGELOG) · Before: Valkyrie
 
 Replace `sqlite-vfs` (rkusa, unmaintained since 2022, self-described prototype) with
 `sqlite-plugin` (orbitinghail/Carl Sverre, active, used by Graft).
@@ -276,12 +276,6 @@ Value partitions are read-only, built at import. Handle staleness gracefully.
 - [ ] `madvise(MADV_RANDOM)`
 - [ ] Handle cache file growth: `mremap` on Linux, re-map on macOS
 - [ ] Benchmark: warm lookup latency mmap vs pread (expect ~10-50us to ~1-5us)
-
-### CLI subcommands
-- [ ] `turbolite bench` -- move tiered-bench into CLI subcommand
-- [ ] `turbolite gc --bucket X --prefix Y` -- one-shot GC
-- [ ] `turbolite import --bucket X --prefix Y --db local.db`
-- [ ] `turbolite info --bucket X --prefix Y` -- print manifest summary
 
 ### Bidirectional prefetch
 - Track access direction, prefetch backward for DESC queries
