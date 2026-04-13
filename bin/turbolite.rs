@@ -550,7 +550,7 @@ fn cmd_validate(
     let (shared, conn) = open_shared(&db, config, &vfs_name)?;
 
     println!("validating manifest...");
-    let mut result = shared.validate()
+    let result = shared.validate()
         .map_err(|e| anyhow!("validate failed: {}", e))?;
 
     println!(
@@ -596,11 +596,10 @@ fn cmd_validate(
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .context("integrity_check failed")?;
-    result.integrity_check = Some(integrity.clone());
     println!("  integrity_check:   {}", integrity);
 
     println!();
-    if result.passed() {
+    if result.s3_ok() && integrity == "ok" {
         println!("validate: passed");
     } else {
         println!("validate: FAILED");

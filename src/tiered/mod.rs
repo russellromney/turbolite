@@ -112,7 +112,8 @@ pub use settings::{turbolite_config_set, push_setting};
 #[cfg(all(feature = "encryption", feature = "cloud"))]
 pub use rotation::rotate_encryption_key;
 
-/// Result of a database validation run.
+/// Result of a database validation run (manifest + data integrity).
+/// The caller should run `PRAGMA integrity_check` separately via the connection.
 #[derive(Debug)]
 pub struct ValidateResult {
     pub manifest_version: u64,
@@ -127,16 +128,16 @@ pub struct ValidateResult {
     pub index_chunks_missing: Vec<String>,
     pub orphaned_keys: Vec<String>,
     pub decode_errors: Vec<(String, String)>,
-    pub integrity_check: Option<String>,
 }
 
 impl ValidateResult {
-    pub fn passed(&self) -> bool {
+    /// True if all S3 keys are present and all data decodes correctly.
+    /// Does NOT include SQLite integrity check (caller runs that separately).
+    pub fn s3_ok(&self) -> bool {
         self.page_groups_missing.is_empty()
             && self.interior_chunks_missing.is_empty()
             && self.index_chunks_missing.is_empty()
             && self.decode_errors.is_empty()
-            && self.integrity_check.as_deref() == Some("ok")
     }
 }
 

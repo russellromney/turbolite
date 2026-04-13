@@ -345,3 +345,4 @@ fn test_validate_clean_database() {
     assert!(stdout.contains("integrity_check"), "should run integrity check");
     assert!(stdout.contains("ok"), "integrity check should be ok");
 }
+

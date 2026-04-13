@@ -810,7 +810,9 @@ impl TurboliteVfs {
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
         let sub_ppf = manifest.sub_pages_per_frame;
+        let encryption_key = self.config.encryption_key.as_ref();
 
+        let total_pg = manifest.page_group_keys.len();
         for (gid, key) in manifest.page_group_keys.iter().enumerate() {
             if pg_missing.contains(key) {
                 continue;
@@ -825,7 +827,7 @@ impl TurboliteVfs {
                                 if let Err(e) = decode_page_group_seekable_full(
                                     &data, ft, page_size, pages_in_group, page_count, 0,
                                     #[cfg(feature = "zstd")] None,
-                                    self.config.encryption_key.as_ref(),
+                                    encryption_key,
                                 ) {
                                     decode_errors.push((key.clone(), format!("{}", e)));
                                 }
@@ -834,7 +836,7 @@ impl TurboliteVfs {
                     } else if let Err(e) = decode_page_group(
                         &data,
                         #[cfg(feature = "zstd")] None,
-                        self.config.encryption_key.as_ref(),
+                        encryption_key,
                     ) {
                         decode_errors.push((key.clone(), format!("{}", e)));
                     }
@@ -844,6 +846,57 @@ impl TurboliteVfs {
                 }
                 Err(e) => {
                     decode_errors.push((key.clone(), format!("fetch: {}", e)));
+                }
+            }
+            if (gid + 1) % 20 == 0 || gid + 1 == total_pg {
+                eprintln!("  decoded {}/{} page groups", gid + 1, total_pg);
+            }
+        }
+
+        // Decode interior chunks
+        for (chunk_id, key) in &manifest.interior_chunk_keys {
+            if int_missing.contains(key) {
+                continue;
+            }
+            match s3.get_page_group(key) {
+                Ok(Some(data)) => {
+                    if let Err(e) = decode_interior_bundle(
+                        &data,
+                        #[cfg(feature = "zstd")] None,
+                        encryption_key,
+                    ) {
+                        decode_errors.push((key.clone(), format!("interior chunk {}: {}", chunk_id, e)));
+                    }
+                }
+                Ok(None) => {
+                    decode_errors.push((key.clone(), format!("interior chunk {}: empty", chunk_id)));
+                }
+                Err(e) => {
+                    decode_errors.push((key.clone(), format!("interior chunk {} fetch: {}", chunk_id, e)));
+                }
+            }
+        }
+
+        // Decode index chunks
+        for (chunk_id, key) in &manifest.index_chunk_keys {
+            if idx_missing.contains(key) {
+                continue;
+            }
+            match s3.get_page_group(key) {
+                Ok(Some(data)) => {
+                    if let Err(e) = decode_interior_bundle(
+                        &data,
+                        #[cfg(feature = "zstd")] None,
+                        encryption_key,
+                    ) {
+                        decode_errors.push((key.clone(), format!("index chunk {}: {}", chunk_id, e)));
+                    }
+                }
+                Ok(None) => {
+                    decode_errors.push((key.clone(), format!("index chunk {}: empty", chunk_id)));
+                }
+                Err(e) => {
+                    decode_errors.push((key.clone(), format!("index chunk {} fetch: {}", chunk_id, e)));
                 }
             }
         }
@@ -861,7 +914,6 @@ impl TurboliteVfs {
             index_chunks_missing: idx_missing,
             orphaned_keys: orphaned,
             decode_errors,
-            integrity_check: None, // caller runs PRAGMA integrity_check separately
         })
     }
 
