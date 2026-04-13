@@ -118,7 +118,7 @@ pub struct TurboliteHandle {
 
     // --- Shared ---
     lock: RwLock<LockLevel>,
-    db_path: PathBuf,
+    pub(crate) db_path: PathBuf,
     /// Separate file handle for byte-range locking
     lock_file: Option<std::sync::Arc<File>>,
     /// Active byte-range locks

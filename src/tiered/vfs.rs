@@ -1102,9 +1102,16 @@ impl Vfs for TurboliteVfs {
         &self,
         handle: &mut Self::Handle,
         region_idx: usize,
-        _region_size: usize,
+        region_size: usize,
         _extend: bool,
     ) -> VfsResult<Option<std::ptr::NonNull<u8>>> {
+        assert_eq!(
+            region_size,
+            crate::WAL_REGION_SIZE,
+            "SQLite requested region_size={} but turbolite uses WAL_REGION_SIZE={}",
+            region_size,
+            crate::WAL_REGION_SIZE,
+        );
         let wal = handle.ensure_wal_index();
         let ptr = wal.ensure_mmap_region(region_idx as u32)
             .map_err(super::sqlite_err::io_to_sqlite)?;
