@@ -18,6 +18,7 @@ mod tiered {
     mod data_ops;
     mod indexes;
     mod gc;
+    mod snapshot_gc;
     #[cfg(feature = "encryption")]
     mod encryption;
     mod advanced;
@@ -31,4 +32,7 @@ mod tiered {
     mod wal_integration;
     mod zenith;
     mod drift;
+    mod oracle_s3;
+    mod crash_flush;
+    mod concurrent_eviction;
 }

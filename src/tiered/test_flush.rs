@@ -109,12 +109,12 @@ fn test_override_threshold_boundary() {
 fn test_override_key_format() {
     use crate::tiered::StorageClient;
     let key = StorageClient::override_frame_key(5, 3, 10);
-    assert_eq!(key, "pg/5_f3_v10");
+    assert_eq!(key, "p/d/5_f3_v10");
 }
 
 #[test]
 fn test_override_key_format_zero_indices() {
     use crate::tiered::StorageClient;
     let key = StorageClient::override_frame_key(0, 0, 1);
-    assert_eq!(key, "pg/0_f0_v1");
+    assert_eq!(key, "p/d/0_f0_v1");
 }

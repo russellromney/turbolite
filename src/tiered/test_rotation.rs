@@ -204,7 +204,7 @@ fn test_rotate_manifest_version_incremented() {
         page_count: 100,
         page_size: 4096,
         pages_per_group: 8,
-        page_group_keys: vec!["pg/0_v5".to_string()],
+        page_group_keys: vec!["p/d/0_v5".to_string()],
         frame_tables: vec![vec![]],
         ..Manifest::empty()
     };
@@ -302,13 +302,13 @@ fn test_rotate_empty_page_group_vec() {
     // Simulate what rotate_encryption_key does: skip empty keys
     let page_group_keys: Vec<String> = vec![
         String::new(),
-        "pg/1_v1".to_string(),
+        "p/d/1_v1".to_string(),
         String::new(),
     ];
 
     let non_empty: Vec<&String> = page_group_keys.iter().filter(|k| !k.is_empty()).collect();
     assert_eq!(non_empty.len(), 1);
-    assert_eq!(non_empty[0], "pg/1_v1");
+    assert_eq!(non_empty[0], "p/d/1_v1");
 
     // And a non-seekable page group can still be rotated
     let pages: Vec<Option<Vec<u8>>> = vec![Some(vec![1u8; 4096])];
@@ -867,8 +867,8 @@ fn test_write_pages_scattered_only_marks_written_pages() {
     assert!(cache.is_present(0), "page 0 should be present");
     assert!(cache.is_present(1), "page 1 should be present");
     // Pages 5 and 10 should NOT be present (data was too short)
-    assert!(!cache.bitmap.lock().is_present(5), "page 5 should NOT be present (no data)");
-    assert!(!cache.bitmap.lock().is_present(10), "page 10 should NOT be present (no data)");
+    assert!(!cache.bitmap.read().is_present(5), "page 5 should NOT be present (no data)");
+    assert!(!cache.bitmap.read().is_present(10), "page 10 should NOT be present (no data)");
 }
 
 #[test]
@@ -900,7 +900,7 @@ fn test_write_pages_scattered_no_tracker_pollution() {
     cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
 
     // Page 5 should be present (bitmap)
-    assert!(cache.bitmap.lock().is_present(5));
+    assert!(cache.bitmap.read().is_present(5));
 
     // Unwritten pages must not be present (bitmap is per-page accurate)
     assert!(!cache.is_present(4), "page 4 must not be present");
@@ -1037,7 +1037,7 @@ fn test_write_pages_scattered_partial_page_data() {
 
     // Only page 0 should be marked (page 1 had partial data)
     assert!(cache.is_present(0), "page 0 with full data should be present");
-    assert!(!cache.bitmap.lock().is_present(1), "page 1 with partial data should not be present");
+    assert!(!cache.bitmap.read().is_present(1), "page 1 with partial data should not be present");
 }
 
 #[test]
@@ -1050,7 +1050,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         page_size: 4096,
         pages_per_group: 8,
         page_group_keys: vec![
-            "pg/0_v5".into(), "pg/1_v5".into(), "pg/2_v5".into(),
+            "p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into(),
         ],
         group_pages: vec![
             vec![0, 5, 10, 15],     // B-tree A (scattered)
@@ -1338,7 +1338,7 @@ fn test_manifest_btree_group_partial_last_group() {
 #[test]
 fn test_manifest_deserialize_btree_fields_default_when_missing() {
     // Old manifests without group_pages/btrees should deserialize cleanly
-    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["pg/0_v1","pg/1_v1","pg/2_v1","pg/3_v1"]}"#;
+    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["p/d/0_v1","p/d/1_v1","p/d/2_v1","p/d/3_v1"]}"#;
     let m: Manifest = serde_json::from_str(json).unwrap();
 
     // B-tree fields default to empty

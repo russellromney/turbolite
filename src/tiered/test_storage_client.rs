@@ -30,7 +30,7 @@ fn test_local_get_missing_page_group() {
     let dir = TempDir::new().unwrap();
     let client = local_client(dir.path());
 
-    let result = client.get_page_group("pg/99_v1").unwrap();
+    let result = client.get_page_group("p/d/99_v1").unwrap();
     assert_eq!(result, None);
 }
 
@@ -91,7 +91,7 @@ fn test_local_delete_missing_is_ok() {
     let client = local_client(dir.path());
 
     // Deleting non-existent key should not error
-    client.delete_page_groups(&["pg/99_v1".to_string()]).unwrap();
+    client.delete_page_groups(&["p/d/99_v1".to_string()]).unwrap();
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn test_local_range_get_missing() {
     let dir = TempDir::new().unwrap();
     let client = local_client(dir.path());
 
-    let result = client.range_get("pg/99_v1", 0, 10).unwrap();
+    let result = client.range_get("p/d/99_v1", 0, 10).unwrap();
     assert_eq!(result, None);
 }
 
@@ -213,10 +213,10 @@ fn test_local_range_get_missing() {
 
 #[test]
 fn test_key_generation() {
-    assert_eq!(StorageClient::page_group_key(0, 1), "pg/0_v1");
-    assert_eq!(StorageClient::page_group_key(42, 7), "pg/42_v7");
-    assert_eq!(StorageClient::interior_chunk_key(3, 5), "ibc/3_v5");
-    assert_eq!(StorageClient::index_chunk_key(1, 2), "ixb/1_v2");
+    assert_eq!(StorageClient::page_group_key(0, 1), "p/d/0_v1");
+    assert_eq!(StorageClient::page_group_key(42, 7), "p/d/42_v7");
+    assert_eq!(StorageClient::interior_chunk_key(3, 5), "p/it/3_v5");
+    assert_eq!(StorageClient::index_chunk_key(1, 2), "p/ix/1_v2");
 }
 
 // ── Is local ──
@@ -336,13 +336,15 @@ fn test_local_diagnostics_are_zero() {
     assert_eq!(client.fetch_bytes(), 0);
 }
 
-// ── pg/ directory creation ──
+// ── page directory creation ──
 
 #[test]
-fn test_local_creates_pg_dir() {
+fn test_local_creates_page_dirs() {
     let dir = TempDir::new().unwrap();
     let _client = local_client(dir.path());
-    assert!(dir.path().join("pg").is_dir());
+    assert!(dir.path().join("p/d").is_dir());
+    assert!(dir.path().join("p/it").is_dir());
+    assert!(dir.path().join("p/ix").is_dir());
 }
 
 #[test]

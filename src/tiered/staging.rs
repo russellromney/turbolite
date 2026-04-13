@@ -18,6 +18,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Magic value to identify manifest trailer in staging log.
+/// Chosen to be extremely unlikely as a valid page number.
+pub(crate) const MANIFEST_MAGIC: u64 = 0xCAFE_FACE_DEAD_BEEF;
+
 /// A single pending flush: staging log path + metadata recorded by sync().
 #[derive(Debug)]
 pub(crate) struct PendingFlush {
@@ -72,6 +76,16 @@ impl StagingWriter {
         Ok(())
     }
 
+    /// Append manifest bytes to the staging log before finalize.
+    /// Format: [MANIFEST_MAGIC: u64 LE][manifest_len: u64 LE][manifest_data: [u8; manifest_len]]
+    /// The magic value distinguishes manifest trailer from page records.
+    pub fn append_manifest(&mut self, manifest_bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(&MANIFEST_MAGIC.to_le_bytes())?;
+        self.writer.write_all(&(manifest_bytes.len() as u64).to_le_bytes())?;
+        self.writer.write_all(manifest_bytes)?;
+        Ok(())
+    }
+
     /// Flush buffers, fsync, and return the path for PendingFlush.
     pub fn finalize(mut self) -> io::Result<(PathBuf, u64)> {
         self.writer.flush()?;
@@ -102,35 +116,72 @@ pub(crate) fn read_staging_log(
         return Ok(HashMap::new());
     }
 
-    if file_len % record_size != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "staging log {} has invalid size {} (not a multiple of record_size {})",
-                path.display(),
-                file_len,
-                record_size,
-            ),
-        ));
-    }
+    // File may contain a manifest trailer (MANIFEST_MAGIC + length + data),
+    // so we can't validate total file size as a multiple of record_size.
+    // Instead, we read records until we hit MANIFEST_MAGIC or EOF.
 
-    let num_records = (file_len / record_size) as usize;
-    let mut pages = HashMap::with_capacity(num_records);
+    let mut pages = HashMap::new();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut page_num_buf = [0u8; 8];
     let mut page_buf = vec![0u8; page_size as usize];
 
-    for _ in 0..num_records {
-        reader.read_exact(&mut page_num_buf)?;
-        reader.read_exact(&mut page_buf)?;
+    loop {
+        // Read page_num (or manifest magic)
+        match reader.read_exact(&mut page_num_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
         let page_num = u64::from_le_bytes(page_num_buf);
-        // Later writes for the same page_num win (HashMap::insert overwrites).
-        // This is correct: if the same page was written multiple times in one
-        // checkpoint, the last write is the committed state.
+
+        // Check for manifest trailer
+        if page_num == MANIFEST_MAGIC {
+            break; // manifest follows, but we only care about pages here
+        }
+
+        reader.read_exact(&mut page_buf)?;
         pages.insert(page_num, page_buf.clone());
     }
 
     Ok(pages)
+}
+
+/// Extract the embedded manifest from a staging log (if present).
+/// Returns None if the staging log has no manifest trailer.
+pub(crate) fn read_staging_manifest(
+    path: &Path,
+    page_size: u32,
+) -> io::Result<Option<Vec<u8>>> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(None);
+    }
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut page_num_buf = [0u8; 8];
+    let mut page_buf = vec![0u8; page_size as usize];
+
+    loop {
+        match reader.read_exact(&mut page_num_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let val = u64::from_le_bytes(page_num_buf);
+        if val == MANIFEST_MAGIC {
+            let mut len_buf = [0u8; 8];
+            reader.read_exact(&mut len_buf)?;
+            let manifest_len = u64::from_le_bytes(len_buf) as usize;
+            // Corrupted length: can't exceed the staging file itself
+            if manifest_len as u64 > file_len {
+                return Ok(None);
+            }
+            let mut manifest_data = vec![0u8; manifest_len];
+            reader.read_exact(&mut manifest_data)?;
+            return Ok(Some(manifest_data));
+        }
+        reader.read_exact(&mut page_buf)?;
+    }
 }
 
 /// Scan staging directory for leftover .log files from interrupted flushes.
@@ -172,16 +223,9 @@ pub(crate) fn recover_staging_logs(
             let _ = fs::remove_file(&path);
             continue;
         }
-        let record_size = 8 + page_size as u64;
-        if meta.len() % record_size != 0 {
-            eprintln!(
-                "[staging] WARN: staging file {} has invalid size {} (record_size={}), skipping",
-                path.display(),
-                meta.len(),
-                record_size,
-            );
-            continue;
-        }
+        // Staging logs may include a manifest trailer (MANIFEST_MAGIC + data),
+        // so file size is NOT guaranteed to be a multiple of record_size.
+        // read_staging_log() correctly handles this by stopping at MANIFEST_MAGIC.
         pending.push(PendingFlush {
             staging_path: path,
             version,
@@ -315,8 +359,12 @@ mod tests {
         File::create(staging_dir.join("4.txt")).unwrap();
 
         let recovered = recover_staging_logs(&staging_dir, page_size).unwrap();
-        assert_eq!(recovered.len(), 1);
+        // Valid log (v1) + partial-size log (v3) both recovered.
+        // The % validation was removed; partial files are accepted and
+        // read_staging_log handles them by reading complete records only.
+        assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].version, 1);
+        assert_eq!(recovered[1].version, 3);
     }
 
     #[test]
@@ -328,17 +376,57 @@ mod tests {
     }
 
     #[test]
-    fn staging_invalid_file_size_error() {
+    fn staging_partial_record_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
         fs::create_dir_all(&staging_dir).unwrap();
         let path = staging_dir.join("1.log");
         let mut f = File::create(&path).unwrap();
-        // Write partial record (5 bytes, not a multiple of 8 + page_size)
+        // Write partial record (5 bytes, can't read a full page_num u64)
         f.write_all(&[0u8; 5]).unwrap();
 
+        // Should return empty (can't read a complete record), not error
         let result = read_staging_log(&path, 64);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid size"));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn staging_log_with_manifest_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // Write 2 pages + manifest trailer
+        let mut writer = StagingWriter::open(&staging_dir, 1, 64).unwrap();
+        writer.append(0, &vec![10u8; 64]).unwrap();
+        writer.append(1, &vec![20u8; 64]).unwrap();
+        writer.append_manifest(b"test-manifest-data").unwrap();
+        let (path, pages) = writer.finalize().unwrap();
+        assert_eq!(pages, 2);
+
+        // read_staging_log should return 2 pages, ignoring the manifest trailer
+        let result = read_staging_log(&path, 64).unwrap();
+        assert_eq!(result.len(), 2, "should have 2 pages");
+        assert_eq!(result[&0], vec![10u8; 64]);
+        assert_eq!(result[&1], vec![20u8; 64]);
+    }
+
+    #[test]
+    fn staging_recovery_accepts_files_with_manifest_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // Write a staging log with manifest trailer (non-multiple of record_size)
+        let mut writer = StagingWriter::open(&staging_dir, 42, 64).unwrap();
+        writer.append(0, &vec![1u8; 64]).unwrap();
+        writer.append_manifest(b"some-manifest").unwrap();
+        let (_path, _) = writer.finalize().unwrap();
+
+        // recover_staging_logs should NOT skip this file
+        let recovered = recover_staging_logs(&staging_dir, 64).unwrap();
+        assert_eq!(recovered.len(), 1, "should recover 1 staging log");
+        assert_eq!(recovered[0].version, 42);
     }
 }

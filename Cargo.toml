@@ -20,21 +20,22 @@ lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
 encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
-parallel = ["dep:rayon"]
-cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:tokio", "dep:crc32fast", "dep:libc"]
+parallel = []
+cloud = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime", "dep:crc32fast"]
 # Backward compat alias
 tiered = ["cloud"]
 wal = ["cloud", "dep:walrust-core", "dep:hadb-io", "dep:async-trait"]
 lambda = ["dep:lambda_runtime", "cloud", "zstd"]
 
 [dependencies]
-sqlite-vfs = "0.2"
+sqlite-vfs = { git = "https://github.com/russellromney/sqlite-vfs.git", branch = "fix/shm-barrier-wal-push" }
 zstd = { version = "0.13", optional = true }
 lz4_flex = { version = "0.11", optional = true }
 snap = { version = "1.1", optional = true }
 flate2 = { version = "1.0", optional = true }
 thiserror = "1"
 parking_lot = "0.12"
+arc-swap = "1"
 fs2 = "0.4"
 file-guard = "0.2"
 once_cell = "1"
@@ -47,15 +48,15 @@ sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 
 # Parallel compression (optional)
-rayon = { version = "1.10", optional = true }
+rayon = "1.10"
 
 # Tiered S3 storage (optional)
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 aws-smithy-runtime = { version = "1", features = ["client"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 crc32fast = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"] }
@@ -69,11 +70,14 @@ ureq = "2"
 lambda_runtime = { version = "0.13", optional = true }
 
 # WAL replication via walrust (optional)
-walrust-core = { path = "../walrust/crates/walrust-core", optional = true, package = "walrust" }
-hadb-io = { path = "../hadb/hadb-io", optional = true }
+walrust-core = { version = "0.5", optional = true, package = "walrust" }
+hadb-io = { version = "0.4", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 rmp-serde = "1.3.1"
+
+# HTTP storage client
+reqwest = { version = "0.12", features = ["json"] }
 
 [build-dependencies]
 cbindgen = "0.27"
@@ -82,6 +86,9 @@ cc = "1"
 [dev-dependencies]
 rayon = "1.10"
 rmp-serde = "1.3.1"
+proptest = "1.5"
+proptest-derive = "0.5"
+arbitrary = { version = "1.3", features = ["derive"] }
 
 [[bin]]
 name = "turbolite"

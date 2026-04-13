@@ -351,6 +351,7 @@ pub fn import_sqlite_file(
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
+        db_header: None, // import doesn't need db_header (fresh import)
     };
     manifest.build_page_index();
     s3.put_manifest(&manifest)?;

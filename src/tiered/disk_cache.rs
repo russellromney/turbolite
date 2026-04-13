@@ -128,14 +128,33 @@ pub(crate) struct DiskCache {
     #[allow(dead_code)] // retained for debugging
     pub(crate) cache_dir: PathBuf,
     /// Local cache file — uncompressed pages at offset page_num * page_size.
-    /// RwLock: read lock for concurrent pread/pwrite (thread-safe on Unix),
-    /// write lock only for set_len (extending the file).
-    pub(crate) cache_file: parking_lot::RwLock<File>,
+    /// pread/pwrite are thread-safe on Unix, no lock needed for I/O.
+    /// Only set_len (extending) is serialized via cache_file_extend.
+    pub(crate) cache_file: File,
+    /// Tracked file length to avoid metadata() syscall on every write.
+    pub(crate) cache_file_len: std::sync::atomic::AtomicU64,
+    /// Serializes set_len calls (rare: only when DB grows beyond current cache file).
+    pub(crate) cache_file_extend: parking_lot::Mutex<()>,
+    /// In-memory page cache: flat array of page data indexed by page_num.
+    /// AtomicPtr per page: null = not cached, non-null = pointer to page_size bytes.
+    /// Zero-lock reads: just atomic load + memcpy.
+    pub(crate) mem_cache: Option<Vec<std::sync::atomic::AtomicPtr<u8>>>,
+    /// Memory budget in bytes (0 = disabled). User-controlled via TurboliteConfig.
+    pub(crate) mem_cache_budget: u64,
+    /// Current usage in bytes.
+    pub(crate) mem_cache_bytes: std::sync::atomic::AtomicU64,
+    /// Deferred mem_cache frees from eviction. Freed in Drop or periodically.
+    /// Avoids UAF: eviction nulls the AtomicPtr instantly, defers actual
+    /// Box::drop so concurrent readers never see freed memory.
+    deferred_frees: parking_lot::Mutex<Vec<Box<[u8]>>>,
+    /// Generation counter: incremented on every sync/checkpoint. Handles compare
+    /// their cached generation to detect stale cache state (another handle wrote).
+    pub(crate) generation: std::sync::atomic::AtomicU64,
     /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
     pub(crate) tracker: parking_lot::Mutex<SubChunkTracker>,
-    /// Legacy page bitmap — kept for backward compatibility during migration.
-    /// TODO: remove once all code paths use tracker exclusively.
-    pub(crate) bitmap: parking_lot::Mutex<PageBitmap>,
+    /// Page bitmap: AtomicU8-backed, lock-free for is_present/mark_present/clear.
+    /// RwLock only protects resize (Vec reallocation). Read lock is ~free.
+    pub(crate) bitmap: parking_lot::RwLock<PageBitmap>,
     /// Per-group state: 0=None, 1=Fetching, 2=Present
     pub(crate) group_states: parking_lot::Mutex<Vec<std::sync::atomic::AtomicU8>>,
     /// Condition variable for wait_for_group (replaces spin-wait)
@@ -200,6 +219,7 @@ impl DiskCache {
             false, 3,
             #[cfg(feature = "zstd")]
             None,
+            0, // mem_cache_budget: disabled by default
         )
     }
 
@@ -208,6 +228,7 @@ impl DiskCache {
         page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>,
         cache_compression: bool, cache_compression_level: i32,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
+        mem_cache_budget: u64,
     ) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
@@ -308,9 +329,25 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
-            cache_file: parking_lot::RwLock::new(cache_file),
+            cache_file_len: std::sync::atomic::AtomicU64::new(cache_file.metadata().map(|m| m.len()).unwrap_or(0)),
+            cache_file,
+            cache_file_extend: parking_lot::Mutex::new(()),
+            mem_cache: if mem_cache_budget > 0 && page_count > 0 && page_size > 0 {
+                let count = page_count as usize;
+                let mut v = Vec::with_capacity(count);
+                for _ in 0..count {
+                    v.push(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+                }
+                Some(v)
+            } else {
+                None
+            },
+            mem_cache_budget,
+            mem_cache_bytes: std::sync::atomic::AtomicU64::new(0),
+            deferred_frees: parking_lot::Mutex::new(Vec::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
             tracker: parking_lot::Mutex::new(tracker),
-            bitmap: parking_lot::Mutex::new(bitmap),
+            bitmap: parking_lot::RwLock::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
             group_condvar: parking_lot::Condvar::new(),
             group_condvar_mutex: parking_lot::Mutex::new(()),
@@ -346,6 +383,102 @@ impl DiskCache {
         })
     }
 
+    /// Bump the generation counter. Called by sync() after writing dirty pages.
+    /// Readers compare their cached generation to detect stale state.
+    pub(crate) fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Release)
+    }
+
+    /// Promote contiguous decoded pages directly into mem_cache (zero extra I/O).
+    /// Called after write_pages_bulk/write_pages_scattered when pages are decoded from S3.
+    /// The data is already in `raw_data` at page-size offsets, so we just memcpy into the cache.
+    pub(crate) fn promote_bulk_to_mem_cache(&self, start_page: u64, raw_data: &[u8], num_pages: u64) {
+        let mc = match self.mem_cache {
+            Some(ref mc) => mc,
+            None => return,
+        };
+        let ps = self.page_size.load(Ordering::Relaxed) as usize;
+        if ps == 0 { return; }
+
+        for i in 0..num_pages as usize {
+            let pnum = start_page + i as u64;
+            if let Some(slot) = mc.get(pnum as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                if !ptr.is_null() {
+                    // Already cached, update in place
+                    let src_start = i * ps;
+                    let copy_len = ps.min(raw_data.len() - src_start);
+                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, copy_len); }
+                } else {
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 > self.mem_cache_budget { return; } // budget exhausted
+                    let src_start = i * ps;
+                    let src_end = (src_start + ps).min(raw_data.len());
+                    let mut page_buf = vec![0u8; ps].into_boxed_slice();
+                    page_buf[..src_end - src_start].copy_from_slice(&raw_data[src_start..src_end]);
+                    let new_ptr = Box::into_raw(page_buf) as *mut u8;
+                    if slot.compare_exchange(
+                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
+                    ).is_ok() {
+                        self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                    } else {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Promote scattered decoded pages directly into mem_cache (zero extra I/O).
+    pub(crate) fn promote_scattered_to_mem_cache(&self, page_nums: &[u64], raw_data: &[u8]) {
+        let mc = match self.mem_cache {
+            Some(ref mc) => mc,
+            None => return,
+        };
+        let ps = self.page_size.load(Ordering::Relaxed) as usize;
+        if ps == 0 { return; }
+
+        for (i, &pnum) in page_nums.iter().enumerate() {
+            if let Some(slot) = mc.get(pnum as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                let src_start = i * ps;
+                if src_start + ps > raw_data.len() { break; }
+                if !ptr.is_null() {
+                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps); }
+                } else {
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 > self.mem_cache_budget { return; }
+                    let mut page_buf = vec![0u8; ps].into_boxed_slice();
+                    page_buf.copy_from_slice(&raw_data[src_start..src_start + ps]);
+                    let new_ptr = Box::into_raw(page_buf) as *mut u8;
+                    if slot.compare_exchange(
+                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
+                    ).is_ok() {
+                        self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                    } else {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure the cache file is at least `needed` bytes. Lock-free fast path
+    /// when file is already large enough; mutex only for the rare set_len.
+    fn ensure_file_len(&self, needed: u64) -> io::Result<()> {
+        if self.cache_file_len.load(Ordering::Relaxed) >= needed {
+            return Ok(());
+        }
+        let _guard = self.cache_file_extend.lock();
+        // Re-check after lock
+        let current = self.cache_file_len.load(Ordering::Relaxed);
+        if current < needed {
+            self.cache_file.set_len(needed)?;
+            self.cache_file_len.store(needed, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Create a zstd decoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn decoder_dict(&self) -> Option<zstd::dict::DecoderDictionary<'static>> {
@@ -364,9 +497,24 @@ impl DiskCache {
             return self.read_page_compressed(page_num, buf);
         }
 
+        // In-memory page cache: zero-lock read via AtomicPtr.
+        // Pages are promoted at decode time (write_pages_bulk/scattered), not on read miss.
+        // This avoids allocation + CAS overhead on every first access.
+        if let Some(ref mc) = self.mem_cache {
+            if let Some(slot) = mc.get(page_num as usize) {
+                let ptr = slot.load(Ordering::Acquire);
+                if !ptr.is_null() {
+                    let ps = self.page_size.load(Ordering::Relaxed) as usize;
+                    let copy_len = buf.len().min(ps);
+                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len); }
+                    return Ok(());
+                }
+            }
+            // Miss: fall through to pread (page not decoded yet or evicted)
+        }
+
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-        let file = self.cache_file.read();
-        file.read_exact_at(buf, offset)?;
+        self.cache_file.read_exact_at(buf, offset)?;
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
             let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
@@ -392,8 +540,7 @@ impl DiskCache {
 
         // Read the compressed (and optionally encrypted) blob
         let mut compressed = vec![0u8; entry.compressed_len as usize];
-        let file = self.cache_file.read();
-        file.read_exact_at(&mut compressed, entry.offset)?;
+        self.cache_file.read_exact_at(&mut compressed, entry.offset)?;
 
         // Decrypt if encrypted (CTR, same size)
         #[cfg(feature = "encryption")]
@@ -455,25 +602,21 @@ impl DiskCache {
 
         let needed = offset + data.len() as u64;
 
-        // Extend file if needed (exclusive lock), then pwrite (shared lock)
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                // Re-check after acquiring write lock
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
+        // Extend file if needed (serialized via mutex), then pwrite (lock-free)
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
+        self.bitmap_mark(page_num);
+        // Update in-memory cache if page is already cached (keep dirty data consistent).
+        // Don't promote on write -- read path handles promotion.
+        if let Some(ref mc) = self.mem_cache {
+            if let Some(slot) = mc.get(page_num as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                if !ptr.is_null() {
+                    let copy_len = data.len().min(self.page_size.load(Ordering::Relaxed) as usize);
+                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len); }
                 }
-                file.write_all_at(data, offset)?;
-            } else {
-                file.write_all_at(data, offset)?;
             }
         }
-        self.bitmap.lock().mark_present(page_num);
-        // Do NOT mark sub-chunk tracker here — write_page writes a single page,
-        // not a complete sub-chunk. Sub-chunk tracker is only updated by
-        // write_pages_bulk() which writes complete frames fetched from S3.
         Ok(())
     }
 
@@ -507,21 +650,10 @@ impl DiskCache {
         };
 
         let needed = offset + blob_len as u64;
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, offset)?;
-            } else {
-                file.write_all_at(&blob, offset)?;
-            }
-        }
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, offset)?;
 
-        self.bitmap.lock().mark_present(page_num);
+        self.bitmap_mark(page_num);
         Ok(())
     }
 
@@ -535,6 +667,9 @@ impl DiskCache {
         if self.cache_compression {
             return self.write_pages_bulk_compressed(start_page, data, num_pages);
         }
+
+        // Promote decoded pages to mem_cache BEFORE encryption (we want raw data).
+        self.promote_bulk_to_mem_cache(start_page, data, num_pages);
 
         // CTR encryption: encrypt each page in-place (same size, no overhead)
         #[cfg(feature = "encryption")]
@@ -555,23 +690,20 @@ impl DiskCache {
         let offset = start_page * page_sz as u64;
         let needed = offset + data.len() as u64;
 
-        // Try read lock first (concurrent pwrite). Only upgrade to write lock if file too small.
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
+
+        // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
         {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(data, offset)?;
-            } else {
-                file.write_all_at(data, offset)?;
+            let last_page = start_page + num_pages - 1;
+            let needed = last_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(last_page);
             }
         }
-
-        // Mark all pages present in legacy bitmap
-        let mut bitmap = self.bitmap.lock();
+        let bitmap = self.bitmap.read();
         for i in 0..num_pages {
             bitmap.mark_present(start_page + i);
         }
@@ -639,22 +771,20 @@ impl DiskCache {
         };
 
         let needed = base_offset + blob.len() as u64;
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, base_offset)?;
+
+        // Mark all pages present in bitmap (ensure capacity once, then atomic marks)
         {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, base_offset)?;
-            } else {
-                file.write_all_at(&blob, base_offset)?;
+            let last_page = start_page + num_pages - 1;
+            let needed = last_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(last_page);
             }
         }
-
-        // Mark all pages present in legacy bitmap
-        let mut bitmap = self.bitmap.lock();
+        let bitmap = self.bitmap.read();
         for i in 0..num_pages {
             bitmap.mark_present(start_page + i);
         }
@@ -696,53 +826,39 @@ impl DiskCache {
             return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
         }
 
+        // Promote decoded pages to mem_cache before encryption
+        self.promote_scattered_to_mem_cache(written_pages, data);
+
         // Find max page to size the cache file
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
         let needed = (max_page + 1) * page_sz as u64;
 
-        // Ensure file is large enough
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                for (i, &pnum) in written_pages.iter().enumerate() {
-                    let src_start = i * page_sz;
-                    let page_data = &data[src_start..src_start + page_sz];
-                    #[cfg(feature = "encryption")]
-                    let page_data = if let Some(ref key) = self.encryption_key {
-                        &compress::encrypt_ctr(page_data, pnum, key)?
-                    } else {
-                        page_data
-                    };
-                    #[cfg(not(feature = "encryption"))]
-                    let page_data = page_data;
-                    let offset = pnum * page_sz as u64;
-                    file.write_all_at(page_data, offset)?;
-                }
+        self.ensure_file_len(needed)?;
+        for (i, &pnum) in written_pages.iter().enumerate() {
+            let src_start = i * page_sz;
+            let page_data = &data[src_start..src_start + page_sz];
+            #[cfg(feature = "encryption")]
+            let page_data = if let Some(ref key) = self.encryption_key {
+                &compress::encrypt_ctr(page_data, pnum, key)?
             } else {
-                for (i, &pnum) in written_pages.iter().enumerate() {
-                    let src_start = i * page_sz;
-                    let page_data = &data[src_start..src_start + page_sz];
-                    #[cfg(feature = "encryption")]
-                    let page_data = if let Some(ref key) = self.encryption_key {
-                        &compress::encrypt_ctr(page_data, pnum, key)?
-                    } else {
-                        page_data
-                    };
-                    #[cfg(not(feature = "encryption"))]
-                    let page_data = page_data;
-                    let offset = pnum * page_sz as u64;
-                    file.write_all_at(page_data, offset)?;
-                }
-            }
+                page_data
+            };
+            #[cfg(not(feature = "encryption"))]
+            let page_data = page_data;
+            let offset = pnum * page_sz as u64;
+            self.cache_file.write_all_at(page_data, offset)?;
         }
 
-        // Mark bitmap for per-page presence
-        let mut bitmap = self.bitmap.lock();
+        // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
+        if let Some(&max_page) = written_pages.iter().max() {
+            let needed = max_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(max_page);
+            }
+        }
+        let bitmap = self.bitmap.read();
         for &pnum in written_pages {
             bitmap.mark_present(pnum);
         }
@@ -811,22 +927,19 @@ impl DiskCache {
         };
 
         let needed = base_offset + blob.len() as u64;
-        {
-            let file = self.cache_file.read();
-            if file.metadata()?.len() < needed {
-                drop(file);
-                let file = self.cache_file.write();
-                if file.metadata()?.len() < needed {
-                    file.set_len(needed)?;
-                }
-                file.write_all_at(&blob, base_offset)?;
-            } else {
-                file.write_all_at(&blob, base_offset)?;
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(&blob, base_offset)?;
+
+        // Mark bitmap for per-page presence (ensure capacity, then atomic marks)
+        if let Some(&max_page) = written_pages.iter().max() {
+            let needed = max_page as usize / 8 + 1;
+            let bm = self.bitmap.read();
+            if needed > bm.bits.len() {
+                drop(bm);
+                self.bitmap.write().ensure_capacity(max_page);
             }
         }
-
-        // Mark bitmap for per-page presence
-        let mut bitmap = self.bitmap.lock();
+        let bitmap = self.bitmap.read();
         for &pnum in written_pages {
             bitmap.mark_present(pnum);
         }
@@ -852,12 +965,29 @@ impl DiskCache {
         self.tracker.lock().set_sub_chunk_byte_size(scbs);
     }
 
+    /// Mark a page present, auto-growing the bitmap if needed.
+    /// Fast path (read lock) if capacity is sufficient; slow path (write lock) to grow.
+    pub(crate) fn bitmap_mark(&self, page_num: u64) {
+        let needed = page_num as usize / 8 + 1;
+        {
+            let bm = self.bitmap.read();
+            if needed <= bm.bits.len() {
+                bm.mark_present(page_num);
+                return;
+            }
+        }
+        // Need to grow
+        let mut bm = self.bitmap.write();
+        bm.ensure_capacity(page_num);
+        bm.mark_present(page_num);
+    }
+
     /// Check if a page is present in the local cache.
     /// Uses bitmap (per-page accurate). SubChunkTracker is not consulted here
     /// because it uses positional mapping which is wrong for B-tree-aware groups.
     /// In compressed mode, also verifies the page is in the cache index.
     pub(crate) fn is_present(&self, page_num: u64) -> bool {
-        let in_bitmap = self.bitmap.lock().is_present(page_num);
+        let in_bitmap = self.bitmap.read().is_present(page_num);
         if self.cache_compression && in_bitmap {
             // Double-check: bitmap says present, but index must also have it
             return self.cache_index.lock().contains(page_num);
@@ -1079,12 +1209,30 @@ impl DiskCache {
         }
     }
 
-    /// Clear bitmap bits, remove from cache index, and hole-punch pages on Linux.
+    /// Clear bitmap bits, free mem_cache entries, remove from cache index, and hole-punch pages on Linux.
     pub(crate) fn clear_pages_from_disk(&self, page_nums: &[u64]) {
         {
-            let mut bitmap = self.bitmap.lock();
+            let bitmap = self.bitmap.read();
             for &pnum in page_nums {
                 bitmap.clear(pnum);
+            }
+        }
+        // Evict from in-memory cache: null the pointer (instant, lock-free),
+        // defer actual deallocation. Readers see null immediately and fall through
+        // to pread. No UAF risk because we don't free the old pointer here.
+        // Deferred frees are collected in deferred_frees and drained by Drop.
+        if let Some(ref mc) = self.mem_cache {
+            let ps = self.page_size.load(Ordering::Relaxed) as usize;
+            for &pnum in page_nums {
+                if let Some(slot) = mc.get(pnum as usize) {
+                    let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
+                    if !old.is_null() && ps > 0 {
+                        // Reconstruct the Box to defer its drop (no UAF risk)
+                        let boxed = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
+                        self.deferred_frees.lock().push(boxed);
+                        self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
+                    }
+                }
             }
         }
         // Remove from compressed cache index
@@ -1098,14 +1246,13 @@ impl DiskCache {
         #[cfg(target_os = "linux")]
         if !self.cache_compression {
             use std::os::unix::io::AsRawFd;
-            let file = self.cache_file.write();
             let ps = self.page_size.load(Ordering::Acquire) as u64;
             for &pnum in page_nums {
                 let offset = (pnum * ps) as libc::off_t;
                 let len = ps as libc::off_t;
                 unsafe {
                     libc::fallocate(
-                        file.as_raw_fd(),
+                        self.cache_file.as_raw_fd(),
                         libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
                         offset,
                         len,
@@ -1230,14 +1377,55 @@ impl DiskCache {
         let _ = index.persist();
     }
 
+    /// Mark all pages as present in the bitmap and all groups as Present.
+    /// Called after an external process (walrust restore) writes pages directly
+    /// to the cache file without going through the VFS.
+    pub(crate) fn mark_all_pages_present(&self, page_count: u64) {
+        let mut bitmap = self.bitmap.write();
+        bitmap.resize(page_count);
+        for p in 0..page_count {
+            bitmap.mark_present(p);
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let group_count = (page_count + ppg - 1) / ppg;
+            let states = self.group_states.lock();
+            self.ensure_group_states_capacity(&states, group_count.saturating_sub(1));
+            for gid in 0..group_count as usize {
+                if let Some(s) = states.get(gid) {
+                    s.store(GroupState::Present as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
-        self.bitmap.lock().persist()?;
+        self.bitmap.read().persist()?;
         self.tracker.lock().persist()?;
         if self.cache_compression {
             self.cache_index.lock().persist()?;
         }
         Ok(())
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        // Free all mem_cache allocations
+        if let Some(ref mc) = self.mem_cache {
+            let ps = self.page_size.load(Ordering::Relaxed) as usize;
+            if ps > 0 {
+                for slot in mc.iter() {
+                    let ptr = slot.swap(std::ptr::null_mut(), Ordering::Relaxed);
+                    if !ptr.is_null() {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                    }
+                }
+            }
+        }
+        // Drain deferred frees from eviction (Box drops automatically)
+        self.deferred_frees.lock().clear();
     }
 }
 

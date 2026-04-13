@@ -214,14 +214,14 @@ fn test_local_vfs_recover_from_page_groups() {
     }
 
     // Verify page groups exist on disk
-    let pg_dir = dir.path().join("pg");
-    assert!(pg_dir.is_dir(), "pg/ directory should exist");
+    let pg_dir = dir.path().join("p/d");
+    assert!(pg_dir.is_dir(), "p/d/ directory should exist");
     let pg_files: Vec<_> = std::fs::read_dir(&pg_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|ext| ext != "tmp").unwrap_or(true))
         .collect();
-    assert!(!pg_files.is_empty(), "page group files should exist in pg/");
+    assert!(!pg_files.is_empty(), "page group files should exist in p/d/");
 
     // Phase 2: delete cache file + bitmap (simulate cache loss), reopen
     let _ = std::fs::remove_file(dir.path().join("data.cache"));

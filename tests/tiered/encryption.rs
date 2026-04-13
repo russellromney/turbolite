@@ -635,7 +635,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
             if let Some(ep) = &endpoint {
-                s3_config = s3_config.endpoint_url(ep);
+                s3_config = s3_config.endpoint_url(ep).force_path_style(true);
             }
             let client = aws_sdk_s3::Client::from_conf(s3_config.build());
             let resp = client
@@ -678,7 +678,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
             if let Some(ep) = &endpoint {
-                s3_config = s3_config.endpoint_url(ep);
+                s3_config = s3_config.endpoint_url(ep).force_path_style(true);
             }
             let client = aws_sdk_s3::Client::from_conf(s3_config.build());
             let resp = client

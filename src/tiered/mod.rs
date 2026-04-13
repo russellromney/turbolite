@@ -55,10 +55,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
-#[cfg(feature = "cloud")]
 use tokio::runtime::Handle as TokioHandle;
 
 use crate::compress;
@@ -88,6 +88,7 @@ mod prediction;
 mod prefetch;
 mod query_plan;
 mod rotation;
+mod http_client;
 mod s3_client;
 mod settings;
 mod staging;

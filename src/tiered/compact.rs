@@ -213,7 +213,7 @@ pub struct OverrideCompactResult {
 /// Auto-compact groups exceeding threshold.
 pub(crate) fn auto_compact_overrides(
     storage: &StorageClient,
-    shared_manifest: &parking_lot::RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     compaction_threshold: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
@@ -227,7 +227,7 @@ pub(crate) fn auto_compact_overrides(
 #[allow(dead_code)]
 pub(crate) fn compact_all_overrides(
     storage: &StorageClient,
-    shared_manifest: &parking_lot::RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
@@ -238,13 +238,13 @@ pub(crate) fn compact_all_overrides(
 
 fn compact_overrides_inner(
     storage: &StorageClient,
-    shared_manifest: &parking_lot::RwLock<Manifest>,
+    shared_manifest: &ArcSwap<Manifest>,
     threshold: Option<u32>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
-    let manifest_snap = shared_manifest.read().clone();
+    let manifest_snap = (**shared_manifest.load()).clone();
     let groups_to_compact: Vec<u64> = manifest_snap.subframe_overrides.iter()
         .enumerate()
         .filter(|(_, ovs)| {
@@ -290,7 +290,7 @@ fn compact_overrides_inner(
     storage.put_page_groups(&uploads)?;
 
     {
-        let mut m = shared_manifest.write();
+        let mut m = (**shared_manifest.load()).clone();
         for result in &compaction_results {
             while m.page_group_keys.len() <= result.gid as usize { m.page_group_keys.push(String::new()); }
             m.page_group_keys[result.gid as usize] = result.new_key.clone();
@@ -299,9 +299,10 @@ fn compact_overrides_inner(
             if let Some(ovs) = m.subframe_overrides.get_mut(result.gid as usize) { ovs.clear(); }
         }
         m.version = next_version;
+        shared_manifest.store(Arc::new(m));
     }
 
-    let manifest_for_persist = shared_manifest.read().clone();
+    let manifest_for_persist = (**shared_manifest.load()).clone();
     storage.put_manifest(&manifest_for_persist, &[])?;
 
     if !all_replaced_keys.is_empty() {

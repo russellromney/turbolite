@@ -3,7 +3,7 @@ use super::*;
 // ===== StorageClient: unified local + S3 storage abstraction =====
 
 /// Unified storage client for page groups and manifests.
-/// Local: reads/writes files under `{base_dir}/pg/` and `{base_dir}/manifest.msgpack`.
+/// Local: reads/writes files under `{base_dir}/p/{d,it,ix}/` and `{base_dir}/manifest.msgpack`.
 /// S3: delegates to the existing S3Client.
 pub(crate) enum StorageClient {
     Local {
@@ -11,15 +11,17 @@ pub(crate) enum StorageClient {
     },
     #[cfg(feature = "cloud")]
     S3(Arc<s3_client::S3Client>),
+    Http(Arc<http_client::HttpClient>),
 }
 
 impl StorageClient {
     /// Create a StorageClient from the config's effective backend.
     /// For S3 mode, requires a pre-constructed S3Client (created with tokio runtime).
-    /// For Local mode, creates the `pg/` directory.
+    /// For Local mode, creates the page directories.
     pub(crate) fn local(base_dir: PathBuf) -> io::Result<Self> {
-        let pg_dir = base_dir.join("pg");
-        fs::create_dir_all(&pg_dir)?;
+        fs::create_dir_all(base_dir.join("p/d"))?;
+        fs::create_dir_all(base_dir.join("p/it"))?;
+        fs::create_dir_all(base_dir.join("p/ix"))?;
         Ok(StorageClient::Local { base_dir })
     }
 
@@ -29,17 +31,22 @@ impl StorageClient {
     }
 
     /// Whether this is a local-only client.
+    pub(crate) fn http(client: Arc<http_client::HttpClient>) -> Self {
+        StorageClient::Http(client)
+    }
+
     pub(crate) fn is_local(&self) -> bool {
         match self {
             StorageClient::Local { .. } => true,
             #[cfg(feature = "cloud")]
             StorageClient::S3(_) => false,
+            StorageClient::Http(_) => false,
         }
     }
 
     // ── Page group operations ──
 
-    /// Fetch a page group by its key (e.g., "pg/0_v1").
+    /// Fetch a page group by its key (e.g., "p/d/0_v1").
     /// Returns Ok(None) if the key doesn't exist.
     pub(crate) fn get_page_group(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         match self {
@@ -53,6 +60,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.get_page_group(key),
+            StorageClient::Http(http) => http.get_page_group(key),
         }
     }
 
@@ -73,6 +81,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.get_page_groups_by_key(keys),
+            StorageClient::Http(http) => http.get_page_groups_by_key(keys),
         }
     }
 
@@ -94,6 +103,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.put_page_groups(groups),
+            StorageClient::Http(http) => http.put_page_groups(groups),
         }
     }
 
@@ -113,6 +123,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.delete_objects(keys),
+            StorageClient::Http(http) => http.delete_objects(keys),
         }
     }
 
@@ -144,6 +155,9 @@ impl StorageClient {
             StorageClient::S3(s3) => {
                 Ok((s3.get_manifest()?, Vec::new()))
             }
+            StorageClient::Http(http) => {
+                Ok((http.get_manifest()?, Vec::new()))
+            }
         }
     }
 
@@ -159,6 +173,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.put_manifest(manifest),
+            StorageClient::Http(http) => http.put_manifest(manifest),
         }
     }
 
@@ -172,29 +187,35 @@ impl StorageClient {
             StorageClient::S3(s3) => {
                 Ok(s3.get_manifest()?.is_some())
             }
+            StorageClient::Http(http) => {
+                Ok(http.get_manifest()?.is_some())
+            }
         }
     }
 
     // ── Key generation helpers (same format regardless of backend) ──
+    //
+    // Key convention: p/d/ (data), p/it/ (interior), p/ix/ (index)
+    // Short prefixes to save space in manifests.
 
-    /// Generate a page group key: `pg/{group_id}_v{version}`
+    /// Generate a data page group key: `p/d/{group_id}_v{version}`
     pub(crate) fn page_group_key(group_id: u64, version: u64) -> String {
-        format!("pg/{}_v{}", group_id, version)
+        format!("p/d/{}_v{}", group_id, version)
     }
 
-    /// Generate an interior bundle key: `ibc/{chunk_id}_v{version}`
+    /// Generate an interior bundle key: `p/it/{chunk_id}_v{version}`
     pub(crate) fn interior_chunk_key(chunk_id: u32, version: u64) -> String {
-        format!("ibc/{}_v{}", chunk_id, version)
+        format!("p/it/{}_v{}", chunk_id, version)
     }
 
-    /// Generate an index leaf bundle key: `ixb/{chunk_id}_v{version}`
+    /// Generate an index leaf bundle key: `p/ix/{chunk_id}_v{version}`
     pub(crate) fn index_chunk_key(chunk_id: u32, version: u64) -> String {
-        format!("ixb/{}_v{}", chunk_id, version)
+        format!("p/ix/{}_v{}", chunk_id, version)
     }
 
     /// Phase Drift: override frame key.
     pub(crate) fn override_frame_key(group_id: u64, frame_idx: usize, version: u64) -> String {
-        format!("pg/{}_f{}_v{}", group_id, frame_idx, version)
+        format!("p/d/{}_f{}_v{}", group_id, frame_idx, version)
     }
 
     // ── S3-specific operations (no-op for local) ──
@@ -217,6 +238,7 @@ impl StorageClient {
             }
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.range_get(key, start, len),
+            StorageClient::Http(http) => http.range_get(key, start, len),
         }
     }
 
@@ -226,6 +248,7 @@ impl StorageClient {
             StorageClient::Local { .. } => 0,
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.fetch_count.load(Ordering::Relaxed),
+            StorageClient::Http(http) => http.fetch_count.load(Ordering::Relaxed),
         }
     }
 
@@ -235,6 +258,7 @@ impl StorageClient {
             StorageClient::Local { .. } => 0,
             #[cfg(feature = "cloud")]
             StorageClient::S3(s3) => s3.fetch_bytes.load(Ordering::Relaxed),
+            StorageClient::Http(http) => http.fetch_bytes.load(Ordering::Relaxed),
         }
     }
 }

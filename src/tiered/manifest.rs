@@ -20,7 +20,7 @@ pub struct Manifest {
     /// Pages per page group
     #[serde(default = "default_pages_per_group")]
     pub pages_per_group: u32,
-    /// Map groupId → S3 key. Versioned: "pg/{gid}_v{version}"
+    /// Map groupId → S3 key. Versioned: "p/d/{gid}_v{version}"
     #[serde(default)]
     pub page_group_keys: Vec<String>,
     /// Chunked interior bundle: chunk_id → S3 key. Each chunk covers bundle_chunk_range(page_size) page numbers.
@@ -83,6 +83,14 @@ pub struct Manifest {
     /// Used by per-query prefetch schedule selection (SEARCH vs default hops).
     #[serde(skip)]
     pub group_to_tree_name: HashMap<u64, String>,
+
+    /// Full content of page 0 (SQLite's page 1: database header + root table).
+    /// Stored in manifest so multiwriter catch-up can write it to local cache,
+    /// giving SQLite the correct database header (page count, schema cookie)
+    /// without fetching from S3 or reopening the connection.
+    /// None for manifests created before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_header: Option<Vec<u8>>,
 }
 
 fn default_strategy() -> GroupingStrategy {
@@ -178,6 +186,7 @@ impl Manifest {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: None,
         }
     }
 
@@ -328,9 +337,11 @@ pub(crate) fn dirty_frames_for_group(
     for &dirty_pnum in dirty_page_nums {
         if let Some(pos) = group_pages.iter().position(|&p| p == dirty_pnum) {
             let frame_idx = pos / sub_pages_per_frame as usize;
-            if frame_idx < frame_table.len() {
-                dirty_frame_set.insert(frame_idx);
-            }
+            // Include frames beyond the base frame_table: new pages assigned
+            // to this group may land in frames that don't exist in the base
+            // page group yet. Override frames are standalone S3 objects, so
+            // they don't require a base frame_table entry.
+            dirty_frame_set.insert(frame_idx);
         }
     }
     let mut result: Vec<usize> = dirty_frame_set.into_iter().collect();

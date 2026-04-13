@@ -13,7 +13,7 @@ pub struct TurboliteSharedState {
     pub(super) cache: Arc<DiskCache>,
     pub(super) prefetch_pool: Arc<PrefetchPool>,
     // Shared state for flush_to_s3()
-    pub(super) shared_manifest: Arc<RwLock<Manifest>>,
+    pub(super) shared_manifest: Arc<ArcSwap<Manifest>>,
     pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     pub(super) flush_lock: Arc<Mutex<()>>,
@@ -55,8 +55,10 @@ impl TurboliteSharedState {
         // Clear bitmap except for interior pages, index pages, group 0, and pending groups
         {
             let gp = self.cache.group_pages.read();
-            let mut bitmap = self.cache.bitmap.lock();
-            bitmap.bits.fill(0);
+            let bitmap = self.cache.bitmap.read();
+            for b in &bitmap.bits {
+                b.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
             }
@@ -134,8 +136,10 @@ impl TurboliteSharedState {
         // Clear bitmap except for interior pages, group 0, and pending groups
         {
             let gp = self.cache.group_pages.read();
-            let mut bitmap = self.cache.bitmap.lock();
-            bitmap.bits.fill(0);
+            let bitmap = self.cache.bitmap.read();
+            for b in &bitmap.bits {
+                b.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
             }
@@ -210,8 +214,10 @@ impl TurboliteSharedState {
         self.cache.index_pages.lock().clear();
 
         {
-            let mut bitmap = self.cache.bitmap.lock();
-            bitmap.bits.fill(0);
+            let bitmap = self.cache.bitmap.read();
+            for b in &bitmap.bits {
+                b.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = bitmap.persist();
         }
 
@@ -283,7 +289,7 @@ impl TurboliteSharedState {
     /// Returns the number of groups evicted.
     pub fn evict_tree(&self, tree_names_csv: &str) -> u32 {
         let pending = self.shared_dirty_groups.lock().unwrap().clone();
-        let manifest = self.shared_manifest.read();
+        let manifest = self.shared_manifest.load();
         let interior_groups = self.cache.interior_groups.lock().clone();
 
         let mut evicted = 0u32;
@@ -354,7 +360,7 @@ impl TurboliteSharedState {
     /// Return cache info as a JSON string. Includes size, tier breakdown,
     /// cached/total group counts, and S3 stats.
     pub fn cache_info(&self) -> String {
-        let manifest = self.shared_manifest.read();
+        let manifest = self.shared_manifest.load();
         let page_size = manifest.page_size as u64;
         let sub_pages = self.cache.sub_pages_per_frame as u64;
         let sub_chunk_bytes = sub_pages * page_size;
@@ -422,7 +428,7 @@ impl TurboliteSharedState {
     /// Note: requires a valid sqlite3 db handle to run EQP. The FFI entry point
     /// in ext_entry.c passes the db handle from the SQL function context.
     pub fn warm_from_plan(&self, accesses: &[query_plan::PlannedAccess]) -> String {
-        let manifest = self.shared_manifest.read();
+        let manifest = self.shared_manifest.load();
         let mut trees_warmed: Vec<String> = Vec::new();
         let mut groups_submitted = 0u32;
 
@@ -442,7 +448,7 @@ impl TurboliteSharedState {
                         self.prefetch_pool.submit(
                             gid, key.clone(), ft,
                             manifest.page_size, manifest.sub_pages_per_frame,
-                            gp, ovrs,
+                            gp, ovrs, manifest.version,
                         );
                         groups_submitted += 1;
                     }
@@ -464,7 +470,7 @@ impl TurboliteSharedState {
         if pending.is_empty() {
             return HashMap::new();
         }
-        let manifest = self.shared_manifest.read();
+        let manifest = self.shared_manifest.load();
         let mut result = HashMap::new();
         for &gid in pending.iter() {
             let pages = manifest.group_page_nums(gid).into_owned();
@@ -478,7 +484,7 @@ impl TurboliteSharedState {
     /// All pages must be in the local cache before calling (run a query or warm first).
     /// Returns JSON report with compaction results.
     pub fn compact(&self, threshold: f64) -> io::Result<String> {
-        let manifest = self.shared_manifest.read().clone();
+        let manifest = (**self.shared_manifest.load()).clone();
         let page_size = manifest.page_size;
         let ppg = manifest.pages_per_group;
 
@@ -505,7 +511,7 @@ impl TurboliteSharedState {
         let mut compacted = 0u32;
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
-        let mut manifest = self.shared_manifest.write();
+        let mut manifest = (**self.shared_manifest.load()).clone();
         // Phase Somme: use file change counter from cache for version
         let next_version = read_change_counter_from_cache(&self.cache, page_size);
 
@@ -660,6 +666,7 @@ impl TurboliteSharedState {
 
         // Upload new manifest
         self.s3.put_manifest(&manifest)?;
+        self.shared_manifest.store(Arc::new(manifest));
 
         // GC old groups
         if !replaced_keys.is_empty() && self.gc_enabled {
@@ -689,7 +696,7 @@ impl TurboliteSharedState {
     pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
         use std::os::unix::fs::FileExt;
 
-        let manifest = self.shared_manifest.read().clone();
+        let manifest = (**self.shared_manifest.load()).clone();
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
 

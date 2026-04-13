@@ -297,7 +297,7 @@ fn test_seekable_manifest_serde_with_frames() {
         page_count: 128,
         page_size: 4096,
         pages_per_group: 64,
-        page_group_keys: vec!["pg/0_v1".to_string(), "pg/1_v1".to_string()],
+        page_group_keys: vec!["p/d/0_v1".to_string(), "p/d/1_v1".to_string()],
         frame_tables: vec![
             vec![
                 FrameEntry { offset: 0, len: 500 },
@@ -419,7 +419,7 @@ fn test_write_page_does_not_mark_sub_chunk_tracker() {
     cache.write_page(0, &data).unwrap();
 
     // Bitmap should mark page 0 present
-    assert!(cache.bitmap.lock().is_present(0));
+    assert!(cache.bitmap.read().is_present(0));
 
     // Sub-chunk tracker should NOT mark sub-chunk as present
     let tracker = cache.tracker.lock();
@@ -569,7 +569,9 @@ fn test_bitmap_fallback_after_clear_cache_index() {
     assert!(cache.is_present(5));
 
     // Raw bitmap clear (no index_pages re-mark) — page disappears
-    cache.bitmap.lock().bits.fill(0);
+    for b in &cache.bitmap.read().bits {
+        b.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     assert!(!cache.is_present(5),
         "after raw bitmap clear, eagerly loaded page should not be present");
 }
@@ -595,9 +597,11 @@ fn test_index_pages_survive_clear_cache() {
     let idx = cache.index_pages.lock().clone();
     let ppg = cache.pages_per_group as u64;
     {
-        let mut bitmap = cache.bitmap.lock();
+        let bitmap = cache.bitmap.read();
         let total_pages = bitmap.bits.len() as u64 * 8;
-        bitmap.bits.fill(0);
+        for b in &bitmap.bits {
+            b.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         for &p in &pinned { bitmap.mark_present(p); }
         for &p in &idx { bitmap.mark_present(p); }
         let g0_end = ppg.min(total_pages);

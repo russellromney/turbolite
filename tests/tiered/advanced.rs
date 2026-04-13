@@ -436,6 +436,8 @@ fn test_ppg_mismatch_uses_manifest() {
 
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
+    // Verify S3 manifest is readable before opening cold reader
+    super::helpers::verify_s3_manifest(&bucket, &prefix, &endpoint, 1, 65536);
     drop(conn);
 
     // Read with DIFFERENT pages_per_group in config (64 instead of 2048).

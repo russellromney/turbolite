@@ -47,6 +47,141 @@ pub fn endpoint_url() -> String {
         .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
+/// Storage tier: local-only (no S3) or S3-backed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageTier {
+    /// Pure local storage, no S3 dependency.
+    Local,
+    /// S3-backed with Durable sync (checkpoint uploads to S3).
+    S3Durable,
+    /// S3-backed with LocalThenFlush (checkpoint writes locally, explicit flush uploads).
+    S3LocalThenFlush,
+}
+
+/// Test mode: combinatorial product of storage x compression x encryption.
+/// 3 storage tiers x 2 compression x 2 encryption = 12 combinations.
+#[derive(Debug, Clone, Copy)]
+pub struct TestMode {
+    pub storage: StorageTier,
+    pub compressed: bool,
+    pub encrypted: bool,
+}
+
+/// Deterministic test encryption key (NOT for production).
+const TEST_ENCRYPTION_KEY: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
+impl TestMode {
+    /// All 12 combinations.
+    pub fn all() -> Vec<TestMode> {
+        let mut modes = Vec::new();
+        for &storage in &[StorageTier::Local, StorageTier::S3Durable, StorageTier::S3LocalThenFlush] {
+            for &compressed in &[false, true] {
+                for &encrypted in &[false, true] {
+                    modes.push(TestMode { storage, compressed, encrypted });
+                }
+            }
+        }
+        modes
+    }
+
+    /// S3 modes only (Durable + LTF). For tests that need S3.
+    pub fn s3_modes() -> Vec<TestMode> {
+        Self::all().into_iter().filter(|m| m.storage != StorageTier::Local).collect()
+    }
+
+    /// S3 Durable modes only. For tests that need cold-read from S3.
+    pub fn s3_durable_modes() -> Vec<TestMode> {
+        Self::all().into_iter().filter(|m| m.storage == StorageTier::S3Durable).collect()
+    }
+
+    /// Short name for test output and unique prefixes.
+    pub fn name(&self) -> String {
+        let stor = match self.storage {
+            StorageTier::Local => "local",
+            StorageTier::S3Durable => "s3",
+            StorageTier::S3LocalThenFlush => "s3ltf",
+        };
+        let comp = if self.compressed { "_zstd" } else { "_plain" };
+        let enc = if self.encrypted { "_enc" } else { "" };
+        format!("{}{}{}", stor, comp, enc)
+    }
+
+    /// Apply this mode's settings to a TurboliteConfig.
+    pub fn apply(&self, config: &mut TurboliteConfig) {
+        config.compression_level = if self.compressed { 3 } else { 0 };
+
+        if self.encrypted {
+            #[cfg(feature = "encryption")]
+            {
+                config.encryption_key = Some(TEST_ENCRYPTION_KEY);
+            }
+        }
+
+        match self.storage {
+            StorageTier::Local => {
+                // Local mode: no S3 fields needed, test_config already sets them
+                // but we override to local-only by clearing bucket
+            }
+            StorageTier::S3Durable => {
+                // Default sync_mode is Durable, no change needed
+            }
+            StorageTier::S3LocalThenFlush => {
+                config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+            }
+        }
+    }
+
+    pub fn is_s3(&self) -> bool {
+        self.storage != StorageTier::Local
+    }
+
+    pub fn supports_cold_read(&self) -> bool {
+        self.storage == StorageTier::S3Durable
+    }
+}
+
+/// Macro to generate one #[test] fn per TestMode for a given test body function.
+/// Usage: `mode_tests!(test_fn_name, run_fn, modes_fn);`
+/// Run a test function across all S3 Durable mode combinations.
+/// Panics with mode name on failure.
+pub fn run_across_s3_durable(f: impl Fn(TestMode)) {
+    for mode in TestMode::s3_durable_modes() {
+        eprintln!("--- running mode: {} ---", mode.name());
+        f(mode);
+    }
+}
+
+/// Run a test function across all S3 mode combinations (Durable + LTF).
+pub fn run_across_all_s3(f: impl Fn(TestMode)) {
+    for mode in TestMode::s3_modes() {
+        eprintln!("--- running mode: {} ---", mode.name());
+        f(mode);
+    }
+}
+
+/// Create a TurboliteConfig for a specific test mode with a unique prefix.
+pub fn test_config_mode(prefix: &str, cache_dir: &std::path::Path, mode: TestMode) -> TurboliteConfig {
+    let mut config = test_config(prefix, cache_dir);
+    mode.apply(&mut config);
+    config
+}
+
+/// Create a cold reader config that inherits encryption from the writer mode.
+pub fn cold_reader_config_mode(
+    bucket: &str, prefix: &str, endpoint: &Option<String>,
+    cache_dir: &std::path::Path, mode: TestMode,
+) -> TurboliteConfig {
+    let mut config = cold_reader_config(bucket, prefix, endpoint, cache_dir);
+    mode.apply(&mut config);
+    // Cold readers are always read-only (already set by cold_reader_config)
+    config
+}
+
 /// Create a TurboliteConfig with a unique prefix (so tests don't collide).
 pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let unique_prefix = format!(

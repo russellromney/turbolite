@@ -40,6 +40,31 @@ Benchmarks are organized by **cache level** (what's already on local disk when t
 
 **interior** is the most realistic cold benchmark: interior pages load eagerly on connection open, so by the time you run your first query, they're cached. Index pages aggressively prefetch on first access in the background and may not be ready yet.
 
+### Warm cache (VFS overhead vs plain SQLite)
+
+100K rows, Fly.io performance-2x (dedicated vCPU, NVMe, IAD):
+
+| Operation | SQLite | turbolite | Overhead |
+|-----------|--------|-----------|----------|
+| Point lookup | 145K/s | 73K/s | 2.0x |
+| Range scan | 8.8K/s | 8.3K/s | **parity** |
+| Full table scan | 56/s | 60/s | **parity** |
+| INSERT | 19K/s | 23K/s | **faster** |
+| UPDATE by PK | 40K/s | 27K/s | 1.5x |
+| Batch INSERT (in txn) | 685K/s | 740K/s | **faster** |
+
+Point lookups have the highest per-page overhead (~2x). Everything else approaches or beats parity. Lock-free cache architecture means concurrent reads never block writes.
+
+### Checkpoint cost
+
+| After | Local | S3 (same-region RustFS) |
+|-------|-------|-------------------------|
+| 1K inserts | 19ms | 38ms |
+| 10K batch | 17ms | 114ms |
+| 1K updates | 9ms | 36ms |
+
+Writes are always local-speed. The S3 cost is at checkpoint only. Numbers with RustFS in same Fly region (~2ms RTT). S3 Express One Zone would be comparable.
+
 ## Quick Start
 
 ### Python
@@ -121,6 +146,14 @@ Each consecutive miss advances through a **prefetch schedule** that controls wha
 You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
+
+### A note on precise prefetch
+
+turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
+
+In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Jena's precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
+
+The code is there (`TURBOLITE_JENA=true` to enable) for future investigation. It may work better on lower-latency backends (S3 Express, ~4ms GETs) where the cost of an extra GET is cheap and precision matters more. For now, the hop schedule wins.
 
 ### Encryption & Compression
 
