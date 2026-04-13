@@ -1212,7 +1212,11 @@ impl DiskCache {
                 bitmap.clear(pnum);
             }
         }
-        // Free in-memory cache entries
+        // Free in-memory cache entries.
+        // Safety: clear_pages_from_disk is called during eviction, which happens during
+        // sync() under SQLite's EXCLUSIVE lock. Other handles cannot read during EXCLUSIVE
+        // because SQLite's WAL protocol blocks reader lock acquisition until checkpoint
+        // completes. Therefore no concurrent read_page can hold a pointer to these pages.
         if let Some(ref mc) = self.mem_cache {
             let ps = self.page_size.load(Ordering::Relaxed) as u64;
             for &pnum in page_nums {

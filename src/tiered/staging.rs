@@ -172,6 +172,10 @@ pub(crate) fn read_staging_manifest(
             let mut len_buf = [0u8; 8];
             reader.read_exact(&mut len_buf)?;
             let manifest_len = u64::from_le_bytes(len_buf) as usize;
+            // Guard against corrupted length (partial crash during manifest write)
+            if manifest_len > 10_000_000 {
+                return Ok(None); // > 10MB manifest is clearly corrupt
+            }
             let mut manifest_data = vec![0u8; manifest_len];
             reader.read_exact(&mut manifest_data)?;
             return Ok(Some(manifest_data));
