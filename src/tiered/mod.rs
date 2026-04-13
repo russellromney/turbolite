@@ -128,7 +128,6 @@ pub(crate) use cache_tracking::*;
 pub(crate) use disk_cache::*;
 pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
-pub(crate) use query_plan::*;
 pub(crate) use s3_client::*;
 pub(crate) use storage_client::*;
 

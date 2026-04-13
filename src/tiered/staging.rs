@@ -93,10 +93,12 @@ impl StagingWriter {
         Ok((self.path, self.pages_written))
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    #[allow(dead_code)]
     pub fn pages_written(&self) -> u64 {
         self.pages_written
     }
@@ -110,7 +112,7 @@ pub(crate) fn read_staging_log(
 ) -> io::Result<HashMap<u64, Vec<u8>>> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
-    let record_size = 8 + page_size as u64;
+    let _record_size = 8 + page_size as u64;
 
     if file_len == 0 {
         return Ok(HashMap::new());

@@ -99,6 +99,7 @@ impl HttpClient {
         }
     }
 
+    #[allow(dead_code)]
     async fn range_get_async(&self, key: &str, start: u64, len: u32) -> io::Result<Option<Vec<u8>>> {
         let range = format!("bytes={}-{}", start, start + len as u64 - 1);
         let mut retries = 0u32;
@@ -211,6 +212,7 @@ impl HttpClient {
 
     // ── Parallel batch operations ──
 
+    #[allow(dead_code)]
     async fn get_page_groups_by_key_async(&self, keys: &[String]) -> io::Result<HashMap<String, Vec<u8>>> {
         let mut handles = Vec::with_capacity(keys.len());
         for key in keys {
@@ -324,6 +326,7 @@ impl HttpClient {
         Self::block_on(&self.runtime, self.get_object_async(key))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_page_groups_by_key(&self, keys: &[String]) -> io::Result<HashMap<String, Vec<u8>>> {
         Self::block_on(&self.runtime, self.get_page_groups_by_key_async(keys))
     }
@@ -336,6 +339,7 @@ impl HttpClient {
         Self::block_on(&self.runtime, self.delete_objects_async(keys))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn range_get(&self, key: &str, start: u64, len: u32) -> io::Result<Option<Vec<u8>>> {
         Self::block_on(&self.runtime, self.range_get_async(key, start, len))
     }

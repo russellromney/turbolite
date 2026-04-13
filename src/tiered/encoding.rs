@@ -28,7 +28,7 @@ pub(crate) fn encode_page_group(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    encryption_key: Option<&[u8; 32]>,
+    _encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     // Find last non-empty page to avoid trailing zeros
     let page_count = pages
@@ -87,7 +87,7 @@ pub(crate) fn encode_page_group_seekable(
     sub_ppg: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    encryption_key: Option<&[u8; 32]>,
+    _encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(Vec<u8>, Vec<FrameEntry>)> {
     // Find last non-empty page to avoid trailing zeros
     let page_count = pages
@@ -122,7 +122,7 @@ pub(crate) fn encode_page_group_seekable(
         }
 
         let offset = blob.len() as u64;
-        let mut frame_data = compress::compress(
+        let frame_data = compress::compress(
             &raw,
             compression_level,
             #[cfg(feature = "zstd")]
@@ -319,7 +319,7 @@ pub(crate) fn encode_interior_bundle(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    encryption_key: Option<&[u8; 32]>,
+    _encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     let page_count = pages.len() as u32;
     let header_len = 8 + pages.len() * 8; // 2×u32 + page_count×u64
@@ -427,7 +427,7 @@ pub(crate) fn encode_override_frame(
             raw.resize(raw.len() + page_size as usize - data.len(), 0);
         }
     }
-    let mut frame_data = compress::compress(
+    let frame_data = compress::compress(
         &raw, compression_level,
         #[cfg(feature = "zstd")] encoder_dict,
         #[cfg(not(feature = "zstd"))] None,

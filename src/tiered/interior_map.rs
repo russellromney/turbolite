@@ -186,6 +186,7 @@ impl InteriorMap {
 
     /// Find ALL leaf groups under a given interior page (recursive).
     /// Useful for SCAN: prefetch every leaf group in this subtree.
+    #[allow(dead_code)]
     pub fn subtree_groups(&self, interior_page: u64) -> Vec<u64> {
         let mut groups = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -193,6 +194,7 @@ impl InteriorMap {
         groups
     }
 
+    #[allow(dead_code)]
     fn collect_subtree_groups(
         &self,
         page: u64,

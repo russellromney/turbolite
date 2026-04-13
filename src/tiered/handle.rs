@@ -486,10 +486,12 @@ impl TurboliteHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn s3(&self) -> &S3Client {
         self.s3.as_ref().expect("s3 client required for tiered mode")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn disk_cache(&self) -> &DiskCache {
         self.cache
             .as_ref()
@@ -497,6 +499,7 @@ impl TurboliteHandle {
     }
 
     /// Copy raw page data into the output buffer, handling sub-page offsets.
+    #[allow(dead_code)]
     pub(crate) fn copy_raw_into_buf(
         raw: &[u8],
         buf: &mut [u8],
