@@ -138,6 +138,33 @@ enum Commands {
         cache_dir: PathBuf,
     },
 
+    /// Validate database integrity against S3
+    Validate {
+        /// Path to the database file
+        #[arg(long)]
+        db: PathBuf,
+
+        /// S3 bucket (required, or set TURBOLITE_BUCKET)
+        #[arg(long, env = "TURBOLITE_BUCKET")]
+        bucket: String,
+
+        /// S3 key prefix (or set TURBOLITE_PREFIX)
+        #[arg(long, env = "TURBOLITE_PREFIX")]
+        prefix: Option<String>,
+
+        /// S3 endpoint URL (or set AWS_ENDPOINT_URL)
+        #[arg(long, env = "AWS_ENDPOINT_URL")]
+        endpoint: Option<String>,
+
+        /// AWS region (or set AWS_REGION)
+        #[arg(long, env = "AWS_REGION")]
+        region: Option<String>,
+
+        /// Local cache directory
+        #[arg(long, default_value = "/tmp/turbolite-cache")]
+        cache_dir: PathBuf,
+    },
+
     /// Import a plain SQLite file into turbolite S3 format
     Import {
         /// Path to the plain SQLite file to import
@@ -510,6 +537,79 @@ fn cmd_download(
     Ok(())
 }
 
+fn cmd_validate(
+    db: PathBuf,
+    bucket: String,
+    prefix: Option<String>,
+    endpoint: Option<String>,
+    region: Option<String>,
+    cache_dir: PathBuf,
+) -> Result<()> {
+    let config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, true);
+    let vfs_name = format!("turbolite-validate-{}", std::process::id());
+    let (shared, conn) = open_shared(&db, config, &vfs_name)?;
+
+    println!("validating manifest...");
+    let mut result = shared.validate()
+        .map_err(|e| anyhow!("validate failed: {}", e))?;
+
+    println!(
+        "  page groups:       {}/{} present",
+        result.page_groups_present, result.page_groups_total,
+    );
+    for key in &result.page_groups_missing {
+        println!("    MISSING: {}", key);
+    }
+
+    println!(
+        "  interior chunks:   {}/{} present",
+        result.interior_chunks_present, result.interior_chunks_total,
+    );
+    for key in &result.interior_chunks_missing {
+        println!("    MISSING: {}", key);
+    }
+
+    println!(
+        "  index chunks:      {}/{} present",
+        result.index_chunks_present, result.index_chunks_total,
+    );
+    for key in &result.index_chunks_missing {
+        println!("    MISSING: {}", key);
+    }
+
+    println!("  orphaned objects:  {}", result.orphaned_keys.len());
+    for key in &result.orphaned_keys {
+        println!("    ORPHAN: {}", key);
+    }
+
+    if !result.decode_errors.is_empty() {
+        println!("\nvalidating data...");
+        for (key, err) in &result.decode_errors {
+            println!("  DECODE ERROR: {} -- {}", key, err);
+        }
+    } else {
+        println!("\nvalidating data...");
+        println!("  page groups:       {}/{} decode ok", result.page_groups_present, result.page_groups_total);
+    }
+
+    println!("\nvalidating database...");
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .context("integrity_check failed")?;
+    result.integrity_check = Some(integrity.clone());
+    println!("  integrity_check:   {}", integrity);
+
+    println!();
+    if result.passed() {
+        println!("validate: passed");
+    } else {
+        println!("validate: FAILED");
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 fn cmd_export(
     db: PathBuf,
     output: PathBuf,
@@ -617,6 +717,9 @@ fn main() -> Result<()> {
         }
         Commands::Download { db, bucket, prefix, endpoint, region, cache_dir, threads } => {
             cmd_download(db, bucket, prefix, endpoint, region, cache_dir, threads)?;
+        }
+        Commands::Validate { db, bucket, prefix, endpoint, region, cache_dir } => {
+            cmd_validate(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
         Commands::Export { db, output, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_export(db, output, bucket, prefix, endpoint, region, cache_dir)?;

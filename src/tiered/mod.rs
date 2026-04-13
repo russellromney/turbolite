@@ -112,6 +112,34 @@ pub use settings::{turbolite_config_set, push_setting};
 #[cfg(all(feature = "encryption", feature = "cloud"))]
 pub use rotation::rotate_encryption_key;
 
+/// Result of a database validation run.
+#[derive(Debug)]
+pub struct ValidateResult {
+    pub manifest_version: u64,
+    pub page_groups_total: usize,
+    pub page_groups_present: usize,
+    pub page_groups_missing: Vec<String>,
+    pub interior_chunks_total: usize,
+    pub interior_chunks_present: usize,
+    pub interior_chunks_missing: Vec<String>,
+    pub index_chunks_total: usize,
+    pub index_chunks_present: usize,
+    pub index_chunks_missing: Vec<String>,
+    pub orphaned_keys: Vec<String>,
+    pub decode_errors: Vec<(String, String)>,
+    pub integrity_check: Option<String>,
+}
+
+impl ValidateResult {
+    pub fn passed(&self) -> bool {
+        self.page_groups_missing.is_empty()
+            && self.interior_chunks_missing.is_empty()
+            && self.index_chunks_missing.is_empty()
+            && self.decode_errors.is_empty()
+            && self.integrity_check.as_deref() == Some("ok")
+    }
+}
+
 // Backward-compat type aliases (deprecated, use Turbolite* names)
 #[deprecated(note = "renamed to TurboliteVfs")]
 pub type TieredVfs = TurboliteVfs;
