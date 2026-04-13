@@ -483,8 +483,8 @@ turbolite gc --db my.db --bucket my-bucket
 # Force checkpoint + S3 upload
 turbolite checkpoint --db my.db --bucket my-bucket
 
-# Warm local cache by fetching all page groups
-turbolite prefetch --db my.db --bucket my-bucket --threads 8
+# Download entire database from S3 into local cache
+turbolite download --db my.db --bucket my-bucket --threads 8
 
 # Export to plain SQLite (for migration or backup)
 turbolite export --db my.db --output plain.db
