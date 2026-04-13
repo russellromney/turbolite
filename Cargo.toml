@@ -63,7 +63,7 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.35", optional = true }
+rusqlite = { version = "0.35", features = ["backup"], optional = true }
 libsqlite3-sys = { version = "0.33", features = ["bundled"], optional = true }
 tempfile = "3"
 ureq = "2"

@@ -458,6 +458,43 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 )?;
 ```
 
+## CLI
+
+turbolite ships a CLI for inspecting, managing, and interacting with turbolite databases without writing Rust.
+
+```bash
+cargo install turbolite --features cloud,zstd
+```
+
+### Commands
+
+```bash
+# Inspect a database manifest
+turbolite info --db my.db
+turbolite info --db my.db --bucket my-bucket --endpoint https://t3.storage.dev
+
+# Interactive SQLite shell (with turbolite VFS)
+turbolite shell --db my.db
+turbolite shell --db my.db --bucket my-bucket --read-only
+
+# Garbage collection (delete orphaned S3 objects)
+turbolite gc --db my.db --bucket my-bucket
+
+# Force checkpoint + S3 upload
+turbolite checkpoint --db my.db --bucket my-bucket
+
+# Warm local cache by fetching all page groups
+turbolite prefetch --db my.db --bucket my-bucket --threads 8
+
+# Export to plain SQLite (for migration or backup)
+turbolite export --db my.db --output plain.db
+
+# Import a plain SQLite file into turbolite S3 format
+turbolite import --input plain.db --bucket my-bucket --prefix databases/my-db
+```
+
+All S3 commands accept `--bucket`, `--prefix`, `--endpoint`, and `--region` flags, or read from `TURBOLITE_BUCKET`, `TURBOLITE_PREFIX`, `AWS_ENDPOINT_URL`, and `AWS_REGION` environment variables.
+
 ## Related Projects and Comparison
 
 There are many projects in the SQLite-over-network space. turbolite borrows ideas from all of them.

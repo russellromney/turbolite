@@ -1,7 +1,41 @@
 # turbolite Roadmap
 
+## Mercury: CLI
+> After: Pelican (CHANGELOG) · Before: Soyuz
+
+Replace the placeholder CLI binary with a useful command-line tool for inspecting,
+managing, and interacting with turbolite databases. Currently the only way to GC,
+import, export, or inspect a manifest is through the Rust API. A CLI makes turbolite
+usable by operators and scripts without writing Rust.
+
+### a. Core commands (high value)
+- [ ] `turbolite info <db>` -- print manifest summary: page count, group count, compression ratio, S3 size vs uncompressed, storage backend, last checkpoint. The "is my database healthy?" command.
+- [ ] `turbolite shell <db>` -- open an interactive SQLite REPL on a turbolite database (register VFS, open connection, readline loop). Saves users from manually wiring up the VFS.
+- [ ] `turbolite gc <db>` -- run garbage collection on old page group versions. Currently only available via Rust API.
+
+### b. Operations commands (medium value)
+- [ ] `turbolite checkpoint <db>` -- force checkpoint + S3 upload. Useful for cron jobs or pre-shutdown scripts.
+- [ ] `turbolite prefetch <db>` -- warm the local cache by fetching all page groups from S3. "I'm about to get traffic, pre-warm this database."
+- [ ] `turbolite export <db> <path>` -- materialize a turbolite database into a plain SQLite file (decompress, decrypt, write sequential pages). For migration or backup.
+- [ ] `turbolite import <path> <db>` -- take a plain SQLite file and chunk it into turbolite format in S3. Onboarding path.
+
+### c. Nice to have
+- [ ] `turbolite dict train <db>` -- train a zstd dictionary from a database's pages. Currently only in the bench binary.
+- [ ] `turbolite keys rotate <db>` -- encryption key rotation from CLI instead of Rust API.
+- [ ] `turbolite bench` -- move tiered-bench into CLI subcommand.
+
+### d. Tests
+- [ ] Integration tests for each command (invoke binary, check output/exit code)
+- [ ] `info` on local and S3 databases, empty database, corrupted manifest
+- [ ] `shell` executes SQL and returns results
+- [ ] `gc` removes old versions, idempotent on clean database
+- [ ] `export` produces valid SQLite file, `import` round-trips with `export`
+- [ ] `checkpoint` forces upload, `prefetch` warms cache
+
+---
+
 ## Soyuz: Migrate from sqlite-vfs to sqlite-plugin
-> After: Pelican (CHANGELOG) · Before: Valkyrie
+> After: Mercury · Before: Valkyrie
 
 Replace `sqlite-vfs` (rkusa, unmaintained since 2022, self-described prototype) with
 `sqlite-plugin` (orbitinghail/Carl Sverre, active, used by Graft).
@@ -276,12 +310,6 @@ Value partitions are read-only, built at import. Handle staleness gracefully.
 - [ ] `madvise(MADV_RANDOM)`
 - [ ] Handle cache file growth: `mremap` on Linux, re-map on macOS
 - [ ] Benchmark: warm lookup latency mmap vs pread (expect ~10-50us to ~1-5us)
-
-### CLI subcommands
-- [ ] `turbolite bench` -- move tiered-bench into CLI subcommand
-- [ ] `turbolite gc --bucket X --prefix Y` -- one-shot GC
-- [ ] `turbolite import --bucket X --prefix Y --db local.db`
-- [ ] `turbolite info --bucket X --prefix Y` -- print manifest summary
 
 ### Bidirectional prefetch
 - Track access direction, prefetch backward for DESC queries
