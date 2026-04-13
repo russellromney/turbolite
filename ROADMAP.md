@@ -270,6 +270,24 @@ Value partitions are read-only, built at import. Handle staleness gracefully.
 
 ## Future
 
+### `turbolite validate`
+Verify database integrity against S3. No flags, just check everything.
+
+- [ ] Manifest consistency: all page_group_keys, interior_chunk_keys, index_chunk_keys exist in S3 (HEAD requests)
+- [ ] Orphan detection: objects in S3 prefix not referenced by manifest
+- [ ] Data integrity: every page group decodes without error (decompress + decrypt)
+- [ ] Frame table validation: frame entries match actual encoded data boundaries
+- [ ] Interior/index chunk decode verification
+- [ ] SQLite integrity: open via VFS, run `PRAGMA integrity_check`
+- [ ] Output: per-step pass/fail summary, exit 0 on success, exit 1 on any failure
+- [ ] Test: validate clean database (pass), validate with missing S3 key (fail), validate with corrupted page group (fail)
+
+### Shell tab completion
+- [ ] Table name completion after FROM, JOIN, INTO, UPDATE, etc.
+- [ ] Column name completion after SELECT, WHERE, ORDER BY (requires schema introspection)
+- [ ] `.tables`, `.schema`, `.quit` completion after `.`
+- [ ] Use rustyline or similar for readline + completion
+
 ### mmap cache
 - [ ] `mmap` the cache file instead of `pread` for reads
 - [ ] Keep `pwrite` for cache population
