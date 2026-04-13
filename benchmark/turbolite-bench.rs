@@ -440,7 +440,7 @@ fn bench_with_corpus(
     cache_percent: f64,
     mmap_percent: f64,
     wal_autocheckpoint: i64,
-    encryption_key: &str,
+    _encryption_key: &str,
     fresh: bool,
     vfs_counter: &std::sync::atomic::AtomicU32,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
@@ -675,7 +675,7 @@ fn bench_existing_db(
     cache_percent: f64,
     mmap_percent: f64,
     wal_autocheckpoint: i64,
-    encryption_key: Option<&str>,
+    _encryption_key: Option<&str>,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
     let start_total = Instant::now();
 

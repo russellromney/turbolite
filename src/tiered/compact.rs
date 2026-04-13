@@ -12,6 +12,7 @@ use super::*;
 
 /// Per-B-tree dead space analysis.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BTreeDeadSpace {
     pub name: String,
     pub root_page: u64,
@@ -29,6 +30,7 @@ pub struct DeadSpaceReport {
     pub btrees: Vec<BTreeDeadSpace>,
     pub total_live: usize,
     pub total_dead: usize,
+    #[allow(dead_code)]
     pub total_in_groups: usize,
     /// B-trees exceeding the compaction threshold.
     pub candidates: Vec<String>,
@@ -183,6 +185,7 @@ pub fn compact_btree(
 pub struct CompactResult {
     pub btree_name: String,
     pub old_group_ids: Vec<u64>,
+    #[allow(dead_code)]
     pub old_keys: Vec<String>,
     /// New dense-packed page lists (one per new group).
     pub new_groups: Vec<Vec<u64>>,

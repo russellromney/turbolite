@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Phase Verdun: Predictive cross-tree prefetch + access history.
 //!
 //! Learns which B-trees appear together in lock sessions (transactions/queries)

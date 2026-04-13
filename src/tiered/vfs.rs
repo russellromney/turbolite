@@ -59,6 +59,7 @@ pub struct TurboliteVfs {
     /// Tokio runtime handle for spawning WAL replication background task.
     /// None in local-only mode (no tokio dependency).
     #[cfg(feature = "cloud")]
+    #[allow(dead_code)]
     runtime_handle: Option<tokio::runtime::Handle>,
 }
 

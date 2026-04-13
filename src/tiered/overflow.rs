@@ -119,6 +119,7 @@ pub(crate) fn detect_overflow_pages(
 ///
 /// Each overflow page's first 4 bytes contain the next page number (1-based, 0 = end).
 /// The rest is overflow payload data.
+#[allow(dead_code)]
 pub(crate) fn follow_overflow_chain(
     first_page: u64,
     cache: &DiskCache,
