@@ -127,8 +127,8 @@ fn test_help_flag() {
         "help should mention checkpoint command"
     );
     assert!(
-        stdout.contains("prefetch"),
-        "help should mention prefetch command"
+        stdout.contains("download"),
+        "help should mention download command"
     );
 }
 

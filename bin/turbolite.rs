@@ -133,8 +133,8 @@ enum Commands {
         cache_dir: PathBuf,
     },
 
-    /// Warm the local cache by fetching all page groups from S3
-    Prefetch {
+    /// Download the entire database from S3 into local cache
+    Download {
         /// Path to the database file
         #[arg(long)]
         db: PathBuf,
@@ -562,7 +562,7 @@ fn cmd_checkpoint(
     Ok(())
 }
 
-fn cmd_prefetch(
+fn cmd_download(
     db: PathBuf,
     bucket: String,
     prefix: Option<String>,
@@ -574,14 +574,14 @@ fn cmd_prefetch(
     let mut config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, true);
     config.prefetch_threads = threads;
 
-    let vfs_name = format!("turbolite-prefetch-{}", std::process::id());
+    let vfs_name = format!("turbolite-download-{}", std::process::id());
     let (shared, conn) = open_shared(&db, config, &vfs_name)?;
 
     let manifest = shared.manifest();
     let total_groups = manifest.page_group_keys.len();
 
-    // Connection open already fetches interior + index pages eagerly.
-    // Now scan every table to pull all data pages into the local cache.
+    // Connection open fetches interior + index pages eagerly.
+    // Full table scans pull all remaining data pages into local cache.
     let tables: Vec<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -593,7 +593,6 @@ fn cmd_prefetch(
     };
 
     for table in &tables {
-        // Full scan triggers prefetch of all data page groups for this table
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
         let _: i64 = conn
             .query_row(&sql, [], |row| row.get(0))
@@ -602,7 +601,7 @@ fn cmd_prefetch(
 
     let (fetches, bytes) = shared.s3_counters();
     println!(
-        "prefetch: {} tables, {} groups, {} S3 GETs, {:.1} MB fetched",
+        "download: {} tables, {} groups, {} S3 GETs, {:.1} MB",
         tables.len(),
         total_groups,
         fetches,
@@ -726,8 +725,8 @@ fn main() -> Result<()> {
         Commands::Checkpoint { db, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_checkpoint(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
-        Commands::Prefetch { db, bucket, prefix, endpoint, region, cache_dir, threads } => {
-            cmd_prefetch(db, bucket, prefix, endpoint, region, cache_dir, threads)?;
+        Commands::Download { db, bucket, prefix, endpoint, region, cache_dir, threads } => {
+            cmd_download(db, bucket, prefix, endpoint, region, cache_dir, threads)?;
         }
         Commands::Export { db, output, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_export(db, output, bucket, prefix, endpoint, region, cache_dir)?;

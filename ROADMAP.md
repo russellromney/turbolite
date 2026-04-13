@@ -15,7 +15,7 @@ usable by operators and scripts without writing Rust.
 
 ### b. Operations commands (medium value)
 - [ ] `turbolite checkpoint <db>` -- force checkpoint + S3 upload. Useful for cron jobs or pre-shutdown scripts.
-- [ ] `turbolite prefetch <db>` -- warm the local cache by fetching all page groups from S3. "I'm about to get traffic, pre-warm this database."
+- [ ] `turbolite download <db>` -- download the entire database from S3 into local cache.
 - [ ] `turbolite export <db> <path>` -- materialize a turbolite database into a plain SQLite file (decompress, decrypt, write sequential pages). For migration or backup.
 - [ ] `turbolite import <path> <db>` -- take a plain SQLite file and chunk it into turbolite format in S3. Onboarding path.
 
