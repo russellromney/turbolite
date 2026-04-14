@@ -7,7 +7,7 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "turbolite", version, about = "turbolite CLI")]
@@ -18,6 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Generate shell completions (bash, zsh, fish)
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Print manifest summary for a turbolite database
     Info {
         /// Path to the database file
@@ -754,6 +761,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "turbolite",
+                &mut std::io::stdout(),
+            );
+        }
         Commands::Info { db, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_info(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
