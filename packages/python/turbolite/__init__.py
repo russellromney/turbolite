@@ -20,7 +20,7 @@ import platform
 import sqlite3
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def _find_ext() -> str:
