@@ -62,7 +62,7 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --bin turbolite --target ${{ matrix.target }} \
-            --features cloud,zstd,bundled-sqlite
+            --features cloud,zstd,bundled-sqlite,wal
 
       - name: Determine library filename
         id: lib
@@ -180,7 +180,7 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --bin turbolite --target ${{ matrix.target }} \
-            --features cloud,zstd,bundled-sqlite
+            --features cloud,zstd,bundled-sqlite,wal
           cp target/${{ matrix.target }}/release/turbolite packages/node/turbolite
           chmod +x packages/node/turbolite
 
