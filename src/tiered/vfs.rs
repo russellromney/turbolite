@@ -1230,6 +1230,12 @@ impl TurboliteVfs {
             eprintln!("[set_manifest] warning: failed to persist manifest locally: {}", e);
         }
 
+        // Bump cache generation so handles see a generation mismatch and bypass
+        // their fast-path cache (which may have stale pages from before the manifest
+        // change). Without this, SQLite reads through the handle's fast path and
+        // returns stale data even after the DiskCache has been updated.
+        self.cache.bump_generation();
+
         // Persist bitmap changes from eviction
         if let Err(e) = self.cache.persist_bitmap() {
             eprintln!("[set_manifest] warning: failed to persist bitmap: {}", e);
