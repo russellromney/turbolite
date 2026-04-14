@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
 
 fn turbolite_bin() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -14,13 +15,17 @@ fn turbolite_bin() -> PathBuf {
     path
 }
 
+static BUILD_ONCE: Once = Once::new();
+
 fn build_bin() {
-    let status = Command::new("cargo")
-        .args(["build", "--bin", "turbolite", "--features", "cloud,zstd"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("failed to build turbolite binary");
-    assert!(status.success(), "cargo build failed");
+    BUILD_ONCE.call_once(|| {
+        let status = Command::new("cargo")
+            .args(["build", "--bin", "turbolite", "--features", "cloud,zstd"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("failed to build turbolite binary");
+        assert!(status.success(), "cargo build failed");
+    });
 }
 
 /// Create a turbolite database by piping SQL through the shell command.

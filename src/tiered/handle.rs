@@ -2024,13 +2024,12 @@ impl DatabaseHandle for TurboliteHandle {
             let _ = cache.persist_bitmap();
 
             // Local mode: flush dirty page groups to local pg/ directory.
-            // Deferred to background -- staging log + cache file provide crash recovery.
-            // The pg/ flush only matters for cold start from scratch (no cache).
+            // Runs synchronously to prevent manifest races: the flush updates
+            // the shared manifest (page_group_keys), so it must complete before
+            // the next checkpoint's sync() reads and modifies the manifest.
+            // A background flush would race with the next checkpoint, causing
+            // lost manifest updates and SQLite corruption under concurrent writes.
             if self.s3.is_none() {
-                // Pure local mode: persist manifest and spawn background flush.
-                // Manifest is persisted synchronously so cold reopens see the
-                // correct version. Page group flush is deferred to a background
-                // thread (staging log replay populates the cache on reopen).
                 {
                     let m = (**self.manifest.load()).clone();
                     let local = manifest::LocalManifest {
@@ -2040,50 +2039,48 @@ impl DatabaseHandle for TurboliteHandle {
                     let _ = local.persist(&cache_dir);
                 }
                 if let Some(ref storage) = self.storage {
-                    let storage = storage.clone();
-                    let cache = cache_arc.clone();
-                    let manifest = Arc::clone(&self.manifest);
-                    let dirty_groups = Arc::clone(&self.s3_dirty_groups);
-                    let pending = Arc::clone(&self.pending_flushes);
-                    let comp_level = self.compression_level;
-                    #[cfg(feature = "zstd")]
-                    let dict = self.dictionary_bytes.clone();
-                    let enc_key = self.encryption_key;
-                    let override_thresh = self.override_threshold;
-                    let compact_thresh = self.compaction_threshold;
-                    std::thread::spawn(move || {
-                        if let Err(e) = flush::flush_local_groups(
-                            &storage,
-                            &cache,
-                            &manifest,
-                            &dirty_groups,
-                            &pending,
-                            comp_level,
-                            #[cfg(feature = "zstd")]
-                            dict.as_deref(),
-                            enc_key,
-                            override_thresh,
-                            compact_thresh,
-                        ) {
-                            eprintln!("[sync] background local flush failed: {}", e);
-                        }
-                    });
+                    if let Err(e) = flush::flush_local_groups(
+                        storage,
+                        cache,
+                        &self.manifest,
+                        &self.s3_dirty_groups,
+                        &self.pending_flushes,
+                        self.compression_level,
+                        #[cfg(feature = "zstd")]
+                        self.dictionary_bytes.as_deref(),
+                        self.encryption_key,
+                        self.override_threshold,
+                        self.compaction_threshold,
+                    ) {
+                        eprintln!("[sync] local flush failed: {}", e);
+                    }
                 }
-            } else if let Some(ref storage) = self.storage {
-                // S3 mode with local storage: flush synchronously (needed before S3 upload)
-                flush::flush_local_groups(
-                    storage,
-                    cache,
-                    &self.manifest,
-                    &self.s3_dirty_groups,
-                    &self.pending_flushes,
-                    self.compression_level,
-                    #[cfg(feature = "zstd")]
-                    self.dictionary_bytes.as_deref(),
-                    self.encryption_key,
-                    self.override_threshold,
-                    self.compaction_threshold,
-                )?;
+            } else {
+                // S3 mode: persist manifest locally for crash recovery,
+                // then flush page groups if storage is available.
+                {
+                    let m = (**self.manifest.load()).clone();
+                    let local = manifest::LocalManifest {
+                        manifest: m,
+                        dirty_groups: pending_groups_snapshot.clone(),
+                    };
+                    let _ = local.persist(&cache_dir);
+                }
+                if let Some(ref storage) = self.storage {
+                    flush::flush_local_groups(
+                        storage,
+                        cache,
+                        &self.manifest,
+                        &self.s3_dirty_groups,
+                        &self.pending_flushes,
+                        self.compression_level,
+                        #[cfg(feature = "zstd")]
+                        self.dictionary_bytes.as_deref(),
+                        self.encryption_key,
+                        self.override_threshold,
+                        self.compaction_threshold,
+                    )?;
+                }
             }
 
             return Ok(());

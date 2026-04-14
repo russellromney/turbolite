@@ -5,9 +5,11 @@
 //! log captures exact page contents at checkpoint time, immune to overwrite by
 //! subsequent checkpoints.
 //!
-//! Format: fixed-size records, no framing:
+//! Format: 4-byte header + fixed-size records:
 //! ```text
-//! [page_num: u64 LE][page_data: [u8; page_size]]
+//! [page_size: u32 LE]
+//! [page_num: u64 LE][page_data: [u8; page_size]]*
+//! [MANIFEST_MAGIC: u64 LE][manifest_len: u64 LE][manifest_data]*
 //! ```
 //!
 //! `flush_to_s3()` reads from staging logs instead of the live disk cache,
@@ -15,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// Magic value to identify manifest trailer in staging log.
@@ -43,7 +45,8 @@ pub(crate) struct StagingWriter {
 }
 
 impl StagingWriter {
-    /// Open a new staging log for writing.
+    /// Open a new staging log for writing. Writes a 4-byte page_size header
+    /// so recovery can parse records without depending on the manifest.
     pub fn open(staging_dir: &Path, version: u64, page_size: u32) -> io::Result<Self> {
         fs::create_dir_all(staging_dir)?;
         let path = staging_dir.join(format!("{}.log", version));
@@ -52,8 +55,10 @@ impl StagingWriter {
             .write(true)
             .truncate(true)
             .open(&path)?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        writer.write_all(&page_size.to_le_bytes())?;
         Ok(Self {
-            writer: BufWriter::with_capacity(256 * 1024, file),
+            writer,
             path,
             page_size,
             pages_written: 0,
@@ -105,30 +110,30 @@ impl StagingWriter {
 }
 
 /// Read all pages from a staging log into a HashMap.
-/// Returns page_num -> page_data.
+/// Returns page_num -> page_data. The `_page_size` argument is ignored;
+/// page size is read from the 4-byte file header.
 pub(crate) fn read_staging_log(
     path: &Path,
-    page_size: u32,
+    _page_size: u32,
 ) -> io::Result<HashMap<u64, Vec<u8>>> {
     let file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let _record_size = 8 + page_size as u64;
-
-    if file_len == 0 {
+    if file.metadata()?.len() < 4 {
         return Ok(HashMap::new());
     }
 
-    // File may contain a manifest trailer (MANIFEST_MAGIC + length + data),
-    // so we can't validate total file size as a multiple of record_size.
-    // Instead, we read records until we hit MANIFEST_MAGIC or EOF.
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut ps_buf = [0u8; 4];
+    reader.read_exact(&mut ps_buf)?;
+    let page_size = u32::from_le_bytes(ps_buf);
+    if page_size == 0 || page_size > 65536 {
+        return Ok(HashMap::new());
+    }
 
     let mut pages = HashMap::new();
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut page_num_buf = [0u8; 8];
     let mut page_buf = vec![0u8; page_size as usize];
 
     loop {
-        // Read page_num (or manifest magic)
         match reader.read_exact(&mut page_num_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -136,9 +141,8 @@ pub(crate) fn read_staging_log(
         }
         let page_num = u64::from_le_bytes(page_num_buf);
 
-        // Check for manifest trailer
         if page_num == MANIFEST_MAGIC {
-            break; // manifest follows, but we only care about pages here
+            break;
         }
 
         reader.read_exact(&mut page_buf)?;
@@ -150,16 +154,24 @@ pub(crate) fn read_staging_log(
 
 /// Extract the embedded manifest from a staging log (if present).
 /// Returns None if the staging log has no manifest trailer.
+/// The `_page_size` argument is ignored; page size is read from the header.
 pub(crate) fn read_staging_manifest(
     path: &Path,
-    page_size: u32,
+    _page_size: u32,
 ) -> io::Result<Option<Vec<u8>>> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
-    if file_len == 0 {
+    if file_len < 4 {
         return Ok(None);
     }
     let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut ps_buf = [0u8; 4];
+    reader.read_exact(&mut ps_buf)?;
+    let page_size = u32::from_le_bytes(ps_buf);
+    if page_size == 0 || page_size > 65536 {
+        return Ok(None);
+    }
+
     let mut page_num_buf = [0u8; 8];
     let mut page_buf = vec![0u8; page_size as usize];
 
@@ -174,7 +186,6 @@ pub(crate) fn read_staging_manifest(
             let mut len_buf = [0u8; 8];
             reader.read_exact(&mut len_buf)?;
             let manifest_len = u64::from_le_bytes(len_buf) as usize;
-            // Corrupted length: can't exceed the staging file itself
             if manifest_len as u64 > file_len {
                 return Ok(None);
             }
@@ -225,13 +236,24 @@ pub(crate) fn recover_staging_logs(
             let _ = fs::remove_file(&path);
             continue;
         }
-        // Staging logs may include a manifest trailer (MANIFEST_MAGIC + data),
-        // so file size is NOT guaranteed to be a multiple of record_size.
-        // read_staging_log() correctly handles this by stopping at MANIFEST_MAGIC.
+        // Read page_size from 4-byte file header
+        let file_ps = match File::open(&path) {
+            Ok(mut f) => {
+                let mut buf = [0u8; 4];
+                match f.read_exact(&mut buf) {
+                    Ok(()) => {
+                        let ps = u32::from_le_bytes(buf);
+                        if ps > 0 && ps <= 65536 { ps } else { page_size }
+                    }
+                    Err(_) => page_size,
+                }
+            }
+            Err(_) => page_size,
+        };
         pending.push(PendingFlush {
             staging_path: path,
             version,
-            page_size,
+            page_size: file_ps,
         });
     }
 

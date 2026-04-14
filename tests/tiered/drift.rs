@@ -221,7 +221,7 @@ fn drift_override_write_and_cold_read() {
     shared.flush_to_s3().expect("override flush");
 
     // Verify override keys exist in S3 (pattern: pg/{gid}_f{frame_idx}_v{version})
-    let pg_keys = list_s3_keys(&bucket, &format!("{}/pg/", prefix), &endpoint);
+    let pg_keys = list_s3_keys(&bucket, &format!("{}/p/d/", prefix), &endpoint);
     let override_keys: Vec<_> = pg_keys
         .iter()
         .filter(|k| k.contains("_f") && k.contains("_v"))
@@ -521,7 +521,7 @@ fn drift_override_with_encryption() {
     shared.flush_to_s3().expect("override flush");
 
     // Verify override keys exist
-    let pg_keys = list_s3_keys(&bucket, &format!("{}/pg/", prefix), &endpoint);
+    let pg_keys = list_s3_keys(&bucket, &format!("{}/p/d/", prefix), &endpoint);
     let override_keys: Vec<_> = pg_keys
         .iter()
         .filter(|k| k.contains("_f") && k.contains("_v"))

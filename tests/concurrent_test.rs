@@ -1,6 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
-use turbolite::clear_all_caches;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -107,7 +106,9 @@ fn test_concurrent_read_write() {
     assert!(reader_result.is_ok(), "Reader failed: {:?}", reader_result);
     assert!(writer_result.is_ok(), "Writer failed: {:?}", writer_result);
 
-    clear_all_caches();
+    // NOTE: do NOT call clear_all_caches() here. It wipes the global
+    // IN_PROCESS_LOCKS map, which breaks WAL index lock coordination for
+    // any concurrent test that shares the same process.
 }
 
 /// Test without WAL mode to isolate the issue
@@ -234,7 +235,9 @@ fn test_concurrent_no_wal() {
 
     assert_eq!(r_errors, 0, "Had {} read errors", r_errors);
 
-    clear_all_caches();
+    // NOTE: do NOT call clear_all_caches() here. It wipes the global
+    // IN_PROCESS_LOCKS map, which breaks WAL index lock coordination for
+    // any concurrent test that shares the same process.
 }
 
 /// More aggressive test matching benchmark conditions
@@ -409,5 +412,7 @@ fn test_concurrent_high_throughput() {
     assert_eq!(r_errors, 0, "Had {} read errors", r_errors);
     assert_eq!(w_errors, 0, "Had {} write errors", w_errors);
 
-    clear_all_caches();
+    // NOTE: do NOT call clear_all_caches() here. It wipes the global
+    // IN_PROCESS_LOCKS map, which breaks WAL index lock coordination for
+    // any concurrent test that shares the same process.
 }

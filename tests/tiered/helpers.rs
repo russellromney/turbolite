@@ -301,7 +301,7 @@ pub fn verify_s3_has_page_groups(
         let resp = client
             .list_objects_v2()
             .bucket(bucket)
-            .prefix(format!("{}/pg/", prefix))
+            .prefix(format!("{}/p/d/", prefix))
             .send()
             .await
             .expect("listing page groups should succeed");

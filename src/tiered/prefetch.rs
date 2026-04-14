@@ -38,13 +38,25 @@ pub(crate) struct PrefetchJob {
 
 #[cfg(feature = "cloud")]
 /// Fixed thread pool for background page group prefetching.
-/// Workers loop on a shared mpsc receiver, fetching page groups from S3
+/// Workers loop on a shared flume receiver, fetching page groups from S3
 /// and writing them to the local cache. Default thread count: num_cpus + 1
 /// (keeps pipeline full when threads block on S3 I/O).
+///
+/// Uses flume channels instead of std::sync::mpsc (Phase Flume):
+/// 1. flume::Receiver is Clone + Sync, so workers recv directly (no Mutex wrapper)
+/// 2. Completion channel replaces AtomicU64 spin-polling in wait_idle()
+/// 3. Bounded job channel provides backpressure when workers are saturated
 pub(crate) struct PrefetchPool {
-    pub(crate) sender: std::sync::mpsc::Sender<PrefetchJob>,
-    pub(crate) in_flight: Arc<AtomicU64>,
-    pub(crate) workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Bounded job channel. Capacity = 2x workers to keep the pipeline full
+    /// without unbounded growth.
+    job_tx: flume::Sender<PrefetchJob>,
+    /// Completion channel. Workers send gid on finish (success or skip).
+    /// wait_idle() drains this instead of spin-polling an atomic counter.
+    done_rx: flume::Receiver<u64>,
+    /// Number of jobs submitted but not yet completed. Used by wait_idle()
+    /// to know how many completions to drain.
+    in_flight: AtomicU64,
+    workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "cloud")]
@@ -59,9 +71,9 @@ impl PrefetchPool {
         encryption_key: Option<[u8; 32]>,
         shared_manifest: Arc<ArcSwap<super::manifest::Manifest>>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<PrefetchJob>();
-        let rx = Arc::new(Mutex::new(rx));
-        let in_flight = Arc::new(AtomicU64::new(0));
+        // Bounded: 2x workers keeps pipeline full without unbounded growth
+        let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
+        let (done_tx, done_rx) = flume::unbounded::<u64>();
         let mut workers = Vec::with_capacity(num_workers as usize);
 
         #[cfg(feature = "zstd")]
@@ -70,11 +82,11 @@ impl PrefetchPool {
         let encryption_key = Arc::new(encryption_key);
 
         for _ in 0..num_workers {
-            let rx = Arc::clone(&rx);
+            let job_rx = job_rx.clone();
+            let done_tx = done_tx.clone();
             let s3 = Arc::clone(&s3);
             let cache = Arc::clone(&cache);
             let page_count = Arc::clone(&page_count);
-            let in_flight = Arc::clone(&in_flight);
             let _ppg = pages_per_group;
             #[cfg(feature = "zstd")]
             let dictionary = dictionary.clone();
@@ -82,29 +94,24 @@ impl PrefetchPool {
             let shared_manifest = Arc::clone(&shared_manifest);
 
             workers.push(std::thread::spawn(move || {
-                loop {
-                    let job = {
-                        let lock = rx.lock().expect("prefetch rx poisoned");
-                        match lock.recv() {
-                            Ok(job) => job,
-                            Err(_) => break, // channel closed
-                        }
-                    };
+                // flume::Receiver is Clone+Sync: no Mutex needed, workers steal directly
+                while let Ok(job) = job_rx.recv() {
+                    let gid = job.gid;
 
                     // Group may have been pre-claimed by the read path (Fetching)
                     // or submitted by trigger_prefetch (still None). Try to claim
                     // if not already Fetching; skip if already Done/Ready.
-                    let current = cache.group_state(job.gid);
+                    let current = cache.group_state(gid);
                     if current == GroupState::None {
-                        if !cache.try_claim_group(job.gid) {
-                            in_flight.fetch_sub(1, Ordering::Release);
+                        if !cache.try_claim_group(gid) {
+                            let _ = done_tx.send(gid);
                             continue;
                         }
                     } else if current != GroupState::Fetching {
                         if std::env::var("BENCH_VERBOSE").is_ok() {
-                            turbolite_debug!("  [prefetch-skip] gid={} state={:?}", job.gid, current);
+                            turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
-                        in_flight.fetch_sub(1, Ordering::Release);
+                        let _ = done_tx.send(gid);
                         continue;
                     }
 
@@ -115,18 +122,18 @@ impl PrefetchPool {
                     let pg_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&job.key)) {
                         Ok(data) => data,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} fetch error: {}", job.gid, e);
-                            cache.unclaim_group(job.gid);
-                            in_flight.fetch_sub(1, Ordering::Release);
+                            eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
+                            cache.unclaim_group(gid);
+                            let _ = done_tx.send(gid);
                             continue;
                         }
                     };
                     let fetch_ms = fetch_start.elapsed().as_millis();
 
                     let Some(pg_data) = pg_data else {
-                        // Key not found — reset to None
-                        cache.unclaim_group(job.gid);
-                        in_flight.fetch_sub(1, Ordering::Release);
+                        // Key not found, reset to None
+                        cache.unclaim_group(gid);
+                        let _ = done_tx.send(gid);
                         continue;
                     };
 
@@ -161,9 +168,9 @@ impl PrefetchPool {
                     let (pg_count, _pg_size, page_data) = match decode_result {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} decode error: {}", job.gid, e);
-                            cache.unclaim_group(job.gid);
-                            in_flight.fetch_sub(1, Ordering::Release);
+                            eprintln!("[prefetch] gid={} decode error: {}", gid, e);
+                            cache.unclaim_group(gid);
+                            let _ = done_tx.send(gid);
                             continue;
                         }
                     };
@@ -176,15 +183,15 @@ impl PrefetchPool {
                     let current_version = shared_manifest.load().version;
                     if current_version != job.manifest_version {
                         turbolite_debug!("[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
-                            job.gid, job.manifest_version, current_version);
-                        cache.unclaim_group(job.gid);
-                        in_flight.fetch_sub(1, Ordering::Release);
+                            gid, job.manifest_version, current_version);
+                        cache.unclaim_group(gid);
+                        let _ = done_tx.send(gid);
                         continue;
                     }
 
                     // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
                     turbolite_debug!("[prefetch] gid={} writing {} pages (job_v={}, current_v={})",
-                        job.gid, pg_count, job.manifest_version, current_version);
+                        gid, pg_count, job.manifest_version, current_version);
                     let write_start = Instant::now();
                     let actual_pages = std::cmp::min(pg_count as usize, job.group_page_nums.len());
                     let write_result = if actual_pages > 0 {
@@ -199,9 +206,9 @@ impl PrefetchPool {
                         Ok(())
                     };
                     if let Err(e) = write_result {
-                        eprintln!("[prefetch] gid={} write error: {}", job.gid, e);
-                        cache.unclaim_group(job.gid);
-                        in_flight.fetch_sub(1, Ordering::Release);
+                        eprintln!("[prefetch] gid={} write error: {}", gid, e);
+                        cache.unclaim_group(gid);
+                        let _ = done_tx.send(gid);
                         continue;
                     }
                     let write_ms = write_start.elapsed().as_millis();
@@ -215,11 +222,11 @@ impl PrefetchPool {
                             let type_byte = page_data.get(page_start + hdr_off).copied();
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
-                                    cache.mark_interior_group(job.gid, pnum, i as u32);
+                                    cache.mark_interior_group(gid, pnum, i as u32);
                                 } else if b == 0x0A {
                                     if let Some(page_slice) = page_data.get(page_start..page_start + ps) {
                                         if is_valid_btree_page(page_slice, hdr_off) {
-                                            cache.mark_index_page(pnum, job.gid, i as u32);
+                                            cache.mark_index_page(pnum, gid, i as u32);
                                         }
                                     }
                                 }
@@ -235,12 +242,12 @@ impl PrefetchPool {
                                 Ok(Some(data)) => data,
                                 Ok(None) => {
                                     turbolite_debug!("[prefetch] gid={} override frame {} key '{}' not found in S3",
-                                        job.gid, frame_idx, ovr.key);
+                                        gid, frame_idx, ovr.key);
                                     continue;
                                 }
                                 Err(e) => {
                                     eprintln!("[prefetch] gid={} override frame {} fetch error: {}",
-                                        job.gid, frame_idx, e);
+                                        gid, frame_idx, e);
                                     continue;
                                 }
                             };
@@ -266,33 +273,35 @@ impl PrefetchPool {
                         }
                     }
 
-                    cache.mark_group_present(job.gid);
-                    cache.touch_group(job.gid);
+                    cache.mark_group_present(gid);
+                    cache.touch_group(gid);
                     if std::env::var("BENCH_VERBOSE").is_ok() {
                         turbolite_debug!(
                             "  [prefetch-done] gid={} ({:.1}KB) fetch={}ms decompress={}ms write={}ms total={}ms",
-                            job.gid,
+                            gid,
                             pg_data.len() as f64 / 1024.0,
                             fetch_ms, decompress_ms, write_ms,
                             worker_start.elapsed().as_millis(),
                         );
                     }
-                    in_flight.fetch_sub(1, Ordering::Release);
+                    let _ = done_tx.send(gid);
                 }
             }));
         }
 
         Self {
-            sender: tx,
-            in_flight,
+            job_tx,
+            done_rx,
+            in_flight: AtomicU64::new(0),
             workers: parking_lot::Mutex::new(workers),
         }
     }
 
-    /// Submit a prefetch job (non-blocking). Returns false if channel is closed.
+    /// Submit a prefetch job. Returns false if channel is closed.
+    /// With bounded channel, this blocks if workers are saturated (backpressure).
     pub(crate) fn submit(&self, gid: u64, key: String, frame_table: Vec<FrameEntry>, page_size: u32, sub_ppf: u32, group_page_nums: Vec<u64>, overrides: HashMap<usize, super::manifest::SubframeOverride>, manifest_version: u64) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
-        match self.sender.send(PrefetchJob {
+        match self.job_tx.send(PrefetchJob {
             gid,
             key,
             frame_table,
@@ -311,9 +320,20 @@ impl PrefetchPool {
     }
 
     /// Wait until all in-flight prefetch jobs complete.
+    /// Drains the completion channel instead of spin-polling an atomic counter.
     pub(crate) fn wait_idle(&self) {
-        while self.in_flight.load(Ordering::Acquire) > 0 {
-            std::thread::sleep(Duration::from_millis(1));
+        loop {
+            let remaining = self.in_flight.load(Ordering::Acquire);
+            if remaining == 0 {
+                break;
+            }
+            // Block on completion signal from a worker
+            match self.done_rx.recv() {
+                Ok(_gid) => {
+                    self.in_flight.fetch_sub(1, Ordering::Release);
+                }
+                Err(_) => break, // all workers gone
+            }
         }
     }
 }
@@ -321,8 +341,14 @@ impl PrefetchPool {
 #[cfg(feature = "cloud")]
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
-        // Drop sender to close the channel, then join all workers
-        drop(std::mem::replace(&mut self.sender, mpsc::channel().0));
+        // Drop the job sender to close the channel, causing workers to exit
+        // their recv() loop. Then join all worker threads.
+        let (dead_tx, _) = flume::bounded(0);
+        drop(std::mem::replace(&mut self.job_tx, dead_tx));
+
+        // Drain any remaining completions so workers aren't blocked on send
+        while self.done_rx.try_recv().is_ok() {}
+
         let mut workers = self.workers.lock();
         for handle in workers.drain(..) {
             let _ = handle.join();

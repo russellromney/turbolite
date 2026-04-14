@@ -343,6 +343,71 @@ impl TurboliteVfs {
         cache.ensure_group_capacity(manifest_groups);
 
 
+        // Phase Kursk: recover staging logs (must run before Arc-wrapping cache/manifest)
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
+        if !recovered_staging.is_empty() {
+            turbolite_debug!("[tiered] recovered {} staging logs from interrupted flush", recovered_staging.len());
+
+            // Extract newest manifest from staging logs (may be newer than
+            // manifest.msgpack if the flush didn't complete before crash).
+            for flush_entry in recovered_staging.iter().rev() {
+                if let Ok(Some(manifest_bytes)) = staging::read_staging_manifest(
+                    &flush_entry.staging_path, flush_entry.page_size,
+                ) {
+                    if let Ok(local_manifest) = rmp_serde::from_slice::<manifest::LocalManifest>(&manifest_bytes) {
+                        if local_manifest.manifest.version >= manifest.version {
+                            turbolite_debug!(
+                                "[tiered] staging log has newer manifest v{} (current v{}), applying",
+                                local_manifest.manifest.version, manifest.version,
+                            );
+                            manifest = local_manifest.manifest;
+                            manifest.detect_and_normalize_strategy();
+                            let new_groups = manifest.total_groups() as usize;
+                            cache.ensure_group_capacity(new_groups);
+                            if !manifest.group_pages.is_empty() {
+                                cache.set_group_pages(manifest.group_pages.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Replay staging log pages into cache so reads work immediately
+            // without waiting for the pending flush to write page groups.
+            // The staging log header contains the correct page_size; update
+            // the cache if it was initialized with a fallback (manifest was empty).
+            for flush_entry in &recovered_staging {
+                if flush_entry.page_size > 0 {
+                    let current_ps = cache.page_size.load(Ordering::Relaxed);
+                    if current_ps == 0 || (current_ps == 4096 && flush_entry.page_size != 4096) {
+                        cache.set_page_size(flush_entry.page_size);
+                        if manifest.page_size == 0 {
+                            manifest.page_size = flush_entry.page_size;
+                        }
+                        if manifest.pages_per_group == 0 {
+                            manifest.pages_per_group = ppg;
+                        }
+                    }
+                }
+                if let Ok(pages) = staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size) {
+                    turbolite_debug!("[tiered] replaying {} pages from staging log v{}", pages.len(), flush_entry.version);
+                    for (page_num, data) in &pages {
+                        let _ = cache.write_page(*page_num, &data);
+                        // Update manifest page_count from replayed pages
+                        let new_count = *page_num + 1;
+                        if new_count > manifest.page_count {
+                            manifest.page_count = new_count;
+                        }
+                    }
+                }
+            }
+        }
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
+        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
+
         let s3 = Arc::new(s3);
         let storage = Arc::new(StorageClient::s3(Arc::clone(&s3)));
         let cache = Arc::new(cache);
@@ -367,16 +432,6 @@ impl TurboliteVfs {
         }
         let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
         let flush_lock = Arc::new(Mutex::new(()));
-
-        // Phase Kursk: recover staging logs
-        let staging_dir = config.cache_dir.join("staging");
-        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
-        if !recovered_staging.is_empty() {
-            turbolite_debug!("[tiered] recovered {} staging logs from interrupted flush", recovered_staging.len());
-        }
-        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
-        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
-        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
 
         let vfs = Self {
             storage,

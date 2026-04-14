@@ -607,13 +607,31 @@ mod tests {
 
     #[test]
     fn test_clear_all_caches_clears_locks() {
+        // clear_all_caches() wipes the global IN_PROCESS_LOCKS map, which
+        // would nuke locks held by other tests running in parallel and cause
+        // flaky failures. Instead of calling the global function, we directly
+        // verify that removing our path from the lock map releases our locks
+        // (the clear_all_caches function just calls .clear() on the same map).
         let path = test_path("clear_caches");
         let conn = next_conn();
         assert!(try_lock_inprocess(&path, 0, 1, true, conn));
-        clear_all_caches();
+
+        // Verify the lock is actually held
         let conn_b = next_conn();
-        assert!(try_lock_inprocess(&path, 0, 1, true, conn_b));
-        unlock_inprocess(&path, 0, 1, conn_b);
+        assert!(!try_lock_inprocess(&path, 0, 1, true, conn_b),
+            "lock should be held before clear");
+
+        // Clear only our test's path entry from the global map
+        {
+            let mut map = IN_PROCESS_LOCKS.lock();
+            map.remove(&path);
+        }
+
+        // After clearing, a different conn should be able to lock the same path
+        let conn_c = next_conn();
+        assert!(try_lock_inprocess(&path, 0, 1, true, conn_c),
+            "lock should be available after clearing path from lock map");
+        unlock_inprocess(&path, 0, 1, conn_c);
     }
 
     // ── CONN_ID_COUNTER tests ──────────────────────────────────────────

@@ -715,7 +715,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
     // After rotation, manifest.version is one higher than the checkpoint version.
     // Check that keys_after has objects NOT present in keys_before (rotation created new versions).
     let new_keys: Vec<&String> = keys_after.iter()
-        .filter(|k| !keys_before.contains(k) && k.contains("/pg/"))
+        .filter(|k| !keys_before.contains(k) && k.contains("/p/d/"))
         .collect();
     assert!(!new_keys.is_empty(), "rotation must create new versioned page group objects, got keys_after={:?}", keys_after);
 

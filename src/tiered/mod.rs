@@ -50,8 +50,7 @@ use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "cloud")]
-use std::sync::mpsc;
+// flume channels used by PrefetchPool (sync/async-agnostic)
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
