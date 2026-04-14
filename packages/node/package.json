@@ -4,10 +4,16 @@
   "description": "Compressed SQLite — transparent zstd compression via a custom VFS",
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "turbolite": "bin/turbolite.js"
+  },
   "files": [
     "index.js",
     "index.d.ts",
-    "turbolite.*.node"
+    "turbolite.*.node",
+    "bin/turbolite.js",
+    "turbolite",
+    "turbolite.exe"
   ],
   "napi": {
     "name": "turbolite",

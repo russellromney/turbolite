@@ -55,6 +55,15 @@ jobs:
           cargo build --release --lib --target ${{ matrix.target }} \
             --no-default-features --features loadable-extension,zstd,cloud,wal
 
+      - name: Build CLI binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: |
+          cargo build --release --bin turbolite --target ${{ matrix.target }} \
+            --features cloud,zstd,bundled-sqlite
+
       - name: Determine library filename
         id: lib
         run: |
@@ -66,10 +75,13 @@ jobs:
             echo "prefix=lib" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Copy extension into Python package
+      - name: Copy extension and CLI binary into Python package
         run: |
           cp target/${{ matrix.target }}/release/${{ steps.lib.outputs.prefix }}turbolite.${{ steps.lib.outputs.ext }} \
             packages/python/turbolite/turbolite.${{ steps.lib.outputs.ext }}
+          cp target/${{ matrix.target }}/release/turbolite \
+            packages/python/turbolite/turbolite
+          chmod +x packages/python/turbolite/turbolite
 
       - uses: actions/setup-python@v5
         with:
@@ -161,10 +173,23 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }}
 
+      - name: Build CLI binary for Node package
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: |
+          cargo build --release --bin turbolite --target ${{ matrix.target }} \
+            --features cloud,zstd,bundled-sqlite
+          cp target/${{ matrix.target }}/release/turbolite packages/node/turbolite
+          chmod +x packages/node/turbolite
+
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.node-arch }}
-          path: packages/node/turbolite.*.node
+          path: |
+            packages/node/turbolite.*.node
+            packages/node/turbolite
 
   node-publish:
     needs: node-build

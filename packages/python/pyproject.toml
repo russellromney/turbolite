@@ -16,8 +16,11 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.scripts]
+turbolite = "turbolite.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["turbolite*"]
 
 [tool.setuptools.package-data]
-turbolite = ["*.so", "*.dylib"]
+turbolite = ["*.so", "*.dylib", "turbolite", "turbolite.exe"]
