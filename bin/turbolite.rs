@@ -18,6 +18,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show setup instructions (shell completions, etc.)
+    Setup,
+
     /// Generate shell completions (bash, zsh, fish)
     #[command(hide = true)]
     Completions {
@@ -762,6 +765,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Setup => {
+            println!("turbolite setup");
+            println!();
+            println!("  Shell completions:");
+            println!("    bash:  eval \"$(turbolite completions bash)\"");
+            println!("    zsh:   eval \"$(turbolite completions zsh)\"");
+            println!("    fish:  turbolite completions fish > ~/.config/fish/completions/turbolite.fish");
+            println!();
+            println!("  Add the line for your shell to your profile (~/.bashrc, ~/.zshrc, etc.)");
+            println!("  to enable tab completion for turbolite commands and flags.");
+        }
         Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,
