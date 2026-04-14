@@ -232,11 +232,6 @@ pub struct TurboliteConfig {
     /// Only evicts Data tier (interior + index remain for next query's fast path).
     /// Default: false. Also settable via turbolite_config_set('evict_on_checkpoint', 'true').
     pub evict_on_checkpoint: bool,
-    /// Phase Jena: enable interior map introspection + leaf chasing + overflow prefetch.
-    /// Experimental. Parses B-tree interior pages for precise prefetch instead of
-    /// hop-schedule guessing. Currently adds overhead without proven latency improvement.
-    /// Default: false. Set `TURBOLITE_JENA=true` to enable.
-    pub jena_enabled: bool,
     /// Phase Drift: override threshold. 0 = auto (frames_per_group / 4).
     pub override_threshold: u32,
     /// Phase Drift-d: compaction threshold. Default 8.
@@ -307,9 +302,6 @@ impl Default for TurboliteConfig {
                 .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
                 .and_then(|n| if n == 0 { None } else { Some(n) }),
             evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
-                .map(|v| matches!(v.as_str(), "true" | "1"))
-                .unwrap_or(false),
-            jena_enabled: std::env::var("TURBOLITE_JENA")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),
             override_threshold: std::env::var("TURBOLITE_OVERRIDE_THRESHOLD")

@@ -29,10 +29,6 @@ extern int turbolite_ext_register_vfs(void);
  * Defined in src/tiered/query_plan.rs (Phase Marne). */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
 
-/* Rust function -- discovers schema from sqlite_master for leaf chasing.
- * Defined in src/tiered/query_plan.rs (Phase Jena-d). */
-extern void turbolite_discover_schema(sqlite3 *db);
-
 /* Rust function -- signals query completion for between-query eviction.
  * Defined in src/tiered/query_plan.rs (Phase Stalingrad). */
 extern void turbolite_trace_end_query(void);
@@ -376,12 +372,6 @@ static int turbolite_trace_callback(
         sqlite3 *db = sqlite3_db_handle(stmt);
 
         turbolite_trace_reentrant = 1;
-
-        /* Phase Jena-d: discover schema for leaf chasing.
-         * Re-discovers on every connection (no static flag) because different
-         * connections may open different databases. The VFS side deduplicates
-         * via schema_info.is_none() check. */
-        turbolite_discover_schema(db);
 
         turbolite_trace_push_plan(db, sql);
         turbolite_trace_reentrant = 0;

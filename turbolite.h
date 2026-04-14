@@ -331,15 +331,6 @@ extern int64_t sqlite3_column_int64(void *stmt, int32_t col);
 void turbolite_trace_push_plan(void *db, const char *sql);
 
 /**
- * Phase Jena-d2: discover schema from sqlite_master and push to global cache.
- * Called once per db connection from the trace callback.
- *
- * # Safety
- * `db` must be a valid sqlite3 handle.
- */
-void turbolite_discover_schema(void *db);
-
-/**
  * FFI entry point called from C trace profile callback.
  * Signals query completion for between-query eviction.
  */

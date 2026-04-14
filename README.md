@@ -580,14 +580,6 @@ cargo test --features zstd,cloud             # + S3 integration tests
 cargo test --features zstd,encryption         # + encryption tests
 ```
 
-## Experimental: precise prefetch
-
-turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
-
-In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
-
-The code is there (`TURBOLITE_JENA=true` to enable) for future investigation. It may work better on lower-latency backends (S3 Express, ~4ms GETs) where the cost of an extra GET is cheap and precision matters more. For now, the hop schedule wins.
-
 ## Notes
 
 turbolite was previously named `sqlite-compress-encrypt-vfs`, aka `sqlces`.

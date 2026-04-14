@@ -85,7 +85,7 @@ Replace syscall-per-page I/O with batched io_uring submissions. On Linux, this m
 ---
 
 ## Stalingrad (remaining): Query Cost Estimation
-> After: Austerlitz (CHANGELOG) · Before: Jena
+> After: Austerlitz (CHANGELOG) · Before: Rosetta
 
 Diagnostic tools, not blocking production use. Build when needed.
 
@@ -94,111 +94,14 @@ Diagnostic tools, not blocking production use. Build when needed.
 
 ---
 
-## Jena: Interior Page Introspection for Precise Prefetch
-> After: Stalingrad · Before: Rosetta
-
-The B-tree structure is fully known from interior pages (cached/pinned). By extracting child pointers at checkpoint and persisting them in the manifest, we can predict exact leaf pages for any query without guessing. Replaces the hop schedule heuristic with direct structural knowledge.
-
-**Why it works:** Interior pages are always cached (pinned on open). They contain child pointers to leaf pages. Parsing all interior pages costs ~100us (15 pages, ~4500 cells at 1M rows). Maps live on `TurboliteHandle` (per-connection), built from local cache (the authority). Manifest persists a snapshot for cold start.
-
-**Freshness:** Maps rebuild when interior pages are written (page splits/merges). `detect_interior_page` already identifies page types 0x02/0x05 on every write. When an interior page write is detected, increment a counter. Every N interior writes (default 1, configurable), rebuild maps from local cache. Data-only writes (the common case) have zero overhead. Checkpoint serializes current maps to manifest for future cold readers.
-
-**What it solves:**
-- SEARCH: predict exact leaf group, 1 range GET (18KB) instead of 12 GETs (9.4MB)
-- Profile: parse index leaf to find exact data groups (5MB instead of 67MB)
-- Joins: pipeline prefetch across tables, overlap S3 I/O
-- Replaces hop schedule for BTreeAware (hop schedule becomes Positional-only fallback)
-
-### a. Child pointer maps
-
-Maps live on `TurboliteHandle`. Built from cached interior pages on connection open, rebuilt on interior page writes, persisted to manifest at checkpoint.
-
-- [ ] `InteriorMap` struct: `child_to_parent: HashMap<u64, u64>`, `interior_children: HashMap<u64, Vec<u64>>`
-- [ ] `rebuild_interior_map(cache) -> InteriorMap`: parse each cached interior page's cells (4-byte child pointer per cell + rightmost pointer from page header bytes 8..12)
-- [ ] Connection open: call `rebuild_interior_map` from pinned interior pages
-- [ ] Interior page write: detect in `write_all_at` via page type check, increment counter, rebuild every N interior writes
-- [ ] Checkpoint: serialize current `InteriorMap` to manifest `interior_map` field
-- [ ] Cold start: deserialize from manifest (skip rebuild if present)
-- [ ] Tests: roundtrip through manifest serde, correct parent/child relationships, rebuild after simulated page split, empty for Positional, survives VACUUM + rebuild
-
-### b. Sibling prefetch ("cheater prefetch")
-
-On leaf miss, look up parent interior page, prefetch sibling leaf groups. Replaces hop schedule fraction math with exact structural knowledge.
-
-- [ ] On cache miss for leaf page P: look up `child_to_parent[P]` to find parent interior page
-- [ ] Get `interior_children[parent]` to find all siblings, find P's index
-- [ ] For SCAN (from EQP): prefetch ALL sibling groups
-- [ ] For SEARCH: prefetch 0-1 siblings (conservative, most of the time the one leaf is enough)
-- [ ] For unknown (no EQP info): prefetch next 2 siblings (minimal speculation)
-- [ ] Wire into `read_exact_at` replacing `trigger_prefetch` for BTreeAware
-- [ ] `trigger_prefetch` becomes Positional-only fallback
-- [ ] Remove `consecutive_misses` tracking for BTreeAware (no longer needed)
-- [ ] Tests: sibling prediction matches B-tree structure, SCAN prefetches all, SEARCH prefetches 0-1, multi-level B-tree (interior children that are also interior pages), Positional fallback still works
-- [ ] Benchmark: compare v6 hop schedule vs sibling prefetch on 1M posts (expect post+user drops from 12 GETs to 1-2)
-
-### c. Exact leaf prediction for SEARCH
-
-Parse key boundaries from interior cells at checkpoint. Given a search key, binary search interior pages to find exact leaf group before SQLite asks.
-
-- [ ] Extend checkpoint extraction: parse key data from interior cells (varint record header + column values), not just child pointers
-- [ ] `predict_leaf(interior_map, tree_name, search_key) -> Option<(u64, u32)>` returns (group_id, frame_index)
-- [ ] Key comparison: BINARY collation (memcmp), NOCASE (case-fold before compare)
-- [ ] Composite key support: multi-column indexes with prefix matching
-- [ ] Bench path: pass params through `push_query_plan()`, call `predict_leaf` before first read
-- [ ] Extension path: `sqlite3_expanded_sql(stmt)` in trace callback, parse integer/string literals
-- [ ] Submit predicted group to prefetch pool (or issue sub-chunk range GET directly)
-- [ ] Tests: single-column integer, composite key, NOCASE, key at cell boundary, rightmost child pointer, empty index, single-page index (no interior pages)
-- [ ] Benchmark: SEARCH latency with/without prediction on 1M posts (Express + Tigris)
-
-### d. Cross-tree leaf chasing
-
-When a leaf page arrives from S3, parse its cells to extract rowids/foreign keys. Map to groups in the next table in the join plan. Prefetch while SQLite processes current results.
-
-- [ ] SQLite record format parser: varint header length, column type codes, integer/string/blob extraction
-- [ ] For table B-tree leaves (0x0D): extract rowid from cell header
-- [ ] For index B-tree leaves (0x0A): extract indexed column values from record payload
-- [ ] On prefetch completion callback: parse arrived leaf, extract keys, map to target groups via `page_location()`, submit to prefetch pool
-- [ ] Join pipeline: EQP gives join order, each leaf arrival triggers prefetch for next table
-- [ ] Start with integer rowids only (covers profile query: idx_posts_user leaf -> post rowids -> posts data groups)
-- [ ] Tests: parse leaf cells for integer PK, composite index, overflow pages (payload > page), string keys
-- [ ] Benchmark: profile query with leaf chasing vs without (expect 53 GETs / 67MB -> ~6 GETs / 5MB)
-
-### e. Overflow chain prefetch
-
-When a leaf page arrives and contains overflow pointers (payload > maxLocal), prefetch the overflow chain proactively instead of blocking on each link. Subframe range GETs already handle small overflow within a group, but multi-MB TEXT/BLOB values with chains spanning multiple page groups cause sequential blocking faults.
-
-Inspired by sqlite-prefetch's overflow cascading (https://github.com/wjordan/sqlite-prefetch).
-
-- [ ] On leaf page (0x0D) fetch completion: parse cells, detect overflow (payload > maxLocal), extract first overflow page number
-- [ ] Map overflow page to group via `page_location()`, submit group to prefetch pool
-- [ ] On overflow page arrival: read next-page pointer (first 4 bytes), cascade to next group
-- [ ] Repeat until next-page pointer is 0 (end of chain)
-- [ ] Cap cascade depth (e.g., 64) to bound runaway chains
-- [ ] Tests: single overflow page, multi-group chain, chain within same group (no-op), cap enforced, no overflow (common case, zero overhead)
-- [ ] Benchmark: table with 1MB+ TEXT values, with/without overflow prefetch
-
-### f. Multi-level interior group lookahead
-
-For very large databases where interior pages span multiple page groups, prefetch the next interior sibling group before SQLite descends into it. Avoids a blocking fault when the current interior group's children are exhausted and SQLite needs the next interior page.
-
-Inspired by sqlite-prefetch's multi-level lookahead (https://github.com/wjordan/sqlite-prefetch).
-
-- [ ] Track remaining sibling groups under current parent interior page during scan
-- [ ] When remaining sibling count drops below threshold (e.g., 5 groups), prefetch the next interior sibling's group from the parent level
-- [ ] Only relevant when interior pages span multiple groups (very large databases, 10M+ rows)
-- [ ] No-op for databases where all interior pages fit in group 0 (the common case today)
-- [ ] Tests: synthetic multi-group interior layout, lookahead triggers at threshold, no-op for small databases
-
----
-
 ## Rosetta: Value-Partitioned Index Access
-> After: Jena · Before: (future)
+> After: Stalingrad · Before: (future)
 
 Double-store index leaf pages in S3, organized by key value range instead of page number. SEARCH queries skip B-tree traversal entirely: the VFS maps the search key to the right partition and does one range GET. Storage cost is negligible (Tigris $0.02/GB). Normal B-tree groups remain for SCANs and general access.
 
 **How it works:** At import, for each index with enough leaf pages, walk the B-tree in key order, group leaf pages into equal-depth partitions (~256 pages each), store as one seekable S3 object per index. Convert partition boundary keys to a normalized byte format (sort-order-preserving). At query time, the engine passes the normalized search key; the VFS binary-searches boundaries and range-GETs exactly one frame.
 
-**Depends on:** Jena's SQLite record format parser (Jena d) for extracting key values from leaf cells. Jena's interior introspection is complementary, not replaced.
+**Depends on:** SQLite record format parser for extracting key values from leaf cells.
 
 ### a. Normalized key bytes
 
@@ -235,7 +138,7 @@ VFS uses value partitions for SEARCH queries when available.
 - [ ] Issue range GET for that single frame of the partition's seekable S3 object
 - [ ] Decode frame, write pages to cache (scattered writes, same as normal prefetch)
 - [ ] Pages land in cache by their real page numbers; SQLite reads them normally
-- [ ] Fallback: if no value partition exists, or search_key is None, use normal B-tree access (Jena or hop schedule)
+- [ ] Fallback: if no value partition exists, or search_key is None, use normal B-tree access (hop schedule)
 - [ ] Tests: SEARCH hits correct partition, value at partition boundary, value before first partition, value after last partition, fallback when no partition exists, fallback when key is None
 
 ### d. Engine integration

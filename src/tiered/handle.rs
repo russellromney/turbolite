@@ -102,14 +102,6 @@ pub struct TurboliteHandle {
     /// Staging directory path (cache_dir/staging).
     staging_dir: PathBuf,
 
-    // --- Phase Jena: interior map for precise prefetch (experimental, off by default) ---
-    jena_enabled: bool,
-    interior_map: interior_map::InteriorMap,
-    interior_writes_since_rebuild: u32,
-    chase_rules: Vec<leaf_chaser::ChaseRule>,
-    schema_info: Option<schema::SchemaInfo>,
-    bench_verbose: bool,
-
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
 
@@ -153,7 +145,6 @@ impl TurboliteHandle {
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
-        jena_enabled: bool,
     ) -> io::Result<Self> {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = (**shared_manifest.load()).clone();
@@ -337,22 +328,6 @@ impl TurboliteHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
-        // Phase Jena: build interior map from cached interior pages (if enabled).
-        let interior_map = if jena_enabled {
-            let m = shared_manifest.load();
-            let map = interior_map::InteriorMap::build(&cache, &m);
-            if !map.is_empty() {
-                turbolite_debug!(
-                    "[tiered] Jena: built interior map ({} interior pages, {} children)",
-                    map.interior_count(),
-                    map.child_count(),
-                );
-            }
-            map
-        } else {
-            interior_map::InteriorMap::default()
-        };
-
         Ok(Self {
             s3,
             storage,
@@ -391,12 +366,6 @@ impl TurboliteHandle {
             pending_flushes,
             staging_seq,
             staging_dir,
-            jena_enabled,
-            interior_map,
-            interior_writes_since_rebuild: 0,
-            chase_rules: Vec::new(),
-            schema_info: None,
-            bench_verbose: std::env::var("BENCH_VERBOSE").is_ok(),
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -445,12 +414,6 @@ impl TurboliteHandle {
             pending_flushes: Arc::new(Mutex::new(Vec::new())),
             staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
-            jena_enabled: false,
-            interior_map: interior_map::InteriorMap::default(),
-            interior_writes_since_rebuild: 0,
-            chase_rules: Vec::new(),
-            schema_info: None,
-            bench_verbose: false,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -709,228 +672,14 @@ impl TurboliteHandle {
         );
     }
 
-    /// Phase Jena-d: attempt cross-tree leaf chasing after reading a leaf page.
-    ///
-    /// If chase rules exist for the current tree, parse the leaf page,
-    /// extract join column values, predict target leaf groups, and submit
-    /// them for prefetch.
-    fn try_leaf_chase(&mut self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
-        if !self.jena_enabled || self.chase_rules.is_empty() {
-            return;
-        }
-
-        let hdr_off = if page_num == 0 { 100 } else { 0 };
-        let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
-
-        // Only chase from leaf pages (0x0D = table leaf, 0x0A = index leaf)
-        let is_table_leaf = type_byte == 0x0D;
-        let is_index_leaf = type_byte == 0x0A;
-        if !is_table_leaf && !is_index_leaf {
-            return;
-        }
-
-        // Find which tree this page belongs to
-        let manifest = self.manifest.load();
-        let tree_name = manifest.group_to_tree_name
-            .get(&manifest.page_location(page_num).map(|l| l.group_id).unwrap_or(u64::MAX))
-            .cloned();
-
-        let tree_name = match tree_name {
-            Some(n) => n,
-            None => { drop(manifest); return; },
-        };
-
-        // Check all chase rules for this source tree
-        let pool = match &self.prefetch_pool {
-            Some(p) => Arc::clone(p),
-            None => { drop(manifest); return; },
-        };
-        let ps = manifest.page_size;
-        let sub_ppf = manifest.sub_pages_per_frame;
-
-        for rule in &self.chase_rules {
-            if rule.source_tree != tree_name {
-                continue;
-            }
-
-            // Extract chase keys from the leaf page
-            let keys = leaf_chaser::extract_chase_keys(
-                buf, hdr_off, rule.col_index, is_table_leaf, 64, // max 64 keys per page
-            );
-            if keys.is_empty() {
-                continue;
-            }
-
-            // Predict target groups
-            let groups = leaf_chaser::chase_predict_groups(
-                &keys, rule.target_root_page, &self.interior_map,
-            );
-
-            // Submit for prefetch
-            let mut submitted = 0usize;
-            for gid in &groups {
-                if cache.group_state(*gid) != GroupState::None {
-                    continue;
-                }
-                if !cache.try_claim_group(*gid) {
-                    continue;
-                }
-                if let Some(key) = manifest.page_group_keys.get(*gid as usize) {
-                    if !key.is_empty() {
-                        let ft = manifest.frame_tables.get(*gid as usize).cloned().unwrap_or_default();
-                        let gp = manifest.group_page_nums(*gid).into_owned();
-                        let ovrs = manifest.subframe_overrides.get(*gid as usize).cloned().unwrap_or_default();
-                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
-                            submitted += 1;
-                        } else {
-                            cache.unclaim_group(*gid);
-                        }
-                    } else {
-                        cache.unclaim_group(*gid);
-                    }
-                } else {
-                    cache.unclaim_group(*gid);
-                }
-            }
-
-            if submitted > 0 && self.bench_verbose {
-                turbolite_debug!(
-                    "  [jena-chase] {} -> {}: {} keys, {} groups predicted, {} submitted",
-                    rule.source_tree, rule.target_tree, keys.len(), groups.len(), submitted,
-                );
-            }
-        }
-        drop(manifest);
-    }
-
-    /// Phase Jena-f: on interior page read, prefetch sibling interior page groups.
-    ///
-    /// For very large databases where interior pages span multiple groups,
-    /// this prevents a blocking fault when SQLite descends to the next
-    /// interior page. Only fires for pages that ARE interior pages and
-    /// whose siblings are in different groups.
-    fn try_interior_lookahead(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
-        if !self.jena_enabled { return; }
-        let hdr_off = if page_num == 0 { 100 } else { 0 };
-        let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
-        if type_byte != 0x05 && type_byte != 0x02 {
-            return; // not an interior page
-        }
-
-        // Find siblings of this interior page (they share the same parent)
-        let sibling_groups = self.interior_map.sibling_groups(page_num);
-        if sibling_groups.is_empty() {
-            return;
-        }
-
-        let pool = match &self.prefetch_pool {
-            Some(p) => p,
-            None => return,
-        };
-        let manifest = self.manifest.load();
-        let ps = manifest.page_size;
-        let sub_ppf = manifest.sub_pages_per_frame;
-
-        let mut submitted = 0usize;
-        for &gid in &sibling_groups {
-            if cache.group_state(gid) != GroupState::None { continue; }
-            if !cache.try_claim_group(gid) { continue; }
-            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                if !key.is_empty() {
-                    let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
-                    let gp = manifest.group_page_nums(gid).into_owned();
-                    let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
-                        submitted += 1;
-                    } else {
-                        cache.unclaim_group(gid);
-                    }
-                } else {
-                    cache.unclaim_group(gid);
-                }
-            } else {
-                cache.unclaim_group(gid);
-            }
-        }
-
-        if submitted > 0 && self.bench_verbose {
-            turbolite_debug!(
-                "  [jena-lookahead] interior page={} prefetched {} sibling interior groups",
-                page_num, submitted,
-            );
-        }
-    }
-
-    /// Phase Jena-e: detect overflow in a leaf page and prefetch overflow page groups.
-    fn try_overflow_prefetch(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
-        if !self.jena_enabled { return; }
-        let page_size = self.page_size.load(Ordering::Relaxed);
-        if page_size == 0 { return; }
-
-        let overflow_pages = overflow::detect_overflow_pages(buf, page_num, page_size);
-        if overflow_pages.is_empty() { return; }
-
-        let pool = match &self.prefetch_pool {
-            Some(p) => p,
-            None => return,
-        };
-        let manifest = self.manifest.load();
-        let ps = manifest.page_size;
-        let sub_ppf = manifest.sub_pages_per_frame;
-
-        let mut submitted = 0usize;
-        for ovfl_page in &overflow_pages {
-            if let Some(loc) = manifest.page_location(*ovfl_page) {
-                let gid = loc.group_id;
-                if cache.group_state(gid) != GroupState::None { continue; }
-                if !cache.try_claim_group(gid) { continue; }
-                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                    if !key.is_empty() {
-                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
-                        let gp = manifest.group_page_nums(gid).into_owned();
-                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp, ovrs, manifest.version) {
-                            submitted += 1;
-                        } else {
-                            cache.unclaim_group(gid);
-                        }
-                    } else {
-                        cache.unclaim_group(gid);
-                    }
-                } else {
-                    cache.unclaim_group(gid);
-                }
-            }
-        }
-
-        if submitted > 0 && self.bench_verbose {
-            turbolite_debug!(
-                "  [jena-overflow] page={} detected {} overflow pages, submitted {} groups",
-                page_num, overflow_pages.len(), submitted,
-            );
-        }
-    }
-
-    /// Ensure interior map is up to date before making prefetch decisions.
-    /// Rebuilds if interior pages were written since last rebuild.
-    fn ensure_interior_map_fresh(&mut self) {
-        if self.interior_writes_since_rebuild > 0 {
-            if let Some(cache) = &self.cache {
-                let manifest = self.manifest.load();
-                self.interior_map = interior_map::InteriorMap::build(cache, &manifest);
-                self.interior_writes_since_rebuild = 0;
-            }
-        }
-    }
-
-    /// Phase Jena: precise prefetch using interior map.
+    /// Prefetch sibling groups on cache miss.
     ///
     /// On cache miss, uses the B-tree child pointer map to identify exact
     /// sibling groups instead of guessing with hop-schedule fractions.
     /// Falls back to manifest-based sibling prefetch if interior map is empty.
     pub(crate) fn trigger_prefetch(
         &mut self,
-        page_num: u64,
+        _page_num: u64,
         current_gid: u64,
         manifest: &Manifest,
         cache: &Arc<DiskCache>,
@@ -967,49 +716,7 @@ impl TurboliteHandle {
             false
         };
 
-        // Phase Jena: use interior map for precise sibling selection (if enabled).
-        if self.jena_enabled && !self.interior_map.is_empty() {
-            let tree_name = manifest.group_to_tree_name.get(&current_gid);
-            let is_search = tree_name.map(|n| self.search_trees.contains(n)).unwrap_or(false);
-
-            // For SEARCH: prefetch exact siblings from interior map
-            // For SCAN: handled by plan-aware bulk prefetch (not here)
-            // For lookup: conservative, prefetch 0-1 siblings
-            let sibling_groups = self.interior_map.sibling_groups(page_num);
-
-            if sibling_groups.is_empty() {
-                return;
-            }
-
-            let max_submit = if is_search {
-                sibling_groups.len() // SEARCH: prefetch all siblings
-            } else {
-                // Lookup: conservative, use hop schedule fraction
-                let hops = &self.prefetch_lookup;
-                let miss_count = self.miss_count(tree_name);
-                let hop_idx = miss_count.saturating_sub(1) as usize;
-                let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
-                if fraction <= 0.0 { return; }
-                ((sibling_groups.len() as f32) * fraction).ceil() as usize
-            };
-
-            let mut submitted = 0usize;
-            for &gid in &sibling_groups {
-                if submitted >= max_submit { break; }
-                try_submit(gid, &mut submitted);
-            }
-
-            if std::env::var("BENCH_VERBOSE").is_ok() {
-                turbolite_debug!(
-                    "  [jena-prefetch] page={} gid={} siblings={} submitted={} mode={}",
-                    page_num, current_gid, sibling_groups.len(), submitted,
-                    if is_search { "search" } else { "lookup" },
-                );
-            }
-            return;
-        }
-
-        // Fallback: manifest-based sibling prefetch (legacy hop schedule)
+        // Manifest-based sibling prefetch (hop schedule)
         let siblings = manifest.prefetch_siblings(current_gid);
         let eligible: Vec<u64> = siblings.iter()
             .copied()
@@ -1253,29 +960,6 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
 
-                // Phase Jena-d: build chase rules from plan + schema.
-                // Take schema info from global cache (pushed by extension trace callback).
-                // Re-take if schema was invalidated (DDL/VACUUM changes schema cookie).
-                if self.schema_info.is_none() {
-                    self.schema_info = schema::take_schema();
-                }
-                // Check for fresh schema (DDL may have pushed a new one)
-                if let Some(fresh) = schema::take_schema() {
-                    self.schema_info = Some(fresh);
-                }
-                if let Some(ref schema) = self.schema_info {
-                    self.chase_rules = leaf_chaser::build_chase_rules(
-                        &planned,
-                        &schema.tree_roots,
-                        &schema.table_columns,
-                    );
-                    if !self.chase_rules.is_empty() && self.bench_verbose {
-                        turbolite_debug!(
-                            "  [jena-chase] built {} chase rules from {} planned accesses",
-                            self.chase_rules.len(), planned.len(),
-                        );
-                    }
-                }
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     let manifest_snap = self.manifest.load();
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
@@ -1337,9 +1021,6 @@ impl DatabaseHandle for TurboliteHandle {
                     page_num, gid, nonzero, buf.len());
             }
             self.detect_interior_page(buf, page_num, cache);
-            self.try_leaf_chase(buf, page_num, &cache_arc);
-            self.try_overflow_prefetch(buf, page_num, &cache_arc);
-            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
@@ -1458,9 +1139,6 @@ impl DatabaseHandle for TurboliteHandle {
         if cache.is_present(page_num) {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
-            self.try_leaf_chase(buf, page_num, &cache_arc);
-            self.try_overflow_prefetch(buf, page_num, &cache_arc);
-            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
             cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
@@ -1518,7 +1196,6 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                 }
-                self.ensure_interior_map_fresh();
                 self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
 
                 let s3_start = Instant::now();
@@ -1600,9 +1277,6 @@ impl DatabaseHandle for TurboliteHandle {
                         }
 
                         self.detect_interior_page(buf, page_num, cache);
-                        self.try_leaf_chase(buf, page_num, &cache_arc);
-                        self.try_overflow_prefetch(buf, page_num, &cache_arc);
-                        self.try_interior_lookahead(buf, page_num, &cache_arc);
                         cache.touch_group(gid);
                         self.reset_misses(current_tree_name.as_ref());
 
@@ -1644,7 +1318,6 @@ impl DatabaseHandle for TurboliteHandle {
         } else if state != GroupState::Present {
             if cache.try_claim_group(gid) {
                 self.increment_misses(current_tree_name.as_ref());
-                self.ensure_interior_map_fresh();
                 self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
@@ -1753,9 +1426,6 @@ impl DatabaseHandle for TurboliteHandle {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
-            self.try_leaf_chase(buf, page_num, &cache_arc);
-            self.try_overflow_prefetch(buf, page_num, &cache_arc);
-            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             return Ok(());
         }
@@ -1765,9 +1435,6 @@ impl DatabaseHandle for TurboliteHandle {
             cache.bitmap_mark(page_num);
             cache.mark_group_present(gid);
             self.detect_interior_page(buf, page_num, cache);
-            self.try_leaf_chase(buf, page_num, &cache_arc);
-            self.try_overflow_prefetch(buf, page_num, &cache_arc);
-            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             return Ok(());
         }
@@ -1839,9 +1506,6 @@ impl DatabaseHandle for TurboliteHandle {
                 // and sync() will handle them after assign_new_pages_to_groups.
                 if let Some(loc) = self.manifest.load().page_location(page_num) {
                     cache.mark_interior_group(loc.group_id, page_num, loc.index);
-                }
-                if self.jena_enabled {
-                    self.interior_writes_since_rebuild += 1;
                 }
             }
         }

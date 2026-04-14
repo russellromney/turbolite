@@ -300,7 +300,6 @@ extern "C" {
     fn sqlite3_column_text(stmt: *mut std::ffi::c_void, col: i32) -> *const std::ffi::c_char;
 
     fn sqlite3_finalize(stmt: *mut std::ffi::c_void) -> i32;
-    fn sqlite3_column_int64(stmt: *mut std::ffi::c_void, col: i32) -> i64;
 }
 
 /// FFI entry point called from C trace callback.
@@ -323,86 +322,6 @@ pub unsafe extern "C" fn turbolite_trace_push_plan(
 
     let accesses = run_eqp_and_parse(db, sql_str);
     push_planned_accesses(accesses);
-}
-
-/// Phase Jena-d2: discover schema from sqlite_master and push to global cache.
-/// Called once per db connection from the trace callback.
-///
-/// # Safety
-/// `db` must be a valid sqlite3 handle.
-#[no_mangle]
-pub unsafe extern "C" fn turbolite_discover_schema(db: *mut std::ffi::c_void) {
-    // Skip if schema already cached (avoid redundant sqlite_master queries)
-    if super::schema::peek_schema().is_some() {
-        return;
-    }
-
-    let sql = "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE type IN ('table', 'index')";
-    let c_sql = match std::ffi::CString::new(sql) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let mut stmt: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut tail: *const std::ffi::c_char = std::ptr::null();
-
-    let rc = sqlite3_prepare_v2(
-        db,
-        c_sql.as_ptr(),
-        -1,
-        &mut stmt as *mut *mut std::ffi::c_void as *mut *mut _,
-        &mut tail as *mut *const std::ffi::c_char as *mut *const _,
-    );
-    if rc != 0 || stmt.is_null() {
-        return;
-    }
-
-    let mut rows: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
-
-    loop {
-        let step_rc = sqlite3_step(stmt);
-        if step_rc == 100 {
-            // SQLITE_ROW
-            let get_text = |col: i32| -> String {
-                let ptr = sqlite3_column_text(stmt, col);
-                if ptr.is_null() {
-                    String::new()
-                } else {
-                    std::ffi::CStr::from_ptr(ptr as *const _).to_str().unwrap_or("").to_string()
-                }
-            };
-
-            let obj_type = get_text(0);
-            let name = get_text(1);
-            let tbl_name = get_text(2);
-            let rootpage = sqlite3_column_int64(stmt, 3);
-            let sql_text = {
-                let ptr = sqlite3_column_text(stmt, 4);
-                if ptr.is_null() {
-                    None
-                } else {
-                    std::ffi::CStr::from_ptr(ptr as *const _).to_str().ok().map(|s| s.to_string())
-                }
-            };
-
-            rows.push((obj_type, name, tbl_name, rootpage, sql_text));
-        } else {
-            break;
-        }
-    }
-
-    sqlite3_finalize(stmt);
-
-    if !rows.is_empty() {
-        let info = super::schema::build_schema_info(&rows);
-        if std::env::var("BENCH_VERBOSE").is_ok() {
-            turbolite_debug!(
-                "[jena] schema discovered: {} tables, {} indexes",
-                info.table_columns.len(), info.index_columns.len(),
-            );
-        }
-        super::schema::push_schema(info);
-    }
 }
 
 /// FFI entry point called from C trace profile callback.
