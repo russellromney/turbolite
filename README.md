@@ -167,7 +167,7 @@ SQLite (PRAGMA cache_size=0)
 - `TURBOLITE_MEM_CACHE_BUDGET` env var (e.g., `128MB`, `1GB`).
 - Set to `0` to disable the in-memory cache entirely.
 
-> **Required for read replicas / HA followers:** set `PRAGMA cache_size=0` on the SQLite connection. SQLite's built-in page cache does not invalidate when turbolite receives new pages via replication. Without this pragma, follower reads return stale data. turbolite's own cache (configured above) handles caching correctly.
+`turbolite.connect()` (Python/Go/TypeScript) automatically disables SQLite's page cache and uses turbolite's instead. Rust consumers using `Connection::open_with_flags_and_vfs` directly should set `PRAGMA cache_size=0` to get the same behavior.
 
 ### Encryption & Compression
 

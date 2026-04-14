@@ -81,6 +81,7 @@ def connect(
     compression_level: int | None = None,
     prefetch_threads: int | None = None,
     read_only: bool = False,
+    page_cache: str = "64MB",
 ) -> sqlite3.Connection:
     """
     Open a turbolite database.
@@ -96,6 +97,8 @@ def connect(
         compression_level: Zstd level 1-22 (default 3).
         prefetch_threads: Prefetch worker threads (default num_cpus + 1).
         read_only: Open in read-only mode.
+        page_cache: In-memory page cache size (default "64MB"). turbolite manages
+            its own manifest-aware page cache. Set to "0" to disable.
 
     Returns:
         An open sqlite3.Connection.
@@ -132,6 +135,7 @@ def connect(
         os.environ["TURBOLITE_COMPRESSION_LEVEL"] = str(compression_level)
     if prefetch_threads is not None:
         os.environ["TURBOLITE_PREFETCH_THREADS"] = str(prefetch_threads)
+    os.environ["TURBOLITE_MEM_CACHE_BUDGET"] = page_cache
 
     # Load extension. S3 env vars must be set BEFORE first load because the
     # C init function only runs once per process. If local mode was loaded
@@ -152,6 +156,11 @@ def connect(
 
     vfs = "turbolite-s3" if mode == "s3" else "turbolite"
     conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
+
+    # turbolite manages its own manifest-aware page cache. Disable SQLite's
+    # built-in page cache so all reads go through turbolite's VFS, which
+    # correctly invalidates on manifest change (replication, checkpoint).
+    conn.execute("PRAGMA cache_size=0")
 
     if mode == "s3":
         # 64KB pages for fewer S3 round trips, WAL mode for concurrent reads
