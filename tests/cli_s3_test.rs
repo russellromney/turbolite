@@ -287,3 +287,155 @@ fn test_shell_s3_query() {
     assert!(stdout.contains("charlie"), "should contain charlie");
     assert!(stdout.contains("3"), "should show post count of 3");
 }
+
+// ── validate against S3 database ───────────────────────────────────
+
+#[test]
+fn test_validate_clean_database() {
+    build_bin();
+
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let plain_db = create_plain_db(tmpdir.path(), "validate-source.db");
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let prefix = unique_prefix();
+
+    // Import
+    let output = run_cli(&[
+        "import",
+        "--input",
+        plain_db.to_str().expect("path"),
+        "--bucket",
+        &bucket,
+        "--prefix",
+        &prefix,
+        "--endpoint",
+        &endpoint,
+    ]);
+    assert!(output.status.success(), "import failed for validate test");
+
+    // Validate
+    let cache_dir = tmpdir.path().join("validate-cache");
+    let db_path = tmpdir.path().join("validate.db");
+
+    let output = run_cli(&[
+        "validate",
+        "--db",
+        db_path.to_str().expect("path"),
+        "--bucket",
+        &bucket,
+        "--prefix",
+        &prefix,
+        "--endpoint",
+        &endpoint,
+        "--cache-dir",
+        cache_dir.to_str().expect("path"),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "validate failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(stdout.contains("validate: passed"), "should pass validation");
+    assert!(stdout.contains("present"), "should show present counts");
+    assert!(stdout.contains("integrity_check"), "should run integrity check");
+    assert!(stdout.contains("ok"), "integrity check should be ok");
+}
+
+// ── download from S3 ───────────────────────────────────────────────
+
+#[test]
+fn test_download_s3_database() {
+    build_bin();
+
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let plain_db = create_plain_db(tmpdir.path(), "download-source.db");
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let prefix = unique_prefix();
+
+    // Import first
+    let output = run_cli(&[
+        "import",
+        "--input",
+        plain_db.to_str().expect("path"),
+        "--bucket",
+        &bucket,
+        "--prefix",
+        &prefix,
+        "--endpoint",
+        &endpoint,
+    ]);
+    assert!(output.status.success(), "import failed for download test");
+
+    // Download entire database to local cache
+    let cache_dir = tmpdir.path().join("download-cache");
+    let db_path = tmpdir.path().join("download.db");
+
+    let output = run_cli(&[
+        "download",
+        "--db",
+        db_path.to_str().expect("path"),
+        "--bucket",
+        &bucket,
+        "--prefix",
+        &prefix,
+        "--endpoint",
+        &endpoint,
+        "--cache-dir",
+        cache_dir.to_str().expect("path"),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "download failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr,
+    );
+    assert!(stdout.contains("download:"), "should show download summary");
+    assert!(stdout.contains("tables"), "should mention tables");
+    assert!(stdout.contains("groups"), "should mention groups");
+
+    // Verify the data is queryable after download (should be cached locally)
+    let output = Command::new(turbolite_bin())
+        .args([
+            "shell",
+            "--db",
+            db_path.to_str().expect("path"),
+            "--bucket",
+            &bucket,
+            "--prefix",
+            &prefix,
+            "--endpoint",
+            &endpoint,
+            "--cache-dir",
+            cache_dir.to_str().expect("path"),
+            "--read-only",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(b"SELECT COUNT(*) FROM users;\n.quit\n")?;
+            }
+            child.wait_with_output()
+        })
+        .expect("failed to run shell after download");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("3"),
+        "should have 3 users after download.\nstdout: {}",
+        stdout,
+    );
+}
+
