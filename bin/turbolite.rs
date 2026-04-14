@@ -19,6 +19,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Generate shell completions (bash, zsh, fish)
+    #[command(hide = true)]
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
