@@ -270,23 +270,16 @@ Value partitions are read-only, built at import. Handle staleness gracefully.
 
 ## Future
 
-### `turbolite validate`
-Verify database integrity against S3. No flags, just check everything.
+### `pip install turbolite` ships the CLI (maturin)
+Replace setuptools with maturin as the Python build backend. `pip install turbolite` should install both the Python API (loadable extension) and the `turbolite` CLI binary.
 
-- [ ] Manifest consistency: all page_group_keys, interior_chunk_keys, index_chunk_keys exist in S3 (HEAD requests)
-- [ ] Orphan detection: objects in S3 prefix not referenced by manifest
-- [ ] Data integrity: every page group decodes without error (decompress + decrypt)
-- [ ] Frame table validation: frame entries match actual encoded data boundaries
-- [ ] Interior/index chunk decode verification
-- [ ] SQLite integrity: open via VFS, run `PRAGMA integrity_check`
-- [ ] Output: per-step pass/fail summary, exit 0 on success, exit 1 on any failure
-- [ ] Test: validate clean database (pass), validate with missing S3 key (fail), validate with corrupted page group (fail)
-
-### Shell tab completion
-- [ ] Table name completion after FROM, JOIN, INTO, UPDATE, etc.
-- [ ] Column name completion after SELECT, WHERE, ORDER BY (requires schema introspection)
-- [ ] `.tables`, `.schema`, `.quit` completion after `.`
-- [ ] Use rustyline or similar for readline + completion
+- [ ] Switch `packages/python/pyproject.toml` from setuptools to maturin
+- [ ] Configure maturin to build the `turbolite` binary (bin target) alongside the loadable extension (cdylib)
+- [ ] Declare `turbolite` as a console script entry point in pyproject.toml
+- [ ] Verify wheel contains both the `.so`/`.dylib` loadable extension and the CLI binary
+- [ ] Update release CI: replace setuptools wheel build with `maturin build`
+- [ ] Test: `pip install turbolite && turbolite --version && python -c "import turbolite"`
+- [ ] Update README install instructions
 
 ### mmap cache
 - [ ] `mmap` the cache file instead of `pread` for reads
