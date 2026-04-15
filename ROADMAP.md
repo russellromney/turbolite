@@ -42,6 +42,35 @@ supports xFetch/xUnfetch for memory-mapped page reads.
 
 ---
 
+## Phase Apollo: Standardized Language SDKs
+
+> After: Flume (page cache) . Before: Valkyrie
+
+**Status:** Not started
+
+**Goal:** Every language SDK returns the language's standard SQLite connection. turbolite is a storage engine, not a query API.
+
+**Current:** Python and Rust return standard connections. Node and Go return crippled custom wrappers (no prepared statements, no param binding, no transactions).
+
+**Target:** `turbolite.connect()` in every language returns the standard SQLite connection for that language, opened through turbolite's VFS.
+
+### Node (better-sqlite3)
+1. Build turbolite loadable extension against better-sqlite3's bundled SQLite headers
+2. `turbolite.connect(path, opts)` loads extension, opens via VFS URI, returns `better-sqlite3.Database`
+3. Ships platform-specific `.dylib/.so/.dll` alongside JS wrapper
+
+### Go (mattn/go-sqlite3)
+1. Build turbolite loadable extension against go-sqlite3's bundled SQLite headers
+2. `turbolite.Open(path, opts)` returns `*sql.DB` (full `database/sql` interface)
+3. Custom driver loads turbolite extension on init
+
+### Shared concerns
+- Loadable extension must NOT bundle its own SQLite (links against host's)
+- CI matrix: macOS arm64, macOS x86_64, Linux x86_64, Linux arm64
+- Tests: prepared statements, param binding, transactions, concurrent reads
+
+---
+
 ## Valkyrie: io_uring VFS (Linux, faster than SQLite)
 > After: Soyuz · Before: Stalingrad
 
