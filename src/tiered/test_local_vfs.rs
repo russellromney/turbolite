@@ -148,7 +148,8 @@ fn test_local_vfs_schema_changes() {
     assert_eq!(email, "alice@example.com");
 }
 
-/// Local VFS gc() and flush_to_s3() return appropriate errors.
+/// Local VFS gc() and destroy_s3() return appropriate errors.
+/// flush_to_storage() is a valid no-op on local VFS (returns Ok).
 #[cfg(feature = "cloud")]
 #[test]
 fn test_local_vfs_cloud_methods_error() {
@@ -164,8 +165,9 @@ fn test_local_vfs_cloud_methods_error() {
     let gc_err = vfs.gc();
     assert!(gc_err.is_err());
 
-    let flush_err = vfs.flush_to_s3();
-    assert!(flush_err.is_err());
+    // flush_to_storage uses StorageClient abstraction, works on all backends
+    let flush_result = vfs.flush_to_storage();
+    assert!(flush_result.is_ok(), "flush_to_storage should be a no-op on local VFS");
 
     let destroy_err = vfs.destroy_s3();
     assert!(destroy_err.is_err());

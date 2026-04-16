@@ -23,7 +23,7 @@ pub struct TurboliteVfs {
     /// Unified storage client: Local (filesystem) or S3.
     pub(crate) storage: Arc<StorageClient>,
     /// S3 client (only set in cloud mode). Kept separate because PrefetchPool
-    /// and flush_to_s3 need Arc<S3Client> directly.
+    /// needs Arc<S3Client> directly.
     s3: Option<Arc<S3Client>>,
     cache: Arc<DiskCache>,
     prefetch_pool: Option<Arc<PrefetchPool>>,
@@ -35,21 +35,21 @@ pub struct TurboliteVfs {
     #[cfg(feature = "cloud")]
     _runtime: Option<tokio::runtime::Runtime>,
     /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
-    /// read by flush_to_s3() for non-blocking S3 upload.
+    /// read by flush_to_storage() for non-blocking storage upload.
     shared_manifest: Arc<ArcSwap<Manifest>>,
-    /// Shared pending S3 groups. Accumulated by TurboliteHandle during local-only
-    /// checkpoints, drained by flush_to_s3(). Legacy path for global
+    /// Shared pending dirty groups. Accumulated by TurboliteHandle during local-only
+    /// checkpoints, drained by flush_to_storage(). Legacy path for global
     /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     /// Phase Kursk: pending staging log flushes. Populated by sync() in
-    /// LocalThenFlush mode, drained by flush_to_s3().
+    /// LocalThenFlush mode, drained by flush_to_storage().
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     /// Phase Kursk: monotonic counter for staging log filenames.
     /// Avoids version collisions when manifest version is updated by flush
     /// between two checkpoints.
     staging_seq: Arc<AtomicU64>,
-    /// Serializes flush_to_s3() calls. Prevents two concurrent flushes from
-    /// racing on version numbers and S3 keys. Also prevents a durable-mode
+    /// Serializes flush_to_storage() calls. Prevents two concurrent flushes from
+    /// racing on version numbers and storage keys. Also prevents a durable-mode
     /// checkpoint (which drains s3_dirty_groups in sync()) from interleaving
     /// with a flush in progress.
     flush_lock: Arc<Mutex<()>>,
@@ -78,8 +78,9 @@ impl TurboliteVfs {
 
     /// Construct an HTTP-backed VFS. Uses Bearer token auth against a storage API.
     fn new_http(mut config: TurboliteConfig, endpoint: &str, token: &str, prefix: &str, fence_token: Arc<AtomicU64>) -> io::Result<Self> {
-        // HTTP backend flushes through StorageClient, not S3 directly.
-        // Durable and S3Primary require self.s3 (Arc<S3Client>) which is None for HTTP.
+        // HTTP backend: checkpoint writes to local staging, then flush_to_storage()
+        // uploads through the StorageClient (HttpClient). S3Primary mode is not
+        // compatible (requires direct S3 access for inline commits).
         config.sync_mode = SyncMode::LocalThenFlush;
 
         // Check config.runtime_handle (cloud feature only), fall back to try_current()
@@ -637,26 +638,22 @@ impl TurboliteVfs {
     /// conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     /// turbolite::tiered::set_local_checkpoint_only(false);
     ///
-    /// // Phase 2: slow (S3 uploads), NO SQLite lock held
-    /// vfs.flush_to_s3().unwrap();
+    /// // Phase 2: slow (storage uploads), NO SQLite lock held
+    /// vfs.flush_to_storage().unwrap();
     /// ```
     ///
     /// # Durability model
     ///
     /// Between phase 1 and phase 2, data exists ONLY in the local disk cache.
     /// - Process crash: data survives (on local disk)
-    /// - Machine loss: data lost (not yet on S3)
+    /// - Machine loss: data lost (not yet on storage)
     /// - `clear_cache*` methods protect pending groups from eviction
     ///
-    /// After flush_to_s3() completes, data is durable on S3.
-    #[cfg(feature = "cloud")]
-    pub fn flush_to_s3(&self) -> io::Result<()> {
-        let s3 = self.s3.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "flush_to_s3 requires S3 backend")
-        })?;
+    /// After flush_to_storage() completes, data is durable on the storage backend.
+    pub fn flush_to_storage(&self) -> io::Result<()> {
         let _guard = self.flush_lock.lock().unwrap();
-        flush::flush_dirty_groups_to_s3(
-            s3,
+        flush::flush_local_groups(
+            &self.storage,
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
@@ -665,10 +662,15 @@ impl TurboliteVfs {
             #[cfg(feature = "zstd")]
             self.config.dictionary.as_deref(),
             self.config.encryption_key,
-            self.config.gc_enabled,
             self.config.override_threshold,
             self.config.compaction_threshold,
         )
+    }
+
+    /// Backward-compatible alias for [`flush_to_storage`].
+    #[cfg(feature = "cloud")]
+    pub fn flush_to_s3(&self) -> io::Result<()> {
+        self.flush_to_storage()
     }
 
     /// Returns true if there are dirty groups or staging logs pending S3 upload.

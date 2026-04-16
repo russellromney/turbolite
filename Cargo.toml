@@ -12,7 +12,7 @@ categories = ["database", "compression"]
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["zstd", "bundled-sqlite"]
+default = ["zstd", "bundled-sqlite", "cloud"]
 bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "dep:libsqlite3-sys"]
 loadable-extension = []
 zstd = ["dep:zstd"]
