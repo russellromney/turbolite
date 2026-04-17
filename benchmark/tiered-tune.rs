@@ -19,11 +19,57 @@ use turbolite::tiered::{
     TurboliteSharedState, TurboliteConfig, TurboliteVfs,
     parse_eqp_output, push_planned_accesses, push_setting,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// Post-Phase-Anvil-g: build an S3 backend + wrap the VFS's SharedState with
+// baseline-subtraction counters (see tiered-bench for the same pattern).
+fn build_s3_backend(
+    runtime: &tokio::runtime::Handle,
+    prefix: &str,
+) -> Arc<hadb_storage_s3::S3Storage> {
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let storage = runtime.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+            .await
+            .expect("build S3Storage")
+    });
+    Arc::new(storage.with_prefix(prefix.to_string()))
+}
+
+struct BenchCtx<'a> {
+    state: &'a TurboliteSharedState,
+    s3: Arc<hadb_storage_s3::S3Storage>,
+    fetch_count_base: AtomicU64,
+    bytes_fetched_base: AtomicU64,
+}
+
+impl<'a> BenchCtx<'a> {
+    fn new(state: &'a TurboliteSharedState, s3: Arc<hadb_storage_s3::S3Storage>) -> Self {
+        Self {
+            fetch_count_base: AtomicU64::new(s3.fetch_count()),
+            bytes_fetched_base: AtomicU64::new(s3.bytes_fetched()),
+            state,
+            s3,
+        }
+    }
+    fn clear_cache_data_only(&self) { self.state.clear_cache_data_only(); }
+    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+    fn reset_s3_counters(&self) {
+        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+    }
+    fn s3_counters(&self) -> (u64, u64) {
+        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        (fc, fb)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tiered-tune")]
@@ -274,7 +320,7 @@ fn run_query_pair(
 fn bench_cold(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -332,7 +378,7 @@ fn bench_cold(
 fn bench_index_level(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -447,21 +493,29 @@ fn main() {
     let cache_dir = TempDir::new().expect("failed to create temp dir");
     let vfs_name = unique_vfs_name();
     let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: cli.prefix.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
         read_only: true,
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         query_plan_prefetch: cli.plan_aware,
         ..Default::default()
     };
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
-    let handle = vfs.shared_state();
+    let owned_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build bench runtime");
+    let rt_handle = owned_runtime.handle().clone();
+    let s3 = build_s3_backend(&rt_handle, &cli.prefix);
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rt_handle.clone(),
+    ).expect("failed to create VFS");
+    let shared_state = vfs.shared_state();
+    let handle = BenchCtx::new(&shared_state, s3.clone());
     turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
 
     let db_name = "tune.db";

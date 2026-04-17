@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use turbolite::clear_all_caches;
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -506,7 +506,6 @@ fn bench_with_corpus(
     let vfs_name = format!("bench_{}_{}", mode, vfs_id);
 
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: target_db_dir.clone(),
         ..Default::default()
     };
@@ -684,7 +683,6 @@ fn bench_existing_db(
     let vfs_name = format!("bench_{}", mode);
 
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: temp_dir.path().into(),
         ..Default::default()
     };
@@ -1315,7 +1313,6 @@ fn _bench_compact_removed() {
             let vfs_name = format!("compact_bench_{}_{}", mode, vfs_id);
 
             let config = TurboliteConfig {
-                storage_backend: StorageBackend::Local,
                 cache_dir: dir.path().into(),
                 compression_level,
                 ..Default::default()

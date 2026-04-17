@@ -21,12 +21,92 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// =========================================================================
+// Post-Phase-Anvil-g S3 wiring
+//
+// The VFS no longer owns an S3Client, so the benchmark holds an
+// Arc<S3Storage> itself for counter reads. `WriteBenchCtx` wraps the
+// shared state with matching baseline-subtraction methods so the rest of
+// the file can stay close to its pre-Anvil-g shape (same method names).
+// =========================================================================
+
+fn build_s3_backend(
+    runtime: &tokio::runtime::Handle,
+    prefix: &str,
+) -> Arc<hadb_storage_s3::S3Storage> {
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let storage = runtime.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+            .await
+            .expect("build S3Storage")
+    });
+    Arc::new(storage.with_prefix(prefix.to_string()))
+}
+
+fn bench_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build bench runtime")
+}
+
+/// Owns the S3 backend counters + baseline and delegates cache control to
+/// the VFS's TurboliteSharedState. The VFS itself also holds `s3`; this
+/// struct's copy is only for counter reads.
+struct WriteBenchCtx {
+    state: TurboliteSharedState,
+    s3: Arc<hadb_storage_s3::S3Storage>,
+    fetch_count_base: AtomicU64,
+    bytes_fetched_base: AtomicU64,
+    put_count_base: AtomicU64,
+    bytes_put_base: AtomicU64,
+}
+
+impl WriteBenchCtx {
+    fn new(state: TurboliteSharedState, s3: Arc<hadb_storage_s3::S3Storage>) -> Self {
+        Self {
+            fetch_count_base: AtomicU64::new(s3.fetch_count()),
+            bytes_fetched_base: AtomicU64::new(s3.bytes_fetched()),
+            put_count_base: AtomicU64::new(s3.put_count()),
+            bytes_put_base: AtomicU64::new(s3.bytes_put()),
+            state,
+            s3,
+        }
+    }
+    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+
+    fn reset_s3_counters(&self) {
+        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+        self.put_count_base.store(self.s3.put_count(), Ordering::Relaxed);
+        self.bytes_put_base.store(self.s3.bytes_put(), Ordering::Relaxed);
+    }
+    fn s3_counters(&self) -> (u64, u64) {
+        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        (fc, fb)
+    }
+    fn s3_put_counters(&self) -> (u64, u64) {
+        let pc = self.s3.put_count().saturating_sub(self.put_count_base.load(Ordering::Relaxed));
+        let pb = self.s3.bytes_put().saturating_sub(self.bytes_put_base.load(Ordering::Relaxed));
+        (pc, pb)
+    }
+    /// Pre-Anvil-g alias. Now the backend-agnostic path. Kept for minimal
+    /// diff in scenario code.
+    fn flush_to_s3(&self) -> std::io::Result<()> {
+        self.state.flush_to_storage()
+    }
+}
 
 // =========================================================================
 // CLI
@@ -112,14 +192,10 @@ fn endpoint_url() -> Option<String> {
         .ok()
 }
 
-fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
+fn make_config(_prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
     TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         gc_enabled: true,
@@ -127,15 +203,11 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> Turbolit
     }
 }
 
-fn make_reader_config(prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
+fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
     TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
         read_only: true,
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         ..Default::default()
@@ -197,18 +269,18 @@ struct S3Snapshot {
     get_bytes: u64,
 }
 
-fn s3_snapshot(bench: &TurboliteSharedState) -> S3Snapshot {
+fn s3_snapshot(bench: &WriteBenchCtx) -> S3Snapshot {
     let (puts, put_bytes) = bench.s3_put_counters();
     let (gets, get_bytes) = bench.s3_counters();
     S3Snapshot { puts, put_bytes, gets, get_bytes }
 }
 
-fn s3_put_delta(bench: &TurboliteSharedState, before: &S3Snapshot) -> (u64, u64) {
+fn s3_put_delta(bench: &WriteBenchCtx, before: &S3Snapshot) -> (u64, u64) {
     let (puts, bytes) = bench.s3_put_counters();
     (puts - before.puts, bytes - before.put_bytes)
 }
 
-fn s3_get_delta(bench: &TurboliteSharedState, before: &S3Snapshot) -> (u64, u64) {
+fn s3_get_delta(bench: &WriteBenchCtx, before: &S3Snapshot) -> (u64, u64) {
     let (gets, bytes) = bench.s3_counters();
     (gets - before.gets, bytes - before.get_bytes)
 }
@@ -233,7 +305,7 @@ struct CheckpointStats {
     s3_bytes: u64,
 }
 
-fn timed_checkpoint(conn: &Connection, bench: &TurboliteSharedState) -> CheckpointStats {
+fn timed_checkpoint(conn: &Connection, bench: &WriteBenchCtx) -> CheckpointStats {
     let before = s3_snapshot(bench);
     let start = Instant::now();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -257,7 +329,7 @@ struct TwoPhaseCheckpointStats {
 
 /// Two-phase checkpoint: fast local phase (holds lock briefly) + async S3 upload (no lock).
 /// Reads and writes can continue during the S3 upload phase.
-fn timed_checkpoint_two_phase(conn: &Connection, bench: &TurboliteSharedState) -> TwoPhaseCheckpointStats {
+fn timed_checkpoint_two_phase(conn: &Connection, bench: &WriteBenchCtx) -> TwoPhaseCheckpointStats {
     let before = s3_snapshot(bench);
     let total_start = Instant::now();
 
@@ -287,8 +359,18 @@ fn verify_cold_reader(prefix: &str, db_name: &str, cli: &Cli, expected_rows: usi
     let reader_cache = TempDir::new().expect("reader temp dir");
     let reader_config = make_reader_config(prefix, reader_cache.path(), cli);
     let vfs_name = unique_vfs_name("verify");
-    let vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
+    let rt = bench_runtime();
+    let rth = rt.handle().clone();
+    let s3 = build_s3_backend(&rth, prefix);
+    let vfs = TurboliteVfs::new_with_storage(
+        reader_config,
+        s3 as Arc<dyn hadb_storage::StorageBackend>,
+        rth,
+    ).expect("reader VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
+    // Hold the runtime alive for the duration of reader calls. Bound with
+    // a variable so the compiler can't drop it early.
+    let _rt_guard = rt;
 
     let conn = Connection::open_with_flags_and_vfs(
         db_name,
@@ -347,10 +429,11 @@ fn groups_for(page_count: i64, ppg: u32) -> i64 {
 
 struct VfsSetup {
     conn: Connection,
-    bench: TurboliteSharedState,
+    bench: WriteBenchCtx,
     prefix: String,
     db_name: String,
     _cache_dir: TempDir,
+    _runtime: tokio::runtime::Runtime,
 }
 
 fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
@@ -359,9 +442,17 @@ fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
     let config = make_config(&prefix, cache_dir.path(), cli);
     let db_name = format!("{}_test.db", name_prefix);
 
+    let runtime = bench_runtime();
+    let rth = runtime.handle().clone();
+    let s3 = build_s3_backend(&rth, &prefix);
     let vfs_name = unique_vfs_name(name_prefix);
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
-    let bench = vfs.shared_state();
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rth,
+    ).expect("TurboliteVfs");
+    let state = vfs.shared_state();
+    let bench = WriteBenchCtx::new(state, s3);
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -380,7 +471,7 @@ fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
     .expect("pragma setup");
     conn.execute_batch(SCHEMA).expect("create tables");
 
-    VfsSetup { conn, bench, prefix, db_name, _cache_dir: cache_dir }
+    VfsSetup { conn, bench, prefix, db_name, _cache_dir: cache_dir, _runtime: runtime }
 }
 
 /// Bulk insert rows with batched transactions. Returns insert wall time in ms.
@@ -584,8 +675,16 @@ fn scenario_update(cli: &Cli) {
         let reader_cache = TempDir::new().expect("reader temp dir");
         let reader_config = make_reader_config(&s.prefix, reader_cache.path(), cli);
         let vfs_name = unique_vfs_name("verify_upd");
-        let vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
+        let rt = bench_runtime();
+        let rth = rt.handle().clone();
+        let s3 = build_s3_backend(&rth, &s.prefix);
+        let vfs = TurboliteVfs::new_with_storage(
+            reader_config,
+            s3 as Arc<dyn hadb_storage::StorageBackend>,
+            rth,
+        ).expect("reader VFS");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
+        let _rt_guard = rt;
         let reader = Connection::open_with_flags_and_vfs(
             &s.db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &vfs_name,
         ).expect("cold reader");
@@ -831,9 +930,16 @@ fn scenario_cold_write(cli: &Cli) {
     let config = make_config(&prefix, cache_dir.path(), cli);
     let db_name = "cold_write_test.db";
 
+    let seed_runtime = bench_runtime();
+    let seed_rth = seed_runtime.handle().clone();
+    let seed_s3 = build_s3_backend(&seed_rth, &prefix);
     let vfs_name = unique_vfs_name("cold_seed");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
-    let bench_seed = vfs.shared_state();
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        seed_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        seed_rth,
+    ).expect("TurboliteVfs");
+    let bench_seed = WriteBenchCtx::new(vfs.shared_state(), seed_s3);
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -857,9 +963,16 @@ fn scenario_cold_write(cli: &Cli) {
     // Phase 2: Open a COLD VFS against the same S3 prefix (empty cache) and write
     let cold_cache = TempDir::new().expect("cold cache dir");
     let cold_config = make_config(&prefix, cold_cache.path(), cli);
+    let cold_runtime = bench_runtime();
+    let cold_rth = cold_runtime.handle().clone();
+    let cold_s3 = build_s3_backend(&cold_rth, &prefix);
     let cold_vfs_name = unique_vfs_name("cold_write");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold TurboliteVfs");
-    let cold_bench = cold_vfs.shared_state();
+    let cold_vfs = TurboliteVfs::new_with_storage(
+        cold_config,
+        cold_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        cold_rth,
+    ).expect("cold TurboliteVfs");
+    let cold_bench = WriteBenchCtx::new(cold_vfs.shared_state(), cold_s3);
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = Connection::open_with_flags_and_vfs(
@@ -918,21 +1031,25 @@ fn scenario_merge_write(cli: &Cli) {
     let cache_dir = TempDir::new().expect("cache dir");
     // Use default config but override ppg/page_size from manifest (manifest takes precedence)
     let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         gc_enabled: true,
         ..Default::default()
     };
+    let runtime = bench_runtime();
+    let rth = runtime.handle().clone();
+    let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("merge_write");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
-    let bench = vfs.shared_state();
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rth,
+    ).expect("TurboliteVfs");
+    let bench = WriteBenchCtx::new(vfs.shared_state(), s3);
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
+    let _rt_guard = runtime;
 
     let conn = Connection::open_with_flags_and_vfs(
         &cli.db_name,
@@ -1047,21 +1164,25 @@ fn scenario_arctic_write(cli: &Cli) {
 
     let cache_dir = TempDir::new().expect("cache dir");
     let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         gc_enabled: true,
         ..Default::default()
     };
+    let runtime = bench_runtime();
+    let rth = runtime.handle().clone();
+    let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("arctic_write");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
-    let bench = vfs.shared_state();
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rth,
+    ).expect("TurboliteVfs");
+    let bench = WriteBenchCtx::new(vfs.shared_state(), s3);
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
+    let _rt_guard = runtime;
 
     // Open connection (this eagerly fetches interior bundles)
     let conn = Connection::open_with_flags_and_vfs(
@@ -1157,21 +1278,25 @@ fn scenario_two_phase(cli: &Cli) {
 
     let cache_dir = TempDir::new().expect("cache dir");
     let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.path().to_path_buf(),
         compression_level: 1,
-        endpoint_url: endpoint_url(),
-        region: std::env::var("AWS_REGION").ok(),
         pages_per_group: cli.ppg,
         prefetch_threads: cli.prefetch_threads,
         gc_enabled: true,
         ..Default::default()
     };
+    let runtime = bench_runtime();
+    let rth = runtime.handle().clone();
+    let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("two_phase");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
-    let bench = vfs.shared_state();
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rth,
+    ).expect("TurboliteVfs");
+    let bench = WriteBenchCtx::new(vfs.shared_state(), s3);
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
+    let _rt_guard = runtime;
 
     let conn = Connection::open_with_flags_and_vfs(
         &cli.db_name,

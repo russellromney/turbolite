@@ -15,10 +15,35 @@ use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// Post-Phase-Anvil-g: VFS no longer builds its own S3 client. Helpers build
+// an Arc<S3Storage> from env + prefix so each VFS uses matching storage.
+fn build_s3_backend(
+    runtime: &tokio::runtime::Handle,
+    prefix: &str,
+) -> Arc<hadb_storage_s3::S3Storage> {
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let storage = runtime.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket, Some(endpoint.as_str()))
+            .await
+            .expect("build S3Storage")
+    });
+    Arc::new(storage.with_prefix(prefix.to_string()))
+}
+
+fn bench_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build bench runtime")
+}
 
 #[derive(Parser)]
 #[command(name = "tpch-bench")]
@@ -100,29 +125,24 @@ fn open_reader(db_name: &str, vfs_name: &str, cache_pages: i64) -> Connection {
     conn
 }
 
-fn make_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
+/// Build a writer config + a unique S3 prefix derived from `prefix`.
+/// The caller wires the prefix into the S3 backend.
+fn make_config(prefix: &str, cache_dir: &std::path::Path) -> (TurboliteConfig, String) {
     let unique_prefix = format!("tpch/{}/{}", prefix,
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: unique_prefix,
+    let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 3,
-        endpoint_url: Some(endpoint_url()),
-        region: Some("auto".to_string()),
         ..Default::default()
-    }
+    };
+    (config, unique_prefix)
 }
 
-fn make_reader_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
+fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 3,
-        endpoint_url: Some(endpoint_url()),
         read_only: true,
-        region: Some("auto".to_string()),
         ..Default::default()
     }
 }
@@ -477,6 +497,7 @@ fn bench_range(conn: &Connection, iterations: usize, label: &str) -> BenchResult
 }
 
 fn bench_cold_query(
+    rt: &tokio::runtime::Handle,
     s3_prefix: &str, db_name: &str, label: &str, sql: &str,
     iterations: usize,
 ) -> BenchResult {
@@ -485,7 +506,12 @@ fn bench_cold_query(
         let cache = TempDir::new().expect("temp dir");
         let vfs_name = unique_vfs_name("cold_q");
         let config = make_reader_config(s3_prefix, cache.path());
-        let vfs = TurboliteVfs::new(config).expect("cold VFS");
+        let s3 = build_s3_backend(rt, s3_prefix);
+        let vfs = TurboliteVfs::new_with_storage(
+            config,
+            s3 as Arc<dyn hadb_storage::StorageBackend>,
+            rt.clone(),
+        ).expect("cold VFS");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let start = Instant::now();
         let conn = open_reader(db_name, &vfs_name, 1);
@@ -523,12 +549,19 @@ fn main() {
     println!("Iterations: {} hot/warm, {} cold", cli.iterations, cli.cold_iterations);
     println!();
 
-    // Setup: create VFS
+    // Setup: runtime + S3 backend + writer VFS
+    let owned_runtime = bench_runtime();
+    let rt_handle = owned_runtime.handle().clone();
+
     let cache_dir = TempDir::new().expect("temp dir");
-    let config = make_config(&format!("sf_{}", scale), cache_dir.path());
-    let s3_prefix = config.prefix.clone();
+    let (config, s3_prefix) = make_config(&format!("sf_{}", scale), cache_dir.path());
     let vfs_name = unique_vfs_name("write");
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let writer_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+    let vfs = TurboliteVfs::new_with_storage(
+        config,
+        writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
+        rt_handle.clone(),
+    ).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_name = format!("tpch_sf{}.db", scale);
@@ -574,7 +607,12 @@ fn main() {
     println!("--- WARM (disk cache + 20% page cache) ---");
     let warm_vfs_name = unique_vfs_name("warm");
     let warm_config = make_reader_config(&s3_prefix, cache_dir.path());
-    let warm_vfs = TurboliteVfs::new(warm_config).expect("warm VFS");
+    let warm_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+    let warm_vfs = TurboliteVfs::new_with_storage(
+        warm_config,
+        warm_s3 as Arc<dyn hadb_storage::StorageBackend>,
+        rt_handle.clone(),
+    ).expect("warm VFS");
     turbolite::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
 
     let cache_pages = (est_db_mb * 1024.0 * 1024.0 * 0.2 / 65536.0) as i64;
@@ -594,7 +632,7 @@ fn main() {
     let mut cold_results: Vec<BenchResult> = Vec::new();
     for q in &QUERIES {
         cold_results.push(bench_cold_query(
-            &s3_prefix, &db_name, &format!("Cold {}", q.label), q.sql,
+            &rt_handle, &s3_prefix, &db_name, &format!("Cold {}", q.label), q.sql,
             cli.cold_iterations,
         ));
     }
@@ -607,7 +645,12 @@ fn main() {
             let cache = TempDir::new().unwrap();
             let vn = unique_vfs_name("cold_pt");
             let cfg = make_reader_config(&s3_prefix, cache.path());
-            let v = TurboliteVfs::new(cfg).expect("cold VFS");
+            let s3 = build_s3_backend(&rt_handle, &s3_prefix);
+            let v = TurboliteVfs::new_with_storage(
+                cfg,
+                s3 as Arc<dyn hadb_storage::StorageBackend>,
+                rt_handle.clone(),
+            ).expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -628,7 +671,12 @@ fn main() {
             let cache = TempDir::new().unwrap();
             let vn = unique_vfs_name("cold_rng");
             let cfg = make_reader_config(&s3_prefix, cache.path());
-            let v = TurboliteVfs::new(cfg).expect("cold VFS");
+            let s3 = build_s3_backend(&rt_handle, &s3_prefix);
+            let v = TurboliteVfs::new_with_storage(
+                cfg,
+                s3 as Arc<dyn hadb_storage::StorageBackend>,
+                rt_handle.clone(),
+            ).expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -667,15 +715,20 @@ fn main() {
         eprint!("  Cleaning up S3... ");
         let cleanup_cache = TempDir::new().unwrap();
         let cleanup_config = TurboliteConfig {
-            bucket: test_bucket(), prefix: s3_prefix,
-            cache_dir: cleanup_cache.path().to_path_buf(), compression_level: 3,
-            endpoint_url: Some(endpoint_url()), region: Some("auto".to_string()),
+            cache_dir: cleanup_cache.path().to_path_buf(),
+            compression_level: 3,
             ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).expect("cleanup VFS");
-        cleanup_vfs.destroy_s3().expect("S3 cleanup failed");
+        let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+        let cleanup_vfs = TurboliteVfs::new_with_storage(
+            cleanup_config,
+            cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
+            rt_handle.clone(),
+        ).expect("cleanup VFS");
+        cleanup_vfs.destroy_remote().expect("remote cleanup failed");
         eprintln!("done");
     }
+    drop(owned_runtime);
 
     println!("Done.");
 }

@@ -82,16 +82,15 @@ impl TurboliteVfs {
     }
 
     /// Create a VFS backed by a caller-supplied `StorageBackend` + tokio
-    /// runtime handle. Sets `SyncMode::LocalThenFlush` by default (the
-    /// backend is assumed to be remote; writes land in staging logs first).
+    /// runtime handle. The caller's `config.sync_mode` is honoured: pick
+    /// `Durable` for full remote upload on every checkpoint,
+    /// `LocalThenFlush` for staged uploads via `flush_to_storage()`, or
+    /// `RemotePrimary` for per-commit manifest publish.
     pub fn new_with_storage(
-        mut config: TurboliteConfig,
+        config: TurboliteConfig,
         backend: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
-        if config.sync_mode == SyncMode::Durable {
-            config.sync_mode = SyncMode::LocalThenFlush;
-        }
         fs::create_dir_all(&config.cache_dir)?;
         Self::new_inner(config, backend, runtime, None, false)
     }
