@@ -1752,38 +1752,43 @@ impl DatabaseHandle for TurboliteHandle {
             // Persist bitmap so reopened sessions see which pages are cached.
             let _ = cache.persist_bitmap();
 
-            // Persist manifest + dirty_groups locally for crash recovery,
-            // then flush page groups through the unified backend path.
+            // Persist manifest + dirty_groups locally for crash recovery.
             {
                 let m = (**self.manifest.load()).clone();
                 let _ = manifest::persist_manifest_local(&cache_dir, &m);
                 let _ = manifest::persist_dirty_groups(&cache_dir, &pending_groups_snapshot);
             }
-            if let (Some(ref storage), Some(ref runtime)) =
-                (self.storage.as_ref(), self.runtime.as_ref())
-            {
-                let flush_res = flush::flush_dirty_groups(
-                    storage.as_ref(),
-                    runtime,
-                    self.is_local,
-                    cache,
-                    &self.manifest,
-                    &self.s3_dirty_groups,
-                    &self.pending_flushes,
-                    self.compression_level,
-                    #[cfg(feature = "zstd")]
-                    self.dictionary_bytes.as_deref(),
-                    self.encryption_key,
-                    self.gc_enabled,
-                    self.override_threshold,
-                    self.compaction_threshold,
-                );
-                if self.is_local {
+
+            // LocalThenFlush contract:
+            //   - Local backend (filesystem): page groups must land on disk for
+            //     followers/reopens to see them. Cheap; stay inline.
+            //   - Remote backend: DEFER. The whole point of LocalThenFlush is to
+            //     release the SQLite EXCLUSIVE lock in ~1ms by not touching the
+            //     network. `flush_to_storage()` drains pending_flushes later,
+            //     outside the lock, via the same flush_dirty_groups path.
+            if self.is_local {
+                if let (Some(ref storage), Some(ref runtime)) =
+                    (self.storage.as_ref(), self.runtime.as_ref())
+                {
+                    let flush_res = flush::flush_dirty_groups(
+                        storage.as_ref(),
+                        runtime,
+                        true,
+                        cache,
+                        &self.manifest,
+                        &self.s3_dirty_groups,
+                        &self.pending_flushes,
+                        self.compression_level,
+                        #[cfg(feature = "zstd")]
+                        self.dictionary_bytes.as_deref(),
+                        self.encryption_key,
+                        self.gc_enabled,
+                        self.override_threshold,
+                        self.compaction_threshold,
+                    );
                     if let Err(ref e) = flush_res {
                         eprintln!("[sync] local flush failed: {}", e);
                     }
-                } else {
-                    flush_res?;
                 }
             }
 
