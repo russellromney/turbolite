@@ -89,8 +89,28 @@ pub struct Manifest {
     /// giving SQLite the correct database header (page count, schema cookie)
     /// without fetching from S3 or reopening the connection.
     /// None for manifests created before this field was added.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Phase Strata note: this field intentionally has no `skip_serializing_if`.
+    /// Under rmp_serde's positional encoding, a conditionally-skipped field in
+    /// the middle of the struct shifts every subsequent field's array index,
+    /// which breaks deserialization whenever a new field is added after it.
+    /// Always-serialize keeps the positional layout stable; `None` is encoded
+    /// as a single nil byte in msgpack, so the cost is negligible.
+    #[serde(default)]
     pub db_header: Option<Vec<u8>>,
+
+    /// Discontinuity stamp. Bumped ONLY by out-of-band operations that make
+    /// the prior cache invalid (admin-driven fork/rollback/restore). Normal
+    /// checkpoints preserve it. Consumers that see a remote manifest whose
+    /// epoch differs from their cached manifest's epoch treat their local
+    /// cache as stale and cold-start from the remote.
+    ///
+    /// Placed at the end of the struct so adding it doesn't shift any prior
+    /// field's positional index — pre-Strata manifest.msgpack bytes already
+    /// on disk deserialize cleanly (missing trailing element → serde default
+    /// fills `epoch = 0`).
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 fn default_strategy() -> GroupingStrategy {
@@ -260,6 +280,7 @@ impl Manifest {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
+            epoch: 0,
         }
     }
 

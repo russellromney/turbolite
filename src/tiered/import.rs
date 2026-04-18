@@ -330,6 +330,7 @@ pub fn import_sqlite_file(
     let mut manifest = Manifest {
         version,
         change_counter: version, // import uses the same value; walrust not relevant for import
+        epoch: 0,
         page_count,
         page_size,
         pages_per_group: ppg,
