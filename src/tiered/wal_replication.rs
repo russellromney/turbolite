@@ -74,10 +74,11 @@ impl WalReplicationState {
             snapshot_interval: std::time::Duration::from_secs(86400),
             retry_policy: walrust_core::RetryPolicy::new(walrust_core::RetryConfig::default()),
             db_name: None,
+            ..Default::default()
         };
 
         let handle = runtime_handle.spawn(async move {
-            let storage = match walrust_core::S3Backend::from_env(bucket, endpoint.as_deref()).await {
+            let storage = match hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("[wal-replication] ERROR: S3 backend: {}", e);
@@ -154,15 +155,15 @@ pub(crate) fn recover_wal_from_shared_state(
 
     // Step 1: check for WAL segments before doing expensive materialization
     let incr_keys = safe_block_on(runtime_handle, async {
-        let storage = walrust_core::S3Backend::from_env(bucket.to_string(), endpoint).await
+        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
-        use walrust_core::StorageBackend;
+        use hadb_storage::StorageBackend;
         let db_name = wal_prefix.trim_end_matches('/').rsplit('/').next().unwrap_or("db");
         let incr_prefix = format!("{}{}/0000/", wal_prefix, db_name);
         let start_key = format!("{}{:016x}-{:016x}.hadbp", incr_prefix, manifest_version, manifest_version);
 
-        storage.list_objects_after(&incr_prefix, &start_key).await
+        storage.list(&incr_prefix, Some(&start_key)).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("list WAL: {}", e)))
     })?;
 
@@ -179,15 +180,23 @@ pub(crate) fn recover_wal_from_shared_state(
 
     // Step 3: download and apply WAL segments
     let applied = safe_block_on(runtime_handle, async {
-        let storage = walrust_core::S3Backend::from_env(bucket.to_string(), endpoint).await
+        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
-        use walrust_core::StorageBackend;
+        use hadb_storage::StorageBackend;
         let mut count = 0u64;
         let mut prev_checksum = 0u64; // Start of chain; first changeset validates from 0
         for key in &incr_keys {
-            let data = storage.download_bytes(key).await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e)))?;
+            // hadb_storage::StorageBackend::get returns Ok(None) for absent keys.
+            // The list() above filtered by prefix + `after`, so a missing key here
+            // means the object was deleted between list and get — treat as a hard
+            // error so the caller knows recovery is incomplete.
+            let data = storage.get(key).await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e)))?
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("WAL segment {} disappeared between list and get", key),
+                ))?;
             match walrust_core::ltx::apply_changeset_to_db(&data, &recovery_path, prev_checksum) {
                 Ok(result) => {
                     prev_checksum = result.checksum;
