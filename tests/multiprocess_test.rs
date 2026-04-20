@@ -18,7 +18,7 @@ fn register_local_vfs(name: &str, cache_dir: &Path) {
         cache_dir: cache_dir.into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
     turbolite::tiered::register(name, vfs).expect("register VFS");
 }
 

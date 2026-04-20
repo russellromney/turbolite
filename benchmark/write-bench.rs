@@ -365,7 +365,7 @@ fn verify_cold_reader(prefix: &str, db_name: &str, cli: &Cli, expected_rows: usi
     let rt = bench_runtime();
     let rth = rt.handle().clone();
     let s3 = build_s3_backend(&rth, prefix);
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         reader_config,
         s3 as Arc<dyn hadb_storage::StorageBackend>,
         rth,
@@ -449,7 +449,7 @@ fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
     let rth = runtime.handle().clone();
     let s3 = build_s3_backend(&rth, &prefix);
     let vfs_name = unique_vfs_name(name_prefix);
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rth,
@@ -681,7 +681,7 @@ fn scenario_update(cli: &Cli) {
         let rt = bench_runtime();
         let rth = rt.handle().clone();
         let s3 = build_s3_backend(&rth, &s.prefix);
-        let vfs = TurboliteVfs::new_with_storage(
+        let vfs = TurboliteVfs::with_backend(
             reader_config,
             s3 as Arc<dyn hadb_storage::StorageBackend>,
             rth,
@@ -937,7 +937,7 @@ fn scenario_cold_write(cli: &Cli) {
     let seed_rth = seed_runtime.handle().clone();
     let seed_s3 = build_s3_backend(&seed_rth, &prefix);
     let vfs_name = unique_vfs_name("cold_seed");
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         seed_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         seed_rth,
@@ -970,7 +970,7 @@ fn scenario_cold_write(cli: &Cli) {
     let cold_rth = cold_runtime.handle().clone();
     let cold_s3 = build_s3_backend(&cold_rth, &prefix);
     let cold_vfs_name = unique_vfs_name("cold_write");
-    let cold_vfs = TurboliteVfs::new_with_storage(
+    let cold_vfs = TurboliteVfs::with_backend(
         cold_config,
         cold_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         cold_rth,
@@ -1048,7 +1048,7 @@ fn scenario_merge_write(cli: &Cli) {
     let rth = runtime.handle().clone();
     let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("merge_write");
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rth,
@@ -1184,7 +1184,7 @@ fn scenario_arctic_write(cli: &Cli) {
     let rth = runtime.handle().clone();
     let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("arctic_write");
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rth,
@@ -1301,7 +1301,7 @@ fn scenario_two_phase(cli: &Cli) {
     let rth = runtime.handle().clone();
     let s3 = build_s3_backend(&rth, prefix);
     let vfs_name = unique_vfs_name("two_phase");
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rth,

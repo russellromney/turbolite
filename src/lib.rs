@@ -18,7 +18,7 @@
 //!     cache_dir: "/data/mydb".into(),
 //!     ..Default::default()
 //! };
-//! let vfs = TurboliteVfs::new(config)?;
+//! let vfs = TurboliteVfs::new_local(config)?;
 //! turbolite::tiered::register("mydb", vfs)?;
 //! ```
 
@@ -85,7 +85,7 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
     let read_only = config.read_only;
 
-    let vfs = TurboliteVfs::new(config)?;
+    let vfs = TurboliteVfs::new_local(config)?;
     let shared = SharedTurboliteVfs::new(vfs);
     tiered::register_shared(&vfs_name, shared)?;
 

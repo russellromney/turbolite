@@ -509,7 +509,7 @@ fn main() {
         .expect("build bench runtime");
     let rt_handle = owned_runtime.handle().clone();
     let s3 = build_s3_backend(&rt_handle, &cli.prefix);
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),

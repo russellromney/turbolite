@@ -39,7 +39,7 @@ fn test_encrypted_write_cold_read() {
 
     // Write phase
     {
-        let vfs = TurboliteVfs::new(config).expect("failed to create encrypted TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create encrypted TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -87,7 +87,7 @@ fn test_encrypted_write_cold_read() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_read");
-        let vfs = TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+        let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -125,7 +125,7 @@ fn test_encrypted_write_cold_read() {
             encryption_key: Some(test_encryption_key()),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -143,7 +143,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
     // Write with correct key
     {
         let vfs_name = unique_vfs_name("tiered_enc_wr");
-        let vfs = TurboliteVfs::new(config).expect("failed to create encrypted TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create encrypted TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -177,7 +177,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_wrong");
-        let vfs = TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+        let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         // Wrong key may fail at connection open (SQLite reads page 0 header
@@ -210,7 +210,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             encryption_key: Some(test_encryption_key()),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -229,7 +229,7 @@ fn test_encrypted_arctic_start_all_page_types() {
     // Write: create a table with an index (exercises interior, index leaf, and data pages)
     {
         let vfs_name = unique_vfs_name("tiered_enc_arctic_w");
-        let vfs = TurboliteVfs::new(config).expect("failed to create encrypted TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create encrypted TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -272,7 +272,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_arctic_r");
-        let vfs = TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+        let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -321,7 +321,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             encryption_key: Some(test_encryption_key()),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -345,7 +345,7 @@ fn test_rotate_key_cold_read_succeeds() {
     // Write phase with key A
     {
         let vfs_name = unique_vfs_name("tiered_rot_wr");
-        let vfs = TurboliteVfs::new(config).expect("failed to create encrypted TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create encrypted TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -412,7 +412,7 @@ fn test_rotate_key_cold_read_succeeds() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_rd");
-        let vfs = TurboliteVfs::new(reader_config).unwrap();
+        let vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -462,7 +462,7 @@ fn test_rotate_key_cold_read_succeeds() {
             encryption_key: Some(key_b),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -484,7 +484,7 @@ fn test_rotate_key_old_key_fails() {
     // Write with key A
     {
         let vfs_name = unique_vfs_name("tiered_rot_old_wr");
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -535,7 +535,7 @@ fn test_rotate_key_old_key_fails() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_old_rd");
-        let vfs = TurboliteVfs::new(reader_config).unwrap();
+        let vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         // Wrong key may fail at connection open (SQLite reads page 0 header
@@ -569,7 +569,7 @@ fn test_rotate_key_old_key_fails() {
             encryption_key: Some(key_b),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -591,7 +591,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
     // Write with key A
     {
         let vfs_name = unique_vfs_name("tiered_rot_gc_wr");
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -732,7 +732,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             encryption_key: Some(key_b),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -756,7 +756,7 @@ fn test_rotate_key_data_integrity() {
     let mut expected_rows: HashMap<i64, String> = HashMap::new();
     {
         let vfs_name = unique_vfs_name("tiered_rot_int_wr");
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -823,7 +823,7 @@ fn test_rotate_key_data_integrity() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_int_rd");
-        let vfs = TurboliteVfs::new(reader_config).unwrap();
+        let vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -866,7 +866,7 @@ fn test_rotate_key_data_integrity() {
             encryption_key: Some(key_b),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -887,7 +887,7 @@ fn test_remove_encryption_cold_read() {
     // Write phase with encryption
     {
         let vfs_name = unique_vfs_name("tiered_rmenc_wr");
-        let vfs = TurboliteVfs::new(config).expect("failed to create encrypted TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create encrypted TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -953,7 +953,7 @@ fn test_remove_encryption_cold_read() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rmenc_rd");
-        let vfs = TurboliteVfs::new(reader_config).unwrap();
+        let vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -987,7 +987,7 @@ fn test_remove_encryption_cold_read() {
             encryption_key: None,
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }
@@ -1008,7 +1008,7 @@ fn test_add_encryption_cold_read() {
     // Write phase WITHOUT encryption
     {
         let vfs_name = unique_vfs_name("tiered_addenc_wr");
-        let vfs = TurboliteVfs::new(config).expect("failed to create TurboliteVfs");
+        let vfs = TurboliteVfs::new_local(config).expect("failed to create TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1074,7 +1074,7 @@ fn test_add_encryption_cold_read() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_addenc_rd");
-        let vfs = TurboliteVfs::new(reader_config).unwrap();
+        let vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1109,7 +1109,7 @@ fn test_add_encryption_cold_read() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let fail_vfs_name = unique_vfs_name("tiered_addenc_fail");
-        let vfs = TurboliteVfs::new(fail_config).unwrap();
+        let vfs = TurboliteVfs::new_local(fail_config).unwrap();
         turbolite::tiered::register(&fail_vfs_name, vfs).unwrap();
 
         let result = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1141,7 +1141,7 @@ fn test_add_encryption_cold_read() {
             encryption_key: Some(key_b),
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }

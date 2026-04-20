@@ -1248,7 +1248,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
         let vfs_name = unique_vfs_name("write");
         let writer_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-        let vfs = TurboliteVfs::new_with_storage(
+        let vfs = TurboliteVfs::with_backend(
             config,
             writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),
@@ -1304,14 +1304,14 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
     // Phase Cirrus d removed eager interior/index prefetch entirely; those
     // pages now come in on first-query miss. BENCH_NO_EAGER_INDEX is a no-op.
-    eprintln!("[bench] calling TurboliteVfs::new_with_storage()...");
+    eprintln!("[bench] calling TurboliteVfs::with_backend()...");
     let reader_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-    let reader_vfs = TurboliteVfs::new_with_storage(
+    let reader_vfs = TurboliteVfs::with_backend(
         reader_config,
         reader_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
     ).expect("reader VFS");
-    eprintln!("[bench] TurboliteVfs::new_with_storage() returned OK");
+    eprintln!("[bench] TurboliteVfs::with_backend() returned OK");
     let shared_state = reader_vfs.shared_state();
     let ctx = BenchCtx::new(&shared_state, reader_s3.clone());
     let reader_vfs_name = unique_vfs_name("reader");
@@ -1584,7 +1584,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-        let cleanup_vfs = TurboliteVfs::new_with_storage(
+        let cleanup_vfs = TurboliteVfs::with_backend(
             cleanup_config,
             cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),

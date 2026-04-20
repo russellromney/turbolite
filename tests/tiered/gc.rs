@@ -14,7 +14,7 @@ fn test_gc_post_checkpoint() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -90,7 +90,7 @@ fn test_gc_disabled_preserves_old_versions() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -158,7 +158,7 @@ fn test_gc_full_scan() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -205,7 +205,7 @@ fn test_gc_full_scan() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).unwrap();
+    let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
     eprintln!("Full GC deleted {} objects", deleted);
 
@@ -243,7 +243,7 @@ fn test_gc_no_orphans() {
     config.gc_enabled = true; // GC on from the start
     let vfs_name = unique_vfs_name("tiered_gc_noop");
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -276,7 +276,7 @@ fn test_gc_no_orphans() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).unwrap();
+    let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
     assert_eq!(deleted, 0, "GC on empty prefix should delete nothing");
 }

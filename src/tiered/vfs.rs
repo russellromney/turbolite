@@ -13,7 +13,7 @@ use crate::tiered::storage as storage_helpers;
 /// turbolite is byte-agnostic below the VFS; the actual storage (filesystem,
 /// S3, Cinch HTTP, etc.) is an `Arc<dyn hadb_storage::StorageBackend>`. Use
 /// [`TurboliteVfs::new`] for the default local-filesystem backend rooted
-/// under `config.cache_dir`, or [`TurboliteVfs::new_with_storage`] to
+/// under `config.cache_dir`, or [`TurboliteVfs::with_backend`] to
 /// inject any other backend + the tokio runtime handle the VFS should
 /// drive it on.
 pub struct TurboliteVfs {
@@ -60,10 +60,11 @@ pub struct TurboliteVfs {
 }
 
 impl TurboliteVfs {
-    /// Create a new VFS backed by `hadb_storage_local::LocalStorage`
-    /// rooted at `config.cache_dir`. Spins up a dedicated 2-thread tokio
-    /// runtime for backend calls.
-    pub fn new(config: TurboliteConfig) -> io::Result<Self> {
+    /// Local mode. Wraps `hadb_storage_local::LocalStorage` rooted at
+    /// `config.cache_dir` and spins up a dedicated 2-thread tokio runtime.
+    /// Use [`TurboliteVfs::with_backend`] if you want to supply a remote
+    /// `StorageBackend` + reuse an existing runtime.
+    pub fn new_local(config: TurboliteConfig) -> io::Result<Self> {
         let owned = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -78,26 +79,25 @@ impl TurboliteVfs {
         fs::create_dir_all(&config.cache_dir)?;
 
         let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&config.cache_dir));
-        Self::new_inner(config, storage, runtime, Some(owned), true)
+        Self::assemble(config, storage, runtime, Some(owned), true)
     }
 
-    /// Create a VFS backed by a caller-supplied `StorageBackend` + tokio
-    /// runtime handle. The caller's `config.sync_mode` is honoured: pick
-    /// `Durable` for full remote upload on every checkpoint,
-    /// `LocalThenFlush` for staged uploads via `flush_to_storage()`, or
-    /// `RemotePrimary` for per-commit manifest publish.
-    pub fn new_with_storage(
+    /// Caller-supplied backend. The caller's `config.sync_mode` is honoured:
+    /// `Durable` uploads on every checkpoint, `LocalThenFlush` stages for
+    /// later `flush_to_storage()`, `RemotePrimary` publishes per commit.
+    pub fn with_backend(
         config: TurboliteConfig,
         backend: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
         fs::create_dir_all(&config.cache_dir)?;
-        Self::new_inner(config, backend, runtime, None, false)
+        Self::assemble(config, backend, runtime, None, false)
     }
 
-    /// Shared constructor path. `owned_runtime` is Some only when `new()`
-    /// built its own runtime.
-    fn new_inner(
+    /// Private assembly path shared by [`Self::new_local`] and
+    /// [`Self::with_backend`]. `owned_runtime` is Some only when the caller
+    /// handed us a runtime to keep alive.
+    fn assemble(
         mut config: TurboliteConfig,
         storage: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,

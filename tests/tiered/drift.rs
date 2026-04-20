@@ -138,7 +138,7 @@ fn drift_sanity_import_write_cold_read() {
     durable_config.endpoint_url = config.endpoint_url.clone();
     // Re-use the same config but override sync mode
     let vfs_name = unique_vfs_name("drift_sanity");
-    let vfs = TurboliteVfs::new(durable_config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(durable_config).expect("create vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register vfs");
 
     let conn = open_vfs_conn(&vfs_name, "drift_sanity");
@@ -162,7 +162,7 @@ fn drift_sanity_import_write_cold_read() {
     let cold_dir = TempDir::new().expect("cold dir");
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("drift_sanity_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold vfs");
 
     let cold_conn = open_cold_conn(&cold_vfs_name, "drift_sanity");
@@ -197,7 +197,7 @@ fn drift_override_write_and_cold_read() {
 
     // Step 2: open VFS, do small updates, checkpoint+flush to produce override frames
     let vfs_name = unique_vfs_name("drift_ov_write");
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).expect("register vfs");
 
@@ -242,7 +242,7 @@ fn drift_override_write_and_cold_read() {
     let cold_dir = TempDir::new().expect("cold dir");
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("drift_ov_write_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold vfs");
 
     let cold_conn = open_cold_conn(&cold_vfs_name, "drift_ov_write");
@@ -299,7 +299,7 @@ fn drift_override_compaction_and_cold_read() {
     create_and_import(&config, cache_dir.path(), "drift_compact", 100, "base");
 
     let vfs_name = unique_vfs_name("drift_compact");
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).expect("register vfs");
 
@@ -337,7 +337,7 @@ fn drift_override_compaction_and_cold_read() {
     let cold_dir = TempDir::new().expect("cold dir");
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("drift_compact_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold vfs");
 
     let cold_conn = open_cold_conn(&cold_vfs_name, "drift_compact");
@@ -394,7 +394,7 @@ fn drift_two_writer_cache_validation() {
 
     // Writer 1: open and verify data, then close
     let vfs_name1 = unique_vfs_name("drift_2w_w1");
-    let vfs1 = TurboliteVfs::new(config1).expect("create vfs1");
+    let vfs1 = TurboliteVfs::new_local(config1).expect("create vfs1");
     turbolite::tiered::register(&vfs_name1, vfs1).expect("register vfs1");
 
     let conn1 = open_vfs_conn(&vfs_name1, "drift_2w");
@@ -421,7 +421,7 @@ fn drift_two_writer_cache_validation() {
         ..Default::default()
     };
     let vfs_name2 = unique_vfs_name("drift_2w_w2");
-    let vfs2 = TurboliteVfs::new(config2).expect("create vfs2");
+    let vfs2 = TurboliteVfs::new_local(config2).expect("create vfs2");
     turbolite::tiered::register(&vfs_name2, vfs2).expect("register vfs2");
 
     let conn2 = open_vfs_conn(&vfs_name2, "drift_2w");
@@ -461,7 +461,7 @@ fn drift_two_writer_cache_validation() {
         ..Default::default()
     };
     let vfs_name1_reopen = unique_vfs_name("drift_2w_w1_reopen");
-    let vfs1_reopen = TurboliteVfs::new(reopen_config).expect("reopen vfs1");
+    let vfs1_reopen = TurboliteVfs::new_local(reopen_config).expect("reopen vfs1");
     turbolite::tiered::register(&vfs_name1_reopen, vfs1_reopen).expect("register reopen vfs1");
 
     let conn1_reopen = open_cold_conn(&vfs_name1_reopen, "drift_2w");
@@ -505,7 +505,7 @@ fn drift_override_with_encryption() {
     create_and_import(&config, cache_dir.path(), "drift_enc", 100, "secret");
 
     let vfs_name = unique_vfs_name("drift_enc");
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).expect("register vfs");
 
@@ -546,7 +546,7 @@ fn drift_override_with_encryption() {
         ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("drift_enc_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold vfs");
 
     let cold_conn = open_cold_conn(&cold_vfs_name, "drift_enc");
@@ -587,7 +587,7 @@ fn drift_override_with_encryption() {
         ..Default::default()
     };
     let bad_vfs_name = unique_vfs_name("drift_enc_bad");
-    let bad_vfs = TurboliteVfs::new(bad_config).expect("bad vfs");
+    let bad_vfs = TurboliteVfs::new_local(bad_config).expect("bad vfs");
     turbolite::tiered::register(&bad_vfs_name, bad_vfs).expect("register bad vfs");
 
     let bad_db = format!("file:drift_enc.db?vfs={}", bad_vfs_name);

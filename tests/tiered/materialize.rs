@@ -23,7 +23,7 @@ fn import_and_open(
     }
     let manifest = import_sqlite_file(&config, &local_db).unwrap();
     let vfs_name = unique_vfs_name(prefix);
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     (manifest, vfs_name, bench)
@@ -177,7 +177,7 @@ fn test_materialize_large_page_size() {
 
     import_sqlite_file(&config, &local_db).unwrap();
     let vfs_name = unique_vfs_name("mat_64k");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -280,7 +280,7 @@ fn test_materialize_empty_manifest_errors() {
     let config = test_config("mat_empty", cache_dir.path());
 
     let vfs_name = unique_vfs_name("mat_empty");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -361,7 +361,7 @@ fn test_materialize_matches_source_bytes() {
     import_sqlite_file(&config, &local_db).unwrap();
 
     let vfs_name = unique_vfs_name("mat_bytes");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 

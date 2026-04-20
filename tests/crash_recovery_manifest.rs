@@ -43,7 +43,7 @@ fn build_remote_vfs(
         cache: CacheConfig { pages_per_group: 4, ..Default::default() },
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new_with_storage(cfg, backend, handle).expect("vfs");
+    let vfs = TurboliteVfs::with_backend(cfg, backend, handle).expect("vfs");
     let shared = SharedTurboliteVfs::new(vfs);
     let vfs_name = unique_vfs_name(label);
     register_shared(&vfs_name, shared.clone()).expect("register");

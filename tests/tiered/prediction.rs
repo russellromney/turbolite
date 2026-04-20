@@ -14,7 +14,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_rt");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_rt.db?vfs={}", vfs_name);
@@ -112,7 +112,7 @@ fn test_checkpoint_no_patterns_when_disabled() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_off");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_off.db?vfs={}", vfs_name);
@@ -150,7 +150,7 @@ fn test_single_table_no_predictions() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_single");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_single.db?vfs={}", vfs_name);
@@ -209,7 +209,7 @@ fn test_vacuum_predictions_no_corruption() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs_name = unique_vfs_name("pred_vac");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_vac.db?vfs={}", vfs_name);
@@ -275,7 +275,7 @@ fn test_vacuum_predictions_no_corruption() {
             ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("pred_vac_reader");
-        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:pred_vac.db?vfs={}", reader_vfs_name);
@@ -296,7 +296,7 @@ fn test_drop_create_same_name_no_crash() {
     config.prediction_enabled = true;
 
     let vfs_name = unique_vfs_name("pred_drop");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:pred_drop.db?vfs={}", vfs_name);

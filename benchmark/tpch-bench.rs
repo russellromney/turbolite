@@ -507,7 +507,7 @@ fn bench_cold_query(
         let vfs_name = unique_vfs_name("cold_q");
         let config = make_reader_config(s3_prefix, cache.path());
         let s3 = build_s3_backend(rt, s3_prefix);
-        let vfs = TurboliteVfs::new_with_storage(
+        let vfs = TurboliteVfs::with_backend(
             config,
             s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt.clone(),
@@ -557,7 +557,7 @@ fn main() {
     let (config, s3_prefix) = make_config(&format!("sf_{}", scale), cache_dir.path());
     let vfs_name = unique_vfs_name("write");
     let writer_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-    let vfs = TurboliteVfs::new_with_storage(
+    let vfs = TurboliteVfs::with_backend(
         config,
         writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
@@ -608,7 +608,7 @@ fn main() {
     let warm_vfs_name = unique_vfs_name("warm");
     let warm_config = make_reader_config(&s3_prefix, cache_dir.path());
     let warm_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-    let warm_vfs = TurboliteVfs::new_with_storage(
+    let warm_vfs = TurboliteVfs::with_backend(
         warm_config,
         warm_s3 as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
@@ -646,7 +646,7 @@ fn main() {
             let vn = unique_vfs_name("cold_pt");
             let cfg = make_reader_config(&s3_prefix, cache.path());
             let s3 = build_s3_backend(&rt_handle, &s3_prefix);
-            let v = TurboliteVfs::new_with_storage(
+            let v = TurboliteVfs::with_backend(
                 cfg,
                 s3 as Arc<dyn hadb_storage::StorageBackend>,
                 rt_handle.clone(),
@@ -672,7 +672,7 @@ fn main() {
             let vn = unique_vfs_name("cold_rng");
             let cfg = make_reader_config(&s3_prefix, cache.path());
             let s3 = build_s3_backend(&rt_handle, &s3_prefix);
-            let v = TurboliteVfs::new_with_storage(
+            let v = TurboliteVfs::with_backend(
                 cfg,
                 s3 as Arc<dyn hadb_storage::StorageBackend>,
                 rt_handle.clone(),
@@ -720,7 +720,7 @@ fn main() {
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
-        let cleanup_vfs = TurboliteVfs::new_with_storage(
+        let cleanup_vfs = TurboliteVfs::with_backend(
             cleanup_config,
             cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),

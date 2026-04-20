@@ -80,7 +80,7 @@ fn register_local() -> Result<(), std::io::Error> {
             .unwrap_or_else(|_| PathBuf::from(".")),
         ..TurboliteConfig::from_env()
     };
-    let vfs = TurboliteVfs::new(config)?;
+    let vfs = TurboliteVfs::new_local(config)?;
     crate::tiered::register("turbolite", vfs)
 }
 
@@ -89,7 +89,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     // The loadable-extension's S3 wiring used the old bucket / prefix /
     // endpoint_url fields on TurboliteConfig. With the backend-agnostic
     // refactor those fields live on the hadb_storage_s3 construction path
-    // (the Rust API exposes new_with_storage). Rewiring the extension
+    // (the Rust API exposes with_backend). Rewiring the extension
     // entrypoint is tracked under Phase Turbogenesis c5.
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -382,7 +382,7 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
         cache_dir,
         ..crate::tiered::TurboliteConfig::from_env()
     };
-    match crate::tiered::TurboliteVfs::new(config) {
+    match crate::tiered::TurboliteVfs::new_local(config) {
         Ok(vfs) => match crate::tiered::register(&name, vfs) {
             Ok(()) => 0,
             Err(e) => {

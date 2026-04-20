@@ -122,7 +122,7 @@ pub extern "C" fn turbolite_register_local(
         ..Default::default()
     };
 
-    let vfs = match crate::tiered::TurboliteVfs::new(config) {
+    let vfs = match crate::tiered::TurboliteVfs::new_local(config) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(&format!("local vfs creation failed: {}", e));
@@ -184,7 +184,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
         }
     };
 
-    let vfs = match crate::tiered::TurboliteVfs::new(config) {
+    let vfs = match crate::tiered::TurboliteVfs::new_local(config) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(&format!("vfs creation failed: {}", e));
@@ -271,7 +271,7 @@ pub extern "C" fn turbolite_register_cloud(
         }
     };
 
-    let vfs = match crate::tiered::TurboliteVfs::new_with_storage(config, backend, handle) {
+    let vfs = match crate::tiered::TurboliteVfs::with_backend(config, backend, handle) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(&format!("cloud vfs creation failed: {}", e));

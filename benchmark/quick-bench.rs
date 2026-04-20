@@ -30,7 +30,7 @@ fn main() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
     turbolite::tiered::register("bench", vfs).expect("register VFS");
 
     let db_path = dir.path().join("bench.db");

@@ -10,7 +10,7 @@ fn test_refresh_profiling_simple() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("test_refresh_prof", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");

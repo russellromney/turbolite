@@ -18,7 +18,7 @@ fn register_fresh_vfs(dir: &std::path::Path) -> String {
         cache_dir: dir.into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&name, vfs).expect("failed to register VFS");
     name
 }

@@ -10,7 +10,7 @@ fn test_basic_operations() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("compressed", vfs).expect("Failed to register VFS");
 
     // Open connection with our VFS
@@ -54,7 +54,7 @@ fn test_large_data() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("compressed2", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -97,7 +97,7 @@ fn test_wal_mode() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("compressed_wal", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -148,7 +148,7 @@ fn test_persistence_with_reopen() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("compressed_persist", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("persist.db");
@@ -190,7 +190,7 @@ fn test_passthrough_mode() {
         compression: CompressionConfig { level: 0, ..Default::default() },
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("passthrough_test", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -220,7 +220,7 @@ fn test_delete_and_update() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_delete_update", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -276,7 +276,7 @@ fn test_rollback_transaction() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_rollback", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -311,7 +311,7 @@ fn test_create_index_and_query() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_index", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -356,7 +356,7 @@ fn test_multiple_tables_and_joins() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_joins", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -410,7 +410,7 @@ fn test_alter_table_add_column() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_alter", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -452,7 +452,7 @@ fn test_page_size_64k() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_page64k", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -496,7 +496,7 @@ fn test_page_size_4k() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_page4k", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -539,7 +539,7 @@ fn test_vacuum() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_vacuum", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");
@@ -602,7 +602,7 @@ fn test_savepoint_release_and_rollback() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_savepoint", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -644,7 +644,7 @@ fn test_large_transaction() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_large_tx", vfs).expect("Failed to register VFS");
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -689,7 +689,7 @@ fn test_checkpoint_truncate() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("integ_checkpoint", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");

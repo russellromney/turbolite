@@ -1,14 +1,14 @@
 //! Phase Anvil g review tests: SyncMode semantics on remote backends.
 //!
 //! These tests pin the contract so future refactors can't silently flip the
-//! behaviour. They exercise `TurboliteVfs::new_with_storage` + `hadb-storage-mem`
+//! behaviour. They exercise `TurboliteVfs::with_backend` + `hadb-storage-mem`
 //! + a tokio runtime; no S3, no network.
 //!
 //! Invariants verified:
 //!   - `SyncMode::LocalThenFlush`: checkpoint does NOT upload to a remote
 //!     backend. `flush_to_storage()` is the drain.
 //!   - `SyncMode::Durable`: checkpoint DOES upload to the backend inline.
-//!     Without this, the review-fix regression for `new_with_storage`
+//!     Without this, the review-fix regression for `with_backend`
 //!     silently downgrading Durable -> LocalThenFlush can come back.
 
 use std::sync::Arc;
@@ -61,7 +61,7 @@ fn build_vfs_with_mode(
     };
 
     let vfs =
-        TurboliteVfs::new_with_storage(cfg, backend, handle).expect("build vfs");
+        TurboliteVfs::with_backend(cfg, backend, handle).expect("build vfs");
     let shared = SharedTurboliteVfs::new(vfs);
     let vfs_name = unique_vfs_name(label);
     turbolite::tiered::register_shared(&vfs_name, shared.clone())
@@ -141,7 +141,7 @@ fn durable_uploads_inline_on_remote_backend() {
     assert_eq!(backend_key_count(&rt, &mem), 0, "backend starts empty");
 
     // Durable's contract: every checkpoint pushes to the backend. Before
-    // Phase Anvil g's review fix, new_with_storage silently rewrote this
+    // Phase Anvil g's review fix, with_backend silently rewrote this
     // to LocalThenFlush and the backend stayed empty. This test pins the
     // behaviour back.
     write_and_checkpoint(&vfs_name);
@@ -150,7 +150,7 @@ fn durable_uploads_inline_on_remote_backend() {
     assert!(
         after_ckpt >= 1,
         "Durable checkpoint must push to the backend inline; got {after_ckpt} keys. \
-         If this assertion fires, new_with_storage is silently downgrading Durable \
+         If this assertion fires, with_backend is silently downgrading Durable \
          again (see vfs.rs review fix)."
     );
     assert!(

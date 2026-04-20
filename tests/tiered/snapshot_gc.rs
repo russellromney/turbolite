@@ -22,7 +22,7 @@ fn test_gc_preserves_snapshot_page_groups() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 
@@ -94,7 +94,7 @@ fn test_gc_preserves_snapshot_page_groups() {
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).expect("gc vfs");
+    let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let deleted = gc_vfs.gc().expect("gc");
     eprintln!("GC deleted {} objects (with snapshot protecting v1)", deleted);
 
@@ -134,7 +134,7 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 
@@ -201,7 +201,7 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).expect("gc vfs");
+    let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let deleted = gc_vfs.gc().expect("gc");
     eprintln!("GC deleted {} objects after snapshot deleted", deleted);
 
@@ -242,7 +242,7 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -309,7 +309,7 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).expect("gc vfs");
+    let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let result = gc_vfs.gc();
     assert!(result.is_ok(), "gc should not crash on corrupt snapshot manifest: {:?}", result.err());
 
@@ -343,7 +343,7 @@ fn test_gc_multiple_snapshots() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 
@@ -421,7 +421,7 @@ fn test_gc_multiple_snapshots() {
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).expect("gc vfs");
+    let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let deleted = gc_vfs.gc().expect("gc");
     eprintln!("GC with 2 snapshots deleted {} objects", deleted);
 
@@ -478,7 +478,7 @@ fn test_fork_from_snapshot_manifest() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 
@@ -551,7 +551,7 @@ fn test_fork_from_snapshot_manifest() {
         gc_enabled: false,
         ..Default::default()
     };
-    let fork_vfs = TurboliteVfs::new(fork_config).expect("fork vfs");
+    let fork_vfs = TurboliteVfs::new_local(fork_config).expect("fork vfs");
 
     // Seed the fork with the snapshot manifest
     fork_vfs.seed_manifest(&snap_manifest).expect("seed manifest");
@@ -595,7 +595,7 @@ fn test_fork_cow_isolation() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 
@@ -646,7 +646,7 @@ fn test_fork_cow_isolation() {
         gc_enabled: false,
         ..Default::default()
     };
-    let fork_vfs = SharedTurboliteVfs::new(TurboliteVfs::new(fork_config).expect("fork vfs"));
+    let fork_vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(fork_config).expect("fork vfs"));
     let fork_vfs_ref = fork_vfs.clone();
     fork_vfs_ref.seed_manifest(&snap_manifest).expect("seed");
 
@@ -704,7 +704,7 @@ fn test_snapshot_manifest_roundtrip() {
     config.gc_enabled = false;
     let vfs_name = unique_vfs_name("snap_roundtrip");
 
-    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new(config).expect("vfs"));
+    let vfs = SharedTurboliteVfs::new(TurboliteVfs::new_local(config).expect("vfs"));
     let vfs_ref = vfs.clone();
     turbolite::tiered::register_shared(&vfs_name, vfs).expect("register");
 

@@ -23,7 +23,7 @@ fn zenith_single_write_and_cold_read() {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name("zenith_single");
 
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -57,7 +57,7 @@ fn zenith_single_write_and_cold_read() {
     let cold_dir = TempDir::new().unwrap();
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("zenith_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -81,7 +81,7 @@ fn zenith_sequential_writes_increment_version() {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name("zenith_seq");
 
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -112,7 +112,7 @@ fn zenith_sequential_writes_increment_version() {
     let cold_dir = TempDir::new().unwrap();
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("zenith_seq_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -133,7 +133,7 @@ fn zenith_empty_sync_is_noop() {
     let config = s3primary_config("zenith_noop", cache_dir.path());
     let vfs_name = unique_vfs_name("zenith_noop");
 
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -165,7 +165,7 @@ fn zenith_multiple_rows_per_transaction() {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name("zenith_multi");
 
-    let vfs = TurboliteVfs::new(config).expect("create vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("create vfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -198,7 +198,7 @@ fn zenith_multiple_rows_per_transaction() {
     let cold_dir = TempDir::new().unwrap();
     let cold_config = cold_reader_config(&bucket, &prefix, &endpoint, cold_dir.path());
     let cold_vfs_name = unique_vfs_name("zenith_multi_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(

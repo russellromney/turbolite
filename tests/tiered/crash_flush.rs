@@ -22,7 +22,7 @@ fn cold_read_and_verify(
     let cold_dir = TempDir::new().expect("cold dir");
     let cold_config = cold_reader_config_mode(bucket, prefix, endpoint, cold_dir.path(), mode);
     let vfs_name = unique_vfs_name("crash_cold");
-    let vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register cold");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -62,7 +62,7 @@ fn run_crash_incremental(mode: TestMode) {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name(&format!("crash_incr_{}", mode.name()));
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -123,7 +123,7 @@ fn run_uncommitted_not_visible(mode: TestMode) {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name(&format!("crash_uncommit_{}", mode.name()));
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -173,7 +173,7 @@ fn run_large_dataset(mode: TestMode) {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name(&format!("crash_large_{}", mode.name()));
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -208,7 +208,7 @@ fn run_large_dataset(mode: TestMode) {
     let cold_dir = TempDir::new().expect("cold dir");
     let cold_config = cold_reader_config_mode(&bucket, &prefix, &endpoint, cold_dir.path(), mode);
     let cold_name = unique_vfs_name(&format!("crash_large_{}_cold", mode.name()));
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_name, cold_vfs).expect("register cold");
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(

@@ -34,7 +34,7 @@ fn setup_concurrent_db(prefix: &str) -> (String, String, Option<String>, TempDir
     let s3_prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -100,7 +100,7 @@ fn open_evicting_reader(
         ..Default::default()
     };
     let vfs_name = unique_vfs_name("conc_evict_reader");
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(

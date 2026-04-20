@@ -62,7 +62,7 @@ fn cold_reader(
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold VFS");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold VFS");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
     rusqlite::Connection::open_with_flags_and_vfs(
         db,
@@ -83,7 +83,7 @@ fn borodino_version_increments_per_checkpoint() {
     let config = test_config("ver_incr", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let vfs_name = unique_vfs_name("ver_incr");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -110,7 +110,7 @@ fn borodino_gc_does_not_delete_current_version() {
     config.gc_enabled = true;
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let vfs_name = unique_vfs_name("gc_cur");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -140,7 +140,7 @@ fn borodino_encryption_staging_roundtrip() {
     config.encryption_key = Some([0xAB; 32]);
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("enc_staging");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -164,7 +164,7 @@ fn borodino_encryption_staging_roundtrip() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("enc_staging_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
         "enc_staging.db",
@@ -184,7 +184,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
     config.encryption_key = Some([0xAB; 32]);
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("enc_wrong");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -208,7 +208,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("enc_wrong_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
     let result = rusqlite::Connection::open_with_flags_and_vfs(
         "enc_wrong.db",
@@ -233,7 +233,7 @@ fn borodino_vacuum_local_then_flush() {
     let config = ltf_config("vac_ltf", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("vac_ltf");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -267,7 +267,7 @@ fn borodino_compact_between_checkpoint_and_flush() {
     let config = ltf_config("compact_btw", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("compact_btw");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -297,7 +297,7 @@ fn borodino_eviction_protects_pending_staging() {
     config.max_cache_bytes = Some(256 * 1024); // 256KB, very small
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("evict_pend");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -333,7 +333,7 @@ fn borodino_multi_db_separate_vfs() {
     let config1 = ltf_config("multi_db1", cache_dir1.path());
     let (bucket1, prefix1, endpoint1) = (config1.bucket.clone(), config1.prefix.clone(), config1.endpoint_url.clone());
 
-    let vfs1 = TurboliteVfs::new(config1).unwrap();
+    let vfs1 = TurboliteVfs::new_local(config1).unwrap();
     let shared1 = vfs1.shared_state();
     let vfs_name1 = unique_vfs_name("multi_db1");
     turbolite::tiered::register(&vfs_name1, vfs1).unwrap();
@@ -349,7 +349,7 @@ fn borodino_multi_db_separate_vfs() {
     let config2 = ltf_config("multi_db2", cache_dir2.path());
     let (bucket2, prefix2, endpoint2) = (config2.bucket.clone(), config2.prefix.clone(), config2.endpoint_url.clone());
 
-    let vfs2 = TurboliteVfs::new(config2).unwrap();
+    let vfs2 = TurboliteVfs::new_local(config2).unwrap();
     let shared2 = vfs2.shared_state();
     let vfs_name2 = unique_vfs_name("multi_db2");
     turbolite::tiered::register(&vfs_name2, vfs2).unwrap();

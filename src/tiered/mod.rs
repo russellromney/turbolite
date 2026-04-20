@@ -3,7 +3,7 @@
 //! Backend-agnostic: all bytes flow through an
 //! `Arc<dyn hadb_storage::StorageBackend>` that the embedder picks. The VFS
 //! ships with `TurboliteVfs::new` (wires up `hadb_storage_local::LocalStorage`
-//! rooted at `config.cache_dir`) and `TurboliteVfs::new_with_storage` (you
+//! rooted at `config.cache_dir`) and `TurboliteVfs::with_backend` (you
 //! bring the backend + tokio handle).
 //!
 //! # Quick start (local mode)
@@ -15,7 +15,7 @@
 //!     cache_dir: "/data/mydb".into(),
 //!     ..Default::default()
 //! };
-//! let vfs = TurboliteVfs::new(config)?;
+//! let vfs = TurboliteVfs::new_local(config)?;
 //! turbolite::tiered::register("mydb", vfs)?;
 //! // Now open with rusqlite: "file:test.db?vfs=mydb"
 //! ```
@@ -288,7 +288,7 @@ pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
 /// with SQLite while keeping a handle for `manifest()` / `set_manifest()`.
 ///
 /// ```ignore
-/// let vfs = TurboliteVfs::new(config)?;
+/// let vfs = TurboliteVfs::new_local(config)?;
 /// let shared = SharedTurboliteVfs::new(vfs);
 /// let vfs_ref = shared.clone(); // keep this for manifest ops
 /// turbolite::tiered::register_shared("mydb", shared)?;

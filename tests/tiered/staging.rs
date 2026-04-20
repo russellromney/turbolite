@@ -62,7 +62,7 @@ fn cold_reader(
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).expect("cold VFS");
+    let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold VFS");
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         db,
@@ -135,7 +135,7 @@ fn staging_race_overwrite_then_flush() {
     let config = ltf_config("race_overwrite", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("race_ow");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -166,7 +166,7 @@ fn staging_race_triple_overwrite() {
     let config = ltf_config("race_triple", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("race_triple");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -201,7 +201,7 @@ fn staging_race_multi_table_interleave() {
     let config = ltf_config("race_multi", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("race_multi");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -252,7 +252,7 @@ fn staging_scale_10k_rows() {
     let config = ltf_config("scale_10k", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("scale_10k");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -284,7 +284,7 @@ fn staging_scale_many_small_checkpoints() {
     let config = ltf_config("scale_many_cp", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("scale_many_cp");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -320,7 +320,7 @@ fn staging_schema_create_index() {
     let config = ltf_config("schema_idx", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("schema_idx");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -361,7 +361,7 @@ fn staging_schema_delete_vacuum() {
     let config = ltf_config("schema_vacuum", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("schema_vacuum");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -390,7 +390,7 @@ fn staging_schema_alter_table() {
     let config = ltf_config("schema_alter", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("schema_alter");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -425,7 +425,7 @@ fn staging_crash_recover_then_continue() {
     // Phase 1: write + checkpoint, then crash
     {
         let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_cont_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let conn = open_conn(&vfs_name, "crash_cont.db");
@@ -436,7 +436,7 @@ fn staging_crash_recover_then_continue() {
 
     // Phase 2: reopen, write more, checkpoint, flush
     let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush(), "should recover staging from phase 1");
 
@@ -471,7 +471,7 @@ fn staging_crash_two_checkpoints() {
 
     {
         let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_two_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let conn = open_conn(&vfs_name, "crash_two.db");
@@ -486,7 +486,7 @@ fn staging_crash_two_checkpoints() {
 
     // Recover and verify from local cache, then flush
     let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush());
 
@@ -512,7 +512,7 @@ fn staging_crash_double() {
     // Phase 1: write two batches with two checkpoints, then "crash" (drop without flush)
     {
         let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-        let vfs = TurboliteVfs::new(config).unwrap();
+        let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_dbl_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let conn = open_conn(&vfs_name, "crash_dbl.db");
@@ -527,7 +527,7 @@ fn staging_crash_double() {
 
     // Phase 2: recover all staging logs, flush, verify
     let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush(), "should recover staging logs");
     let vfs_name = unique_vfs_name("crash_dbl_r");
@@ -553,7 +553,7 @@ fn staging_active_reader_during_flush() {
     let config = ltf_config("active_reader", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("active_reader");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -598,7 +598,7 @@ fn staging_follower_sees_data_after_flush() {
     let config = ltf_config("follower", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("follower_w");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -620,7 +620,7 @@ fn staging_follower_sees_data_after_flush() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name = unique_vfs_name("follower_r1");
-    let follower_vfs = TurboliteVfs::new(follower_config).unwrap();
+    let follower_vfs = TurboliteVfs::new_local(follower_config).unwrap();
     turbolite::tiered::register(&follower_vfs_name, follower_vfs).unwrap();
     let follower_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "follower.db",
@@ -652,7 +652,7 @@ fn staging_follower_sees_data_after_flush() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name2 = unique_vfs_name("follower_r2");
-    let follower_vfs2 = TurboliteVfs::new(follower_config2).unwrap();
+    let follower_vfs2 = TurboliteVfs::new_local(follower_config2).unwrap();
     turbolite::tiered::register(&follower_vfs_name2, follower_vfs2).unwrap();
     let follower_conn2 = rusqlite::Connection::open_with_flags_and_vfs(
         "follower.db",
@@ -671,7 +671,7 @@ fn staging_follower_no_staging_files() {
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
     // Writer: write, checkpoint, flush (so there's a manifest on S3)
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("follower_nolog_w");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -694,7 +694,7 @@ fn staging_follower_no_staging_files() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name = unique_vfs_name("follower_nolog_r");
-    let follower_vfs = TurboliteVfs::new(follower_config).unwrap();
+    let follower_vfs = TurboliteVfs::new_local(follower_config).unwrap();
     turbolite::tiered::register(&follower_vfs_name, follower_vfs).unwrap();
     let follower_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "follower_nolog.db",
@@ -718,7 +718,7 @@ fn staging_durable_overwrite_no_staging() {
     config.sync_mode = SyncMode::Durable;
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let vfs_name = unique_vfs_name("durable_ow");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -753,7 +753,7 @@ fn staging_edge_flush_noop() {
     let cache_dir = TempDir::new().unwrap();
     let config = ltf_config("edge_noop", cache_dir.path());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(!shared.has_pending_flush());
     shared.flush_to_s3().expect("empty flush should succeed");
@@ -765,7 +765,7 @@ fn staging_edge_readonly_no_staging() {
     let cache_dir = TempDir::new().unwrap();
     let config = ltf_config("edge_ro", cache_dir.path());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let vfs_name = unique_vfs_name("edge_ro");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -792,7 +792,7 @@ fn staging_edge_large_single_txn() {
     let config = ltf_config("edge_large", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     let vfs_name = unique_vfs_name("edge_large");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -818,7 +818,7 @@ fn staging_edge_concurrent_flush() {
     let config = ltf_config("edge_concurrent", cache_dir.path());
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared1 = vfs.shared_state();
     let shared2 = vfs.shared_state();
     let vfs_name = unique_vfs_name("edge_concurrent");

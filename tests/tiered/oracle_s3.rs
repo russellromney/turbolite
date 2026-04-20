@@ -77,7 +77,7 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     let endpoint = config.endpoint_url.clone();
     let vfs_name = unique_vfs_name(&format!("oracle_{}_w", mode.name()));
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let v = open_vanilla(&vanilla_dir.path().join("vanilla.db"));
@@ -159,7 +159,7 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
             &bucket, &prefix, &endpoint, reader_dir.path(), mode,
         );
         let cold_vfs_name = unique_vfs_name(&format!("oracle_{}_cold", mode.name()));
-        let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
+        let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
         turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold");
 
         let cold = Connection::open_with_flags_and_vfs(
@@ -206,7 +206,7 @@ fn run_oracle_incremental(mode: TestMode) {
     );
     let vfs_name = unique_vfs_name(&format!("oracle_incr_{}", mode.name()));
 
-    let vfs = TurboliteVfs::new(config).expect("vfs");
+    let vfs = TurboliteVfs::new_local(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let v = open_vanilla(&vanilla_dir.path().join("vanilla.db"));

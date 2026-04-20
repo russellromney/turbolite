@@ -13,7 +13,7 @@ fn test_basic_write_read() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create TurboliteVfs");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create TurboliteVfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("basic_test.db");
@@ -79,7 +79,7 @@ fn test_checkpoint_uploads() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create TurboliteVfs");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create TurboliteVfs");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -170,7 +170,7 @@ fn test_reader_from_s3() {
     let reader_endpoint = config.endpoint_url.clone();
     let reader_region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create writer VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create writer VFS");
     turbolite::tiered::register(&writer_vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -222,7 +222,7 @@ fn test_reader_from_s3() {
     };
     let reader_vfs_name = unique_vfs_name("tiered_reader");
     let reader_vfs =
-        TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+        TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -257,7 +257,7 @@ fn test_64kb_pages() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -332,7 +332,7 @@ fn test_large_cold_scan() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -381,7 +381,7 @@ fn test_large_cold_scan() {
     };
     let reader_vfs_name = unique_vfs_name("tiered_coldscan_reader");
     let reader_vfs =
-        TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+        TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -421,7 +421,7 @@ fn test_no_index_append_pattern() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -511,7 +511,7 @@ fn test_read_only_rejects_writes() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&writer_vfs, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -543,7 +543,7 @@ fn test_read_only_rejects_writes() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let ro_vfs_name = unique_vfs_name("tiered_ro_reader");
-    let ro_vfs = TurboliteVfs::new(ro_config).unwrap();
+    let ro_vfs = TurboliteVfs::new_local(ro_config).unwrap();
     turbolite::tiered::register(&ro_vfs_name, ro_vfs).unwrap();
 
     let ro_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -571,7 +571,7 @@ fn test_cache_clear_survival() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -620,7 +620,7 @@ fn test_cache_clear_survival() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let fresh_vfs_name = unique_vfs_name("tiered_cacheclr2");
-    let fresh_vfs = TurboliteVfs::new(fresh_config).unwrap();
+    let fresh_vfs = TurboliteVfs::new_local(fresh_config).unwrap();
     turbolite::tiered::register(&fresh_vfs_name, fresh_vfs)
         .unwrap();
 
@@ -658,7 +658,7 @@ fn test_page_group_cache_populates() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -710,7 +710,7 @@ fn test_page_group_cache_populates() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_pgcache_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -756,7 +756,7 @@ fn test_destroy_s3() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -808,7 +808,7 @@ fn test_destroy_s3() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let destroy_vfs = TurboliteVfs::new(destroy_config).unwrap();
+    let destroy_vfs = TurboliteVfs::new_local(destroy_config).unwrap();
     destroy_vfs.destroy_s3().unwrap();
 
     // Verify manifest is gone
@@ -844,7 +844,7 @@ fn test_1k_rows_checkpoint_cold_read() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -890,7 +890,7 @@ fn test_1k_rows_checkpoint_cold_read() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_1k_reader");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -931,7 +931,7 @@ fn test_manifest_version_increments() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1048,7 +1048,7 @@ fn test_default_4096_page_size() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -1098,7 +1098,7 @@ fn test_default_4096_page_size() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_4k_reader");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 

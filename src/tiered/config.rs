@@ -317,7 +317,7 @@ impl WalConfig {
 /// turbolite is a byte-level storage consumer; the concrete backend (local
 /// filesystem, S3, Cinch HTTP, etc.) is an embedder's choice. Use
 /// [`TurboliteVfs::new`] for local mode (page groups on `cache_dir`) or
-/// [`TurboliteVfs::new_with_storage`] to inject any
+/// [`TurboliteVfs::with_backend`] to inject any
 /// `Arc<dyn hadb_storage::StorageBackend>` plus a tokio runtime handle.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]

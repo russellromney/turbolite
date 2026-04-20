@@ -20,7 +20,7 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
     let s3_prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -71,7 +71,7 @@ fn cold_reader(
     config_fn(&mut config);
     let vfs_name = unique_vfs_name("evict_cold");
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -94,7 +94,7 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let _ = TurboliteVfs::new(config).unwrap().destroy_s3();
+    let _ = TurboliteVfs::new_local(config).unwrap().destroy_s3();
 }
 
 // ── turbolite_evict('data'/'index'/'all') ──
@@ -189,7 +189,7 @@ fn test_evict_on_checkpoint_clears_data_tier() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 

@@ -5,7 +5,7 @@
 //!
 //! The CLI is the embedder of turbolite here; it picks the concrete
 //! `StorageBackend` (local filesystem or S3 via hadb_storage_s3) and
-//! injects it via `TurboliteVfs::new_with_storage`. turbolite itself
+//! injects it via `TurboliteVfs::with_backend`. turbolite itself
 //! has no S3 deps.
 
 use std::io::{self, BufRead};
@@ -241,7 +241,7 @@ fn build_vfs(
     };
     match bucket {
         None => Ok((
-            TurboliteVfs::new(config).context("failed to create local VFS")?,
+            TurboliteVfs::new_local(config).context("failed to create local VFS")?,
             None,
         )),
         Some(b) => {
@@ -260,7 +260,7 @@ fn build_vfs(
                 .map(|s| s.with_prefix(prefix_for_s3))
                 .context("build S3Storage")?;
             let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
-            let vfs = TurboliteVfs::new_with_storage(config, backend, handle)
+            let vfs = TurboliteVfs::with_backend(config, backend, handle)
                 .context("failed to create S3-backed VFS")?;
             Ok((vfs, Some(runtime)))
         }
@@ -724,7 +724,7 @@ fn build_with_prefetch_threads(
     };
     match bucket {
         None => Ok((
-            TurboliteVfs::new(config).context("failed to create local VFS")?,
+            TurboliteVfs::new_local(config).context("failed to create local VFS")?,
             None,
         )),
         Some(b) => {
@@ -743,7 +743,7 @@ fn build_with_prefetch_threads(
                 .map(|s| s.with_prefix(prefix_for_s3))
                 .context("build S3Storage")?;
             let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
-            let vfs = TurboliteVfs::new_with_storage(config, backend, handle)
+            let vfs = TurboliteVfs::with_backend(config, backend, handle)
                 .context("failed to create S3-backed VFS")?;
             Ok((vfs, Some(runtime)))
         }

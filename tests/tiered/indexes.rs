@@ -14,7 +14,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
     let region = config.region.clone();
     let vfs_name = unique_vfs_name("ixb");
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -98,7 +98,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
     let _bench = cold_vfs.shared_state();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
@@ -133,7 +133,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -147,7 +147,7 @@ fn test_index_bundles_eager_load_disabled() {
     let region = config.region.clone();
     let vfs_name = unique_vfs_name("ixb_ne");
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -194,7 +194,7 @@ fn test_index_bundles_eager_load_disabled() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
-    let cold_vfs = TurboliteVfs::new(cold_config).unwrap();
+    let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -221,7 +221,7 @@ fn test_index_bundles_eager_load_disabled() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -236,7 +236,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
     let vfs_name = unique_vfs_name("warm_prof_w");
 
     // -- Phase 1: Create database with benchmark schema --
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -325,7 +325,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("warm_prof_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let warm_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -403,7 +403,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         region,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+    let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
 }
 
@@ -434,7 +434,7 @@ fn test_small_ppg_index_integrity() {
     };
 
     let vfs_name = unique_vfs_name("small_ppg_write");
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -485,7 +485,7 @@ fn test_small_ppg_index_integrity() {
     };
 
     let reader_vfs_name = unique_vfs_name("small_ppg_reader");
-    let reader_vfs = TurboliteVfs::new(reader_config).expect("failed to create reader VFS");
+    let reader_vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader_conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -541,7 +541,7 @@ fn test_small_ppg_index_integrity() {
             pages_per_group: 8,
             runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).unwrap();
+        let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
     }
 }

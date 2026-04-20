@@ -18,7 +18,7 @@ fn test_ttl_eviction() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -66,7 +66,7 @@ fn test_ttl_eviction() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ttl_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -113,7 +113,7 @@ fn test_dictionary_mismatch_errors() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -160,7 +160,7 @@ fn test_dictionary_mismatch_errors() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_dict_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -209,7 +209,7 @@ fn test_dictionary_roundtrip() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -255,7 +255,7 @@ fn test_dictionary_roundtrip() {
     };
     reader_config.dictionary = Some(dict_bytes);
     let reader_vfs_name = unique_vfs_name("tiered_drt_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -293,7 +293,7 @@ fn test_custom_pages_per_group() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -375,7 +375,7 @@ fn test_custom_pages_per_group() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppg8_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -404,7 +404,7 @@ fn test_ppg_mismatch_uses_manifest() {
     let endpoint = config.endpoint_url.clone();
     let region = config.region.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -454,7 +454,7 @@ fn test_ppg_mismatch_uses_manifest() {
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppgmm_r");
-    let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
     turbolite::tiered::register(&reader_vfs_name, reader_vfs)
         .unwrap();
 
@@ -524,7 +524,7 @@ fn test_evict_tree_by_name() {
 
     // Step 3: Open via tiered VFS (cold read from S3)
     let vfs_name = unique_vfs_name("tiered_evict_tree");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
+    let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -566,7 +566,7 @@ fn test_evict_tree_by_name() {
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn test_cache_info_returns_valid_json() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
+    let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -636,7 +636,7 @@ fn test_cache_info_returns_valid_json() {
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 #[test]
@@ -681,7 +681,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
 
     // Step 3: Open via tiered VFS, write new data, local-checkpoint to create pending groups
     let vfs_name = unique_vfs_name("tiered_evict_pending");
-    let vfs = TurboliteVfs::new(config).expect("TurboliteVfs");
+    let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -744,7 +744,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
 }
 
 /// Phase Thermopylae-c: verify autovacuum works through the tiered VFS.
@@ -760,7 +760,7 @@ fn test_autovacuum_with_gc() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -833,7 +833,7 @@ fn test_autovacuum_with_gc() {
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    let gc_vfs = TurboliteVfs::new(gc_config).unwrap();
+    let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
     eprintln!("Full GC after autovacuum deleted {} objects", deleted);
 
@@ -874,7 +874,7 @@ fn test_cache_truncation_after_vacuum() {
     let endpoint = config.endpoint_url.clone();
     let cache_path = cache_dir.path().to_path_buf();
 
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -950,5 +950,5 @@ fn test_cache_truncation_after_vacuum() {
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
-    TurboliteVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
 }

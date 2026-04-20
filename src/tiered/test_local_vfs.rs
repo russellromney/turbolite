@@ -1,7 +1,7 @@
 use super::*;
 use tempfile::TempDir;
 
-/// RED TEST: TurboliteVfs::new() with StorageBackend::Local should succeed
+/// RED TEST: TurboliteVfs::new_local() with StorageBackend::Local should succeed
 /// without any S3 credentials, tokio runtime, or cloud dependencies.
 #[test]
 fn test_local_vfs_construction() {
@@ -11,7 +11,7 @@ fn test_local_vfs_construction() {
         ..Default::default()
     };
 
-    let vfs = TurboliteVfs::new(config).expect("local VFS construction should succeed");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS construction should succeed");
 
     // Verify it's local
     assert!(vfs.is_local);
@@ -27,7 +27,7 @@ fn test_local_vfs_shared_state_is_total() {
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     let state = vfs.shared_state();
     assert!(state.is_local);
 }
@@ -40,7 +40,7 @@ fn test_local_vfs_exists_empty() {
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     // Empty dir: no manifest in the backend.
     use sqlite_vfs::Vfs;
     assert!(!vfs.exists("main.db").unwrap());
@@ -56,7 +56,7 @@ fn test_local_vfs_sqlite_roundtrip() {
     };
 
     let vfs_name = format!("local_rt_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -84,7 +84,7 @@ fn test_local_vfs_with_compression() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmp_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS with compression");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS with compression");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -103,7 +103,7 @@ fn test_local_vfs_with_compression() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmp2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen with compression");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen with compression");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -122,7 +122,7 @@ fn test_local_vfs_schema_changes() {
         ..Default::default()
     };
     let vfs_name = format!("local_schema_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -167,7 +167,7 @@ fn test_local_vfs_cloud_methods_error() {
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
 
     // Cloud-only methods should return Unsupported errors, not panic
     let gc_err = vfs.gc();
@@ -191,7 +191,7 @@ fn test_local_vfs_smoke_construct() {
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let _vfs = TurboliteVfs::new(config).expect("local VFS");
+    let _vfs = TurboliteVfs::new_local(config).expect("local VFS");
 }
 
 /// RED TEST: Delete cache file after checkpoint, reopen, verify data recovered from local page groups.
@@ -206,7 +206,7 @@ fn test_local_vfs_recover_from_page_groups() {
             ..Default::default()
         };
         let vfs_name = format!("local_pg1_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -242,7 +242,7 @@ fn test_local_vfs_recover_from_page_groups() {
             ..Default::default()
         };
         let vfs_name = format!("local_pg2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS after cache loss");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS after cache loss");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -270,7 +270,7 @@ fn test_local_vfs_multi_checkpoint() {
             ..Default::default()
         };
         let vfs_name = format!("local_mc_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -310,7 +310,7 @@ fn test_local_vfs_multi_checkpoint() {
             ..Default::default()
         };
         let vfs_name = format!("local_mc2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -342,7 +342,7 @@ fn test_local_vfs_checkpoint_reopen() {
             ..Default::default()
         };
         let vfs_name = format!("local_ck1_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -360,7 +360,7 @@ fn test_local_vfs_checkpoint_reopen() {
             ..Default::default()
         };
         let vfs_name = format!("local_ck2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -397,7 +397,7 @@ fn test_local_vfs_override_write_cold_read() {
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -416,7 +416,7 @@ fn test_local_vfs_override_write_cold_read() {
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -445,7 +445,7 @@ fn test_local_vfs_override_then_full_rewrite() {
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr1_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -465,7 +465,7 @@ fn test_local_vfs_override_then_full_rewrite() {
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr2_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -481,7 +481,7 @@ fn test_local_vfs_override_then_full_rewrite() {
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr3_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("final reopen");
+        let vfs = TurboliteVfs::new_local(config).expect("final reopen");
         crate::tiered::register(&vfs_name, vfs).expect("register3");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -511,7 +511,7 @@ fn test_local_vfs_override_compaction() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmpct1_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -537,7 +537,7 @@ fn test_local_vfs_override_compaction() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmpct2_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -571,7 +571,7 @@ fn test_cache_validation_warm_reopen_same_version() {
             ..Default::default()
         };
         let vfs_name = format!("cv_warm1_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -589,7 +589,7 @@ fn test_cache_validation_warm_reopen_same_version() {
             ..Default::default()
         };
         let vfs_name = format!("cv_warm2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -611,7 +611,7 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ext1_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -631,7 +631,7 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ext2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -650,7 +650,7 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ext3_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -677,7 +677,7 @@ fn test_cache_validation_cold_start_after_cache_delete() {
             ..Default::default()
         };
         let vfs_name = format!("cv_cold1_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -701,7 +701,7 @@ fn test_cache_validation_cold_start_after_cache_delete() {
             ..Default::default()
         };
         let vfs_name = format!("cv_cold2_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -722,7 +722,7 @@ fn test_constraint_violation_does_not_corrupt_reads() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_c_constraint_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -759,7 +759,7 @@ fn test_explicit_transaction_rollback() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_c_rollback_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -790,7 +790,7 @@ fn test_repeated_constraint_violations() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_c_repeated_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
@@ -831,7 +831,7 @@ fn test_migrate_to_s3_primary_from_wal() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_d_migrate_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let uri = format!("file:test.db?vfs={}", vfs_name);
@@ -871,7 +871,7 @@ fn test_migrate_from_delete_to_off() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_d_delete_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let uri = format!("file:test.db?vfs={}", vfs_name);
@@ -900,7 +900,7 @@ fn test_migrate_already_off() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_d_already_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let uri = format!("file:test.db?vfs={}", vfs_name);
@@ -929,7 +929,7 @@ fn test_migrate_preserves_large_dataset() {
         ..Default::default()
     };
     let vfs_name = format!("zenith_d_large_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let uri = format!("file:test.db?vfs={}", vfs_name);
@@ -986,7 +986,7 @@ fn test_stress_large_database_10k_rows() {
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1025,7 +1025,7 @@ fn test_stress_large_database_10k_rows() {
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_r_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1078,7 +1078,7 @@ fn test_stress_many_overrides_compaction() {
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1122,7 +1122,7 @@ fn test_stress_many_overrides_compaction() {
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1167,7 +1167,7 @@ fn test_override_with_compression_roundtrip() {
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1211,7 +1211,7 @@ fn test_override_with_compression_roundtrip() {
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1251,7 +1251,7 @@ fn test_stress_rapid_checkpoint_cycles() {
             ..Default::default()
         };
         let vfs_name = format!("stress_rapid_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1287,7 +1287,7 @@ fn test_stress_rapid_checkpoint_cycles() {
             ..Default::default()
         };
         let vfs_name = format!("stress_rapid_r_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1324,7 +1324,7 @@ fn test_edge_empty_database_reopen() {
             ..Default::default()
         };
         let vfs_name = format!("edge_empty_w_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1347,7 +1347,7 @@ fn test_edge_empty_database_reopen() {
             ..Default::default()
         };
         let vfs_name = format!("edge_empty_r_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1377,7 +1377,7 @@ fn test_edge_single_row_database() {
             ..Default::default()
         };
         let vfs_name = format!("edge_single_w_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1401,7 +1401,7 @@ fn test_edge_single_row_database() {
             ..Default::default()
         };
         let vfs_name = format!("edge_single_r_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1431,7 +1431,7 @@ fn test_edge_group_boundary_pages() {
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_w_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1475,7 +1475,7 @@ fn test_edge_group_boundary_pages() {
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_r_{}", std::process::id());
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1526,7 +1526,7 @@ fn test_edge_override_at_frame_boundary() {
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_frame_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1574,7 +1574,7 @@ fn test_edge_override_at_frame_boundary() {
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_frame_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1611,7 +1611,7 @@ fn test_rollback_multi_group_dirty_pages() {
         ..Default::default()
     };
     let vfs_name = format!("edge_rollback_mg_{}", std::process::id());
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1683,7 +1683,7 @@ fn test_override_then_delete_rows() {
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1721,7 +1721,7 @@ fn test_override_then_delete_rows() {
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1766,7 +1766,7 @@ fn test_compaction_threshold_one() {
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_w_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1808,7 +1808,7 @@ fn test_compaction_threshold_one() {
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_r_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1854,7 +1854,7 @@ fn test_cache_validation_override_changes_between_sessions() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s1_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1880,7 +1880,7 @@ fn test_cache_validation_override_changes_between_sessions() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s2_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -1898,7 +1898,7 @@ fn test_cache_validation_override_changes_between_sessions() {
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s3_{}", id);
-        let vfs = TurboliteVfs::new(config).expect("reopen VFS session 3");
+        let vfs = TurboliteVfs::new_local(config).expect("reopen VFS session 3");
         crate::tiered::register(&vfs_name, vfs).expect("register3");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);

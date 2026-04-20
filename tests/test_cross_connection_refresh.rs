@@ -9,7 +9,7 @@ fn test_cross_connection_refresh() {
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("test_cross", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");

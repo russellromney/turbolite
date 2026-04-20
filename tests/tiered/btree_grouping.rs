@@ -52,7 +52,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
 
     // Open via VFS, insert more rows, checkpoint
     let vfs_name = unique_vfs_name("btree_cp");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -81,7 +81,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
             read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_cp_reader");
-        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:local.db?vfs={}", reader_vfs_name);
@@ -121,7 +121,7 @@ fn test_write_amplification_btree_grouping() {
     let total_groups = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count();
 
     let vfs_name = unique_vfs_name("btree_wa");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
@@ -168,7 +168,7 @@ fn test_vacuum_produces_correct_mapping() {
     });
 
     let vfs_name = unique_vfs_name("btree_vac");
-    let vfs = TurboliteVfs::new(config).unwrap();
+    let vfs = TurboliteVfs::new_local(config).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:vac.db?vfs={}", vfs_name);
@@ -206,7 +206,7 @@ fn test_vacuum_produces_correct_mapping() {
             read_only: true, runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("btree_vac_reader");
-        let reader_vfs = TurboliteVfs::new(reader_config).unwrap();
+        let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
         turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
         let reader_db = format!("file:vac.db?vfs={}", reader_vfs_name);
