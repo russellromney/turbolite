@@ -1301,11 +1301,9 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // Create reader VFS + bench handle
     eprintln!("[bench] creating reader VFS...");
     let reader_cache = TempDir::new().expect("reader temp dir");
-    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
-    if std::env::var("BENCH_NO_EAGER_INDEX").is_ok() {
-        reader_config.prefetch.eager_index_load = false;
-        eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
-    }
+    let reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
+    // Phase Cirrus d removed eager interior/index prefetch entirely; those
+    // pages now come in on first-query miss. BENCH_NO_EAGER_INDEX is a no-op.
     eprintln!("[bench] calling TurboliteVfs::new_with_storage()...");
     let reader_s3 = build_s3_backend(&rt_handle, &s3_prefix);
     let reader_vfs = TurboliteVfs::new_with_storage(

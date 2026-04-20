@@ -1060,7 +1060,6 @@ impl Vfs for TurboliteVfs {
                 self.config.prefetch.lookup.clone(),
                 self.prefetch_pool.as_ref().map(Arc::clone),
                 self.config.cache.gc_enabled,
-                self.config.prefetch.eager_index_load,
                 #[cfg(feature = "zstd")]
                 self.config.compression.dictionary.as_deref(),
                 self.config.encryption.key,

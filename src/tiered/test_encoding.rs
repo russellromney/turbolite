@@ -437,10 +437,9 @@ fn test_write_page_does_not_mark_sub_chunk_tracker() {
 }
 
 #[test]
-fn test_eager_index_load_no_false_cache_hits() {
-    // Simulates the eager index load scenario: scattered index pages are
-    // written individually. Adjacent non-index pages in the same sub-chunk
-    // must NOT be reported as cached.
+fn test_scattered_page_writes_no_false_cache_hits() {
+    // Scattered page writes (e.g. interior/index pages faulted in one at a
+    // time) must not mark adjacent pages in the same sub-chunk as cached.
     let dir = tempfile::tempdir().unwrap();
     // ppg=8, sub_ppf=4, page_size=64, page_count=16
     // Sub-chunk 0 = pages 0-3, Sub-chunk 1 = pages 4-7

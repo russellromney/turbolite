@@ -150,7 +150,6 @@ impl TurboliteHandle {
         prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
         gc_enabled: bool,
-        eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
         query_plan_prefetch: bool,
@@ -162,10 +161,12 @@ impl TurboliteHandle {
         let manifest = (**shared_manifest.load()).clone();
         let page_size = manifest.page_size;
 
-        // Eagerly fetch page group 0 and interior/index chunks from the
-        // backend. In local mode (is_local=true), these are not fetched
-        // eagerly; they're read on demand from local page groups when
-        // first accessed.
+        // Eagerly fetch page group 0 on open. Group 0 holds SQLite's schema +
+        // root page (page 1), which is hit on every connection open, so the
+        // round-trip is load-bearing. Interior and index chunk bundles are NOT
+        // fetched eagerly (Phase Cirrus d): they come in as cache misses on
+        // first query like any other page group. In local mode (is_local=true)
+        // nothing is prefetched; the local page-group files back the reads.
         if !is_local {
             let storage_ref = storage
                 .as_ref()
@@ -238,115 +239,8 @@ impl TurboliteHandle {
                 }
             }
 
-            // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
-            let interior_already_cached = !cache.interior_pages.lock().is_empty();
-            if interior_already_cached {
-                turbolite_debug!(
-                    "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
-                    cache.interior_pages.lock().len(),
-                );
-            } else if !manifest.interior_chunk_keys.is_empty() {
-                let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
-                turbolite_debug!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
-                match storage_helpers::get_page_groups_by_key(
-                    storage_ref.as_ref(),
-                    runtime_ref,
-                    &chunk_keys,
-                ) {
-                    Ok(results) => {
-                        #[cfg(feature = "zstd")]
-                        let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                        let mut total_pages = 0usize;
-                        let mut total_bytes = 0usize;
-                        for (key, data) in &results {
-                            total_bytes += data.len();
-                            match decode_interior_bundle(
-                                data,
-                                #[cfg(feature = "zstd")]
-                                ib_decoder.as_ref(),
-                                encryption_key.as_ref(),
-                            ) {
-                                Ok(pages) => {
-                                    total_pages += pages.len();
-                                    for (pnum, pdata) in &pages {
-                                        let _ = cache.write_page(*pnum, pdata);
-                                        let loc = manifest.page_location(*pnum)
-                                            .expect("interior page must have group assignment");
-                                        cache.mark_interior_group(loc.group_id, *pnum, loc.index);
-                                    }
-                                }
-                                Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                        format!("interior chunk {} decode failed: {}", key, e)));
-                                }
-                            }
-                        }
-                        turbolite_debug!(
-                            "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                            total_pages, results.len(), total_bytes as f64 / 1024.0,
-                        );
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other,
-                            format!("interior chunk fetch failed: {}", e)));
-                    }
-                }
-            }
-
-            // Index leaf bundles: synchronous fetch (errors must surface on open)
-            let index_already_cached = !cache.index_pages.lock().is_empty();
-            if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
-                let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-                let n_chunks = chunk_keys.len();
-                turbolite_debug!("[tiered] fetching {} index leaf chunks...", n_chunks);
-                match storage_helpers::get_page_groups_by_key(
-                    storage_ref.as_ref(),
-                    runtime_ref,
-                    &chunk_keys,
-                ) {
-                    Ok(results) => {
-                        #[cfg(feature = "zstd")]
-                        let ix_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                        let mut total_pages = 0usize;
-                        let mut total_bytes = 0usize;
-                        for (key, data) in &results {
-                            total_bytes += data.len();
-                            match decode_interior_bundle(
-                                data,
-                                #[cfg(feature = "zstd")]
-                                ix_decoder.as_ref(),
-                                encryption_key.as_ref(),
-                            ) {
-                                Ok(pages) => {
-                                    total_pages += pages.len();
-                                    for (pnum, pdata) in &pages {
-                                        let _ = cache.write_page(*pnum, pdata);
-                                        cache.index_pages.lock().insert(*pnum);
-                                    }
-                                }
-                                Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                        format!("index chunk {} decode failed: {}", key, e)));
-                                }
-                            }
-                        }
-                        turbolite_debug!(
-                            "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                            total_pages, results.len(), total_bytes as f64 / 1024.0,
-                        );
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other,
-                            format!("index chunk fetch failed: {}", e)));
-                    }
-                }
-            } else if index_already_cached {
-                turbolite_debug!(
-                    "[tiered] index pages already cached ({} pages), skipping chunk fetch",
-                    cache.index_pages.lock().len(),
-                );
-            }
-        } // end non-local eager fetch block
+        } // end non-local eager fetch block (group 0 only; interior + index
+          // bundles removed in Phase Cirrus d)
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {

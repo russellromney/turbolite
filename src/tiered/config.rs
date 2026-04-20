@@ -152,8 +152,6 @@ pub struct PrefetchConfig {
     pub query_plan: bool,
     /// Enable predictive cross-tree prefetch.
     pub prediction: bool,
-    /// Load all index leaf bundles on VFS open.
-    pub eager_index_load: bool,
     /// Manifest source — Auto (local fallback) vs Remote (always backend).
     pub manifest_source: ManifestSource,
 }
@@ -261,7 +259,6 @@ impl Default for PrefetchConfig {
             threads: cpus + 1,
             query_plan: true,
             prediction: false,
-            eager_index_load: true,
             manifest_source: ManifestSource::Auto,
         }
     }
