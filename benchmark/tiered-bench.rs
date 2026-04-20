@@ -814,13 +814,27 @@ impl SchedulePair {
         Self { search, lookup }
     }
 
-    /// No-op after Phase Cirrus a: prefetch schedules are now set at VFS-open
-    /// time via TurboliteConfig.prefetch.search / prefetch.lookup. The old
-    /// process-global SETTINGS_QUEUE was deleted. Kept for call-site shape;
-    /// tiered-bench's per-query schedule sweep currently runs all pairs with
-    /// the open-time schedule. Reworking the sweep to re-open the VFS per
-    /// pair is a follow-up.
-    fn push(&self) {}
+    /// Push this pair's prefetch schedules onto the current connection's
+    /// turbolite handle via the per-handle settings queue restored in
+    /// Phase Cirrus c. The next slow-path read on the handle drains and
+    /// applies the update, so each pair in matrix mode is actually
+    /// measured with its own schedule.
+    fn push(&self) {
+        let search_val = match &self.search {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        let lookup_val = match &self.lookup {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        // `set` returns Err only if no active handle or the value fails
+        // validation; both are programmer errors in this bench, so panic.
+        turbolite::tiered::settings::set("prefetch_search", &search_val)
+            .expect("settings::set prefetch_search");
+        turbolite::tiered::settings::set("prefetch_lookup", &lookup_val)
+            .expect("settings::set prefetch_lookup");
+    }
 
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {

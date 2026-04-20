@@ -152,13 +152,25 @@ impl SchedulePair {
         Self { search: None, lookup: None }
     }
 
-    /// No-op after Phase Cirrus a: prefetch schedules are now set at VFS-open
-    /// time via TurboliteConfig.prefetch.search / prefetch.lookup. The old
-    /// process-global SETTINGS_QUEUE was deleted. Kept for call-site shape;
-    /// tiered-tune's per-pair sweep currently runs every pair with the
-    /// open-time schedule. Reworking the sweep to re-open the VFS per pair
-    /// is a follow-up.
-    fn push(&self) {}
+    /// Push this pair's prefetch schedules onto the current connection's
+    /// turbolite handle via the per-handle settings queue restored in
+    /// Phase Cirrus c. The next slow-path read on the handle drains and
+    /// applies the update, so each pair in the sweep is measured with
+    /// its own schedule.
+    fn push(&self) {
+        let search_val = match &self.search {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        let lookup_val = match &self.lookup {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        turbolite::tiered::settings::set("prefetch_search", &search_val)
+            .expect("settings::set prefetch_search");
+        turbolite::tiered::settings::set("prefetch_lookup", &lookup_val)
+            .expect("settings::set prefetch_lookup");
+    }
 
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {
@@ -595,11 +607,11 @@ fn main() {
         let best = &pairs[best_pair_idx];
         if let Some(ref search) = best.search {
             let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
-            println!("  TurboliteConfig.prefetch_search = vec![{}];", s);
+            println!("  TurboliteConfig.prefetch.search = vec![{}];", s);
         }
         if let Some(ref lookup) = best.lookup {
             let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
-            println!("  TurboliteConfig.prefetch_lookup = vec![{}];", s);
+            println!("  TurboliteConfig.prefetch.lookup = vec![{}];", s);
         }
         if best.search.is_none() && best.lookup.is_none() {
             println!("  // No prefetch recommended (off/off was fastest)");

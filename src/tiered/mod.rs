@@ -76,7 +76,7 @@ mod prediction;
 mod prefetch;
 mod query_plan;
 mod rotation;
-mod settings;
+pub mod settings;
 mod staging;
 mod storage;
 mod vfs;
