@@ -173,35 +173,54 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             ttl_secs: 0,
-            max_bytes: std::env::var("TURBOLITE_CACHE_LIMIT")
-                .ok()
-                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
-                .and_then(|n| if n == 0 { None } else { Some(n) }),
-            mem_budget: std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
-                .ok()
-                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
-                .unwrap_or(64 * 1024 * 1024),
-            evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
-                .map(|v| matches!(v.as_str(), "true" | "1"))
-                .unwrap_or(false),
-            compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
-                .map(|v| matches!(v.as_str(), "true" | "1"))
-                .unwrap_or(false),
-            compression_level: std::env::var("TURBOLITE_CACHE_COMPRESSION_LEVEL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3),
+            max_bytes: None,
+            mem_budget: 64 * 1024 * 1024,
+            evict_on_checkpoint: false,
+            compression: false,
+            compression_level: 3,
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: true,
+            override_threshold: 0,
+            compaction_threshold: 8,
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Construct a CacheConfig from the `TURBOLITE_*` environment variables,
+    /// falling back to `Default` for any value not overridden.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            max_bytes: std::env::var("TURBOLITE_CACHE_LIMIT")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .and_then(|n| if n == 0 { None } else { Some(n) })
+                .or(d.max_bytes),
+            mem_budget: std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .unwrap_or(d.mem_budget),
+            evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(d.evict_on_checkpoint),
+            compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(d.compression),
+            compression_level: std::env::var("TURBOLITE_CACHE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.compression_level),
             override_threshold: std::env::var("TURBOLITE_OVERRIDE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(d.override_threshold),
             compaction_threshold: std::env::var("TURBOLITE_COMPACTION_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+                .unwrap_or(d.compaction_threshold),
+            ..d
         }
     }
 }
@@ -216,30 +235,54 @@ impl Default for CompressionConfig {
     }
 }
 
+impl CompressionConfig {
+    /// Read `TURBOLITE_COMPRESSION_LEVEL` (the loadable-extension historically
+    /// used this name). Falls back to `Default` otherwise.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            level: std::env::var("TURBOLITE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.level),
+            ..d
+        }
+    }
+}
+
 impl Default for PrefetchConfig {
     fn default() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(2);
         Self {
             search: vec![0.3, 0.3, 0.4],
             lookup: vec![0.0, 0.0, 0.0],
-            threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| {
-                    let cpus = std::thread::available_parallelism()
-                        .map(|n| n.get() as u32)
-                        .unwrap_or(2);
-                    cpus + 1
-                }),
+            threads: cpus + 1,
             query_plan: true,
             prediction: false,
             eager_index_load: true,
+            manifest_source: ManifestSource::Auto,
+        }
+    }
+}
+
+impl PrefetchConfig {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.threads),
             manifest_source: std::env::var("TURBOLITE_MANIFEST_SOURCE")
                 .ok()
                 .map(|v| match v.to_lowercase().as_str() {
                     "remote" | "s3" => ManifestSource::Remote,
                     _ => ManifestSource::Auto,
                 })
-                .unwrap_or_default(),
+                .unwrap_or(d.manifest_source),
+            ..d
         }
     }
 }
@@ -248,13 +291,24 @@ impl Default for PrefetchConfig {
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
+            replication: false,
+            sync_interval_ms: 1000,
+        }
+    }
+}
+
+#[cfg(feature = "wal")]
+impl WalConfig {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
             replication: std::env::var("TURBOLITE_WAL_REPLICATION")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
-                .unwrap_or(false),
+                .unwrap_or(d.replication),
             sync_interval_ms: std::env::var("TURBOLITE_WAL_SYNC_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
+                .unwrap_or(d.sync_interval_ms),
         }
     }
 }
@@ -306,6 +360,30 @@ impl Default for TurboliteConfig {
             prefetch: PrefetchConfig::default(),
             #[cfg(feature = "wal")]
             wal: WalConfig::default(),
+        }
+    }
+}
+
+impl TurboliteConfig {
+    /// Construct a TurboliteConfig by reading `TURBOLITE_*` environment variables.
+    /// Fields not overridden by env vars come from `Default`. `cache_dir` reads
+    /// `TURBOLITE_CACHE_DIR` (default `/tmp/turbolite-cache`).
+    pub fn from_env() -> Self {
+        let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp/turbolite-cache"));
+        Self {
+            cache_dir,
+            read_only: std::env::var("TURBOLITE_READ_ONLY")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            sync_mode: SyncMode::default(),
+            cache: CacheConfig::from_env(),
+            compression: CompressionConfig::from_env(),
+            encryption: EncryptionConfig::default(),
+            prefetch: PrefetchConfig::from_env(),
+            #[cfg(feature = "wal")]
+            wal: WalConfig::from_env(),
         }
     }
 }

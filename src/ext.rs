@@ -71,18 +71,14 @@ fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
     use crate::tiered::{TurboliteConfig, TurboliteVfs};
 
-    let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-
+    // Loadable extensions preserve the historical "." cache_dir fallback when
+    // TURBOLITE_CACHE_DIR is unset. Everything else comes from the env-driven
+    // constructor.
     let config = TurboliteConfig {
-        cache_dir,
-        compression_level: level,
-        ..Default::default()
+        cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".")),
+        ..TurboliteConfig::from_env()
     };
     let vfs = TurboliteVfs::new(config)?;
     crate::tiered::register("turbolite", vfs)
@@ -382,20 +378,9 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
         }
     };
 
-    let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let mem_cache_budget = std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
-        .ok()
-        .and_then(|s| parse_mem_cache_budget(&s))
-        .unwrap_or(64 * 1024 * 1024);
-
     let config = crate::tiered::TurboliteConfig {
         cache_dir,
-        compression_level: level,
-        mem_cache_budget,
-        ..Default::default()
+        ..crate::tiered::TurboliteConfig::from_env()
     };
     match crate::tiered::TurboliteVfs::new(config) {
         Ok(vfs) => match crate::tiered::register(&name, vfs) {
@@ -410,21 +395,6 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
             1
         }
     }
-}
-
-fn parse_mem_cache_budget(s: &str) -> Option<u64> {
-    let s = s.trim().to_uppercase();
-    if s == "0" { return Some(0); }
-    let (num, mult) = if s.ends_with("GB") {
-        (&s[..s.len()-2], 1024 * 1024 * 1024u64)
-    } else if s.ends_with("MB") {
-        (&s[..s.len()-2], 1024 * 1024u64)
-    } else if s.ends_with("KB") {
-        (&s[..s.len()-2], 1024u64)
-    } else {
-        (s.as_str(), 1u64)
-    };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
 #[cfg(not(feature = "cli-s3"))]
