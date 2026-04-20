@@ -53,8 +53,14 @@ extern const char *turbolite_compact(void);
 /* `turbolite_install_config_functions` and its scalar-function
  * counterpart are defined in turbolite-ffi/src/install.rs — they're
  * what embedders call per connection. The extension entry point
- * below no longer auto-registers the SQL function. */
+ * registers this as a SQLite auto-extension (via the adapter below)
+ * so every newly-opened sqlite3 connection picks it up automatically,
+ * with each connection's own handle queue captured as pApp. */
 extern int turbolite_install_config_functions(sqlite3 *db);
+
+/* Forward decl; defined at the bottom of this file. */
+static int install_config_functions_autoext(
+    sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi);
 
 /* Rust functions -- cache eviction + observability.
  * Defined in src/ext.rs. */
@@ -507,11 +513,48 @@ int sqlite3_turbolite_init(
         SQLITE_UTF8, 0, turbolite_compact_func, 0, 0, 0
     );
 
-    /* turbolite_config_set is NOT auto-registered. Users invoke
-     * `turbolite_install_config_functions(db)` per connection to bind
-     * the scalar function to THIS connection's handle queue via pApp.
-     * See the function's block comment above for the contract. */
+    /* Register `turbolite_install_config_functions` as an auto-extension
+     * so every connection opened after this extension is loaded picks up
+     * the scalar function on its own handle queue via pApp — no explicit
+     * per-connection install call required from language bindings. See
+     * `install_config_functions_autoext` below for the callback adapter. */
+    rc = sqlite3_auto_extension((void(*)(void))install_config_functions_autoext);
+    if (rc != SQLITE_OK) {
+        *pzErrMsg = sqlite3_mprintf(
+            "turbolite: sqlite3_auto_extension(install_config_functions) failed"
+        );
+        return rc;
+    }
     return SQLITE_OK;
+}
+
+/*
+ * Auto-extension adapter: SQLite calls this for every newly-opened
+ * sqlite3 connection. We forward to the Rust-side
+ * `turbolite_install_config_functions`, ignoring SQLITE_MISUSE (which
+ * just means the connection isn't turbolite-backed — we register on
+ * every connection in the process, but only turbolite connections need
+ * the scalar).
+ *
+ * The SQLite auto-extension callback signature is the same as the
+ * loadable-extension entry point; SQLITE_EXTENSION_INIT2 is NOT
+ * expected here (the API table is already initialized by the outer
+ * sqlite3_turbolite_init call that registered us).
+ */
+static int install_config_functions_autoext(
+    sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi
+) {
+    (void)pzErrMsg;
+    (void)pApi;
+    int rc = turbolite_install_config_functions(db);
+    /* SQLITE_MISUSE (21) is the expected "no turbolite handle active"
+     * response for non-turbolite connections. Treat it as a benign
+     * no-op so we don't break unrelated sqlite3_open calls in the same
+     * process. */
+    if (rc == 21 /* SQLITE_MISUSE */) {
+        return SQLITE_OK;
+    }
+    return rc;
 }
 
 /* ── Symbol shims ───────────────────────────────────────────────
@@ -531,6 +574,63 @@ int sqlite3_turbolite_init(
 #undef sqlite3_uri_boolean
 #undef sqlite3_trace_v2
 #undef sqlite3_db_handle
+#undef sqlite3_auto_extension
+#undef sqlite3_exec
+#undef sqlite3_free
+#undef sqlite3_create_function_v2
+#undef sqlite3_user_data
+#undef sqlite3_value_text
+#undef sqlite3_result_error
+#undef sqlite3_result_int
+
+/* Shims for the Rust-side `install_config_functions` + its scalar
+ * function (src/install.rs). Each extern "C" symbol Rust references
+ * must route through the sqlite3_api table under loadable-ext mode.
+ * Standalone cdylib builds don't compile this file — they resolve
+ * these names against libsqlite3-sys's linked libsqlite3. */
+
+int sqlite3_auto_extension(void(*xEntryPoint)(void)) {
+    return sqlite3_api->auto_extension(xEntryPoint);
+}
+
+int sqlite3_exec(sqlite3 *db, const char *sql,
+                 int (*cb)(void*, int, char**, char**),
+                 void *arg, char **errmsg) {
+    return sqlite3_api->exec(db, sql, cb, arg, errmsg);
+}
+
+void sqlite3_free(void *p) {
+    sqlite3_api->free(p);
+}
+
+int sqlite3_create_function_v2(
+    sqlite3 *db, const char *zFunctionName, int nArg, int eTextRep,
+    void *pApp,
+    void (*xFunc)(sqlite3_context*, int, sqlite3_value**),
+    void (*xStep)(sqlite3_context*, int, sqlite3_value**),
+    void (*xFinal)(sqlite3_context*),
+    void (*xDestroy)(void*)
+) {
+    return sqlite3_api->create_function_v2(
+        db, zFunctionName, nArg, eTextRep, pApp,
+        xFunc, xStep, xFinal, xDestroy);
+}
+
+void *sqlite3_user_data(sqlite3_context *ctx) {
+    return sqlite3_api->user_data(ctx);
+}
+
+const unsigned char *sqlite3_value_text(sqlite3_value *v) {
+    return sqlite3_api->value_text(v);
+}
+
+void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int len) {
+    sqlite3_api->result_error(ctx, msg, len);
+}
+
+void sqlite3_result_int(sqlite3_context *ctx, int val) {
+    sqlite3_api->result_int(ctx, val);
+}
 
 int sqlite3_trace_v2(sqlite3 *db, unsigned mask,
                      int (*xCallback)(unsigned, void*, void*, void*),

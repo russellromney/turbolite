@@ -69,18 +69,6 @@ def load(conn: sqlite3.Connection) -> None:
         _loaded_s3 = True
 
 
-# Phase Cirrus h2 replaced the loadable extension's auto-registration of
-# `turbolite_config_set` with an explicit per-connection helper
-# (`turbolite_install_config_functions(db)`), which Python's stdlib sqlite3
-# module can't call — it doesn't expose the underlying `sqlite3*` handle.
-# Python consumers that need runtime prefetch tuning from a sqlite3
-# connection must use environment variables at load time
-# (TURBOLITE_COMPRESSION_LEVEL, TURBOLITE_PREFETCH_THREADS,
-# TURBOLITE_MEM_CACHE_BUDGET) or a ctypes-based helper that reaches into
-# the Connection object. A PyO3-backed binding that exposes install +
-# push directly is a follow-up.
-
-
 def connect(
     path: str,
     *,
