@@ -1,0 +1,46 @@
+{
+  "name": "turbolite",
+  "version": "0.5.0",
+  "description": "turbolite -- SQLite with compressed page groups and optional S3 cloud storage. Returns standard better-sqlite3 connections.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "turbolite.dylib",
+    "turbolite.so",
+    "turbolite.dll",
+    "turbolite.*.dylib",
+    "turbolite.*.so",
+    "turbolite.*.dll",
+    "bin/turbolite.js",
+    "turbolite",
+    "postinstall.js"
+  ],
+  "bin": {
+    "turbolite": "bin/turbolite.js"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "sqlite",
+    "compression",
+    "zstd",
+    "database",
+    "vfs",
+    "s3",
+    "better-sqlite3"
+  ],
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.2"
+  },
+  "scripts": {
+    "build": "tsc",
+    "postinstall": "node postinstall.js",
+    "test": "npm run build && node test.mjs",
+    "build-ext": "cd ../.. && cargo build --release --no-default-features --features 'loadable-extension,cli-s3,zstd' --lib && cp ../cinch-target/release/libturbolite_ffi.dylib packages/node/turbolite.dylib 2>/dev/null || cp ../cinch-target/release/libturbolite_ffi.so packages/node/turbolite.so 2>/dev/null"
+  }
+}

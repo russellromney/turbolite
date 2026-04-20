@@ -77,6 +77,22 @@ install: lib header ## Install shared library + header to PREFIX (default /usr/l
 test: ## Run Rust-level FFI integration tests
 	cargo test --features zstd,bundled-sqlite
 
+# ── Language packages ─────────────────────────────────────────────
+
+.PHONY: pkg-python
+pkg-python: ext ## Build Python package (builds ext, bundles binary, creates wheel)
+	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
+	cd packages/python && pip wheel . --no-deps -w dist/
+
+.PHONY: pkg-python-dev
+pkg-python-dev: ext ## Install Python package in dev mode (builds ext first)
+	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
+	cd packages/python && pip install -e .
+
+.PHONY: pkg-node
+pkg-node: ## Build Node.js package
+	cd packages/node && npm install && npm run build && npm run build-ext
+
 # ── Cleanup ────────────────────────────────────────────────────────
 
 .PHONY: clean
