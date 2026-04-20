@@ -142,7 +142,7 @@ Each consecutive miss advances through a **prefetch schedule** that controls wha
 - **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
 - **Lookup schedule** `[0.0, 0.0, 0.0]`: for point queries and index lookups that hit 1-2 pages per tree. Three free hops before any prefetch. Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
 
-You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
+You can tune the prefetch schedule at open time by setting `prefetch_search` / `prefetch_lookup` on `TurboliteConfig` - you know the expected workload shape, so the VFS doesn't have to guess. See [Configuring prefetch](#configuring-prefetch).
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
@@ -231,28 +231,27 @@ Each element is the fraction of sibling groups to prefetch on the Nth consecutiv
 
 **Why two reactive schedules?** SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately.
 
-### Runtime tuning
+### Configuring prefetch
 
-Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+Set `prefetch_search` and `prefetch_lookup` on `TurboliteConfig` at VFS construction:
 
-```sql
-SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
-SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
-SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
-SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
-SELECT turbolite_config_set('plan_aware', 'false');
+```rust
+let config = TurboliteConfig {
+    prefetch_search: vec![0.4, 0.3, 0.3],
+    prefetch_lookup: vec![0.0, 0.0, 0.2],
+    query_plan_prefetch: true,
+    ..Default::default()
+};
 ```
-
-Changes take effect on the next query. Zero overhead when not used.
 
 ### Recommended configs
 
 | Workload | Config | Why |
 |----------|--------|-----|
 | Mixed OLTP | Defaults | Plan-aware handles scans, search schedule warms indexes, lookup schedule stays conservative. |
-| Point-heavy (agent DBs) | `prefetch_lookup=0,0,0` | Lookups almost never need prefetch. |
-| Scan-heavy analytics | `prefetch_search=0.5,0.5`, `plan_aware=true` | Aggressive search warmup plus plan-aware bulk prefetch. |
-| Conservative (bursty serverless) | `prefetch_search=0.1,0.2,0.3`, `prefetch_lookup=0,0,0.1` | Minimal prefetch noise. |
+| Point-heavy (agent DBs) | `prefetch_lookup: vec![0.0, 0.0, 0.0]` | Lookups almost never need prefetch. |
+| Scan-heavy analytics | `prefetch_search: vec![0.5, 0.5]`, `query_plan_prefetch: true` | Aggressive search warmup plus plan-aware bulk prefetch. |
+| Conservative (bursty serverless) | `prefetch_search: vec![0.1, 0.2, 0.3]`, `prefetch_lookup: vec![0.0, 0.0, 0.1]` | Minimal prefetch noise. |
 
 **Note**: prefetch is per-connection. Each new connection starts with cold per-tree miss counters. The cache is shared, so a second connection benefits from pages cached by the first.
 
@@ -292,7 +291,7 @@ cargo run --release --features cloud,zstd --bin tiered-tune -- \
   --iterations 10
 ```
 
-Output is a per-query comparison table (like `tiered-bench --matrix`) showing p50, p90, GET count, and bytes for each schedule pair. The tool recommends a schedule and prints the `turbolite_config_set` SQL to apply it.
+Output is a per-query comparison table (like `tiered-bench --matrix`) showing p50, p90, GET count, and bytes for each schedule pair. The tool recommends a schedule and prints the `TurboliteConfig` assignment to apply it.
 
 ## Durability
 

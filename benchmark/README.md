@@ -67,28 +67,24 @@ The VFS uses three prefetch strategies, selected automatically per query via EXP
 
 Each element in a schedule is the fraction of eligible sibling groups to prefetch on the Nth consecutive cache miss (per-tree). When misses exceed the array length, fraction=1.0 (all remaining siblings).
 
-### Runtime tuning
+### Configuring schedules
 
-Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+Prefetch schedules are set on `TurboliteConfig` at VFS construction:
 
-```sql
--- Tune before a batch of queries
-SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
-SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
-SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
-SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
-SELECT turbolite_config_set('plan_aware', 'false');
-
--- Changes take effect on the next query (zero overhead when not used)
+```rust
+let config = TurboliteConfig {
+    prefetch_search: vec![0.4, 0.3, 0.3],
+    prefetch_lookup: vec![0.0, 0.0, 0.2],
+    query_plan_prefetch: true, // enable plan-aware SCAN bulk prefetch
+    ..Default::default()
+};
 ```
 
-| Key | Values | Description |
+| Field | Type | Description |
 |-----|--------|-------------|
-| `prefetch` | Comma-separated floats | Convenience: sets both search and lookup schedules |
-| `prefetch_search` | Comma-separated floats | SEARCH query prefetch schedule (aggressive) |
-| `prefetch_lookup` | Comma-separated floats | Lookup/point query prefetch schedule (conservative) |
-| `prefetch_reset` | Any (ignored) | Reset both schedules to defaults |
-| `plan_aware` | `true`/`false` | Enable/disable SCAN bulk prefetch |
+| `prefetch_search` | `Vec<f32>` | SEARCH query prefetch schedule (aggressive) |
+| `prefetch_lookup` | `Vec<f32>` | Lookup/point query prefetch schedule (conservative) |
+| `query_plan_prefetch` | `bool` | Enable/disable plan-aware SCAN bulk prefetch |
 
 ### Why two schedules?
 
@@ -180,12 +176,12 @@ cargo run --release --features tiered,zstd --bin tiered-tune -- \
     --plan-aware --iterations 10
 ```
 
-The tool builds a Cartesian product of search x lookup schedules, tests each pair, and recommends the best one with the SQL to apply it:
+The tool builds a Cartesian product of search x lookup schedules, tests each pair, and recommends the best one with the Rust config to apply it:
 
 ```
   Best: 0.50,0.50 / 0.00,0.00,0.10 (p50 = 74.2ms)
-  SELECT turbolite_config_set('prefetch_search', '0.5,0.5');
-  SELECT turbolite_config_set('prefetch_lookup', '0,0,0.1');
+  TurboliteConfig.prefetch_search = vec![0.5, 0.5];
+  TurboliteConfig.prefetch_lookup = vec![0.0, 0.0, 0.1];
 ```
 
 ## Environment Variables

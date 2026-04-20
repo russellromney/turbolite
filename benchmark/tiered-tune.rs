@@ -591,18 +591,18 @@ fn main() {
         println!();
         println!("  Best: {} (p50 = {})", best_label, format_ms(best_p50));
 
-        // Print recommended SQL
+        // Print recommended TurboliteConfig values (set at construction time).
         let best = &pairs[best_pair_idx];
         if let Some(ref search) = best.search {
-            let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-            println!("  SELECT turbolite_config_set('prefetch_search', '{}');", s);
+            let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            println!("  TurboliteConfig.prefetch_search = vec![{}];", s);
         }
         if let Some(ref lookup) = best.lookup {
-            let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-            println!("  SELECT turbolite_config_set('prefetch_lookup', '{}');", s);
+            let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            println!("  TurboliteConfig.prefetch_lookup = vec![{}];", s);
         }
         if best.search.is_none() && best.lookup.is_none() {
-            println!("  -- No prefetch recommended (off/off was fastest)");
+            println!("  // No prefetch recommended (off/off was fastest)");
         }
         println!();
     }

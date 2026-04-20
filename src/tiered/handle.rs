@@ -930,57 +930,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // 3e. Drain per-connection settings (turbolite_config_set SQL function).
-        // Same global-queue pattern as plan drain. Users can tune prefetch schedules
-        // before each query without reopening the connection.
-        //
-        // Keys:
-        //   prefetch        - convenience, sets both search and lookup
-        //   prefetch_search - SEARCH queries (aggressive warmup)
-        //   prefetch_lookup - index lookups / point queries (conservative)
-        //   prefetch_reset  - reset both to defaults
-        //   plan_aware      - enable/disable plan-aware prefetch
-        {
-            let updates = settings::drain_settings();
-            for update in updates {
-                match update.key.as_str() {
-                    "prefetch" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_search = hops.clone();
-                            self.prefetch_lookup = hops;
-                        }
-                    }
-                    "prefetch_search" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_search = hops;
-                        }
-                    }
-                    "prefetch_lookup" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_lookup = hops;
-                        }
-                    }
-                    "prefetch_reset" => {
-                        self.prefetch_search = vec![0.3, 0.3, 0.4];
-                        self.prefetch_lookup = vec![0.0, 0.0, 0.0];
-                    }
-                    "plan_aware" => {
-                        self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
-                    }
-                    "cache_limit" => {
-                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
-                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
-                        }
-                    }
-                    "evict_on_checkpoint" => {
-                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 3f. query-plan-aware prefetch.
+        // 3e. query-plan-aware prefetch.
         //
         // Drain the global plan queue and submit ALL planned groups to the
         // prefetch pool in EQP order: all groups for tree 1, then all groups
