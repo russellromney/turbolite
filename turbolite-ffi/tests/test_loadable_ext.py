@@ -14,12 +14,17 @@ import sqlite3
 import sys
 import tempfile
 
-# `make -C ../turbolite-ffi ext` copies the cdylib to <target>/release/turbolite.<ext>
-# so SQLite's `.load turbolite` resolves without the platform prefix.
-# The shared target-dir is ~/Documents/Github/cinch-target.
+# `make ext` copies the cdylib to <target>/release/turbolite.<ext>
+# so SQLite's `.load turbolite` resolves without the `lib` prefix.
+# The shared target-dir is ~/Documents/Github/cinch-target (sits next
+# to the turbolite workspace root — three levels up from this test).
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 _candidates = [
+    # Workspace layout: turbolite/turbolite-ffi/tests/ → turbolite/ → parent → cinch-target
+    os.path.join(_this_dir, "..", "..", "..", "cinch-target", "release", "turbolite"),
+    # Legacy sibling-repo layout (kept as fallback).
     os.path.join(_this_dir, "..", "..", "cinch-target", "release", "turbolite"),
+    # Crate-local target.
     os.path.join(_this_dir, "..", "target", "release", "turbolite"),
 ]
 EXT_PATH = next(

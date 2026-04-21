@@ -23,9 +23,11 @@ def find_lib():
     """Find the turbolite-ffi shared library."""
     ext = "dylib" if platform.system() == "Darwin" else "so"
     name = f"libturbolite_ffi.{ext}"
-    # cinch-target is the shared target dir for all sibling repos.
-    # Check cinch-target first, then local fallbacks.
+    # cinch-target is the shared target dir for the cinch repo family.
+    # Workspace layout puts cinch-target three directories up from this
+    # test file; older sibling-repo layouts put it two.
     search_dirs = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "cinch-target"),
         os.path.join(os.path.dirname(__file__), "..", "..", "cinch-target"),
         os.path.join(os.path.dirname(__file__), "..", "target"),
     ]

@@ -19,11 +19,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ── Load library ────────────────────────────────────────────────────
 
 const ext = process.platform === "darwin" ? "dylib" : "so";
-// The shared sibling target-dir is ../../../cinch-target.
-const libPath = [
+// Workspace layout: tests/test_ffi_node/ → tests/ → turbolite-ffi/ → turbolite/ → parent → cinch-target
+import { existsSync } from "node:fs";
+const _candidates = [
+  resolve(__dirname, `../../../../cinch-target/release/libturbolite_ffi.${ext}`),
   resolve(__dirname, `../../../cinch-target/release/libturbolite_ffi.${ext}`),
   resolve(__dirname, `../../target/release/libturbolite_ffi.${ext}`),
-].find(() => true);
+];
+const libPath = _candidates.find(p => existsSync(p)) || _candidates[0];
 
 const lib = koffi.load(libPath);
 

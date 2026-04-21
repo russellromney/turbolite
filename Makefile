@@ -20,7 +20,8 @@ FFI_LIB_NAME := turbolite_ffi
 FFI_LIB_FILE := $(LIB_PREFIX)$(FFI_LIB_NAME).$(LIB_EXT)
 CARGO_TARGET_DIR ?= ../cinch-target
 TARGET_DIR := $(CARGO_TARGET_DIR)/release
-FFI_DIR := ../turbolite-ffi
+# turbolite-ffi is a workspace member (nested subdirectory), not a sibling.
+FFI_DIR := turbolite-ffi
 
 # Features forwarded to cargo.
 FEATURES ?= zstd
@@ -56,48 +57,9 @@ test: ## Run all tests (Rust unit + FFI)
 test-all: ## Run all tests including tiered/S3
 	cargo test --features zstd,tiered,bundled-sqlite
 
-.PHONY: test-ext
-test-ext: ext ## Run loadable extension tests (requires Homebrew Python)
-	/opt/homebrew/bin/python3 tests/test_loadable_ext.py
-
-.PHONY: test-ffi
-test-ffi: test-ffi-python test-ffi-c test-ffi-go test-ffi-node ## Run all FFI integration tests (Python, C, Go, Node)
-
-.PHONY: test-ffi-tiered
-test-ffi-tiered: ## Run FFI integration tests with tiered/S3 (needs S3 creds)
-	$(MAKE) test-ffi FEATURES="zstd,tiered"
-
-.PHONY: test-ffi-python
-test-ffi-python: lib-bundled ## FFI test: Python (ctypes)
-	python3 tests/test_ffi_python.py
-
-# Build CFLAGS that mirror Cargo features for the C test.
-FFI_C_DEFINES :=
-ifneq (,$(findstring tiered,$(FEATURES)))
-  FFI_C_DEFINES += -DTURBOLITE_TIERED
-endif
-ifneq (,$(findstring encryption,$(FEATURES)))
-  FFI_C_DEFINES += -DTURBOLITE_ENCRYPTION
-endif
-
-.PHONY: test-ffi-c
-test-ffi-c: lib-bundled header ## FFI test: C (proves turbolite.h works)
-	cc -o $(TARGET_DIR)/test_ffi_c tests/test_ffi_c.c \
-		$(FFI_C_DEFINES) \
-		-L$(TARGET_DIR) -lturbolite_ffi \
-		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
-	$(TARGET_DIR)/test_ffi_c
-
-.PHONY: test-ffi-go
-test-ffi-go: lib-bundled ## FFI test: Go (cgo)
-	cd tests/test_ffi_go && \
-		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
-		go run .
-
-.PHONY: test-ffi-node
-test-ffi-node: lib-bundled ## FFI test: Node.js (koffi)
-	cd tests/test_ffi_node && npm install --silent 2>/dev/null && node test.mjs
+.PHONY: test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node
+test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node: ## FFI / loadable-ext tests live in turbolite-ffi now
+	$(MAKE) -C $(FFI_DIR) $@
 
 # ── Examples ──────────────────────────────────────────────────────
 

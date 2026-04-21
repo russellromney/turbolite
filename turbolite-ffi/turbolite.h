@@ -458,6 +458,8 @@ extern void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int len)
 
 extern void sqlite3_result_int(sqlite3_context *ctx, int val);
 
+extern int sqlite3_file_control(sqlite3 *db, const char *zDbName, int op, void *arg);
+
 /**
  * Register the `turbolite_config_set(key, value)` SQL function on this
  * connection, capturing the calling connection's handle queue via
@@ -465,6 +467,11 @@ extern void sqlite3_result_int(sqlite3_context *ctx, int val);
  *
  * Returns:
  * - `SQLITE_OK` (0) on success
+ * - `SQLITE_MISUSE` if the connection's VFS isn't one of turbolite's
+ *   registered names (protects against cross-connection queue leaks
+ *   when this function is called on a non-turbolite connection while
+ *   a turbolite handle is alive on the same thread — the queue would
+ *   otherwise route pushes to the wrong connection)
  * - A SQLite error code if the `PRAGMA schema_version` probe fails
  *   (connection isn't turbolite-backed)
  * - `SQLITE_MISUSE` if no turbolite handle is active on this thread

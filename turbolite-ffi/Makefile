@@ -83,8 +83,83 @@ test: ## Run Rust-level FFI integration tests
 
 .PHONY: test-auto-ext-python
 test-auto-ext-python: ext ## Python e2e: loadable-ext + sqlite3_auto_extension
-	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) $(TARGET_DIR)/turbolite.$(LIB_EXT)
 	/opt/homebrew/bin/python3 tests/test_auto_extension_python.py
+
+# FFI integration test matrix. Each target builds the correct cdylib
+# flavor then drives it from the language in question. The legacy
+# tests/test_ffi_* files exercise the standalone-cdylib C-level symbol
+# surface; test-ext exercises the loadable-extension path.
+
+.PHONY: test-ext
+test-ext: ext ## Loadable extension tests from Python (requires Homebrew Python)
+	/opt/homebrew/bin/python3 tests/test_loadable_ext.py
+
+.PHONY: test-ffi
+test-ffi: ## Run all standalone-cdylib FFI tests (builds once with cli-s3 + zstd)
+	$(MAKE) lib FEATURES="zstd,cli-s3"
+	$(MAKE) test-ffi-python-only test-ffi-c-only test-ffi-go-only test-ffi-node-only
+
+# Per-language targets without their own `lib` dependency — let the
+# caller do one cdylib build. Use these when you already ran `make lib`.
+.PHONY: test-ffi-python-only
+test-ffi-python-only:
+	python3 tests/test_ffi_python.py
+
+.PHONY: test-ffi-c-only
+test-ffi-c-only:
+	$(MAKE) header
+	cc -o $(TARGET_DIR)/test_ffi_c tests/test_ffi_c.c \
+		-DTURBOLITE_TIERED -DTURBOLITE_CLOUD \
+		-L$(TARGET_DIR) -lturbolite_ffi \
+		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
+	$(TARGET_DIR)/test_ffi_c
+
+.PHONY: test-ffi-go-only
+test-ffi-go-only:
+	cd tests/test_ffi_go && \
+		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
+		go run .
+
+.PHONY: test-ffi-node-only
+test-ffi-node-only:
+	cd tests/test_ffi_node && npm install --silent 2>/dev/null && node test.mjs
+
+.PHONY: test-ffi-tiered
+test-ffi-tiered: ## FFI tests with tiered/S3 (needs S3 creds)
+	$(MAKE) test-ffi FEATURES="zstd,cli-s3"
+
+.PHONY: test-ffi-python
+test-ffi-python: lib ## Python ctypes
+	python3 tests/test_ffi_python.py
+
+# Build CFLAGS that mirror Cargo features for the C test.
+FFI_C_DEFINES :=
+ifneq (,$(findstring cli-s3,$(FEATURES)))
+  FFI_C_DEFINES += -DTURBOLITE_TIERED
+endif
+ifneq (,$(findstring encryption,$(FEATURES)))
+  FFI_C_DEFINES += -DTURBOLITE_ENCRYPTION
+endif
+
+.PHONY: test-ffi-c
+test-ffi-c: lib header ## C (proves turbolite.h works)
+	cc -o $(TARGET_DIR)/test_ffi_c tests/test_ffi_c.c \
+		$(FFI_C_DEFINES) \
+		-L$(TARGET_DIR) -lturbolite_ffi \
+		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
+	$(TARGET_DIR)/test_ffi_c
+
+.PHONY: test-ffi-go
+test-ffi-go: lib ## Go cgo
+	cd tests/test_ffi_go && \
+		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
+		go run .
+
+.PHONY: test-ffi-node
+test-ffi-node: lib ## Node.js koffi
+	cd tests/test_ffi_node && npm install --silent 2>/dev/null && node test.mjs
 
 # ── Language packages ─────────────────────────────────────────────
 
