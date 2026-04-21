@@ -58,6 +58,29 @@ def load_ext(conn):
     conn.load_extension(EXT_PATH)
 
 
+# Every test wants its OWN VFS with its OWN cache dir — otherwise the
+# global "turbolite" VFS (cache_dir = ".") is shared across tests and
+# state leaks ("table t already exists" cascades after the first
+# CREATE). This helper builds a uniquely-named VFS, registers it via
+# turbolite_register_vfs, and returns the name.
+_vfs_counter = 0
+
+
+def register_fresh_vfs(cache_dir):
+    """Register a unique turbolite VFS pointing at `cache_dir`.
+    Returns the VFS name, usable as `vfs=<name>` in a URI filename."""
+    global _vfs_counter
+    _vfs_counter += 1
+    name = f"turbolite-test-{os.getpid()}-{_vfs_counter}"
+    boot = sqlite3.connect(":memory:")
+    load_ext(boot)
+    boot.execute(
+        "SELECT turbolite_register_vfs(?, ?)", (name, cache_dir)
+    ).fetchone()
+    boot.close()
+    return name
+
+
 # ── Happy path ────────────────────────────────────────────────────
 
 
@@ -68,12 +91,18 @@ def _():
     conn.close()
 
 
-@test("turbolite_version returns correct version")
+@test("turbolite_version returns a non-empty version string")
 def _():
+    # Hardcoding the version here just breaks on every bump. The test
+    # only cares that the function is wired up and returns something
+    # that looks like a semver-ish string.
     conn = sqlite3.connect(":memory:")
     load_ext(conn)
     version = conn.execute("SELECT turbolite_version()").fetchone()[0]
-    assert version == "0.2.19", f"expected 0.2.19, got {version}"
+    assert isinstance(version, str) and version.strip(), f"got {version!r}"
+    # Very loose shape check: at least one digit + a dot.
+    assert any(c.isdigit() for c in version), f"expected semver-ish, got {version!r}"
+    assert "." in version, f"expected semver-ish (has a .), got {version!r}"
     conn.close()
 
 
@@ -91,11 +120,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, 'hello')")
         conn.commit()
@@ -104,40 +131,44 @@ def _():
         conn.close()
 
 
-@test("file on disk has compressed magic (SQLCEvfS)")
+@test("turbolite VFS writes real storage artifacts to cache_dir")
 def _():
+    # Pre-Cirrus turbolite inlined compressed pages into the main db
+    # file (with an SQLCEvfS magic header). Current turbolite writes
+    # a manifest + page-groups under cache_dir and leaves the main db
+    # path as a stub/lock target — so there's no magic in the file,
+    # but there IS a manifest and at least one page group on disk.
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO t VALUES (1)")
         conn.commit()
         conn.close()
 
-        with open(path, "rb") as f:
-            magic = f.read(8)
-        assert magic == b"SQLCEvfS", f"expected SQLCEvfS magic, got {magic!r}"
+        manifest_path = os.path.join(d, "manifest.msgpack")
+        assert os.path.isfile(manifest_path), f"missing manifest at {manifest_path}"
+        assert os.path.getsize(manifest_path) > 0, "manifest is empty"
+        pg_dir = os.path.join(d, "p")
+        assert os.path.isdir(pg_dir), f"missing page-group dir at {pg_dir}"
+        assert os.listdir(pg_dir), "page-group dir is empty"
 
 
 @test("data persists across close/reopen")
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, 'persist')")
         conn.commit()
         conn.close()
 
-        conn2 = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn2 = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         row = conn2.execute("SELECT val FROM t WHERE id=1").fetchone()
         assert row == ("persist",), f"got {row}"
         conn2.close()
@@ -147,11 +178,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT)")
         for i in range(100):
@@ -173,11 +202,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, 'original')")
         conn.commit()
@@ -198,11 +225,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True, isolation_level="DEFERRED")
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True, isolation_level="DEFERRED")
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, 'committed')")
         conn.commit()
@@ -220,11 +245,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (a, b INTEGER, c REAL, d TEXT, e BLOB)")
         conn.execute("INSERT INTO t VALUES (NULL, 42, 3.14, 'text', X'DEADBEEF')")
         conn.commit()
@@ -242,11 +265,9 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("CREATE INDEX idx_val ON t(val)")
         for i in range(1000):
@@ -268,7 +289,8 @@ def _():
     # Loading again should not crash — VFS already registered, just no-op
     load_ext(conn)
     version = conn.execute("SELECT turbolite_version()").fetchone()[0]
-    assert version == "0.2.19"
+    # Don't assert the specific version (see turbolite_version test).
+    assert isinstance(version, str) and version.strip(), f"got {version!r}"
     conn.close()
 
 
@@ -279,16 +301,14 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "empty.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         conn.commit()
         conn.close()
 
-        conn2 = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn2 = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         tables = conn2.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
@@ -300,12 +320,10 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
         big_text = "x" * 100_000
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, ?)", (big_text,))
         conn.commit()
@@ -319,12 +337,10 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
         big_blob = os.urandom(100_000)
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val BLOB)")
         conn.execute("INSERT INTO t VALUES (1, ?)", (big_blob,))
         conn.commit()
@@ -338,12 +354,10 @@ def _():
 def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
         text = "Hello \U0001F600 \u4F60\u597D \u041F\u0440\u0438\u0432\u0435\u0442"
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO t VALUES (1, ?)", (text,))
         conn.commit()
@@ -358,11 +372,9 @@ def _():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "abs_test.db")
         assert os.path.isabs(path)
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO t VALUES (1)")
         conn.commit()
@@ -382,13 +394,11 @@ def _():
         conn_normal.commit()
         conn_normal.close()
 
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
         # Try to open the normal db with turbolite VFS — should fail
         try:
-            conn = sqlite3.connect(f"file:{normal_path}?vfs=turbolite", uri=True)
+            conn = sqlite3.connect(f"file:{normal_path}?vfs={vfs}", uri=True)
             conn.execute("SELECT * FROM t")
             assert False, "should have raised an error"
         except Exception:
@@ -451,11 +461,9 @@ def _():
     We can't inspect the queue from Python, but we can verify no crashes."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "test.db")
-        conn = sqlite3.connect(":memory:")
-        load_ext(conn)
-        conn.close()
+        vfs = register_fresh_vfs(d)
 
-        conn = sqlite3.connect(f"file:{path}?vfs=turbolite", uri=True)
+        conn = sqlite3.connect(f"file:{path}?vfs={vfs}", uri=True)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
         conn.execute("CREATE INDEX idx_email ON users(email)")
         conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, content TEXT)")
