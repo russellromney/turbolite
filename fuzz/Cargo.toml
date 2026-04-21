@@ -1,3 +1,7 @@
+# Fuzz crate lives outside turbolite's Cargo workspace — cargo-fuzz
+# needs nightly-only flags that conflict with the stable workspace.
+[workspace]
+
 [package]
 name = "turbolite-fuzz"
 version = "0.0.0"

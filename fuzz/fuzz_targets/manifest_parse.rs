@@ -15,8 +15,11 @@ fn test_ffi_config_parse(data: &[u8]) {
         }
 
         if let Ok(config) = serde_json::from_str::<turbolite::TurboliteConfig>(trimmed) {
-            std::hint::black_box(&config.storage_backend);
+            // Phase Cirrus collapsed StorageBackend out of config; just
+            // touch the fields that survived the refactor.
             std::hint::black_box(&config.cache_dir);
+            std::hint::black_box(&config.compression);
+            std::hint::black_box(&config.prefetch);
         }
     }
 }

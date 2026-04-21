@@ -177,6 +177,21 @@ pkg-python-dev: ext ## Install Python package in dev mode (builds ext first)
 pkg-node: ## Build Node.js package
 	cd packages/node && npm install && npm run build && npm run build-ext
 
+# ── Fuzz ───────────────────────────────────────────────────────────
+
+# cargo-fuzz needs nightly rustc. The fuzz crate lives outside the
+# main workspace (its own `[workspace]` block) because libfuzzer's
+# -Zsanitizer flags conflict with the stable workspace.
+
+.PHONY: fuzz-build
+fuzz-build: ## Build both fuzz targets (nightly)
+	cd ../fuzz && cargo +nightly fuzz build
+
+.PHONY: fuzz-smoke
+fuzz-smoke: ## Quick 10s run of each fuzz target (crash + regression signal)
+	cd ../fuzz && cargo +nightly fuzz run manifest_parse -- -max_total_time=10
+	cd ../fuzz && cargo +nightly fuzz run vfs_operations -- -max_total_time=10
+
 # ── Cleanup ────────────────────────────────────────────────────────
 
 .PHONY: clean
