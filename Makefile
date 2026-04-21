@@ -77,6 +77,11 @@ install: lib header ## Install shared library + header to PREFIX (default /usr/l
 test: ## Run Rust-level FFI integration tests
 	cargo test --features zstd,bundled-sqlite
 
+.PHONY: test-auto-ext-python
+test-auto-ext-python: ext ## Python e2e: loadable-ext + sqlite3_auto_extension
+	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) $(TARGET_DIR)/turbolite.$(LIB_EXT)
+	/opt/homebrew/bin/python3 tests/test_auto_extension_python.py
+
 # ── Language packages ─────────────────────────────────────────────
 
 .PHONY: pkg-python
