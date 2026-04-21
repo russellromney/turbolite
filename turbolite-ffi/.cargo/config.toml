@@ -1,0 +1,8 @@
+# See cinch-cloud/.cargo/config.toml for rationale. Shared target-dir and
+# sccache so turbolite-ffi's builds dedupe with turbolite and the rest of
+# the sibling repos. Keep in sync.
+
+[build]
+target-dir = "../cinch-target"
+rustc-wrapper = "/opt/homebrew/opt/sccache/bin/sccache"
+incremental = true

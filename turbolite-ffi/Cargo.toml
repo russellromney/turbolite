@@ -1,0 +1,55 @@
+[package]
+name = "turbolite-ffi"
+version = "0.4.1"
+edition = "2021"
+description = "C FFI + SQLite loadable-extension front-end for turbolite"
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/turbolite"
+
+# `lib` is needed for integration tests in tests/ to link against the FFI
+# surface as an rlib. `cdylib` is the shipping artifact (.dylib / .so) that
+# C/Python/Go/Node load.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Default mirrors the old turbolite default: standalone cdylib linking a
+# bundled SQLite through turbolite's rusqlite. `make lib-bundled` path.
+default = ["zstd", "bundled-sqlite"]
+# Bundles sqlite3 for consumers that don't already have one linked.
+# Required by the `turbolite_open` / `turbolite_exec` rusqlite wrappers.
+bundled-sqlite = ["turbolite/bundled-sqlite", "dep:rusqlite"]
+# Loadable-extension mode: compile ext.rs + ext_entry.c. In this mode
+# turbolite must be built WITHOUT bundled-sqlite — the host process
+# provides sqlite3 symbols via the extension API table. Typically
+# invoked as `--no-default-features --features loadable-extension,zstd`.
+loadable-extension = []
+# Passthrough turbolite features.
+zstd = ["turbolite/zstd"]
+lz4 = ["turbolite/lz4"]
+snappy = ["turbolite/snappy"]
+gzip = ["turbolite/gzip"]
+encryption = ["turbolite/encryption"]
+# Re-exposes the cloud-mode FFI (`turbolite_register_cloud` /
+# `turbolite_register_tiered`). Requires turbolite's cli-s3 backend.
+cli-s3 = ["turbolite/cli-s3", "dep:hadb-storage-s3", "dep:hadb-storage", "dep:tokio"]
+
+[dependencies]
+turbolite = { path = "../turbolite", version = "0.4", default-features = false }
+libc = "0.2"
+serde_json = "1"
+# Optional: rusqlite is only needed when the cdylib also bundles its own
+# sqlite3 and exposes the `turbolite_open` / `turbolite_exec` rusqlite
+# helpers. In loadable-extension mode it's absent.
+rusqlite = { version = "0.35", features = ["backup"], optional = true }
+# cli-s3 only; resolved by the feature above.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
+hadb-storage = { path = "../hadb/hadb-storage", version = "0.4", optional = true }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4", optional = true }
+
+[build-dependencies]
+cc = "1"
+cbindgen = "0.27"
+
+[dev-dependencies]
+tempfile = "3"

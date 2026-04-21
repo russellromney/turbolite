@@ -1,0 +1,31 @@
+{
+  "name": "@turbolite/browser",
+  "version": "0.1.0",
+  "description": "Read-only browser client for turbolite S3-backed SQLite databases",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
+    "fzstd": "^0.1.1",
+    "wa-sqlite": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "keywords": ["sqlite", "wasm", "browser", "turbolite", "s3", "vfs"],
+  "license": "Apache-2.0"
+}
