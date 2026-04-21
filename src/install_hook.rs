@@ -75,12 +75,35 @@ unsafe extern "C" fn auto_extension_entry(
 
 /// Internal install: if this thread has an active turbolite handle,
 /// bind `turbolite_config_set` to `db` with that handle's queue as
-/// `pApp`. No-op if no turbolite handle is active (unrelated sqlite3
-/// connection).
+/// `pApp`.
+///
+/// Three outcomes, each observable via `tracing` (target = `turbolite`):
+///
+/// - `trace!` — no turbolite handle on this thread. Benign: the
+///   auto-extension fired for a non-turbolite `sqlite3_open_v2` (e.g.
+///   unrelated code in the same process opened its own sqlite db).
+///   No scalar installed. The connection is untouched.
+/// - `error!` — `sqlite3_create_function_v2` returned non-OK. The
+///   connection LOOKED turbolite-backed (had a queue on stack) but
+///   binding the scalar failed. We reclaim the Arc and give up; the
+///   caller later sees "no such function" on `turbolite_config_set`.
+///   If you hit this, something's wrong with the SQLite handle or the
+///   process is in a weird state — escalate.
+/// - silent success on the happy path.
 unsafe fn install(db: *mut ffi::sqlite3) {
     let queue = match settings::top_queue() {
         Some(q) => q,
-        None => return, // Not turbolite-backed
+        None => {
+            // Non-turbolite connection. Normal when turbolite is linked
+            // into a process that also opens plain sqlite databases.
+            tracing::trace!(
+                target: "turbolite",
+                db = ?db,
+                "install_hook: no active turbolite handle on this thread, \
+                 skipping turbolite_config_set binding (non-turbolite connection)"
+            );
+            return;
+        }
     };
 
     let queue_ptr = Arc::into_raw(queue) as *mut std::ffi::c_void;
@@ -102,6 +125,15 @@ unsafe fn install(db: *mut ffi::sqlite3) {
         drop(Arc::from_raw(
             queue_ptr as *const Mutex<Vec<SettingUpdate>>,
         ));
+        tracing::error!(
+            target: "turbolite",
+            db = ?db,
+            rc,
+            "install_hook: sqlite3_create_function_v2 for turbolite_config_set \
+             failed; SELECT turbolite_config_set(...) will fail with 'no such \
+             function' on this connection. Callers can recover by invoking \
+             turbolite::install_config_functions(&conn) explicitly."
+        );
     }
 }
 
