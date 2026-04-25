@@ -2,6 +2,31 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Apollo: Standardized Language SDKs (Node + Go)
+
+Every language SDK returns the language's standard SQLite connection. turbolite is a storage engine, not a query API. Python and Rust already return `sqlite3.Connection` / `rusqlite::Connection` respectively; Apollo lands the same shape for Node and Go.
+
+### Node (better-sqlite3)
+- `turbolite.connect(path, opts)` loads the turbolite extension, opens via VFS URI, returns a `better-sqlite3.Database`.
+- Loadable extension built with `--features loadable-extension,cloud,zstd` (no bundled SQLite — links against host's).
+- Per-database VFS isolation via `turbolite_register_vfs(name, cache_dir)` SQL function.
+- Postinstall patches better-sqlite3 to set `SQLITE_USE_URI=1` (required for VFS URI filenames).
+- Ships platform-specific `.dylib/.so/.dll` alongside the JS wrapper.
+- 33 tests: happy path, persistence, concurrent reads, `load()`, failure modes, edge cases, S3 (real Tigris).
+- CI: ubuntu-latest test, release builds for macOS arm64/x86_64 + Linux x86_64/arm64. npm publish via `release.yml` with platform-specific extension binaries.
+
+### Go (mattn/go-sqlite3)
+- `turbolite.Open(path, opts)` returns `*sql.DB` (full `database/sql` interface).
+- Custom driver loads turbolite extension via go-sqlite3 `Extensions` field; bootstrap connection registers the VFS, real connection uses it via DSN `?vfs=turbolite-go-N`.
+- Per-database VFS isolation via `turbolite_register_vfs(name, cache_dir)` SQL function.
+- 27 tests: happy path, persistence, concurrent reads, failure modes, edge cases, S3 (real Tigris).
+- CI: ubuntu-latest test, module path `github.com/russellromney/turbolite/packages/go`. Go module published via git tag (subdirectory module).
+
+### Shared
+- Loadable extension MUST NOT bundle its own SQLite (links against host's).
+- CI matrix covers macOS arm64, macOS x86_64, Linux x86_64, Linux arm64.
+- Test surface: prepared statements, param binding, transactions, concurrent reads.
+
 ## Mercury: CLI
 
 Replace placeholder CLI binary with management commands for turbolite databases.

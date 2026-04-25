@@ -7,7 +7,7 @@
 //! mode (there's no remote I/O to parallelise).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,6 +43,9 @@ pub(crate) struct PrefetchPool {
     done_rx: flume::Receiver<u64>,
     in_flight: AtomicU64,
     workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Set to true when the pool is shutting down; suppresses noisy
+    /// fetch/decode/write error logs during teardown.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl PrefetchPool {
@@ -60,6 +63,7 @@ impl PrefetchPool {
         let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
         let (done_tx, done_rx) = flume::unbounded::<u64>();
         let mut workers = Vec::with_capacity(num_workers as usize);
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
@@ -77,6 +81,7 @@ impl PrefetchPool {
             let dictionary = dictionary.clone();
             let encryption_key = Arc::clone(&encryption_key);
             let shared_manifest = Arc::clone(&shared_manifest);
+            let shutdown = Arc::clone(&shutdown);
 
             workers.push(std::thread::spawn(move || {
                 while let Ok(job) = job_rx.recv() {
@@ -102,7 +107,9 @@ impl PrefetchPool {
                     let pg_data = match block_on(&runtime, storage.get(&job.key)) {
                         Ok(data) => data,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
+                            if !shutdown.load(Ordering::Acquire) {
+                                eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
+                            }
                             cache.unclaim_group(gid);
                             let _ = done_tx.send(gid);
                             continue;
@@ -146,7 +153,9 @@ impl PrefetchPool {
                     let (pg_count, _pg_size, page_data) = match decode_result {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} decode error: {}", gid, e);
+                            if !shutdown.load(Ordering::Acquire) {
+                                eprintln!("[prefetch] gid={} decode error: {}", gid, e);
+                            }
                             cache.unclaim_group(gid);
                             let _ = done_tx.send(gid);
                             continue;
@@ -183,7 +192,9 @@ impl PrefetchPool {
                         Ok(())
                     };
                     if let Err(e) = write_result {
-                        eprintln!("[prefetch] gid={} write error: {}", gid, e);
+                        if !shutdown.load(Ordering::Relaxed) {
+                            eprintln!("[prefetch] gid={} write error: {}", gid, e);
+                        }
                         cache.unclaim_group(gid);
                         let _ = done_tx.send(gid);
                         continue;
@@ -223,10 +234,12 @@ impl PrefetchPool {
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "[prefetch] gid={} override frame {} fetch error: {}",
-                                        gid, frame_idx, e,
-                                    );
+                                    if !shutdown.load(Ordering::Relaxed) {
+                                        eprintln!(
+                                            "[prefetch] gid={} override frame {} fetch error: {}",
+                                            gid, frame_idx, e,
+                                        );
+                                    }
                                     continue;
                                 }
                             };
@@ -275,6 +288,7 @@ impl PrefetchPool {
             done_rx,
             in_flight: AtomicU64::new(0),
             workers: parking_lot::Mutex::new(workers),
+            shutdown,
         }
     }
 
@@ -328,6 +342,12 @@ impl PrefetchPool {
 
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
+        // Signal shutdown so workers suppress spurious fetch/decode/write
+        // error logs while the runtime/storage is torn down.
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Drain all in-flight work before shutting down the channel.
+        self.wait_idle();
+
         let (dead_tx, _) = flume::bounded(0);
         drop(std::mem::replace(&mut self.job_tx, dead_tx));
         while self.done_rx.try_recv().is_ok() {}
