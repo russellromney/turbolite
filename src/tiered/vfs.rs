@@ -117,7 +117,9 @@ impl TurboliteVfs {
             Some(m) => {
                 turbolite_debug!(
                     "[tiered] loaded local manifest (v{}, {} pages, {} dirty groups)",
-                    m.version, m.page_count, recovered_dirty_groups.len(),
+                    m.version,
+                    m.page_count,
+                    recovered_dirty_groups.len(),
                 );
                 m
             }
@@ -128,7 +130,8 @@ impl TurboliteVfs {
                     Some(m) => {
                         turbolite_debug!(
                             "[tiered] manifest fetched from backend (v{}, {} pages)",
-                            m.version, m.page_count,
+                            m.version,
+                            m.page_count,
                         );
                         m
                     }
@@ -141,7 +144,11 @@ impl TurboliteVfs {
         };
         manifest.detect_and_normalize_strategy();
 
-        let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let page_size = if manifest.page_size > 0 {
+            manifest.page_size
+        } else {
+            4096
+        };
         let ppg = if manifest.pages_per_group > 0 {
             manifest.pages_per_group
         } else {
@@ -185,10 +192,9 @@ impl TurboliteVfs {
             // over the one we loaded above (the background flush may not
             // have run yet, leaving the on-disk / remote manifest stale).
             for flush_entry in recovered_staging.iter().rev() {
-                if let Ok(Some(manifest_bytes)) = staging::read_staging_manifest(
-                    &flush_entry.staging_path,
-                    flush_entry.page_size,
-                ) {
+                if let Ok(Some(manifest_bytes)) =
+                    staging::read_staging_manifest(&flush_entry.staging_path, flush_entry.page_size)
+                {
                     if let Ok(m) = manifest::decode_manifest_bytes(&manifest_bytes) {
                         if m.version > manifest.version {
                             turbolite_debug!(
@@ -226,10 +232,9 @@ impl TurboliteVfs {
                         }
                     }
                 }
-                if let Ok(pages) = staging::read_staging_log(
-                    &flush_entry.staging_path,
-                    flush_entry.page_size,
-                ) {
+                if let Ok(pages) =
+                    staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size)
+                {
                     for (page_num, data) in &pages {
                         let _ = cache.write_page(*page_num, data);
                         let new_count = *page_num + 1;
@@ -330,7 +335,9 @@ impl TurboliteVfs {
                     let dirty = manifest::load_dirty_groups(&self.config.cache_dir)?;
                     turbolite_debug!(
                         "[tiered] loaded local manifest (v{}, {} pages, {} dirty)",
-                        m.version, m.page_count, dirty.len(),
+                        m.version,
+                        m.page_count,
+                        dirty.len(),
                     );
                     m.build_page_index();
                     return Ok((m, dirty, false));
@@ -340,7 +347,8 @@ impl TurboliteVfs {
                     .unwrap_or_else(Manifest::empty);
                 turbolite_debug!(
                     "[tiered] manifest fetched (v{}, {} pages)",
-                    m.version, m.page_count,
+                    m.version,
+                    m.page_count,
                 );
                 Ok((m, Vec::new(), false))
             }
@@ -514,8 +522,7 @@ impl TurboliteVfs {
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
 
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());
@@ -589,12 +596,10 @@ impl TurboliteVfs {
     /// Validate the database against the backend.
     pub fn validate(&self) -> io::Result<super::ValidateResult> {
         let manifest = (**self.shared_manifest.load()).clone();
-        let all_keys: HashSet<String> = storage_helpers::list_all_keys(
-            self.storage.as_ref(),
-            &self.runtime,
-        )?
-        .into_iter()
-        .collect();
+        let all_keys: HashSet<String> =
+            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?
+                .into_iter()
+                .collect();
 
         let mut live_keys: HashSet<String> = HashSet::new();
 
@@ -605,7 +610,12 @@ impl TurboliteVfs {
                 pg_missing.push(key.clone());
             }
         }
-        let pg_present = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count() - pg_missing.len();
+        let pg_present = manifest
+            .page_group_keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .count()
+            - pg_missing.len();
 
         let mut int_missing = Vec::new();
         for key in manifest.interior_chunk_keys.values() {
@@ -647,7 +657,11 @@ impl TurboliteVfs {
         let sub_ppf = manifest.sub_pages_per_frame;
         let encryption_key = self.config.encryption.key.as_ref();
 
-        let total_pg = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count();
+        let total_pg = manifest
+            .page_group_keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .count();
         let mut processed = 0usize;
         for (gid, key) in manifest.page_group_keys.iter().enumerate() {
             if key.is_empty() || pg_missing.contains(key) {
@@ -661,8 +675,14 @@ impl TurboliteVfs {
                         if let Some(ft) = ft {
                             if !ft.is_empty() {
                                 if let Err(e) = decode_page_group_seekable_full(
-                                    &data, ft, page_size, pages_in_group, page_count, 0,
-                                    #[cfg(feature = "zstd")] None,
+                                    &data,
+                                    ft,
+                                    page_size,
+                                    pages_in_group,
+                                    page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    None,
                                     encryption_key,
                                 ) {
                                     decode_errors.push((key.clone(), format!("{}", e)));
@@ -671,7 +691,8 @@ impl TurboliteVfs {
                         }
                     } else if let Err(e) = decode_page_group(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
                         decode_errors.push((key.clone(), format!("{}", e)));
@@ -698,17 +719,23 @@ impl TurboliteVfs {
                 Ok(Some(data)) => {
                     if let Err(e) = decode_interior_bundle(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
-                        decode_errors.push((key.clone(), format!("interior chunk {}: {}", chunk_id, e)));
+                        decode_errors
+                            .push((key.clone(), format!("interior chunk {}: {}", chunk_id, e)));
                     }
                 }
                 Ok(None) => {
-                    decode_errors.push((key.clone(), format!("interior chunk {}: empty", chunk_id)));
+                    decode_errors
+                        .push((key.clone(), format!("interior chunk {}: empty", chunk_id)));
                 }
                 Err(e) => {
-                    decode_errors.push((key.clone(), format!("interior chunk {} fetch: {}", chunk_id, e)));
+                    decode_errors.push((
+                        key.clone(),
+                        format!("interior chunk {} fetch: {}", chunk_id, e),
+                    ));
                 }
             }
         }
@@ -721,24 +748,33 @@ impl TurboliteVfs {
                 Ok(Some(data)) => {
                     if let Err(e) = decode_interior_bundle(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
-                        decode_errors.push((key.clone(), format!("index chunk {}: {}", chunk_id, e)));
+                        decode_errors
+                            .push((key.clone(), format!("index chunk {}: {}", chunk_id, e)));
                     }
                 }
                 Ok(None) => {
                     decode_errors.push((key.clone(), format!("index chunk {}: empty", chunk_id)));
                 }
                 Err(e) => {
-                    decode_errors.push((key.clone(), format!("index chunk {} fetch: {}", chunk_id, e)));
+                    decode_errors.push((
+                        key.clone(),
+                        format!("index chunk {} fetch: {}", chunk_id, e),
+                    ));
                 }
             }
         }
 
         Ok(super::ValidateResult {
             manifest_version: manifest.version,
-            page_groups_total: manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count(),
+            page_groups_total: manifest
+                .page_group_keys
+                .iter()
+                .filter(|k| !k.is_empty())
+                .count(),
             page_groups_present: pg_present,
             page_groups_missing: pg_missing,
             interior_chunks_total: manifest.interior_chunk_keys.len(),
@@ -754,20 +790,12 @@ impl TurboliteVfs {
 
     /// Copy the current manifest to a snapshot key.
     pub fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
-        storage_helpers::copy_manifest_to_snapshot(
-            self.storage.as_ref(),
-            &self.runtime,
-            snap_id,
-        )
+        storage_helpers::copy_manifest_to_snapshot(self.storage.as_ref(), &self.runtime, snap_id)
     }
 
     /// Delete a snapshot manifest copy.
     pub fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
-        storage_helpers::delete_snapshot_manifest(
-            self.storage.as_ref(),
-            &self.runtime,
-            snap_id,
-        )
+        storage_helpers::delete_snapshot_manifest(self.storage.as_ref(), &self.runtime, snap_id)
     }
 
     /// Load a manifest from a snapshot key.
@@ -783,11 +811,34 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// True if the backend already has a canonical turbolite manifest.
+    pub fn remote_manifest_exists(&self) -> io::Result<bool> {
+        storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime)
+    }
+
+    /// Import a local SQLite file into this VFS's backend as checkpointed base state.
+    ///
+    /// This is the fresh-bootstrap path for hybrid Turbolite + walrust deployments:
+    /// the caller already has a committed SQLite file on disk, and turbolite must
+    /// publish that file as page-group base state before walrust starts shipping
+    /// deltas against it.
+    pub fn import_sqlite_file(&self, file_path: &Path) -> io::Result<Manifest> {
+        let mut manifest = import::import_sqlite_file(
+            &self.config,
+            Arc::clone(&self.storage),
+            self.runtime.clone(),
+            file_path,
+        )?;
+        manifest.detect_and_normalize_strategy();
+        self.set_manifest(manifest.clone());
+        manifest::persist_manifest_local(&self.config.cache_dir, &manifest)?;
+        Ok(manifest)
+    }
+
     /// Delete every object the backend knows about. Backend-agnostic
     /// wipe; previously `destroy_s3`.
     pub fn destroy_remote(&self) -> io::Result<()> {
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
         if all_keys.is_empty() {
             return Ok(());
         }
@@ -860,7 +911,8 @@ impl TurboliteVfs {
                 if manifest.version < current.version {
                     turbolite_debug!(
                         "[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
-                        manifest.version, current.version,
+                        manifest.version,
+                        current.version,
                     );
                 }
                 return;
@@ -913,7 +965,8 @@ impl TurboliteVfs {
             let _ = self.cache.write_page(0, page0);
         }
 
-        self.page_count.store(manifest.page_count, Ordering::Release);
+        self.page_count
+            .store(manifest.page_count, Ordering::Release);
 
         self.shared_manifest.store(Arc::new(manifest.clone()));
 
@@ -979,7 +1032,8 @@ impl Vfs for TurboliteVfs {
                     if old_manifest.version > manifest.version {
                         turbolite_debug!(
                             "[cache-validate] local v{} ahead of manifest v{}, full invalidation",
-                            old_manifest.version, manifest.version,
+                            old_manifest.version,
+                            manifest.version,
                         );
                         let states = self.cache.group_states.lock();
                         for state in states.iter() {
@@ -1017,7 +1071,9 @@ impl Vfs for TurboliteVfs {
                             self.cache.group_condvar.notify_all();
                             turbolite_debug!(
                                 "[cache-validate] manifest v{} -> v{}: invalidated {} groups",
-                                old_manifest.version, manifest.version, invalidated,
+                                old_manifest.version,
+                                manifest.version,
+                                invalidated,
                             );
                         }
                     }
@@ -1111,7 +1167,11 @@ impl Vfs for TurboliteVfs {
                 .write(true)
                 .create(true)
                 .open(&path)?;
-            Ok(TurboliteHandle::new_passthrough(file, path, self.config.encryption.key))
+            Ok(TurboliteHandle::new_passthrough(
+                file,
+                path,
+                self.config.encryption.key,
+            ))
         }
     }
 

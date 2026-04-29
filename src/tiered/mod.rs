@@ -77,27 +77,36 @@ mod prefetch;
 mod query_plan;
 mod rotation;
 pub mod settings;
+#[cfg(feature = "wal")]
+mod snapshot_source;
 mod staging;
 mod storage;
 mod vfs;
-mod wire;
 #[cfg(feature = "wal")]
 mod wal_replication;
+mod wire;
 
 // Public API (visible outside the crate)
 pub use bench::TurboliteSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, TurboliteConfig, PageLocation, BTreeManifestEntry};
-pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
 #[cfg(feature = "wal")]
 pub use config::WalConfig;
+pub use config::{
+    BTreeManifestEntry, GroupState, GroupingStrategy, ManifestSource, PageLocation, TurboliteConfig,
+};
+pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
 pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
 pub use vfs::TurboliteVfs;
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
-pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query, run_eqp_and_parse};
+pub use query_plan::{
+    check_and_clear_end_query, parse_eqp_output, push_planned_accesses, run_eqp_and_parse,
+    signal_end_query, AccessType, PlannedAccess,
+};
 #[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;
+#[cfg(feature = "wal")]
+pub use snapshot_source::TurboliteSnapshotSource;
 
 /// Result of a database validation run (manifest + data integrity).
 /// The caller should run `PRAGMA integrity_check` separately via the connection.
@@ -144,7 +153,6 @@ pub(crate) use disk_cache::*;
 pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
 
-
 // ===== Constants =====
 
 /// Default pages per page group (256 x 64KB = 16MB uncompressed, ~8MB compressed).
@@ -188,8 +196,9 @@ pub fn get_manifest(
     backend: &dyn hadb_storage::StorageBackend,
     runtime: &tokio::runtime::Handle,
 ) -> std::io::Result<Option<Manifest>> {
-    let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("fetch manifest: {e}")))?;
+    let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY)).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("fetch manifest: {e}"))
+    })?;
     match bytes {
         None => Ok(None),
         Some(bytes) => {
@@ -221,10 +230,14 @@ pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
 /// segments over the wrong page state).
 pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32) -> u64 {
     let mut page0 = vec![0u8; page_size as usize];
-    cache.read_page(0, &mut page0)
+    cache
+        .read_page(0, &mut page0)
         .expect("page 0 must be in cache at checkpoint time");
     let counter = read_file_change_counter(&page0);
-    assert!(counter > 0, "file change counter must be > 0 at checkpoint time");
+    assert!(
+        counter > 0,
+        "file change counter must be > 0 at checkpoint time"
+    );
     counter
 }
 
@@ -269,7 +282,8 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
     // Content area must be within the page (0 means 65536 for large pages)
     // and past the header (header is at least 8 bytes + 2*cell_count cell pointer bytes)
     let min_content_offset = hdr_offset as u16 + 8 + 2 * cell_count;
-    if content_area != 0 && (content_area < min_content_offset || content_area as usize > buf.len()) {
+    if content_area != 0 && (content_area < min_content_offset || content_area as usize > buf.len())
+    {
         return false;
     }
     // Fragment bytes must be < 255 (at most 60 in practice)
@@ -401,7 +415,12 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     // Check current journal_mode
     let current_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to read journal_mode: {}", e)))?;
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to read journal_mode: {}", e),
+            )
+        })?;
 
     if current_mode == "off" || current_mode == "memory" {
         return Ok(());
@@ -410,7 +429,9 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     if current_mode == "wal" {
         // Checkpoint to flush WAL contents into the main database file
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("checkpoint failed: {}", e)))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("checkpoint failed: {}", e))
+            })?;
     }
 
     // Try the normal PRAGMA path (works when not in WAL mode)
