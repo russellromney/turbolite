@@ -71,6 +71,7 @@ packages/python/turbolite/turbolite
 
 # Claude Code worktrees / scratch
 .claude/
+.git.bloat-backup-*/
 
 # Proptest regression minimization files (generated during failing runs)
 *.proptest-regressions
