@@ -34,7 +34,8 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
 #[cfg(feature = "cli-s3")]
-static BENCH_HANDLE: std::sync::OnceLock<turbolite::tiered::TurboliteSharedState> = std::sync::OnceLock::new();
+static BENCH_HANDLE: std::sync::OnceLock<turbolite::tiered::TurboliteSharedState> =
+    std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -183,12 +184,10 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
         Some(h) => {
             let json = h.cache_info();
             match std::ffi::CString::new(json) {
-                Ok(c) => {
-                    CACHE_INFO_BUF.with(|buf| {
-                        *buf.borrow_mut() = c;
-                        buf.borrow().as_ptr()
-                    })
-                }
+                Ok(c) => CACHE_INFO_BUF.with(|buf| {
+                    *buf.borrow_mut() = c;
+                    buf.borrow().as_ptr()
+                }),
                 Err(_) => std::ptr::null(),
             }
         }
@@ -221,12 +220,10 @@ pub unsafe extern "C" fn turbolite_warm(
             let accesses = turbolite::tiered::run_eqp_and_parse(db, sql_str);
             let json = h.warm_from_plan(&accesses);
             match std::ffi::CString::new(json) {
-                Ok(c) => {
-                    WARM_BUF.with(|buf| {
-                        *buf.borrow_mut() = c;
-                        buf.borrow().as_ptr()
-                    })
-                }
+                Ok(c) => WARM_BUF.with(|buf| {
+                    *buf.borrow_mut() = c;
+                    buf.borrow().as_ptr()
+                }),
                 Err(_) => std::ptr::null(),
             }
         }

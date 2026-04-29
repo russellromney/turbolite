@@ -5,26 +5,67 @@ use rusqlite::Connection;
 use std::time::Instant;
 
 const FIRST_NAMES: &[&str] = &[
-    "Mark", "Eduardo", "Dustin", "Chris", "Sean", "Priscilla", "Sheryl",
-    "Andrew", "Adam", "Mike", "Sarah", "Jessica", "Emily", "David", "Alex",
+    "Mark",
+    "Eduardo",
+    "Dustin",
+    "Chris",
+    "Sean",
+    "Priscilla",
+    "Sheryl",
+    "Andrew",
+    "Adam",
+    "Mike",
+    "Sarah",
+    "Jessica",
+    "Emily",
+    "David",
+    "Alex",
 ];
 const LAST_NAMES: &[&str] = &[
-    "Zuckerberg", "Saverin", "Moskovitz", "Hughes", "Parker", "Chan",
-    "Sandberg", "McCollum", "D'Angelo", "Schroepfer", "Smith", "Johnson",
-    "Williams", "Brown", "Jones",
+    "Zuckerberg",
+    "Saverin",
+    "Moskovitz",
+    "Hughes",
+    "Parker",
+    "Chan",
+    "Sandberg",
+    "McCollum",
+    "D'Angelo",
+    "Schroepfer",
+    "Smith",
+    "Johnson",
+    "Williams",
+    "Brown",
+    "Jones",
 ];
 const SCHOOLS: &[&str] = &[
-    "Harvard", "Stanford", "MIT", "Yale", "Princeton", "Columbia",
-    "Penn", "Brown", "Cornell", "Dartmouth",
+    "Harvard",
+    "Stanford",
+    "MIT",
+    "Yale",
+    "Princeton",
+    "Columbia",
+    "Penn",
+    "Brown",
+    "Cornell",
+    "Dartmouth",
 ];
 const CITIES: &[&str] = &[
-    "Palo Alto, CA", "San Francisco, CA", "New York, NY", "Boston, MA",
-    "Cambridge, MA", "Seattle, WA", "Austin, TX", "Chicago, IL",
+    "Palo Alto, CA",
+    "San Francisco, CA",
+    "New York, NY",
+    "Boston, MA",
+    "Cambridge, MA",
+    "Seattle, WA",
+    "Austin, TX",
+    "Chicago, IL",
 ];
 
 fn phash(seed: u64) -> u64 {
     let mut x = seed;
-    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    x = x
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;
@@ -36,7 +77,8 @@ fn main() {
     let n_users = n_posts / 10;
 
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute_batch("PRAGMA page_size=65536; PRAGMA journal_mode=WAL;").unwrap();
+    conn.execute_batch("PRAGMA page_size=65536; PRAGMA journal_mode=WAL;")
+        .unwrap();
 
     conn.execute_batch("
         CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL,
@@ -59,7 +101,9 @@ fn main() {
     let t = Instant::now();
     let tx = conn.unchecked_transaction().unwrap();
     {
-        let mut s = tx.prepare("INSERT INTO users VALUES (?1,?2,?3,?4,?5,?6,?7,?8)").unwrap();
+        let mut s = tx
+            .prepare("INSERT INTO users VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
+            .unwrap();
         for i in 0..n_users as i64 {
             let h = phash(i as u64);
             s.execute(rusqlite::params![
@@ -71,37 +115,58 @@ fn main() {
                 CITIES[((h >> 32) as usize) % CITIES.len()],
                 format!("Bio for user {}", i),
                 1075000000 + (h % 100_000_000) as i64,
-            ]).unwrap();
+            ])
+            .unwrap();
         }
     }
     {
-        let mut s = tx.prepare("INSERT INTO posts VALUES (?1,?2,?3,?4,?5)").unwrap();
+        let mut s = tx
+            .prepare("INSERT INTO posts VALUES (?1,?2,?3,?4,?5)")
+            .unwrap();
         for i in 0..n_posts as i64 {
             let h = phash(i as u64 + 1_000_000);
-            let content = format!("Post {} content - just moved into the dorm, excited for the semester! {}", i,
-                "x".repeat(((h >> 32) % 1500) as usize));
+            let content = format!(
+                "Post {} content - just moved into the dorm, excited for the semester! {}",
+                i,
+                "x".repeat(((h >> 32) % 1500) as usize)
+            );
             s.execute(rusqlite::params![
-                i, (h % n_users as u64) as i64, content,
+                i,
+                (h % n_users as u64) as i64,
+                content,
                 1075000000 + (h >> 16) as i64 % 94_000_000,
                 (phash(i as u64 + 2_000_000) % 200) as i64,
-            ]).unwrap();
+            ])
+            .unwrap();
         }
     }
     {
-        let mut s = tx.prepare("INSERT OR IGNORE INTO friendships VALUES (?1,?2,?3)").unwrap();
+        let mut s = tx
+            .prepare("INSERT OR IGNORE INTO friendships VALUES (?1,?2,?3)")
+            .unwrap();
         for i in 0..n_users as u64 {
             for j in 0..50u64 {
                 let h = phash(i * 100 + j + 3_000_000);
                 let friend = (h % n_users as u64) as i64;
                 if friend != i as i64 {
-                    let (a, b) = if (i as i64) < friend { (i as i64, friend) } else { (friend, i as i64) };
-                    let _ = s.execute(rusqlite::params![a, b, 1075000000 + (h >> 16) as i64 % 94_000_000]);
+                    let (a, b) = if (i as i64) < friend {
+                        (i as i64, friend)
+                    } else {
+                        (friend, i as i64)
+                    };
+                    let _ = s.execute(rusqlite::params![
+                        a,
+                        b,
+                        1075000000 + (h >> 16) as i64 % 94_000_000
+                    ]);
                 }
             }
         }
     }
     {
-        let mut s = tx.prepare("INSERT OR IGNORE INTO likes VALUES (?1,?2,?3)").unwrap();
+        let mut s = tx
+            .prepare("INSERT OR IGNORE INTO likes VALUES (?1,?2,?3)")
+            .unwrap();
         for i in 0..(n_posts * 3) as u64 {
             let h = phash(i + 4_000_000);
             let _ = s.execute(rusqlite::params![
@@ -112,14 +177,30 @@ fn main() {
         }
     }
     tx.commit().unwrap();
-    println!("Data gen: {:.2}s ({} users, {} posts)", t.elapsed().as_secs_f64(), n_users, n_posts);
+    println!(
+        "Data gen: {:.2}s ({} users, {} posts)",
+        t.elapsed().as_secs_f64(),
+        n_users,
+        n_posts
+    );
 
     // Verify row counts
-    let users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0)).unwrap();
-    let posts: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
-    let friends: i64 = conn.query_row("SELECT COUNT(*) FROM friendships", [], |r| r.get(0)).unwrap();
-    let likes: i64 = conn.query_row("SELECT COUNT(*) FROM likes", [], |r| r.get(0)).unwrap();
-    println!("Rows: {} users, {} posts, {} friendships, {} likes\n", users, posts, friends, likes);
+    let users: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .unwrap();
+    let posts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
+    let friends: i64 = conn
+        .query_row("SELECT COUNT(*) FROM friendships", [], |r| r.get(0))
+        .unwrap();
+    let likes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM likes", [], |r| r.get(0))
+        .unwrap();
+    println!(
+        "Rows: {} users, {} posts, {} friendships, {} likes\n",
+        users, posts, friends, likes
+    );
 
     // Test each query
     let queries: Vec<(&str, &str, Vec<rusqlite::types::Value>)> = vec![
@@ -171,7 +252,9 @@ fn main() {
         let row_count: usize = if params.is_empty() {
             stmt.query_map([], |_| Ok(())).unwrap().count()
         } else {
-            stmt.query_map(rusqlite::params_from_iter(params), |_| Ok(())).unwrap().count()
+            stmt.query_map(rusqlite::params_from_iter(params), |_| Ok(()))
+                .unwrap()
+                .count()
         };
         let elapsed = start.elapsed();
 
@@ -182,7 +265,10 @@ fn main() {
             if params.is_empty() {
                 let _: Vec<_> = s.query_map([], |_| Ok(())).unwrap().collect();
             } else {
-                let _: Vec<_> = s.query_map(rusqlite::params_from_iter(params), |_| Ok(())).unwrap().collect();
+                let _: Vec<_> = s
+                    .query_map(rusqlite::params_from_iter(params), |_| Ok(()))
+                    .unwrap()
+                    .collect();
             }
         }
         let avg_us = iter_start.elapsed().as_micros() as f64 / 100.0;

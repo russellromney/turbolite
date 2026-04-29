@@ -192,8 +192,12 @@ fn multi_connection_same_thread_routes_per_connection_c_path() {
 
     // Drain both queues via a real page read so subsequent peek calls
     // start from a clean slate.
-    conn_a.execute("INSERT INTO _bootstrap VALUES (1)", []).unwrap();
-    conn_b.execute("INSERT INTO _bootstrap VALUES (2)", []).unwrap();
+    conn_a
+        .execute("INSERT INTO _bootstrap VALUES (1)", [])
+        .unwrap();
+    conn_b
+        .execute("INSERT INTO _bootstrap VALUES (2)", [])
+        .unwrap();
 
     // Push AGAIN on A, without touching B. B's queue (top-of-stack)
     // must not carry A's push — the scalar function captured queue_a

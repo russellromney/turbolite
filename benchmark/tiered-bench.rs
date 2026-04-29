@@ -18,11 +18,14 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, CacheConfig, CompressionConfig, PrefetchConfig, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
+use turbolite::tiered::{
+    parse_eqp_output, push_planned_accesses, set_local_checkpoint_only, CacheConfig,
+    CompressionConfig, PrefetchConfig, TurboliteConfig, TurboliteSharedState, TurboliteVfs,
+};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -73,20 +76,34 @@ impl<'a> BenchCtx<'a> {
         }
     }
 
-    fn clear_cache_data_only(&self) { self.state.clear_cache_data_only(); }
-    fn clear_cache_interior_only(&self) { self.state.clear_cache_interior_only(); }
-    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+    fn clear_cache_data_only(&self) {
+        self.state.clear_cache_data_only();
+    }
+    fn clear_cache_interior_only(&self) {
+        self.state.clear_cache_interior_only();
+    }
+    fn clear_cache_all(&self) {
+        self.state.clear_cache_all();
+    }
 
     /// Snapshot the current S3 counters as a new baseline. Subsequent
     /// `s3_counters()` calls report deltas from this moment.
     fn reset_s3_counters(&self) {
-        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
-        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+        self.fetch_count_base
+            .store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base
+            .store(self.s3.bytes_fetched(), Ordering::Relaxed);
     }
 
     fn s3_counters(&self) -> (u64, u64) {
-        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
-        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        let fc = self
+            .s3
+            .fetch_count()
+            .saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self
+            .s3
+            .bytes_fetched()
+            .saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
         (fc, fb)
     }
 }
@@ -96,32 +113,110 @@ impl<'a> BenchCtx<'a> {
 // =========================================================================
 
 const FIRST_NAMES: &[&str] = &[
-    "Mark", "Eduardo", "Dustin", "Chris", "Sean", "Priscilla", "Sheryl",
-    "Andrew", "Adam", "Mike", "Sarah", "Jessica", "Emily", "David", "Alex",
-    "Randi", "Naomi", "Kevin", "Amy", "Dan", "Lisa", "Tom", "Rachel",
-    "Brian", "Caitlin", "Nicole", "Matt", "Laura", "Jake", "Megan",
+    "Mark",
+    "Eduardo",
+    "Dustin",
+    "Chris",
+    "Sean",
+    "Priscilla",
+    "Sheryl",
+    "Andrew",
+    "Adam",
+    "Mike",
+    "Sarah",
+    "Jessica",
+    "Emily",
+    "David",
+    "Alex",
+    "Randi",
+    "Naomi",
+    "Kevin",
+    "Amy",
+    "Dan",
+    "Lisa",
+    "Tom",
+    "Rachel",
+    "Brian",
+    "Caitlin",
+    "Nicole",
+    "Matt",
+    "Laura",
+    "Jake",
+    "Megan",
 ];
 
 const LAST_NAMES: &[&str] = &[
-    "Zuckerberg", "Saverin", "Moskovitz", "Hughes", "Parker", "Chan",
-    "Sandberg", "McCollum", "D'Angelo", "Schroepfer", "Smith", "Johnson",
-    "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez",
-    "Martinez", "Anderson", "Taylor", "Thomas", "Hernandez", "Moore",
-    "Martin", "Jackson", "Thompson", "White", "Lopez",
+    "Zuckerberg",
+    "Saverin",
+    "Moskovitz",
+    "Hughes",
+    "Parker",
+    "Chan",
+    "Sandberg",
+    "McCollum",
+    "D'Angelo",
+    "Schroepfer",
+    "Smith",
+    "Johnson",
+    "Williams",
+    "Brown",
+    "Jones",
+    "Garcia",
+    "Miller",
+    "Davis",
+    "Rodriguez",
+    "Martinez",
+    "Anderson",
+    "Taylor",
+    "Thomas",
+    "Hernandez",
+    "Moore",
+    "Martin",
+    "Jackson",
+    "Thompson",
+    "White",
+    "Lopez",
 ];
 
 const SCHOOLS: &[&str] = &[
-    "Harvard", "Stanford", "MIT", "Yale", "Princeton", "Columbia",
-    "Penn", "Brown", "Cornell", "Dartmouth", "Duke", "Georgetown",
-    "UCLA", "Berkeley", "Michigan", "NYU", "Boston University",
-    "Northeastern", "USC", "Emory",
+    "Harvard",
+    "Stanford",
+    "MIT",
+    "Yale",
+    "Princeton",
+    "Columbia",
+    "Penn",
+    "Brown",
+    "Cornell",
+    "Dartmouth",
+    "Duke",
+    "Georgetown",
+    "UCLA",
+    "Berkeley",
+    "Michigan",
+    "NYU",
+    "Boston University",
+    "Northeastern",
+    "USC",
+    "Emory",
 ];
 
 const CITIES: &[&str] = &[
-    "Palo Alto, CA", "San Francisco, CA", "New York, NY", "Boston, MA",
-    "Cambridge, MA", "Seattle, WA", "Austin, TX", "Chicago, IL",
-    "Los Angeles, CA", "Miami, FL", "Denver, CO", "Portland, OR",
-    "Philadelphia, PA", "Washington, DC", "Atlanta, GA",
+    "Palo Alto, CA",
+    "San Francisco, CA",
+    "New York, NY",
+    "Boston, MA",
+    "Cambridge, MA",
+    "Seattle, WA",
+    "Austin, TX",
+    "Chicago, IL",
+    "Los Angeles, CA",
+    "Miami, FL",
+    "Denver, CO",
+    "Portland, OR",
+    "Philadelphia, PA",
+    "Washington, DC",
+    "Atlanta, GA",
 ];
 
 const POST_TEMPLATES: &[&str] = &[
@@ -143,9 +238,21 @@ const POST_TEMPLATES: &[&str] = &[
 ];
 
 const FILL_WORDS: &[&str] = &[
-    "college", "freshman year", "organic chemistry", "basketball",
-    "pizza", "the team", "campus", "Malcolm Gladwell", "New York",
-    "Harvard", "Alex", "friend", "Radiohead", "dinner", "thesis",
+    "college",
+    "freshman year",
+    "organic chemistry",
+    "basketball",
+    "pizza",
+    "the team",
+    "campus",
+    "Malcolm Gladwell",
+    "New York",
+    "Harvard",
+    "Alex",
+    "friend",
+    "Radiohead",
+    "dinner",
+    "thesis",
     "San Francisco",
 ];
 
@@ -305,7 +412,11 @@ struct Cli {
     /// Format: "search/lookup" per entry. "off" = both disabled.
     /// No slash = same schedule for both search and lookup.
     /// 10 pairs covering off -> aggressive, symmetric and asymmetric.
-    #[arg(long, default_value = "off;0.33,0.33,0.34;0.3,0.3,0.4/0,0.1,0.2;0.3,0.3,0.4/0.3,0.3,0.4;0.5,0.5/0,0,0.1;0.5,0.5/0.1,0.2,0.3;0.5,0.3,0.2/0.1,0.1,0.2;1.0/0;0.2,0.3,0.5/0,0,0.2;0.4,0.3,0.3/0.1,0.2,0.3", env = "BENCH_MATRIX_SCHEDULES")]
+    #[arg(
+        long,
+        default_value = "off;0.33,0.33,0.34;0.3,0.3,0.4/0,0.1,0.2;0.3,0.3,0.4/0.3,0.3,0.4;0.5,0.5/0,0,0.1;0.5,0.5/0.1,0.2,0.3;0.5,0.3,0.2/0.1,0.1,0.2;1.0/0;0.2,0.3,0.5/0,0,0.2;0.4,0.3,0.3/0.1,0.2,0.3",
+        env = "BENCH_MATRIX_SCHEDULES"
+    )]
     matrix_schedules: String,
 }
 
@@ -333,7 +444,9 @@ fn endpoint_url() -> Option<String> {
 /// Deterministic pseudo-random hash
 fn phash(seed: u64) -> u64 {
     let mut x = seed;
-    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    x = x
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;
@@ -358,15 +471,25 @@ struct BenchResult {
 }
 
 impl BenchResult {
-    fn p50(&self) -> f64 { percentile(&self.latencies_us, 0.5) }
-    fn p90(&self) -> f64 { percentile(&self.latencies_us, 0.9) }
-    fn p99(&self) -> f64 { percentile(&self.latencies_us, 0.99) }
+    fn p50(&self) -> f64 {
+        percentile(&self.latencies_us, 0.5)
+    }
+    fn p90(&self) -> f64 {
+        percentile(&self.latencies_us, 0.9)
+    }
+    fn p99(&self) -> f64 {
+        percentile(&self.latencies_us, 0.99)
+    }
     fn avg_fetches(&self) -> f64 {
-        if self.s3_fetches.is_empty() { return 0.0; }
+        if self.s3_fetches.is_empty() {
+            return 0.0;
+        }
         self.s3_fetches.iter().sum::<u64>() as f64 / self.s3_fetches.len() as f64
     }
     fn avg_bytes_kb(&self) -> f64 {
-        if self.s3_bytes.is_empty() { return 0.0; }
+        if self.s3_bytes.is_empty() {
+            return 0.0;
+        }
         (self.s3_bytes.iter().sum::<u64>() as f64 / self.s3_bytes.len() as f64) / 1024.0
     }
 }
@@ -425,8 +548,14 @@ fn make_config(
 ) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
-        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
+        cache: CacheConfig {
+            pages_per_group: ppg,
+            ..Default::default()
+        },
         prefetch: PrefetchConfig {
             threads: prefetch_threads,
             search: prefetch_search,
@@ -447,9 +576,15 @@ fn make_reader_config(
 ) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
         read_only: true,
-        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: ppg,
+            ..Default::default()
+        },
         prefetch: PrefetchConfig {
             threads: prefetch_threads,
             search: prefetch_search,
@@ -539,13 +674,26 @@ fn generate_post_content(id: i64) -> String {
 
 fn generate_bio(id: i64) -> String {
     let h = phash(id as u64 + 7_000_000);
-    let interests = ["music", "startups", "hiking", "photography", "cooking",
-                     "travel", "reading", "sports", "gaming", "art"];
+    let interests = [
+        "music",
+        "startups",
+        "hiking",
+        "photography",
+        "cooking",
+        "travel",
+        "reading",
+        "sports",
+        "gaming",
+        "art",
+    ];
     let i1 = interests[((h >> 8) as usize) % interests.len()];
     let i2 = interests[((h >> 16) as usize) % interests.len()];
     let i3 = interests[((h >> 24) as usize) % interests.len()];
     let year = 2004 + (h % 4);
-    format!("Class of {}. Into {}, {}, and {}. Looking to connect!", year, i1, i2, i3)
+    format!(
+        "Class of {}. Into {}, {}, and {}. Looking to connect!",
+        year, i1, i2, i3
+    )
 }
 
 fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
@@ -556,8 +704,10 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
 
     eprintln!(
         "  Generating: {} users, {} posts, {} friendships, {} likes",
-        format_number(n_users), format_number(n_posts),
-        format_number(n_friendships), format_number(n_likes),
+        format_number(n_users),
+        format_number(n_posts),
+        format_number(n_friendships),
+        format_number(n_likes),
     );
 
     // Users (batch commit every batch_size rows)
@@ -572,16 +722,22 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                     i,
                     FIRST_NAMES[(h as usize) % FIRST_NAMES.len()],
                     LAST_NAMES[((h >> 16) as usize) % LAST_NAMES.len()],
-                    format!("{}.{}{}@{}.edu",
+                    format!(
+                        "{}.{}{}@{}.edu",
                         FIRST_NAMES[(h as usize) % FIRST_NAMES.len()].to_lowercase(),
                         LAST_NAMES[((h >> 16) as usize) % LAST_NAMES.len()].to_lowercase(),
-                        i, SCHOOLS[((h >> 24) as usize) % SCHOOLS.len()].to_lowercase().replace(' ', "")),
+                        i,
+                        SCHOOLS[((h >> 24) as usize) % SCHOOLS.len()]
+                            .to_lowercase()
+                            .replace(' ', "")
+                    ),
                     SCHOOLS[((h >> 24) as usize) % SCHOOLS.len()],
                     CITIES[((h >> 32) as usize) % CITIES.len()],
                     generate_bio(i),
                     1075000000i64 + (h % 100_000_000) as i64,
                 ],
-            ).unwrap();
+            )
+            .unwrap();
             batch += 1;
             if batch >= batch_size {
                 tx.commit().unwrap();
@@ -615,7 +771,11 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                 tx = conn.unchecked_transaction().unwrap();
                 batch = 0;
                 if (i as usize) % (batch_size * 10) == 0 {
-                    eprintln!("    posts: {}/{}", format_number(i as usize), format_number(n_posts));
+                    eprintln!(
+                        "    posts: {}/{}",
+                        format_number(i as usize),
+                        format_number(n_posts)
+                    );
                 }
             }
         }
@@ -634,11 +794,16 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                 let h = phash(i * 100 + j as u64 + 3_000_000);
                 let friend = (h % n_users as u64) as i64;
                 if friend != i as i64 {
-                    let (a, b) = if (i as i64) < friend { (i as i64, friend) } else { (friend, i as i64) };
+                    let (a, b) = if (i as i64) < friend {
+                        (i as i64, friend)
+                    } else {
+                        (friend, i as i64)
+                    };
                     tx.execute(
                         "INSERT OR IGNORE INTO friendships VALUES (?1,?2,?3)",
                         rusqlite::params![a, b, 1075000000i64 + (h >> 16) as i64 % 94_000_000],
-                    ).unwrap();
+                    )
+                    .unwrap();
                     count += 1;
                     batch += 1;
                     if batch >= batch_size {
@@ -647,9 +812,13 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                         batch = 0;
                     }
                 }
-                if count >= n_friendships { break; }
+                if count >= n_friendships {
+                    break;
+                }
             }
-            if count >= n_friendships { break; }
+            if count >= n_friendships {
+                break;
+            }
         }
         tx.commit().unwrap();
         eprintln!("    friendships inserted: {}", format_number(count));
@@ -668,14 +837,19 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                     ((h >> 16) % n_posts as u64) as i64,
                     1075000000i64 + (h >> 32) as i64 % 94_000_000,
                 ],
-            ).unwrap();
+            )
+            .unwrap();
             batch += 1;
             if batch >= batch_size {
                 tx.commit().unwrap();
                 tx = conn.unchecked_transaction().unwrap();
                 batch = 0;
                 if (i as usize) % (batch_size * 10) == 0 && i > 0 {
-                    eprintln!("    likes: {}/{}", format_number(i as usize), format_number(n_likes));
+                    eprintln!(
+                        "    likes: {}/{}",
+                        format_number(i as usize),
+                        format_number(n_likes)
+                    );
                 }
             }
         }
@@ -695,12 +869,21 @@ fn generate_local_db(path: &std::path::Path, n_posts: usize, batch_size: usize, 
     conn.execute_batch(SCHEMA).expect("create tables");
     generate_data(&conn, n_posts, batch_size);
     // Verify
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
-    let ps: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let ps: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
     eprintln!(
         "[local-gen] {} posts, {} pages x {} bytes = {:.1} MB",
-        count, page_count, ps, (page_count * ps) as f64 / (1024.0 * 1024.0),
+        count,
+        page_count,
+        ps,
+        (page_count * ps) as f64 / (1024.0 * 1024.0),
     );
 }
 
@@ -784,7 +967,11 @@ fn push_query_plan(conn: &Connection, sql: &str, params: &[rusqlite::types::Valu
         }
     }
     if std::env::var("BENCH_VERBOSE").is_ok() {
-        eprintln!("  [push-plan] sql={} eqp_output={:?}", &sql[..sql.len().min(60)], &output);
+        eprintln!(
+            "  [push-plan] sql={} eqp_output={:?}",
+            &sql[..sql.len().min(60)],
+            &output
+        );
     }
     let accesses = parse_eqp_output(&output);
     if std::env::var("BENCH_VERBOSE").is_ok() {
@@ -806,7 +993,10 @@ struct SchedulePair {
 impl SchedulePair {
     /// Unified schedule: sets both search and lookup to the same values.
     fn unified(sched: Option<Vec<f32>>) -> Self {
-        Self { search: sched.clone(), lookup: sched }
+        Self {
+            search: sched.clone(),
+            lookup: sched,
+        }
     }
 
     /// Independent search/lookup pair.
@@ -821,11 +1011,19 @@ impl SchedulePair {
     /// measured with its own schedule.
     fn push(&self) {
         let search_val = match &self.search {
-            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            Some(v) => v
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             None => "0,0,0".to_string(),
         };
         let lookup_val = match &self.lookup {
-            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            Some(v) => v
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             None => "0,0,0".to_string(),
         };
         // `set` returns Err only if no active handle or the value fails
@@ -839,7 +1037,11 @@ impl SchedulePair {
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {
             match s {
-                Some(v) => v.iter().map(|f| format!("{:.2}", f)).collect::<Vec<_>>().join(","),
+                Some(v) => v
+                    .iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 None => "off".to_string(),
             }
         };
@@ -910,7 +1112,12 @@ fn bench_data(
         }
     }
 
-    BenchResult { label: format!("[data] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult {
+        label: format!("[data] {}", label),
+        latencies_us: latencies,
+        s3_fetches,
+        s3_bytes,
+    }
 }
 
 /// Cache level: index — interior + index pages cached, data pages from S3.
@@ -931,8 +1138,11 @@ fn bench_index(
         handle.reset_s3_counters();
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("index-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("index-level connection");
         if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [index] {} warmup {} error: {}", label, i, e);
         }
@@ -950,8 +1160,11 @@ fn bench_index(
         let params = param_fn(warmup + i);
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("index-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("index-level connection");
         match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -964,7 +1177,12 @@ fn bench_index(
         drop(conn);
     }
 
-    BenchResult { label: format!("[index] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult {
+        label: format!("[index] {}", label),
+        latencies_us: latencies,
+        s3_fetches,
+        s3_bytes,
+    }
 }
 
 /// Cache level: interior — interior B-tree pages cached, index + data from S3.
@@ -986,8 +1204,11 @@ fn bench_interior(
         handle.reset_s3_counters();
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("interior-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("interior-level connection");
         if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [interior] {} warmup {} error: {}", label, i, e);
         }
@@ -1005,8 +1226,11 @@ fn bench_interior(
         let params = param_fn(warmup + i);
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("interior-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("interior-level connection");
         match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -1019,7 +1243,12 @@ fn bench_interior(
         drop(conn);
     }
 
-    BenchResult { label: format!("[interior] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult {
+        label: format!("[interior] {}", label),
+        latencies_us: latencies,
+        s3_fetches,
+        s3_bytes,
+    }
 }
 
 /// Cache level: none — everything evicted, including interior pages.
@@ -1041,8 +1270,11 @@ fn bench_none(
         handle.reset_s3_counters();
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("none-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("none-level connection");
         if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [none] {} warmup {} error: {}", label, i, e);
         }
@@ -1060,8 +1292,11 @@ fn bench_none(
         let params = param_fn(warmup + i);
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("none-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("none-level connection");
         match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -1074,7 +1309,12 @@ fn bench_none(
         drop(conn);
     }
 
-    BenchResult { label: format!("[none] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult {
+        label: format!("[none] {}", label),
+        latencies_us: latencies,
+        s3_fetches,
+        s3_bytes,
+    }
 }
 
 /// Like bench_none but uses a SchedulePair for independent search/lookup schedules.
@@ -1095,8 +1335,11 @@ fn bench_none_pair(
         handle.reset_s3_counters();
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("none-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("none-level connection");
         if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, pair) {
             eprintln!("    [matrix] {} warmup {} error: {}", label, i, e);
         }
@@ -1114,8 +1357,11 @@ fn bench_none_pair(
         let params = param_fn(warmup + i);
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("none-level connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("none-level connection");
         match run_query_pair(&conn, sql, &params, plan_aware, pair) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -1128,7 +1374,12 @@ fn bench_none_pair(
         drop(conn);
     }
 
-    BenchResult { label: format!("[matrix] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult {
+        label: format!("[matrix] {}", label),
+        latencies_us: latencies,
+        s3_fetches,
+        s3_bytes,
+    }
 }
 
 // =========================================================================
@@ -1180,7 +1431,11 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let prefetch_lookup = parse_prefetch_hops(&cli.prefetch_lookup);
     println!(
         "--- {} posts, {} users (~{:.1} MB, ~{} pages, ~{} page groups) ---",
-        format_number(n_posts), format_number(n_users), db_size_mb, est_pages, est_page_groups,
+        format_number(n_posts),
+        format_number(n_users),
+        db_size_mb,
+        est_pages,
+        est_page_groups,
     );
     println!("    prefetch_search: {:?}", prefetch_search);
     println!("    prefetch_lookup: {:?}", prefetch_lookup);
@@ -1208,10 +1463,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         // Fast path: generate plain SQLite DB locally, then import to S3.
         // When --import auto and data already exists on S3, skip generation and import.
         let check_backend = build_s3_backend(&rt_handle, &s3_prefix);
-        let existing_manifest = turbolite::tiered::get_manifest(
-            check_backend.as_ref(),
-            &rt_handle,
-        ).expect("failed to check S3 manifest");
+        let existing_manifest = turbolite::tiered::get_manifest(check_backend.as_ref(), &rt_handle)
+            .expect("failed to check S3 manifest");
 
         let is_auto = cli.import.as_deref() == Some("auto");
         if is_auto && existing_manifest.is_some() {
@@ -1239,8 +1492,14 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
             let import_start = Instant::now();
             let config = turbolite::tiered::TurboliteConfig {
-                cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
-                compression: CompressionConfig { level: 1, ..Default::default() },
+                cache: CacheConfig {
+                    pages_per_group: cli.ppg,
+                    ..Default::default()
+                },
+                compression: CompressionConfig {
+                    level: 1,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let import_backend = build_s3_backend(&rt_handle, &s3_prefix);
@@ -1249,8 +1508,10 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 import_backend as Arc<dyn hadb_storage::StorageBackend>,
                 rt_handle.clone(),
                 std::path::Path::new(&local_path),
-            ).expect("import failed");
-            println!("  S3 import:   {:.2}s ({} pages, {} groups, {} interior chunks)",
+            )
+            .expect("import failed");
+            println!(
+                "  S3 import:   {:.2}s ({} pages, {} groups, {} interior chunks)",
                 import_start.elapsed().as_secs_f64(),
                 manifest.page_count,
                 manifest.page_group_keys.len(),
@@ -1259,53 +1520,76 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         }
     } else if cli.force {
         // Legacy VFS generation path
-        let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
+        let config = make_config(
+            &s3_prefix,
+            cache_dir.path(),
+            cli.ppg,
+            cli.prefetch_threads,
+            prefetch_search.clone(),
+            prefetch_lookup.clone(),
+        );
         let vfs_name = unique_vfs_name("write");
         let writer_s3 = build_s3_backend(&rt_handle, &s3_prefix);
         let vfs = TurboliteVfs::with_backend(
             config,
             writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),
-        ).expect("failed to create TurboliteVfs");
+        )
+        .expect("failed to create TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = Connection::open_with_flags_and_vfs(
             &db_name,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).expect("failed to open connection");
+        )
+        .expect("failed to open connection");
         conn.execute_batch(&format!(
             "PRAGMA page_size={}; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;",
             cli.page_size
-        )).expect("pragma setup failed");
-        conn.execute_batch("
+        ))
+        .expect("pragma setup failed");
+        conn.execute_batch(
+            "
             DROP TABLE IF EXISTS likes;
             DROP TABLE IF EXISTS friendships;
             DROP TABLE IF EXISTS posts;
             DROP TABLE IF EXISTS users;
-        ").expect("drop tables failed");
+        ",
+        )
+        .expect("drop tables failed");
         conn.execute_batch(SCHEMA).expect("create tables failed");
 
         set_local_checkpoint_only(true);
-        conn.execute_batch("PRAGMA wal_autocheckpoint=100000;").expect("autocheckpoint failed");
+        conn.execute_batch("PRAGMA wal_autocheckpoint=100000;")
+            .expect("autocheckpoint failed");
 
         let gen_start = Instant::now();
         generate_data(&conn, n_posts, cli.batch_size);
         println!("  Data gen:    {:.2}s", gen_start.elapsed().as_secs_f64());
 
         set_local_checkpoint_only(false);
-        conn.execute_batch("PRAGMA wal_autocheckpoint=0;").expect("autocheckpoint reset failed");
-        conn.execute("PRAGMA user_version = 1", []).expect("force dirty page failed");
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0;")
+            .expect("autocheckpoint reset failed");
+        conn.execute("PRAGMA user_version = 1", [])
+            .expect("force dirty page failed");
         let cp_start = Instant::now();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint failed");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint failed");
         println!("  Checkpoint:  {:.2}s", cp_start.elapsed().as_secs_f64());
 
-        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
-        let page_sz: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap_or(0);
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_sz: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(0);
         let actual_mb = (page_count * page_sz) as f64 / (1024.0 * 1024.0);
         let actual_groups = (page_count as u64 + ppg - 1) / ppg;
-        println!("  Actual DB:   {} pages x {} bytes = {:.1} MB ({} page groups)",
-            page_count, page_sz, actual_mb, actual_groups);
+        println!(
+            "  Actual DB:   {} pages x {} bytes = {:.1} MB ({} page groups)",
+            page_count, page_sz, actual_mb, actual_groups
+        );
         drop(conn);
     } else {
         // Default: reuse existing S3 data
@@ -1315,7 +1599,14 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // Create reader VFS + bench handle
     eprintln!("[bench] creating reader VFS...");
     let reader_cache = TempDir::new().expect("reader temp dir");
-    let reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
+    let reader_config = make_reader_config(
+        &s3_prefix,
+        reader_cache.path(),
+        cli.ppg,
+        cli.prefetch_threads,
+        prefetch_search.clone(),
+        prefetch_lookup.clone(),
+    );
     // Phase Cirrus d removed eager interior/index prefetch entirely; those
     // pages now come in on first-query miss. BENCH_NO_EAGER_INDEX is a no-op.
     eprintln!("[bench] calling TurboliteVfs::with_backend()...");
@@ -1324,7 +1615,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         reader_config,
         reader_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
-    ).expect("reader VFS");
+    )
+    .expect("reader VFS");
     eprintln!("[bench] TurboliteVfs::with_backend() returned OK");
     let shared_state = reader_vfs.shared_state();
     let ctx = BenchCtx::new(&shared_state, reader_s3.clone());
@@ -1335,15 +1627,21 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
     // Open persistent connection for warm benchmarks
     let warm_conn = Connection::open_with_flags_and_vfs(
-        &db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &reader_vfs_name,
-    ).expect("warm connection");
+        &db_name,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        &reader_vfs_name,
+    )
+    .expect("warm connection");
     if cli.skip_verify {
         eprintln!("[bench] connection opened, skipping COUNT(*) verification");
     } else {
         // Run integrity_check first to get detailed corruption info
         eprintln!("[bench] connection opened, running integrity_check...");
-        let mut stmt = warm_conn.prepare("PRAGMA integrity_check(100)").expect("prepare integrity_check");
-        let results: Vec<String> = stmt.query_map([], |row| row.get(0))
+        let mut stmt = warm_conn
+            .prepare("PRAGMA integrity_check(100)")
+            .expect("prepare integrity_check");
+        let results: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
             .expect("integrity_check query")
             .filter_map(|r| r.ok())
             .collect();
@@ -1361,7 +1659,10 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
             .expect("count query failed");
         eprintln!("[bench] COUNT(*) returned {}", row_count);
-        println!("  Verified: {} posts accessible", format_number(row_count as usize));
+        println!(
+            "  Verified: {} posts accessible",
+            format_number(row_count as usize)
+        );
     }
 
     // =====================================================================
@@ -1376,17 +1677,23 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         schedule: SchedulePair,
     }
 
-    let query_filter: Option<Vec<String>> = cli.queries.as_ref().map(|q| {
-        q.split(',').map(|s| s.trim().to_lowercase()).collect()
-    });
-    let mode_filter: Option<Vec<String>> = cli.modes.as_ref().map(|m| {
-        m.split(',').map(|s| s.trim().to_lowercase()).collect()
-    });
+    let query_filter: Option<Vec<String>> = cli
+        .queries
+        .as_ref()
+        .map(|q| q.split(',').map(|s| s.trim().to_lowercase()).collect());
+    let mode_filter: Option<Vec<String>> = cli
+        .modes
+        .as_ref()
+        .map(|m| m.split(',').map(|s| s.trim().to_lowercase()).collect());
     let should_run_query = |label: &str| -> bool {
-        query_filter.as_ref().map_or(true, |f| f.iter().any(|q| label.contains(q.as_str())))
+        query_filter
+            .as_ref()
+            .map_or(true, |f| f.iter().any(|q| label.contains(q.as_str())))
     };
     let should_run_mode = |mode: &str| -> bool {
-        mode_filter.as_ref().map_or(true, |f| f.contains(&mode.to_string()))
+        mode_filter
+            .as_ref()
+            .map_or(true, |f| f.contains(&mode.to_string()))
     };
 
     // --naive overrides: disable all prefetch and plan-aware
@@ -1469,7 +1776,10 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             schedule: scan_filter_pair,
         },
     ];
-    let queries: Vec<QueryDef> = all_queries.into_iter().filter(|q| should_run_query(q.label)).collect();
+    let queries: Vec<QueryDef> = all_queries
+        .into_iter()
+        .filter(|q| should_run_query(q.label))
+        .collect();
 
     if naive {
         println!("  Mode:        NAIVE (no prefetch, no plan-aware, fetch-on-demand only)");
@@ -1486,7 +1796,16 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &ctx, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_data(
+                &warm_conn,
+                &ctx,
+                q.label,
+                q.sql,
+                &q.param_fn,
+                cli.iterations,
+                plan_aware,
+                &q.schedule,
+            ));
         }
     }
 
@@ -1497,7 +1816,18 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_index(
+                &reader_vfs_name,
+                &db_name,
+                &ctx,
+                q.label,
+                q.sql,
+                &q.param_fn,
+                cli.warmup,
+                cli.iterations,
+                plan_aware,
+                &q.schedule,
+            ));
         }
     }
 
@@ -1506,7 +1836,18 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_interior(
+                &reader_vfs_name,
+                &db_name,
+                &ctx,
+                q.label,
+                q.sql,
+                &q.param_fn,
+                cli.warmup,
+                cli.iterations,
+                plan_aware,
+                &q.schedule,
+            ));
         }
     }
 
@@ -1515,7 +1856,18 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_none(
+                &reader_vfs_name,
+                &db_name,
+                &ctx,
+                q.label,
+                q.sql,
+                &q.param_fn,
+                cli.warmup,
+                cli.iterations,
+                plan_aware,
+                &q.schedule,
+            ));
         }
     }
 
@@ -1525,7 +1877,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     if cli.matrix {
         // Parse matrix schedules: "search/lookup;search/lookup;..."
         // Each entry is "search_schedule/lookup_schedule" or "off" for both off.
-        let pairs: Vec<SchedulePair> = cli.matrix_schedules
+        let pairs: Vec<SchedulePair> = cli
+            .matrix_schedules
             .split(';')
             .map(|entry| {
                 let entry = entry.trim();
@@ -1546,7 +1899,12 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
         println!();
         println!("=== MATRIX MODE: search/lookup schedule pairs at NONE level ===");
-        println!("  {} pairs x {} queries x {} iterations", pairs.len(), queries.len(), cli.iterations);
+        println!(
+            "  {} pairs x {} queries x {} iterations",
+            pairs.len(),
+            queries.len(),
+            cli.iterations
+        );
         println!();
 
         for q in &queries {
@@ -1594,7 +1952,10 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         let cleanup_cache = TempDir::new().expect("cleanup temp dir");
         let cleanup_config = TurboliteConfig {
             cache_dir: cleanup_cache.path().to_path_buf(),
-            compression: CompressionConfig { level: 1, ..Default::default() },
+            compression: CompressionConfig {
+                level: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
@@ -1602,7 +1963,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             cleanup_config,
             cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),
-        ).expect("cleanup VFS");
+        )
+        .expect("cleanup VFS");
         cleanup_vfs.destroy_remote().expect("remote cleanup failed");
         eprintln!("done");
     }
@@ -1620,10 +1982,20 @@ fn main() {
 
     println!("=== Tiered VFS Benchmark (Page Group Model) ===");
     println!("Bucket:       {}", test_bucket());
-    println!("Endpoint:     {}", endpoint_url().as_deref().unwrap_or("(default S3)"));
+    println!(
+        "Endpoint:     {}",
+        endpoint_url().as_deref().unwrap_or("(default S3)")
+    );
     println!("Page size:    {} bytes", cli.page_size);
-    println!("Pages/group:  {} ({:.1} MB uncompressed per group)", cli.ppg, cli.ppg as f64 * cli.page_size as f64 / (1024.0 * 1024.0));
-    println!("Iterations:   {} measured + {} warmup per cold query, {} per warm query", cli.iterations, cli.warmup, cli.iterations);
+    println!(
+        "Pages/group:  {} ({:.1} MB uncompressed per group)",
+        cli.ppg,
+        cli.ppg as f64 * cli.page_size as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Iterations:   {} measured + {} warmup per cold query, {} per warm query",
+        cli.iterations, cli.warmup, cli.iterations
+    );
     println!("Queries:      post detail, profile, who-liked, mutual friends");
     if cli.plan_aware {
         println!("Plan-aware:   ENABLED (Phase Marne query-plan prefetch)");

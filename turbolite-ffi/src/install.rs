@@ -28,8 +28,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
 use crate::settings::{
-    turbolite_current_queue_clone, turbolite_settings_queue_free_cb,
-    turbolite_settings_queue_push,
+    turbolite_current_queue_clone, turbolite_settings_queue_free_cb, turbolite_settings_queue_push,
 };
 
 // SQLite constants we need. Mirrors <sqlite3.h>.
@@ -153,9 +152,7 @@ unsafe extern "C" fn config_set_scalar(
 /// # Safety
 /// `db` must be a live `sqlite3*` handle.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_install_config_functions(
-    db: *mut sqlite3,
-) -> c_int {
+pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) -> c_int {
     // VFS-name guard. See the `install_hook.rs` equivalent comment:
     // without this, a non-turbolite connection opened on a thread with
     // an active turbolite handle would receive a scalar pointing at
@@ -167,8 +164,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(
     // Force xOpen on the main-db file so THIS connection's handle
     // queue is top-of-stack on the thread-local. `PRAGMA schema_version`
     // reads page 1 which is enough to trigger the VFS open.
-    let pragma = CStr::from_bytes_with_nul(b"PRAGMA schema_version\0")
-        .expect("static cstring");
+    let pragma = CStr::from_bytes_with_nul(b"PRAGMA schema_version\0").expect("static cstring");
     let mut err_msg: *mut c_char = std::ptr::null_mut();
     let rc = sqlite3_exec(
         db,
@@ -189,8 +185,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(
         return SQLITE_MISUSE;
     }
 
-    let fn_name = CStr::from_bytes_with_nul(b"turbolite_config_set\0")
-        .expect("static cstring");
+    let fn_name = CStr::from_bytes_with_nul(b"turbolite_config_set\0").expect("static cstring");
     sqlite3_create_function_v2(
         db,
         fn_name.as_ptr(),

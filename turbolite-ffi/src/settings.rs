@@ -15,9 +15,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::{Arc, Mutex};
 
-use turbolite::tiered::settings::{
-    self, push_to_current, validate, SettingUpdate, SettingsQueue,
-};
+use turbolite::tiered::settings::{self, push_to_current, validate, SettingUpdate, SettingsQueue};
 
 /// FFI entry point: `turbolite_config_set(key, value)`.
 ///
@@ -29,10 +27,7 @@ use turbolite::tiered::settings::{
 /// # Safety
 /// `key` and `value` must be valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_config_set(
-    key: *const c_char,
-    value: *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn turbolite_config_set(key: *const c_char, value: *const c_char) -> c_int {
     if key.is_null() || value.is_null() {
         return 1;
     }
@@ -135,8 +130,7 @@ pub unsafe extern "C" fn turbolite_settings_queue_push(
 
     // Borrow the Arc via ManuallyDrop so we don't consume the refcount;
     // xDestroy still owns one refcount for the function's lifetime.
-    let queue_arc: &Mutex<Vec<SettingUpdate>> =
-        &*(queue_ptr as *const Mutex<Vec<SettingUpdate>>);
+    let queue_arc: &Mutex<Vec<SettingUpdate>> = &*(queue_ptr as *const Mutex<Vec<SettingUpdate>>);
     queue_arc
         .lock()
         .expect("settings queue poisoned")

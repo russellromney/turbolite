@@ -115,15 +115,18 @@ fn test_query_json_roundtrip() {
     let sql = CString::new(
         "CREATE TABLE t (id INTEGER, name TEXT); \
          INSERT INTO t VALUES (1, 'alice'); \
-         INSERT INTO t VALUES (2, 'bob');"
-    ).unwrap();
+         INSERT INTO t VALUES (2, 'bob');",
+    )
+    .unwrap();
     turbolite_exec(db, sql.as_ptr());
 
     let query = CString::new("SELECT * FROM t ORDER BY id").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null(), "query_json should return non-null");
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -160,9 +163,8 @@ fn test_persistence_across_connections() {
     // Write
     let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
     assert!(!db.is_null());
-    let sql = CString::new(
-        "CREATE TABLE kv (k TEXT, v TEXT); INSERT INTO kv VALUES ('a', 'b');"
-    ).unwrap();
+    let sql = CString::new("CREATE TABLE kv (k TEXT, v TEXT); INSERT INTO kv VALUES ('a', 'b');")
+        .unwrap();
     turbolite_exec(db, sql.as_ptr());
     turbolite_close(db);
 
@@ -173,7 +175,9 @@ fn test_persistence_across_connections() {
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 1);
@@ -208,7 +212,11 @@ fn test_register_local_null_name_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("name"), "error should mention 'name', got: {}", msg);
+    assert!(
+        msg.contains("name"),
+        "error should mention 'name', got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -220,7 +228,11 @@ fn test_register_local_null_cache_dir_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("cache_dir"), "error should mention 'cache_dir', got: {}", msg);
+    assert!(
+        msg.contains("cache_dir"),
+        "error should mention 'cache_dir', got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -240,15 +252,18 @@ fn test_register_local_roundtrip() {
     let sql = CString::new(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); \
          INSERT INTO items VALUES (1, 'alpha'); \
-         INSERT INTO items VALUES (2, 'beta');"
-    ).unwrap();
+         INSERT INTO items VALUES (2, 'beta');",
+    )
+    .unwrap();
     assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
     let query = CString::new("SELECT * FROM items ORDER BY id").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -274,9 +289,9 @@ fn test_register_local_persistence_across_connections() {
     {
         let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
         assert!(!db.is_null());
-        let sql = CString::new(
-            "CREATE TABLE kv (k TEXT, v TEXT); INSERT INTO kv VALUES ('x', 'y');"
-        ).unwrap();
+        let sql =
+            CString::new("CREATE TABLE kv (k TEXT, v TEXT); INSERT INTO kv VALUES ('x', 'y');")
+                .unwrap();
         turbolite_exec(db, sql.as_ptr());
         turbolite_close(db);
     }
@@ -289,7 +304,9 @@ fn test_register_local_persistence_across_connections() {
         let json_ptr = turbolite_query_json(db, query.as_ptr());
         assert!(!json_ptr.is_null());
 
-        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+            .to_str()
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let rows = parsed.as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -338,7 +355,9 @@ fn test_register_json_local_mode() {
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     assert_eq!(parsed[0]["id"], 42);
 
@@ -371,7 +390,11 @@ fn test_register_json_invalid_json_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("JSON") || msg.contains("json"), "error should mention JSON, got: {}", msg);
+    assert!(
+        msg.contains("JSON") || msg.contains("json"),
+        "error should mention JSON, got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -390,7 +413,11 @@ fn test_register_json_null_config_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("config_json"), "error should mention 'config_json', got: {}", msg);
+    assert!(
+        msg.contains("config_json"),
+        "error should mention 'config_json', got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -427,7 +454,9 @@ fn test_register_json_explicit_local_backend() {
     let query = CString::new("SELECT v FROM t").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     assert_eq!(parsed[0]["v"], "ok");
 
@@ -471,7 +500,11 @@ fn test_register_tiered_null_bucket_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("bucket"), "error should mention 'bucket', got: {}", msg);
+    assert!(
+        msg.contains("bucket"),
+        "error should mention 'bucket', got: {}",
+        msg
+    );
 }
 
 // --- Query JSON: NULL, REAL, BLOB, empty ---
@@ -490,15 +523,18 @@ fn test_query_json_null_values() {
     let sql = CString::new(
         "CREATE TABLE t (id INTEGER, val TEXT); \
          INSERT INTO t VALUES (1, NULL); \
-         INSERT INTO t VALUES (NULL, 'present');"
-    ).unwrap();
+         INSERT INTO t VALUES (NULL, 'present');",
+    )
+    .unwrap();
     assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
     let query = CString::new("SELECT * FROM t ORDER BY rowid").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 2);
@@ -526,15 +562,18 @@ fn test_query_json_real_values() {
         "CREATE TABLE t (id INTEGER, price REAL); \
          INSERT INTO t VALUES (1, 3.14); \
          INSERT INTO t VALUES (2, -0.001); \
-         INSERT INTO t VALUES (3, 99999.99);"
-    ).unwrap();
+         INSERT INTO t VALUES (3, 99999.99);",
+    )
+    .unwrap();
     assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
     let query = CString::new("SELECT * FROM t ORDER BY id").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 3);
@@ -559,15 +598,18 @@ fn test_query_json_blob_values() {
 
     let sql = CString::new(
         "CREATE TABLE t (id INTEGER, data BLOB); \
-         INSERT INTO t VALUES (1, X'DEADBEEF');"
-    ).unwrap();
+         INSERT INTO t VALUES (1, X'DEADBEEF');",
+    )
+    .unwrap();
     assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
     let query = CString::new("SELECT * FROM t").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 1);
@@ -593,9 +635,14 @@ fn test_query_json_empty_result() {
 
     let query = CString::new("SELECT * FROM t WHERE id = 999").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
-    assert!(!json_ptr.is_null(), "empty result should return non-null pointer");
+    assert!(
+        !json_ptr.is_null(),
+        "empty result should return non-null pointer"
+    );
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     assert_eq!(json_str, "[]");
 
     turbolite_free_string(json_ptr);
@@ -611,7 +658,10 @@ fn test_open_invalid_vfs_fails() {
     let vfs_name = CString::new("ffi-never-registered-vfs").unwrap();
 
     let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
-    assert!(db.is_null(), "opening with unregistered VFS should return null");
+    assert!(
+        db.is_null(),
+        "opening with unregistered VFS should return null"
+    );
 
     let err = turbolite_last_error();
     assert!(!err.is_null());
@@ -678,7 +728,9 @@ fn test_wal_mode_through_ffi() {
         // Use query_json to verify WAL mode was set
         let json_ptr = turbolite_query_json(db, wal_sql.as_ptr());
         assert!(!json_ptr.is_null());
-        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+            .to_str()
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let mode = parsed[0]["journal_mode"].as_str().unwrap();
         assert_eq!(mode, "wal");
@@ -686,8 +738,9 @@ fn test_wal_mode_through_ffi() {
 
         let sql = CString::new(
             "CREATE TABLE t (id INTEGER, val TEXT); \
-             INSERT INTO t VALUES (1, 'wal-test');"
-        ).unwrap();
+             INSERT INTO t VALUES (1, 'wal-test');",
+        )
+        .unwrap();
         assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
         let checkpoint = CString::new("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -705,7 +758,9 @@ fn test_wal_mode_through_ffi() {
         let json_ptr = turbolite_query_json(db, query.as_ptr());
         assert!(!json_ptr.is_null());
 
-        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+        let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+            .to_str()
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let rows = parsed.as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -745,12 +800,10 @@ fn test_register_local_then_open_multiple_dbs() {
     assert!(!db_b.is_null());
 
     // Insert different data in each
-    let sql_a = CString::new(
-        "CREATE TABLE t (val TEXT); INSERT INTO t VALUES ('from-a');"
-    ).unwrap();
-    let sql_b = CString::new(
-        "CREATE TABLE t (val TEXT); INSERT INTO t VALUES ('from-b');"
-    ).unwrap();
+    let sql_a =
+        CString::new("CREATE TABLE t (val TEXT); INSERT INTO t VALUES ('from-a');").unwrap();
+    let sql_b =
+        CString::new("CREATE TABLE t (val TEXT); INSERT INTO t VALUES ('from-b');").unwrap();
     assert_eq!(turbolite_exec(db_a, sql_a.as_ptr()), 0);
     assert_eq!(turbolite_exec(db_b, sql_b.as_ptr()), 0);
 
@@ -759,13 +812,17 @@ fn test_register_local_then_open_multiple_dbs() {
 
     let json_a = turbolite_query_json(db_a, query.as_ptr());
     assert!(!json_a.is_null());
-    let str_a = unsafe { std::ffi::CStr::from_ptr(json_a) }.to_str().unwrap();
+    let str_a = unsafe { std::ffi::CStr::from_ptr(json_a) }
+        .to_str()
+        .unwrap();
     let parsed_a: serde_json::Value = serde_json::from_str(str_a).unwrap();
     assert_eq!(parsed_a[0]["val"], "from-a");
 
     let json_b = turbolite_query_json(db_b, query.as_ptr());
     assert!(!json_b.is_null());
-    let str_b = unsafe { std::ffi::CStr::from_ptr(json_b) }.to_str().unwrap();
+    let str_b = unsafe { std::ffi::CStr::from_ptr(json_b) }
+        .to_str()
+        .unwrap();
     let parsed_b: serde_json::Value = serde_json::from_str(str_b).unwrap();
     assert_eq!(parsed_b[0]["val"], "from-b");
 
@@ -794,15 +851,18 @@ fn test_large_query_result() {
     // Insert 1000 rows using a recursive CTE for speed
     let insert = CString::new(
         "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) \
-         INSERT INTO t SELECT x, 'row-' || x FROM cnt;"
-    ).unwrap();
+         INSERT INTO t SELECT x, 'row-' || x FROM cnt;",
+    )
+    .unwrap();
     assert_eq!(turbolite_exec(db, insert.as_ptr()), 0);
 
     let query = CString::new("SELECT * FROM t ORDER BY id").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     let rows = parsed.as_array().unwrap();
     assert_eq!(rows.len(), 1000);
@@ -841,16 +901,16 @@ fn test_register_json_with_all_local_fields() {
     let db = turbolite_open(db_path.as_ptr(), name.as_ptr());
     assert!(!db.is_null());
 
-    let sql = CString::new(
-        "CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (77);"
-    ).unwrap();
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (77);").unwrap();
     assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
 
     let query = CString::new("SELECT id FROM t").unwrap();
     let json_ptr = turbolite_query_json(db, query.as_ptr());
     assert!(!json_ptr.is_null());
 
-    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }.to_str().unwrap();
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
     assert_eq!(parsed[0]["id"], 77);
 
@@ -881,5 +941,9 @@ fn test_invalidate_cache_null_path_fails() {
     let err = turbolite_last_error();
     assert!(!err.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
-    assert!(msg.contains("path"), "error should mention 'path', got: {}", msg);
+    assert!(
+        msg.contains("path"),
+        "error should mention 'path', got: {}",
+        msg
+    );
 }

@@ -14,11 +14,11 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use turbolite::clear_all_caches;
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use turbolite::clear_all_caches;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// Preset benchmark configurations
 struct PresetConfig {
@@ -32,26 +32,26 @@ fn get_preset(name: &str) -> Option<PresetConfig> {
     match name {
         "100mb" => Some(PresetConfig {
             db_path: "scripts/real_100mb.db",
-            cache_kb: 10 * 1024,  // 10MB
-            mmap_kb: 20 * 1024,   // 20MB
+            cache_kb: 10 * 1024, // 10MB
+            mmap_kb: 20 * 1024,  // 20MB
             duration_secs: 10,
         }),
         "50mb" => Some(PresetConfig {
             db_path: "scripts/real_50mb.db",
-            cache_kb: 5 * 1024,   // 5MB
-            mmap_kb: 10 * 1024,   // 10MB
+            cache_kb: 5 * 1024, // 5MB
+            mmap_kb: 10 * 1024, // 10MB
             duration_secs: 10,
         }),
         "10mb" => Some(PresetConfig {
             db_path: "scripts/real_10mb.db",
-            cache_kb: 1024,       // 1MB
-            mmap_kb: 2 * 1024,    // 2MB
+            cache_kb: 1024,    // 1MB
+            mmap_kb: 2 * 1024, // 2MB
             duration_secs: 5,
         }),
         "500mb" => Some(PresetConfig {
             db_path: "scripts/real_500mb.db",
-            cache_kb: 50 * 1024,  // 50MB
-            mmap_kb: 100 * 1024,  // 100MB
+            cache_kb: 50 * 1024, // 50MB
+            mmap_kb: 100 * 1024, // 100MB
             duration_secs: 15,
         }),
         _ => None,
@@ -60,7 +60,9 @@ fn get_preset(name: &str) -> Option<PresetConfig> {
 
 #[derive(Parser)]
 #[command(name = "turbolite-bench")]
-#[command(about = "SQLite Compression+Encryption Benchmark CLI\n\nSubcommands: bench-db, bench-compact\nPresets: 10mb, 50mb, 100mb, 500mb")]
+#[command(
+    about = "SQLite Compression+Encryption Benchmark CLI\n\nSubcommands: bench-db, bench-compact\nPresets: 10mb, 50mb, 100mb, 500mb"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -196,8 +198,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle subcommands
     match &cli.command {
-        Some(Commands::BenchCompact { rows, iterations, compression_level, gutenberg, corpus_size_mb }) => {
-            return bench_compact_command(*rows, *iterations, *compression_level, *gutenberg, *corpus_size_mb);
+        Some(Commands::BenchCompact {
+            rows,
+            iterations,
+            compression_level,
+            gutenberg,
+            corpus_size_mb,
+        }) => {
+            return bench_compact_command(
+                *rows,
+                *iterations,
+                *compression_level,
+                *gutenberg,
+                *corpus_size_mb,
+            );
         }
         Some(Commands::BenchDb) | None => {
             // Default behavior: bench-db
@@ -230,7 +244,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve database path and settings from preset or CLI args
     let (database, duration_secs, cache_kb, mmap_kb) = if let Some(preset_name) = &cli.preset {
         let preset = get_preset(preset_name).ok_or_else(|| {
-            format!("Unknown preset '{}'. Available: 10mb, 50mb, 100mb, 500mb", preset_name)
+            format!(
+                "Unknown preset '{}'. Available: 10mb, 50mb, 100mb, 500mb",
+                preset_name
+            )
         })?;
         let db_path = PathBuf::from(preset.db_path);
         (
@@ -240,7 +257,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.mmap_kb.unwrap_or(preset.mmap_kb),
         )
     } else if let Some(db_path) = &cli.database {
-        (db_path.clone(), cli.duration_secs, cli.cache_kb.unwrap_or(0), cli.mmap_kb.unwrap_or(0))
+        (
+            db_path.clone(),
+            cli.duration_secs,
+            cli.cache_kb.unwrap_or(0),
+            cli.mmap_kb.unwrap_or(0),
+        )
     } else {
         eprintln!("Error: Either --preset, --database, or --gutenberg is required");
         eprintln!("  Example: turbolite-bench --preset 50mb");
@@ -257,12 +279,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== SQLCEs Database Benchmark ===");
     println!("Database: {}", database.display());
     println!("Modes: {:?}", modes);
-    println!("Duration: {}s with {}x readers + {}x writers running concurrently",
-             duration_secs, cli.reader_threads, cli.writer_threads);
+    println!(
+        "Duration: {}s with {}x readers + {}x writers running concurrently",
+        duration_secs, cli.reader_threads, cli.writer_threads
+    );
     if cache_kb > 0 {
         println!("Cache: {} KB, mmap: {} KB", cache_kb, mmap_kb);
     } else {
-        println!("Cache: {:.0}% of logical size, mmap: {:.0}% of logical size", cli.cache_percent * 100.0, cli.mmap_percent * 100.0);
+        println!(
+            "Cache: {:.0}% of logical size, mmap: {:.0}% of logical size",
+            cli.cache_percent * 100.0,
+            cli.mmap_percent * 100.0
+        );
     }
     println!();
 
@@ -276,13 +304,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
-        match bench_existing_db(&database, mode, duration_secs,
-                               cli.reader_threads, cli.writer_threads,
-                               cache_kb, mmap_kb, cli.cache_percent, cli.mmap_percent,
-                               cli.wal_autocheckpoint, enc_key) {
+        match bench_existing_db(
+            &database,
+            mode,
+            duration_secs,
+            cli.reader_threads,
+            cli.writer_threads,
+            cache_kb,
+            mmap_kb,
+            cli.cache_percent,
+            cli.mmap_percent,
+            cli.wal_autocheckpoint,
+            enc_key,
+        ) {
             Ok(result) => {
-                println!("  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
-                         result.read_ops_per_sec, result.write_ops_per_sec, result.file_size_mb);
+                println!(
+                    "  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
+                    result.read_ops_per_sec, result.write_ops_per_sec, result.file_size_mb
+                );
                 results.push(result);
             }
             Err(e) => {
@@ -353,12 +392,22 @@ fn bench_gutenberg_db(
     println!("=== SQLCEs Database Benchmark (Gutenberg Data) ===");
     println!("Corpus: {} documents, {} MB", corpus.len(), corpus_size_mb);
     println!("Modes: {:?}", modes);
-    println!("Duration: {}s with {}x readers + {}x writers running concurrently",
-             duration_secs, reader_threads, writer_threads);
+    println!(
+        "Duration: {}s with {}x readers + {}x writers running concurrently",
+        duration_secs, reader_threads, writer_threads
+    );
     if cache_kb_override.unwrap_or(0) > 0 {
-        println!("Cache: {} KB, mmap: {} KB", cache_kb_override.unwrap(), mmap_kb_override.unwrap_or(0));
+        println!(
+            "Cache: {} KB, mmap: {} KB",
+            cache_kb_override.unwrap(),
+            mmap_kb_override.unwrap_or(0)
+        );
     } else {
-        println!("Cache: {:.0}% of logical size, mmap: {:.0}% of logical size", cache_percent * 100.0, mmap_percent * 100.0);
+        println!(
+            "Cache: {:.0}% of logical size, mmap: {:.0}% of logical size",
+            cache_percent * 100.0,
+            mmap_percent * 100.0
+        );
     }
     println!();
 
@@ -386,8 +435,10 @@ fn bench_gutenberg_db(
 
         match result {
             Ok(res) => {
-                println!("  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
-                         res.read_ops_per_sec, res.write_ops_per_sec, res.file_size_mb);
+                println!(
+                    "  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
+                    res.read_ops_per_sec, res.write_ops_per_sec, res.file_size_mb
+                );
                 results.push(res);
             }
             Err(e) => {
@@ -471,14 +522,21 @@ fn bench_with_corpus(
         }
         let wal_path = source_db_dir.join("bench.db-wal");
         let shm_path = source_db_dir.join("bench.db-shm");
-        if wal_path.exists() { std::fs::remove_file(&wal_path)?; }
-        if shm_path.exists() { std::fs::remove_file(&shm_path)?; }
+        if wal_path.exists() {
+            std::fs::remove_file(&wal_path)?;
+        }
+        if shm_path.exists() {
+            std::fs::remove_file(&shm_path)?;
+        }
 
         // Create plain SQLite database (NO VFS) for source
         let conn = Connection::open(&source_db_path)?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+        conn.execute(
+            "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+            [],
+        )?;
 
         // Bulk insert corpus
         conn.execute("BEGIN", [])?;
@@ -521,15 +579,17 @@ fn bench_with_corpus(
         }
         let wal_path = target_db_dir.join("bench.db-wal");
         let shm_path = target_db_dir.join("bench.db-shm");
-        if wal_path.exists() { std::fs::remove_file(&wal_path)?; }
-        if shm_path.exists() { std::fs::remove_file(&shm_path)?; }
+        if wal_path.exists() {
+            std::fs::remove_file(&wal_path)?;
+        }
+        if shm_path.exists() {
+            std::fs::remove_file(&shm_path)?;
+        }
 
         // Copy data from source (plain SQLite) to target (through VFS)
         // This applies to ALL modes including passthrough
-        let source_conn = Connection::open_with_flags(
-            &source_db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let source_conn =
+            Connection::open_with_flags(&source_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
         let target_conn = Connection::open_with_flags_and_vfs(
             &target_db_path,
@@ -538,7 +598,10 @@ fn bench_with_corpus(
         )?;
 
         target_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        target_conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+        target_conn.execute(
+            "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+            [],
+        )?;
         target_conn.execute("BEGIN", [])?;
 
         // Copy all data from source to target
@@ -625,19 +688,33 @@ fn bench_with_corpus(
 
     let reader_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
         bench_reads_concurrent(
-            &db_path_readers, &vfs_name_readers, duration_secs, reader_threads,
-            cache_size_kb, mmap_size_kb, &valid_ids_readers
-        ).map_err(|e| e.to_string())
+            &db_path_readers,
+            &vfs_name_readers,
+            duration_secs,
+            reader_threads,
+            cache_size_kb,
+            mmap_size_kb,
+            &valid_ids_readers,
+        )
+        .map_err(|e| e.to_string())
     });
 
     let writer_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
-        bench_writes_concurrent(&db_path_writers, &vfs_name_writers, duration_secs, writer_threads, wal_autocheckpoint)
-            .map_err(|e| e.to_string())
+        bench_writes_concurrent(
+            &db_path_writers,
+            &vfs_name_writers,
+            duration_secs,
+            writer_threads,
+            wal_autocheckpoint,
+        )
+        .map_err(|e| e.to_string())
     });
 
-    let (read_count, read_latencies) = reader_handle.join()
+    let (read_count, read_latencies) = reader_handle
+        .join()
         .map_err(|_| "Reader thread panicked".to_string())??;
-    let (write_count, write_latencies) = writer_handle.join()
+    let (write_count, write_latencies) = writer_handle
+        .join()
         .map_err(|_| "Writer thread panicked".to_string())??;
 
     let read_ops_per_sec = read_count as f64 / read_latencies.iter().sum::<f64>() * 1_000_000.0;
@@ -702,7 +779,10 @@ fn bench_existing_db(
 
     // Read from source database and insert into VFS database
     let source_conn = Connection::open(source_db)?;
-    conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+    conn.execute(
+        "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+        [],
+    )?;
 
     conn.execute("BEGIN", [])?;
     let mut stmt = source_conn.prepare("SELECT author, title, body FROM articles")?;
@@ -782,21 +862,35 @@ fn bench_existing_db(
     // Spawn reader threads
     let reader_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
         bench_reads_concurrent(
-            &db_path_readers, &vfs_name_readers, duration_secs, reader_threads,
-            cache_size_kb, mmap_size_kb, &valid_ids_readers
-        ).map_err(|e| e.to_string())
+            &db_path_readers,
+            &vfs_name_readers,
+            duration_secs,
+            reader_threads,
+            cache_size_kb,
+            mmap_size_kb,
+            &valid_ids_readers,
+        )
+        .map_err(|e| e.to_string())
     });
 
     // Spawn writer threads
     let writer_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
-        bench_writes_concurrent(&db_path_writers, &vfs_name_writers, duration_secs, writer_threads, wal_autocheckpoint)
-            .map_err(|e| e.to_string())
+        bench_writes_concurrent(
+            &db_path_writers,
+            &vfs_name_writers,
+            duration_secs,
+            writer_threads,
+            wal_autocheckpoint,
+        )
+        .map_err(|e| e.to_string())
     });
 
     // Wait for both to complete
-    let (read_count, read_latencies) = reader_handle.join()
+    let (read_count, read_latencies) = reader_handle
+        .join()
         .map_err(|_| "Reader thread panicked".to_string())??;
-    let (write_count, write_latencies) = writer_handle.join()
+    let (write_count, write_latencies) = writer_handle
+        .join()
         .map_err(|_| "Writer thread panicked".to_string())??;
 
     let read_ops_per_sec = read_count as f64 / read_latencies.iter().sum::<f64>() * 1_000_000.0;
@@ -846,7 +940,8 @@ fn bench_reads_concurrent(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
                 &*vfs_name,
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
 
             // Configure cache for this connection
             conn.execute(&format!("PRAGMA cache_size = -{}", cache_size_kb), [])
@@ -882,7 +977,10 @@ fn bench_reads_concurrent(
                         let _body: String = row.get(2)?;
                         Ok(())
                     },
-                ).map_err(|e| format!("Thread {}: SELECT rowid {} failed: {}", thread_id, rowid, e))?;
+                )
+                .map_err(|e| {
+                    format!("Thread {}: SELECT rowid {} failed: {}", thread_id, rowid, e)
+                })?;
 
                 latencies.push(start.elapsed().as_micros() as f64);
                 i += 1;
@@ -899,7 +997,8 @@ fn bench_reads_concurrent(
     let mut all_latencies = Vec::new();
 
     for handle in handles {
-        let (count, mut latencies) = handle.join()
+        let (count, mut latencies) = handle
+            .join()
             .map_err(|_| "Thread panicked")?
             .map_err(|e| e.to_string())?;
         total_count += count;
@@ -916,8 +1015,8 @@ fn bench_writes_concurrent(
     num_threads: usize,
     wal_autocheckpoint: i64,
 ) -> Result<(usize, Vec<f64>), Box<dyn std::error::Error>> {
-    use std::thread;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     let counter = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
@@ -933,13 +1032,15 @@ fn bench_writes_concurrent(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE,
                 &*vfs_name,
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
 
             // CRITICAL: Enable WAL mode and configure for performance
             conn.execute_batch(&format!(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint={};",
                 wal_autocheckpoint
-            )).map_err(|e| e.to_string())?;
+            ))
+            .map_err(|e| e.to_string())?;
 
             let mut latencies = Vec::new();
             let body = "x".repeat(1000);
@@ -957,7 +1058,8 @@ fn bench_writes_concurrent(
                         format!("Write Title {} T{}", i, thread_id),
                         &body,
                     ),
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
 
                 latencies.push(start.elapsed().as_micros() as f64);
                 local_count += 1;
@@ -974,7 +1076,8 @@ fn bench_writes_concurrent(
     let mut all_latencies = Vec::new();
 
     for handle in handles {
-        let (count, mut latencies) = handle.join()
+        let (count, mut latencies) = handle
+            .join()
             .map_err(|_| "Thread panicked")?
             .map_err(|e| e.to_string())?;
         total_count += count;
@@ -1004,18 +1107,24 @@ fn percentile(latencies: &[f64], p: f64) -> f64 {
 
 fn print_comparison_table(results: &[BenchmarkResult]) {
     println!("=== VFS Mode Comparison ===\n");
-    println!("{:<15} {:>12} {:>12} {:>10} {:>10}",
-             "Mode", "Read ops/s", "Write ops/s", "Read P99", "File MB");
-    println!("{:-<15} {:->12} {:->12} {:->10} {:->10}",
-             "", "", "", "", "");
+    println!(
+        "{:<15} {:>12} {:>12} {:>10} {:>10}",
+        "Mode", "Read ops/s", "Write ops/s", "Read P99", "File MB"
+    );
+    println!(
+        "{:-<15} {:->12} {:->12} {:->10} {:->10}",
+        "", "", "", "", ""
+    );
 
     for result in results {
-        println!("{:<15} {:>12.0} {:>12.0} {:>8.1}µs {:>10.2}",
-                 result.mode,
-                 result.read_ops_per_sec,
-                 result.write_ops_per_sec,
-                 result.read_p99_us,
-                 result.file_size_mb);
+        println!(
+            "{:<15} {:>12.0} {:>12.0} {:>8.1}µs {:>10.2}",
+            result.mode,
+            result.read_ops_per_sec,
+            result.write_ops_per_sec,
+            result.read_p99_us,
+            result.file_size_mb
+        );
     }
 
     println!("\nSetup times:");
@@ -1026,18 +1135,24 @@ fn print_comparison_table(results: &[BenchmarkResult]) {
 
 fn format_comparison_table(results: &[BenchmarkResult]) -> String {
     let mut output = String::from("=== VFS Mode Comparison ===\n\n");
-    output.push_str(&format!("{:<15} {:>12} {:>12} {:>10} {:>10}\n",
-                             "Mode", "Read ops/s", "Write ops/s", "Read P99", "File MB"));
-    output.push_str(&format!("{:-<15} {:->12} {:->12} {:->10} {:->10}\n",
-                             "", "", "", "", ""));
+    output.push_str(&format!(
+        "{:<15} {:>12} {:>12} {:>10} {:>10}\n",
+        "Mode", "Read ops/s", "Write ops/s", "Read P99", "File MB"
+    ));
+    output.push_str(&format!(
+        "{:-<15} {:->12} {:->12} {:->10} {:->10}\n",
+        "", "", "", "", ""
+    ));
 
     for result in results {
-        output.push_str(&format!("{:<15} {:>12.0} {:>12.0} {:>8.1}µs {:>10.2}\n",
-                                 result.mode,
-                                 result.read_ops_per_sec,
-                                 result.write_ops_per_sec,
-                                 result.read_p99_us,
-                                 result.file_size_mb));
+        output.push_str(&format!(
+            "{:<15} {:>12.0} {:>12.0} {:>8.1}µs {:>10.2}\n",
+            result.mode,
+            result.read_ops_per_sec,
+            result.write_ops_per_sec,
+            result.read_p99_us,
+            result.file_size_mb
+        ));
     }
     output
 }
@@ -1050,24 +1165,41 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
     output.push_str("|------|-------------:|--------------:|--------------:|---------------:|\n");
 
     for result in results {
-        output.push_str(&format!("| {} | {:.0} | {:.0} | {:.1} | {:.2} |\n",
-                                 result.mode,
-                                 result.read_ops_per_sec,
-                                 result.write_ops_per_sec,
-                                 result.read_p99_us,
-                                 result.file_size_mb));
+        output.push_str(&format!(
+            "| {} | {:.0} | {:.0} | {:.1} | {:.2} |\n",
+            result.mode,
+            result.read_ops_per_sec,
+            result.write_ops_per_sec,
+            result.read_p99_us,
+            result.file_size_mb
+        ));
     }
 
     output.push_str("\n## Detailed Results\n\n");
     for result in results {
         output.push_str(&format!("### {} Mode\n\n", result.mode));
         output.push_str(&format!("- **Documents**: {}\n", result.document_count));
-        output.push_str(&format!("- **Read throughput**: {:.0} ops/sec\n", result.read_ops_per_sec));
-        output.push_str(&format!("- **Read P50/P99**: {:.2}µs / {:.2}µs\n", result.read_p50_us, result.read_p99_us));
-        output.push_str(&format!("- **Write throughput**: {:.0} ops/sec\n", result.write_ops_per_sec));
-        output.push_str(&format!("- **Write P50/P99**: {:.2}µs / {:.2}µs\n", result.write_p50_us, result.write_p99_us));
+        output.push_str(&format!(
+            "- **Read throughput**: {:.0} ops/sec\n",
+            result.read_ops_per_sec
+        ));
+        output.push_str(&format!(
+            "- **Read P50/P99**: {:.2}µs / {:.2}µs\n",
+            result.read_p50_us, result.read_p99_us
+        ));
+        output.push_str(&format!(
+            "- **Write throughput**: {:.0} ops/sec\n",
+            result.write_ops_per_sec
+        ));
+        output.push_str(&format!(
+            "- **Write P50/P99**: {:.2}µs / {:.2}µs\n",
+            result.write_p50_us, result.write_p99_us
+        ));
         output.push_str(&format!("- **File size**: {:.2} MB\n", result.file_size_mb));
-        output.push_str(&format!("- **Setup time**: {:.2}s\n\n", result.setup_duration_secs));
+        output.push_str(&format!(
+            "- **Setup time**: {:.2}s\n\n",
+            result.setup_duration_secs
+        ));
     }
 
     output
@@ -1093,7 +1225,10 @@ const GUTENBERG_TEXTS: &[(u32, &str, &str)] = &[
 ];
 
 /// Download and cache a Gutenberg text
-fn download_gutenberg_text(ebook_id: u32, cache_dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+fn download_gutenberg_text(
+    ebook_id: u32,
+    cache_dir: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
     let cache_file = cache_dir.join(format!("{}.txt", ebook_id));
 
     if cache_file.exists() {
@@ -1102,8 +1237,14 @@ fn download_gutenberg_text(ebook_id: u32, cache_dir: &std::path::Path) -> Result
 
     // Try UTF-8 version first, then ASCII
     let urls = [
-        format!("https://www.gutenberg.org/files/{}/{}-0.txt", ebook_id, ebook_id),
-        format!("https://www.gutenberg.org/files/{}/{}.txt", ebook_id, ebook_id),
+        format!(
+            "https://www.gutenberg.org/files/{}/{}-0.txt",
+            ebook_id, ebook_id
+        ),
+        format!(
+            "https://www.gutenberg.org/files/{}/{}.txt",
+            ebook_id, ebook_id
+        ),
     ];
 
     for url in &urls {
@@ -1157,7 +1298,10 @@ fn clean_gutenberg_text(text: &str) -> String {
 }
 
 /// Get or generate corpus, using cache if available
-fn get_or_generate_corpus(target_size_mb: usize, fresh: bool) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+fn get_or_generate_corpus(
+    target_size_mb: usize,
+    fresh: bool,
+) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
     let cache_dir = get_cache_dir();
     std::fs::create_dir_all(&cache_dir)?;
 
@@ -1184,7 +1328,9 @@ fn get_or_generate_corpus(target_size_mb: usize, fresh: bool) -> Result<Vec<(Str
 }
 
 /// Generate corpus from Gutenberg texts
-fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+fn generate_gutenberg_corpus(
+    target_size_mb: usize,
+) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
     let gutenberg_cache_dir = get_cache_dir().join("gutenberg_texts");
     std::fs::create_dir_all(&gutenberg_cache_dir)?;
 
@@ -1192,7 +1338,10 @@ fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, Strin
     let mut corpus = Vec::new();
     let mut current_size = 0usize;
 
-    println!("Downloading Gutenberg texts (cached in {:?})...", gutenberg_cache_dir);
+    println!(
+        "Downloading Gutenberg texts (cached in {:?})...",
+        gutenberg_cache_dir
+    );
 
     for (ebook_id, author, title) in GUTENBERG_TEXTS {
         if current_size >= target_bytes {
@@ -1206,10 +1355,17 @@ fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, Strin
             Ok(text) => {
                 // Split into sections of ~2000 chars each
                 let sections = split_into_sections(&text, author, title);
-                let section_size: usize = sections.iter().map(|(a, t, txt)| a.len() + t.len() + txt.len()).sum();
+                let section_size: usize = sections
+                    .iter()
+                    .map(|(a, t, txt)| a.len() + t.len() + txt.len())
+                    .sum();
                 current_size += section_size;
 
-                println!("{} sections, {:.2} MB", sections.len(), section_size as f64 / (1024.0 * 1024.0));
+                println!(
+                    "{} sections, {:.2} MB",
+                    sections.len(),
+                    section_size as f64 / (1024.0 * 1024.0)
+                );
                 corpus.extend(sections);
             }
             Err(e) => {
@@ -1235,13 +1391,20 @@ fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, Strin
             let text = std::fs::read_to_string(&cache_file)?;
             let cycled_author = format!("{} (Cycle {})", author, cycle);
             let sections = split_into_sections(&text, &cycled_author, title);
-            let section_size: usize = sections.iter().map(|(a, t, txt)| a.len() + t.len() + txt.len()).sum();
+            let section_size: usize = sections
+                .iter()
+                .map(|(a, t, txt)| a.len() + t.len() + txt.len())
+                .sum();
             current_size += section_size;
             corpus.extend(sections);
         }
     }
 
-    println!("Corpus: {} documents, {:.2} MB", corpus.len(), current_size as f64 / (1024.0 * 1024.0));
+    println!(
+        "Corpus: {} documents, {:.2} MB",
+        corpus.len(),
+        current_size as f64 / (1024.0 * 1024.0)
+    );
     Ok(corpus)
 }
 
@@ -1267,7 +1430,13 @@ fn split_into_sections(text: &str, author: &str, title: &str) -> Vec<(String, St
 }
 
 /// Benchmark parallel vs serial compaction (removed: CompressedVfs was removed)
-fn bench_compact_command(_rows: usize, _iterations: usize, _compression_level: i32, _gutenberg: bool, _corpus_size_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn bench_compact_command(
+    _rows: usize,
+    _iterations: usize,
+    _compression_level: i32,
+    _gutenberg: bool,
+    _corpus_size_mb: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("bench-compact is no longer available (CompressedVfs was removed).");
     Ok(())
 }
@@ -1293,11 +1462,17 @@ fn _bench_compact_removed() {
     println!();
     println!("=== SQLCEs Parallel Compaction Benchmark ===");
     if gutenberg {
-        println!("Mode: Gutenberg corpus ({} MB, {} documents)", corpus_size_mb, doc_count);
+        println!(
+            "Mode: Gutenberg corpus ({} MB, {} documents)",
+            corpus_size_mb, doc_count
+        );
     } else {
         println!("Mode: Synthetic data ({} rows)", rows);
     }
-    println!("Iterations: {}, Compression level: {}", iterations, compression_level);
+    println!(
+        "Iterations: {}, Compression level: {}",
+        iterations, compression_level
+    );
     println!();
 
     let mut parallel_times = Vec::new();
@@ -1307,7 +1482,10 @@ fn _bench_compact_removed() {
         println!("Iteration {}/{}...", iter + 1, iterations);
 
         // Create test databases for this iteration
-        for (mode, times) in [("parallel", &mut parallel_times), ("serial", &mut serial_times)] {
+        for (mode, times) in [
+            ("parallel", &mut parallel_times),
+            ("serial", &mut serial_times),
+        ] {
             let dir = tempfile::tempdir()?;
             let vfs_id = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
             let vfs_name = format!("compact_bench_{}_{}", mode, vfs_id);
@@ -1389,8 +1567,7 @@ fn _bench_compact_removed() {
 
             // Run compaction
             let start = Instant::now();
-            let config = CompactionConfig::new(compression_level)
-                .with_parallel(mode == "parallel");
+            let config = CompactionConfig::new(compression_level).with_parallel(mode == "parallel");
             let _freed = compact_with_recompression(&db_path, config)?;
             let elapsed = start.elapsed();
 
@@ -1398,13 +1575,15 @@ fn _bench_compact_removed() {
 
             if iter == 0 {
                 let stats_after = inspect_database(&db_path)?;
-                println!("  {} mode: {:.3}s (before: {:.2} MB, after: {:.2} MB, dead: {:.1}% -> {:.1}%)",
+                println!(
+                    "  {} mode: {:.3}s (before: {:.2} MB, after: {:.2} MB, dead: {:.1}% -> {:.1}%)",
                     mode,
                     elapsed.as_secs_f64(),
                     stats_before.file_size as f64 / (1024.0 * 1024.0),
                     stats_after.file_size as f64 / (1024.0 * 1024.0),
                     stats_before.dead_space_pct,
-                    stats_after.dead_space_pct);
+                    stats_after.dead_space_pct
+                );
             }
         }
     }
@@ -1419,14 +1598,22 @@ fn _bench_compact_removed() {
 
     println!("{:<12} {:>12} {:>12}", "Mode", "Avg Time", "Speedup");
     println!("{:-<12} {:->12} {:->12}", "", "", "");
-    println!("{:<12} {:>10.3}s {:>12}", "parallel", parallel_avg, format!("{:.2}x", speedup));
+    println!(
+        "{:<12} {:>10.3}s {:>12}",
+        "parallel",
+        parallel_avg,
+        format!("{:.2}x", speedup)
+    );
     println!("{:<12} {:>10.3}s {:>12}", "serial", serial_avg, "baseline");
 
     println!();
     if speedup > 1.5 {
         println!("Parallel compaction is {:.1}x faster!", speedup);
     } else if speedup > 1.0 {
-        println!("Parallel compaction provides {:.0}% speedup.", (speedup - 1.0) * 100.0);
+        println!(
+            "Parallel compaction provides {:.0}% speedup.",
+            (speedup - 1.0) * 100.0
+        );
     } else {
         println!("Serial compaction is faster for this workload (try more rows).");
     }

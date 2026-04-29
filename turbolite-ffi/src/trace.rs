@@ -14,10 +14,7 @@ use turbolite::tiered::{push_planned_accesses, run_eqp_and_parse, signal_end_que
 /// # Safety
 /// `db` must be a valid sqlite3 handle. `sql` must be a valid C string.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_trace_push_plan(
-    db: *mut std::ffi::c_void,
-    sql: *const c_char,
-) {
+pub unsafe extern "C" fn turbolite_trace_push_plan(db: *mut std::ffi::c_void, sql: *const c_char) {
     if sql.is_null() {
         return;
     }

@@ -15,15 +15,14 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{
-    TurboliteSharedState, TurboliteConfig, TurboliteVfs,
-    CacheConfig, CompressionConfig, PrefetchConfig,
-    parse_eqp_output, push_planned_accesses,
-};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
+use turbolite::tiered::{
+    parse_eqp_output, push_planned_accesses, CacheConfig, CompressionConfig, PrefetchConfig,
+    TurboliteConfig, TurboliteSharedState, TurboliteVfs,
+};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -59,15 +58,27 @@ impl<'a> BenchCtx<'a> {
             s3,
         }
     }
-    fn clear_cache_data_only(&self) { self.state.clear_cache_data_only(); }
-    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+    fn clear_cache_data_only(&self) {
+        self.state.clear_cache_data_only();
+    }
+    fn clear_cache_all(&self) {
+        self.state.clear_cache_all();
+    }
     fn reset_s3_counters(&self) {
-        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
-        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+        self.fetch_count_base
+            .store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base
+            .store(self.s3.bytes_fetched(), Ordering::Relaxed);
     }
     fn s3_counters(&self) -> (u64, u64) {
-        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
-        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        let fc = self
+            .s3
+            .fetch_count()
+            .saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self
+            .s3
+            .bytes_fetched()
+            .saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
         (fc, fb)
     }
 }
@@ -112,12 +123,20 @@ struct Cli {
 
     /// Search schedules to test (semicolon-separated, each is comma-separated fractions).
     /// Default covers conservative to aggressive.
-    #[arg(long, default_value = "0.3,0.3,0.4;0.5,0.5;1.0;0.2,0.3,0.5;0.4,0.3,0.3", env = "TUNE_SEARCH_SCHEDULES")]
+    #[arg(
+        long,
+        default_value = "0.3,0.3,0.4;0.5,0.5;1.0;0.2,0.3,0.5;0.4,0.3,0.3",
+        env = "TUNE_SEARCH_SCHEDULES"
+    )]
     search_schedules: String,
 
     /// Lookup schedules to test (semicolon-separated).
     /// Default covers zero-heavy to moderate.
-    #[arg(long, default_value = "0;0,0,0.1;0,0.1,0.2;0,0,0,0.1,0.2;0.1,0.1,0.2", env = "TUNE_LOOKUP_SCHEDULES")]
+    #[arg(
+        long,
+        default_value = "0;0,0,0.1;0,0.1,0.2;0,0,0,0.1,0.2;0.1,0.1,0.2",
+        env = "TUNE_LOOKUP_SCHEDULES"
+    )]
     lookup_schedules: String,
 
     /// Also include "off/off" baseline (no prefetch at all).
@@ -149,7 +168,10 @@ impl SchedulePair {
     }
 
     fn off() -> Self {
-        Self { search: None, lookup: None }
+        Self {
+            search: None,
+            lookup: None,
+        }
     }
 
     /// Push this pair's prefetch schedules onto the current connection's
@@ -159,11 +181,19 @@ impl SchedulePair {
     /// its own schedule.
     fn push(&self) {
         let search_val = match &self.search {
-            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            Some(v) => v
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             None => "0,0,0".to_string(),
         };
         let lookup_val = match &self.lookup {
-            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            Some(v) => v
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             None => "0,0,0".to_string(),
         };
         turbolite::tiered::settings::set("prefetch_search", &search_val)
@@ -175,7 +205,11 @@ impl SchedulePair {
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {
             match s {
-                Some(v) => v.iter().map(|f| format!("{:.2}", f)).collect::<Vec<_>>().join(","),
+                Some(v) => v
+                    .iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 None => "off".to_string(),
             }
         };
@@ -205,7 +239,9 @@ fn endpoint_url() -> Option<String> {
 }
 
 fn percentile(latencies: &[f64], p: f64) -> f64 {
-    if latencies.is_empty() { return 0.0; }
+    if latencies.is_empty() {
+        return 0.0;
+    }
     let mut sorted = latencies.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((p * sorted.len() as f64) as usize).min(sorted.len() - 1);
@@ -254,14 +290,22 @@ struct BenchResult {
 }
 
 impl BenchResult {
-    fn p50(&self) -> f64 { percentile(&self.latencies_us, 0.5) }
-    fn p90(&self) -> f64 { percentile(&self.latencies_us, 0.9) }
+    fn p50(&self) -> f64 {
+        percentile(&self.latencies_us, 0.5)
+    }
+    fn p90(&self) -> f64 {
+        percentile(&self.latencies_us, 0.9)
+    }
     fn avg_fetches(&self) -> f64 {
-        if self.s3_fetches.is_empty() { return 0.0; }
+        if self.s3_fetches.is_empty() {
+            return 0.0;
+        }
         self.s3_fetches.iter().sum::<u64>() as f64 / self.s3_fetches.len() as f64
     }
     fn avg_bytes_kb(&self) -> f64 {
-        if self.s3_bytes.is_empty() { return 0.0; }
+        if self.s3_bytes.is_empty() {
+            return 0.0;
+        }
         (self.s3_bytes.iter().sum::<u64>() as f64 / self.s3_bytes.len() as f64) / 1024.0
     }
 }
@@ -342,8 +386,11 @@ fn bench_cold(
         handle.clear_cache_all();
         handle.reset_s3_counters();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("tune connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("tune connection");
         let _ = run_query_pair(&conn, sql, params, plan_aware, pair);
         drop(conn);
     }
@@ -358,8 +405,11 @@ fn bench_cold(
 
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("tune connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("tune connection");
         match run_query_pair(&conn, sql, params, plan_aware, pair) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -399,8 +449,11 @@ fn bench_index_level(
         handle.clear_cache_data_only();
         handle.reset_s3_counters();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("tune connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("tune connection");
         let _ = run_query_pair(&conn, sql, params, plan_aware, pair);
         drop(conn);
     }
@@ -415,8 +468,11 @@ fn bench_index_level(
 
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("tune connection");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            vfs_name,
+        )
+        .expect("tune connection");
         match run_query_pair(&conn, sql, params, plan_aware, pair) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -453,12 +509,14 @@ fn main() {
     let params: Vec<rusqlite::types::Value> = cli.params.iter().map(|s| parse_param(s)).collect();
 
     // Build schedule grid
-    let search_scheds: Vec<Vec<f32>> = cli.search_schedules
+    let search_scheds: Vec<Vec<f32>> = cli
+        .search_schedules
         .split(';')
         .map(|s| parse_schedule(s.trim()))
         .filter(|v| !v.is_empty())
         .collect();
-    let lookup_scheds: Vec<Vec<f32>> = cli.lookup_schedules
+    let lookup_scheds: Vec<Vec<f32>> = cli
+        .lookup_schedules
         .split(';')
         .map(|s| parse_schedule(s.trim()))
         .filter(|v| !v.is_empty())
@@ -470,7 +528,10 @@ fn main() {
     }
     for search in &search_scheds {
         for lookup in &lookup_scheds {
-            pairs.push(SchedulePair::pair(Some(search.clone()), Some(lookup.clone())));
+            pairs.push(SchedulePair::pair(
+                Some(search.clone()),
+                Some(lookup.clone()),
+            ));
         }
     }
 
@@ -481,20 +542,34 @@ fn main() {
     // Print header
     println!("=== tiered-tune: Prefetch Schedule Tuner ===");
     println!("Bucket:       {}", test_bucket());
-    println!("Endpoint:     {}", endpoint_url().as_deref().unwrap_or("(default S3)"));
+    println!(
+        "Endpoint:     {}",
+        endpoint_url().as_deref().unwrap_or("(default S3)")
+    );
     println!("Prefix:       {}", cli.prefix);
     println!("Page size:    {} bytes", cli.page_size);
     println!("Pages/group:  {}", cli.ppg);
     println!("Cache level:  {}", cli.cache_level);
-    println!("Plan-aware:   {}", if cli.plan_aware { "ENABLED" } else { "disabled" });
+    println!(
+        "Plan-aware:   {}",
+        if cli.plan_aware {
+            "ENABLED"
+        } else {
+            "disabled"
+        }
+    );
     println!("Queries:      {}", n_queries);
-    println!("Schedule pairs: {} ({} search x {} lookup{})",
+    println!(
+        "Schedule pairs: {} ({} search x {} lookup{})",
         n_pairs,
         search_scheds.len(),
         lookup_scheds.len(),
         if cli.baseline { " + baseline" } else { "" },
     );
-    println!("Iterations:   {} measured + {} warmup", cli.iterations, cli.warmup);
+    println!(
+        "Iterations:   {} measured + {} warmup",
+        cli.iterations, cli.warmup
+    );
     println!("Total runs:   {}", total_runs);
     println!();
 
@@ -503,9 +578,15 @@ fn main() {
     let vfs_name = unique_vfs_name();
     let config = TurboliteConfig {
         cache_dir: cache_dir.path().to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
         read_only: true,
-        cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: cli.ppg,
+            ..Default::default()
+        },
         prefetch: PrefetchConfig {
             threads: cli.prefetch_threads,
             query_plan: cli.plan_aware,
@@ -525,7 +606,8 @@ fn main() {
         config,
         s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
-    ).expect("failed to create VFS");
+    )
+    .expect("failed to create VFS");
     let shared_state = vfs.shared_state();
     let handle = BenchCtx::new(&shared_state, s3.clone());
     turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
@@ -535,22 +617,31 @@ fn main() {
     // Verify connection works
     {
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &vfs_name,
-        ).expect("failed to open database");
+            db_name,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &vfs_name,
+        )
+        .expect("failed to open database");
         let page_count: i64 = conn
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .expect("PRAGMA page_count failed");
         let page_size: i64 = conn
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .expect("PRAGMA page_size failed");
-        println!("Database: {} pages x {} bytes = {:.1} MB",
-            page_count, page_size,
+        println!(
+            "Database: {} pages x {} bytes = {:.1} MB",
+            page_count,
+            page_size,
             page_count as f64 * page_size as f64 / (1024.0 * 1024.0),
         );
 
         // Show tables
-        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
-        let tables: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap()
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
             .filter_map(|r| r.ok())
             .collect();
         println!("Tables:   {}", tables.join(", "));
@@ -578,9 +669,29 @@ fn main() {
 
         for (pi, pair) in pairs.iter().enumerate() {
             let r = if use_cold {
-                bench_cold(&vfs_name, db_name, &handle, sql, &params, cli.warmup, cli.iterations, cli.plan_aware, pair)
+                bench_cold(
+                    &vfs_name,
+                    db_name,
+                    &handle,
+                    sql,
+                    &params,
+                    cli.warmup,
+                    cli.iterations,
+                    cli.plan_aware,
+                    pair,
+                )
             } else {
-                bench_index_level(&vfs_name, db_name, &handle, sql, &params, cli.warmup, cli.iterations, cli.plan_aware, pair)
+                bench_index_level(
+                    &vfs_name,
+                    db_name,
+                    &handle,
+                    sql,
+                    &params,
+                    cli.warmup,
+                    cli.iterations,
+                    cli.plan_aware,
+                    pair,
+                )
             };
 
             let p50 = r.p50();
@@ -606,11 +717,19 @@ fn main() {
         // Print recommended TurboliteConfig values (set at construction time).
         let best = &pairs[best_pair_idx];
         if let Some(ref search) = best.search {
-            let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            let s = search
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             println!("  TurboliteConfig.prefetch.search = vec![{}];", s);
         }
         if let Some(ref lookup) = best.lookup {
-            let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            let s = lookup
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             println!("  TurboliteConfig.prefetch.lookup = vec![{}];", s);
         }
         if best.search.is_none() && best.lookup.is_none() {

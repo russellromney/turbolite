@@ -273,10 +273,10 @@ fn open_connection(
     vfs: turbolite::tiered::TurboliteVfs,
     vfs_name: &str,
 ) -> Result<rusqlite::Connection> {
-    turbolite::tiered::register(vfs_name, vfs)
-        .context("failed to register VFS")?;
+    turbolite::tiered::register(vfs_name, vfs).context("failed to register VFS")?;
 
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
     let conn = rusqlite::Connection::open_with_flags_and_vfs(db, flags, vfs_name)
         .context("failed to open database")?;
     Ok(conn)
@@ -292,7 +292,8 @@ fn open_shared(
     turbolite::tiered::register_shared(vfs_name, shared.clone())
         .context("failed to register shared VFS")?;
 
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
     let conn = rusqlite::Connection::open_with_flags_and_vfs(db, flags, vfs_name)
         .context("failed to open database")?;
     Ok((shared, conn))
@@ -313,7 +314,8 @@ fn cmd_info(
         .context("failed to register VFS")?;
 
     // Open connection to initialize VFS state
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
     let _conn = rusqlite::Connection::open_with_flags_and_vfs(&db, flags, &vfs_name)
         .context("failed to open database")?;
 
@@ -331,12 +333,22 @@ fn cmd_info(
     println!();
     println!("  manifest version:  {}", manifest.version);
     println!("  change counter:    {}", manifest.change_counter);
-    println!("  storage:           {}", if shared.has_remote_storage() { "S3" } else { "local" });
+    println!(
+        "  storage:           {}",
+        if shared.has_remote_storage() {
+            "S3"
+        } else {
+            "local"
+        }
+    );
     println!("  strategy:          {:?}", manifest.strategy);
     println!();
     println!("  pages:             {}", page_count);
     println!("  page size:         {} bytes", page_size);
-    println!("  uncompressed size: {:.1} MB", uncompressed_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "  uncompressed size: {:.1} MB",
+        uncompressed_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!();
     println!("  page groups:       {}", total_groups);
     println!("  pages per group:   {}", manifest.pages_per_group);
@@ -345,7 +357,10 @@ fn cmd_info(
     println!("  B-trees:           {}", btree_count);
 
     if manifest.sub_pages_per_frame > 0 {
-        println!("  seekable frames:   yes (sub_ppf={})", manifest.sub_pages_per_frame);
+        println!(
+            "  seekable frames:   yes (sub_ppf={})",
+            manifest.sub_pages_per_frame
+        );
     } else {
         println!("  seekable frames:   no");
     }
@@ -383,7 +398,10 @@ fn load_schema_completions(conn: &rusqlite::Connection) -> (Vec<String>, Vec<Str
 
     let mut columns: Vec<String> = Vec::new();
     for table in &tables {
-        if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""))) {
+        if let Ok(mut stmt) = conn.prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            table.replace('"', "\"\"")
+        )) {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) {
                 for col in rows.flatten() {
                     if !columns.contains(&col) {
@@ -409,7 +427,10 @@ impl ShellCompleter {
             tables,
             columns,
             dot_commands: vec![
-                ".quit".into(), ".exit".into(), ".tables".into(), ".schema".into(),
+                ".quit".into(),
+                ".exit".into(),
+                ".tables".into(),
+                ".schema".into(),
             ],
         }
     }
@@ -428,7 +449,9 @@ impl rustyline::completion::Completer for ShellCompleter {
 
         // Dot commands
         if before.starts_with('.') {
-            let matches: Vec<String> = self.dot_commands.iter()
+            let matches: Vec<String> = self
+                .dot_commands
+                .iter()
                 .filter(|c| c.starts_with(before))
                 .cloned()
                 .collect();
@@ -436,7 +459,8 @@ impl rustyline::completion::Completer for ShellCompleter {
         }
 
         // Find the word being typed
-        let word_start = before.rfind(|c: char| c.is_whitespace() || c == '(' || c == ',')
+        let word_start = before
+            .rfind(|c: char| c.is_whitespace() || c == '(' || c == ',')
             .map(|i| i + 1)
             .unwrap_or(0);
         let partial = &before[word_start..];
@@ -472,12 +496,13 @@ impl rustyline::completion::Completer for ShellCompleter {
         }
 
         // SQL keywords as fallback
-        let keywords = ["SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE",
-            "CREATE", "DROP", "ALTER", "INDEX", "TABLE", "INTO", "VALUES",
-            "SET", "AND", "OR", "NOT", "NULL", "ORDER", "BY", "GROUP",
-            "HAVING", "LIMIT", "OFFSET", "JOIN", "LEFT", "INNER", "ON",
-            "AS", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX",
-            "BEGIN", "COMMIT", "ROLLBACK", "PRAGMA", "EXPLAIN"];
+        let keywords = [
+            "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+            "INDEX", "TABLE", "INTO", "VALUES", "SET", "AND", "OR", "NOT", "NULL", "ORDER", "BY",
+            "GROUP", "HAVING", "LIMIT", "OFFSET", "JOIN", "LEFT", "INNER", "ON", "AS", "DISTINCT",
+            "COUNT", "SUM", "AVG", "MIN", "MAX", "BEGIN", "COMMIT", "ROLLBACK", "PRAGMA",
+            "EXPLAIN",
+        ];
         for kw in &keywords {
             if kw.starts_with(&partial_upper) && !matches.iter().any(|m| m.to_uppercase() == *kw) {
                 matches.push(kw.to_string());
@@ -523,19 +548,21 @@ fn cmd_shell(
     let is_tty = atty::is(atty::Stream::Stdin);
 
     if is_tty {
-        let config = rustyline::Config::builder()
-            .auto_add_history(true)
-            .build();
-        let mut rl = rustyline::Editor::with_config(config)
-            .context("failed to create readline editor")?;
+        let config = rustyline::Config::builder().auto_add_history(true).build();
+        let mut rl =
+            rustyline::Editor::with_config(config).context("failed to create readline editor")?;
         rl.set_helper(Some(completer));
 
         loop {
             match rl.readline("turbolite> ") {
                 Ok(line) => {
                     let trimmed = line.trim();
-                    if trimmed.is_empty() { continue; }
-                    if trimmed == ".quit" || trimmed == ".exit" { break; }
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed == ".quit" || trimmed == ".exit" {
+                        break;
+                    }
                     execute_shell_line(&conn, trimmed);
                 }
                 Err(rustyline::error::ReadlineError::Eof) => {
@@ -561,8 +588,12 @@ fn cmd_shell(
                 break;
             }
             let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
-            if trimmed == ".quit" || trimmed == ".exit" { break; }
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == ".quit" || trimmed == ".exit" {
+                break;
+            }
             execute_shell_line(&conn, trimmed);
         }
     }
@@ -674,7 +705,13 @@ fn cmd_download(
     threads: u32,
 ) -> Result<()> {
     let (vfs, _runtime) = build_with_prefetch_threads(
-        cache_dir, Some(bucket), prefix, endpoint, region, true, threads,
+        cache_dir,
+        Some(bucket),
+        prefix,
+        endpoint,
+        region,
+        true,
+        threads,
     )?;
     let vfs_name = format!("turbolite-download-{}", std::process::id());
     let (shared, conn) = open_shared(&db, vfs, &vfs_name)?;
@@ -696,9 +733,7 @@ fn cmd_download(
 
     for table in &tables {
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
-        let _: i64 = conn
-            .query_row(&sql, [], |row| row.get(0))
-            .unwrap_or(0);
+        let _: i64 = conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0);
     }
 
     println!("download: {} tables, {} groups", tables.len(), total_groups);
@@ -719,7 +754,10 @@ fn build_with_prefetch_threads(
     let config = TurboliteConfig {
         cache_dir,
         read_only,
-        prefetch: PrefetchConfig { threads: prefetch_threads, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: prefetch_threads,
+            ..Default::default()
+        },
         ..Default::default()
     };
     match bucket {
@@ -763,7 +801,8 @@ fn cmd_validate(
     let (shared, conn) = open_shared(&db, vfs, &vfs_name)?;
 
     println!("validating manifest...");
-    let result = shared.validate()
+    let result = shared
+        .validate()
         .map_err(|e| anyhow!("validate failed: {}", e))?;
 
     println!(
@@ -802,7 +841,10 @@ fn cmd_validate(
         }
     } else {
         println!("\nvalidating data...");
-        println!("  page groups:       {}/{} decode ok", result.page_groups_present, result.page_groups_total);
+        println!(
+            "  page groups:       {}/{} decode ok",
+            result.page_groups_present, result.page_groups_total
+        );
     }
 
     println!("\nvalidating database...");
@@ -837,8 +879,8 @@ fn cmd_export(
 
     // Open a plain SQLite destination (no VFS) and use the backup API
     // to copy all pages. This produces a standard SQLite file.
-    let mut dst_conn = rusqlite::Connection::open(&output)
-        .context("failed to create output file")?;
+    let mut dst_conn =
+        rusqlite::Connection::open(&output).context("failed to create output file")?;
 
     let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
         .context("failed to initialize backup")?;
@@ -885,8 +927,14 @@ fn cmd_import(
 
     let prefix_str = prefix.unwrap_or_default();
     let config = TurboliteConfig {
-        cache: CacheConfig { pages_per_group, ..Default::default() },
-        compression: CompressionConfig { level: compression_level, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group,
+            ..Default::default()
+        },
+        compression: CompressionConfig {
+            level: compression_level,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -933,7 +981,9 @@ fn main() -> Result<()> {
             println!("  Shell completions:");
             println!("    bash:  eval \"$(turbolite completions bash)\"");
             println!("    zsh:   eval \"$(turbolite completions zsh)\"");
-            println!("    fish:  turbolite completions fish > ~/.config/fish/completions/turbolite.fish");
+            println!(
+                "    fish:  turbolite completions fish > ~/.config/fish/completions/turbolite.fish"
+            );
             println!();
             println!("  Add the line for your shell to your profile (~/.bashrc, ~/.zshrc, etc.)");
             println!("  to enable tab completion for turbolite commands and flags.");
@@ -946,26 +996,77 @@ fn main() -> Result<()> {
                 &mut std::io::stdout(),
             );
         }
-        Commands::Info { db, bucket, prefix, endpoint, region, cache_dir } => {
+        Commands::Info {
+            db,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            cache_dir,
+        } => {
             cmd_info(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
-        Commands::Shell { db, bucket, prefix, endpoint, region, cache_dir, read_only } => {
+        Commands::Shell {
+            db,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            cache_dir,
+            read_only,
+        } => {
             cmd_shell(db, bucket, prefix, endpoint, region, cache_dir, read_only)?;
         }
-        Commands::Download { db, bucket, prefix, endpoint, region, cache_dir, threads } => {
+        Commands::Download {
+            db,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            cache_dir,
+            threads,
+        } => {
             cmd_download(db, bucket, prefix, endpoint, region, cache_dir, threads)?;
         }
-        Commands::Validate { db, bucket, prefix, endpoint, region, cache_dir } => {
+        Commands::Validate {
+            db,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            cache_dir,
+        } => {
             cmd_validate(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
-        Commands::Export { db, output, bucket, prefix, endpoint, region, cache_dir } => {
+        Commands::Export {
+            db,
+            output,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            cache_dir,
+        } => {
             cmd_export(db, output, bucket, prefix, endpoint, region, cache_dir)?;
         }
         Commands::Import {
-            input, bucket, prefix, endpoint, region,
-            pages_per_group, compression_level,
+            input,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            pages_per_group,
+            compression_level,
         } => {
-            cmd_import(input, bucket, prefix, endpoint, region, pages_per_group, compression_level)?;
+            cmd_import(
+                input,
+                bucket,
+                prefix,
+                endpoint,
+                region,
+                pages_per_group,
+                compression_level,
+            )?;
         }
     }
 

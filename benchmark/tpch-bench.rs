@@ -13,11 +13,11 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{CompressionConfig, TurboliteConfig, TurboliteVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
+use turbolite::tiered::{CompressionConfig, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -81,7 +81,9 @@ fn endpoint_url() -> String {
 }
 
 fn percentile(latencies: &[f64], p: f64) -> f64 {
-    if latencies.is_empty() { return 0.0; }
+    if latencies.is_empty() {
+        return 0.0;
+    }
     let mut sorted = latencies.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((p * sorted.len() as f64) as usize).min(sorted.len() - 1);
@@ -92,7 +94,9 @@ fn format_number(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::new();
     for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { result.push(','); }
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
         result.push(ch);
     }
     result.chars().rev().collect()
@@ -107,20 +111,29 @@ struct BenchResult {
 impl BenchResult {
     fn ops_per_sec(&self) -> f64 {
         let total_secs: f64 = self.latencies_us.iter().sum::<f64>() / 1_000_000.0;
-        if total_secs == 0.0 { return 0.0; }
+        if total_secs == 0.0 {
+            return 0.0;
+        }
         self.ops as f64 / total_secs
     }
-    fn p50(&self) -> f64 { percentile(&self.latencies_us, 0.5) }
-    fn p90(&self) -> f64 { percentile(&self.latencies_us, 0.9) }
-    fn p99(&self) -> f64 { percentile(&self.latencies_us, 0.99) }
+    fn p50(&self) -> f64 {
+        percentile(&self.latencies_us, 0.5)
+    }
+    fn p90(&self) -> f64 {
+        percentile(&self.latencies_us, 0.9)
+    }
+    fn p99(&self) -> f64 {
+        percentile(&self.latencies_us, 0.99)
+    }
 }
 
 fn open_reader(db_name: &str, vfs_name: &str, cache_pages: i64) -> Connection {
-    let conn = Connection::open_with_flags_and_vfs(
-        db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-    ).expect("failed to open reader");
+    let conn =
+        Connection::open_with_flags_and_vfs(db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name)
+            .expect("failed to open reader");
     if cache_pages > 0 {
-        conn.execute(&format!("PRAGMA cache_size = {}", cache_pages), []).unwrap();
+        conn.execute(&format!("PRAGMA cache_size = {}", cache_pages), [])
+            .unwrap();
     }
     conn
 }
@@ -128,11 +141,20 @@ fn open_reader(db_name: &str, vfs_name: &str, cache_pages: i64) -> Connection {
 /// Build a writer config + a unique S3 prefix derived from `prefix`.
 /// The caller wires the prefix into the S3 backend.
 fn make_config(prefix: &str, cache_dir: &std::path::Path) -> (TurboliteConfig, String) {
-    let unique_prefix = format!("tpch/{}/{}", prefix,
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let unique_prefix = format!(
+        "tpch/{}/{}",
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 3, ..Default::default() },
+        compression: CompressionConfig {
+            level: 3,
+            ..Default::default()
+        },
         ..Default::default()
     };
     (config, unique_prefix)
@@ -141,7 +163,10 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path) -> (TurboliteConfig, S
 fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression: CompressionConfig { level: 3, ..Default::default() },
+        compression: CompressionConfig {
+            level: 3,
+            ..Default::default()
+        },
         read_only: true,
         ..Default::default()
     }
@@ -153,15 +178,39 @@ fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path) -> TurboliteCo
 
 const REGIONS: [&str; 5] = ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"];
 const NATIONS: [(i64, &str, i64); 25] = [
-    (0,"ALGERIA",0),(1,"ARGENTINA",1),(2,"BRAZIL",1),(3,"CANADA",1),
-    (4,"EGYPT",4),(5,"ETHIOPIA",0),(6,"FRANCE",3),(7,"GERMANY",3),
-    (8,"INDIA",2),(9,"INDONESIA",2),(10,"IRAN",4),(11,"IRAQ",4),
-    (12,"JAPAN",2),(13,"JORDAN",4),(14,"KENYA",0),(15,"MOROCCO",0),
-    (16,"MOZAMBIQUE",0),(17,"PERU",1),(18,"CHINA",2),(19,"ROMANIA",3),
-    (20,"SAUDI ARABIA",4),(21,"VIETNAM",2),(22,"RUSSIA",3),(23,"UNITED KINGDOM",3),
-    (24,"UNITED STATES",1),
+    (0, "ALGERIA", 0),
+    (1, "ARGENTINA", 1),
+    (2, "BRAZIL", 1),
+    (3, "CANADA", 1),
+    (4, "EGYPT", 4),
+    (5, "ETHIOPIA", 0),
+    (6, "FRANCE", 3),
+    (7, "GERMANY", 3),
+    (8, "INDIA", 2),
+    (9, "INDONESIA", 2),
+    (10, "IRAN", 4),
+    (11, "IRAQ", 4),
+    (12, "JAPAN", 2),
+    (13, "JORDAN", 4),
+    (14, "KENYA", 0),
+    (15, "MOROCCO", 0),
+    (16, "MOZAMBIQUE", 0),
+    (17, "PERU", 1),
+    (18, "CHINA", 2),
+    (19, "ROMANIA", 3),
+    (20, "SAUDI ARABIA", 4),
+    (21, "VIETNAM", 2),
+    (22, "RUSSIA", 3),
+    (23, "UNITED KINGDOM", 3),
+    (24, "UNITED STATES", 1),
 ];
-const SEGMENTS: [&str; 5] = ["AUTOMOBILE", "BUILDING", "FURNITURE", "HOUSEHOLD", "MACHINERY"];
+const SEGMENTS: [&str; 5] = [
+    "AUTOMOBILE",
+    "BUILDING",
+    "FURNITURE",
+    "HOUSEHOLD",
+    "MACHINERY",
+];
 const PRIORITIES: [&str; 5] = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
 const SHIP_MODES: [&str; 7] = ["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"];
 const RETURN_FLAGS: [&str; 3] = ["R", "A", "N"];
@@ -170,7 +219,9 @@ const LINE_STATUSES: [&str; 2] = ["O", "F"];
 /// Deterministic pseudo-random: hash(seed) → u64
 fn phash(seed: u64) -> u64 {
     let mut x = seed;
-    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    x = x
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;
@@ -189,8 +240,15 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     // Simplified calendar conversion
     let mut y = 1970 + days / 365;
     let mut remaining = days - (y - 1970) * 365 - leap_years_since_1970(y);
-    if remaining < 0 { y -= 1; remaining = days - (y - 1970) * 365 - leap_years_since_1970(y); }
-    let leap = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 1 } else { 0 };
+    if remaining < 0 {
+        y -= 1;
+        remaining = days - (y - 1970) * 365 - leap_years_since_1970(y);
+    }
+    let leap = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+        1
+    } else {
+        0
+    };
     let month_days = [31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut m = 0;
     while m < 12 && remaining >= month_days[m] {
@@ -236,25 +294,37 @@ fn generate_data(conn: &Connection, scale: f64) {
     let n_part = (200_000.0 * scale).max(100.0) as i64;
     let n_orders = (1_500_000.0 * scale).max(1000.0) as i64;
 
-    eprintln!("  Generating: {} suppliers, {} customers, {} parts, {} orders",
-        format_number(n_supplier as usize), format_number(n_customer as usize),
-        format_number(n_part as usize), format_number(n_orders as usize));
+    eprintln!(
+        "  Generating: {} suppliers, {} customers, {} parts, {} orders",
+        format_number(n_supplier as usize),
+        format_number(n_customer as usize),
+        format_number(n_part as usize),
+        format_number(n_orders as usize)
+    );
 
     let tx = conn.unchecked_transaction().unwrap();
 
     // Region + Nation (static)
     for (i, name) in REGIONS.iter().enumerate() {
-        tx.execute("INSERT INTO region VALUES (?1, ?2, ?3)",
-            rusqlite::params![i as i64, name, format!("region {} comment", i)]).unwrap();
+        tx.execute(
+            "INSERT INTO region VALUES (?1, ?2, ?3)",
+            rusqlite::params![i as i64, name, format!("region {} comment", i)],
+        )
+        .unwrap();
     }
     for &(key, name, rkey) in &NATIONS {
-        tx.execute("INSERT INTO nation VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![key, name, rkey, format!("nation {} comment", key)]).unwrap();
+        tx.execute(
+            "INSERT INTO nation VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![key, name, rkey, format!("nation {} comment", key)],
+        )
+        .unwrap();
     }
 
     // Supplier
     {
-        let mut stmt = tx.prepare("INSERT INTO supplier VALUES (?1,?2,?3,?4,?5,?6,?7)").unwrap();
+        let mut stmt = tx
+            .prepare("INSERT INTO supplier VALUES (?1,?2,?3,?4,?5,?6,?7)")
+            .unwrap();
         for i in 0..n_supplier {
             let h = phash(i as u64);
             stmt.execute(rusqlite::params![
@@ -262,16 +332,25 @@ fn generate_data(conn: &Connection, scale: f64) {
                 format!("Supplier#{:09}", i + 1),
                 format!("{} Street, City {}", h % 9999, h % 100),
                 (h % 25) as i64,
-                format!("{:02}-{:03}-{:03}-{:04}", h % 90 + 10, h % 1000, h % 1000, h % 10000),
+                format!(
+                    "{:02}-{:03}-{:03}-{:04}",
+                    h % 90 + 10,
+                    h % 1000,
+                    h % 1000,
+                    h % 10000
+                ),
                 (h % 200000) as f64 / 20.0 - 999.99,
                 format!("supplier comment {}", i),
-            ]).unwrap();
+            ])
+            .unwrap();
         }
     }
 
     // Customer
     {
-        let mut stmt = tx.prepare("INSERT INTO customer VALUES (?1,?2,?3,?4,?5,?6,?7,?8)").unwrap();
+        let mut stmt = tx
+            .prepare("INSERT INTO customer VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
+            .unwrap();
         for i in 0..n_customer {
             let h = phash(i as u64 + 1_000_000);
             stmt.execute(rusqlite::params![
@@ -279,17 +358,26 @@ fn generate_data(conn: &Connection, scale: f64) {
                 format!("Customer#{:09}", i + 1),
                 format!("{} Ave, Town {}", h % 9999, h % 200),
                 (h % 25) as i64,
-                format!("{:02}-{:03}-{:03}-{:04}", h % 90 + 10, h % 1000, h % 1000, h % 10000),
+                format!(
+                    "{:02}-{:03}-{:03}-{:04}",
+                    h % 90 + 10,
+                    h % 1000,
+                    h % 1000,
+                    h % 10000
+                ),
                 (h % 200000) as f64 / 20.0 - 999.99,
                 SEGMENTS[(h >> 16) as usize % 5],
                 format!("customer comment {}", i),
-            ]).unwrap();
+            ])
+            .unwrap();
         }
     }
 
     // Part
     {
-        let mut stmt = tx.prepare("INSERT INTO part VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").unwrap();
+        let mut stmt = tx
+            .prepare("INSERT INTO part VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+            .unwrap();
         for i in 0..n_part {
             let h = phash(i as u64 + 2_000_000);
             stmt.execute(rusqlite::params![
@@ -302,23 +390,28 @@ fn generate_data(conn: &Connection, scale: f64) {
                 format!("container-{}", (h >> 20) % 8),
                 (900.0 + (i as f64) / 10.0 + (h % 100) as f64),
                 format!("part comment {}", i),
-            ]).unwrap();
+            ])
+            .unwrap();
         }
     }
 
     // PartSupp (4 suppliers per part)
     {
-        let mut stmt = tx.prepare("INSERT INTO partsupp VALUES (?1,?2,?3,?4,?5)").unwrap();
+        let mut stmt = tx
+            .prepare("INSERT INTO partsupp VALUES (?1,?2,?3,?4,?5)")
+            .unwrap();
         for i in 0..n_part {
             for j in 0..4i64 {
                 let h = phash(i as u64 * 4 + j as u64 + 3_000_000);
                 let suppkey = (i * 4 + j) % n_supplier + 1;
                 stmt.execute(rusqlite::params![
-                    i + 1, suppkey,
+                    i + 1,
+                    suppkey,
                     (h % 9999 + 1) as i64,
                     (h % 100000) as f64 / 100.0,
                     format!("partsupp comment {}-{}", i, j),
-                ]).unwrap();
+                ])
+                .unwrap();
             }
         }
     }
@@ -326,8 +419,9 @@ fn generate_data(conn: &Connection, scale: f64) {
     // Orders + Lineitem
     let mut lineitem_count: i64 = 0;
     {
-        let mut ord_stmt = tx.prepare(
-            "INSERT INTO orders VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").unwrap();
+        let mut ord_stmt = tx
+            .prepare("INSERT INTO orders VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+            .unwrap();
         let mut li_stmt = tx.prepare(
             "INSERT INTO lineitem VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)").unwrap();
 
@@ -355,32 +449,49 @@ fn generate_data(conn: &Connection, scale: f64) {
                 let receipt_days = ship_days + (lh >> 40) % 31; // 0-30 days after ship
                 total += extended * (1.0 - discount) * (1.0 + tax);
 
-                li_stmt.execute(rusqlite::params![
-                    i + 1, partkey, suppkey as i64, j as i64 + 1,
-                    qty as f64, extended, discount, tax,
-                    RETURN_FLAGS[(lh >> 44) as usize % 3],
-                    LINE_STATUSES[(lh >> 46) as usize % 2],
-                    date_from_days(ship_days as i64),
-                    date_from_days(commit_days as i64),
-                    date_from_days(receipt_days as i64),
-                    "DELIVER IN PERSON",
-                    SHIP_MODES[(lh >> 48) as usize % 7],
-                    format!("lineitem comment {}-{}", i, j),
-                ]).unwrap();
+                li_stmt
+                    .execute(rusqlite::params![
+                        i + 1,
+                        partkey,
+                        suppkey as i64,
+                        j as i64 + 1,
+                        qty as f64,
+                        extended,
+                        discount,
+                        tax,
+                        RETURN_FLAGS[(lh >> 44) as usize % 3],
+                        LINE_STATUSES[(lh >> 46) as usize % 2],
+                        date_from_days(ship_days as i64),
+                        date_from_days(commit_days as i64),
+                        date_from_days(receipt_days as i64),
+                        "DELIVER IN PERSON",
+                        SHIP_MODES[(lh >> 48) as usize % 7],
+                        format!("lineitem comment {}-{}", i, j),
+                    ])
+                    .unwrap();
                 lineitem_count += 1;
             }
 
-            ord_stmt.execute(rusqlite::params![
-                i + 1, custkey, status, total, orderdate,
-                PRIORITIES[(h >> 28) as usize % 5],
-                format!("Clerk#{:09}", (h >> 32) % 1000 + 1),
-                0i64,
-                format!("order comment {}", i),
-            ]).unwrap();
+            ord_stmt
+                .execute(rusqlite::params![
+                    i + 1,
+                    custkey,
+                    status,
+                    total,
+                    orderdate,
+                    PRIORITIES[(h >> 28) as usize % 5],
+                    format!("Clerk#{:09}", (h >> 32) % 1000 + 1),
+                    0i64,
+                    format!("order comment {}", i),
+                ])
+                .unwrap();
         }
     }
     tx.commit().unwrap();
-    eprintln!("  Generated {} lineitem rows", format_number(lineitem_count as usize));
+    eprintln!(
+        "  Generated {} lineitem rows",
+        format_number(lineitem_count as usize)
+    );
 }
 
 // =========================================================================
@@ -437,7 +548,8 @@ GROUP BY n_name ORDER BY n_name";
 const Q_POINT: &str = "SELECT * FROM orders WHERE o_orderkey = ?1";
 
 /// Range scan on lineitem by shipdate
-const Q_RANGE: &str = "SELECT COUNT(*), SUM(l_extendedprice) FROM lineitem WHERE l_shipdate BETWEEN ?1 AND ?2";
+const Q_RANGE: &str =
+    "SELECT COUNT(*), SUM(l_extendedprice) FROM lineitem WHERE l_shipdate BETWEEN ?1 AND ?2";
 
 struct QueryDef {
     label: &'static str,
@@ -445,11 +557,26 @@ struct QueryDef {
 }
 
 const QUERIES: [QueryDef; 5] = [
-    QueryDef { label: "Q1 scan+agg", sql: Q1 },
-    QueryDef { label: "Q3 3-join", sql: Q3 },
-    QueryDef { label: "Q5 6-join", sql: Q5 },
-    QueryDef { label: "Q6 filter", sql: Q6 },
-    QueryDef { label: "Q9 6-join", sql: Q9 },
+    QueryDef {
+        label: "Q1 scan+agg",
+        sql: Q1,
+    },
+    QueryDef {
+        label: "Q3 3-join",
+        sql: Q3,
+    },
+    QueryDef {
+        label: "Q5 6-join",
+        sql: Q5,
+    },
+    QueryDef {
+        label: "Q6 filter",
+        sql: Q6,
+    },
+    QueryDef {
+        label: "Q9 6-join",
+        sql: Q9,
+    },
 ];
 
 fn bench_query(conn: &Connection, label: &str, sql: &str, iterations: usize) -> BenchResult {
@@ -461,12 +588,21 @@ fn bench_query(conn: &Connection, label: &str, sql: &str, iterations: usize) -> 
             .query_map([], |row| {
                 let n = row.as_ref().column_count();
                 let mut vals = Vec::with_capacity(n);
-                for i in 0..n { vals.push(row.get::<_, rusqlite::types::Value>(i)?); }
+                for i in 0..n {
+                    vals.push(row.get::<_, rusqlite::types::Value>(i)?);
+                }
                 Ok(vals)
-            }).unwrap().map(|r| r.unwrap()).collect();
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         latencies.push(start.elapsed().as_micros() as f64);
     }
-    BenchResult { label: label.to_string(), ops: iterations, latencies_us: latencies }
+    BenchResult {
+        label: label.to_string(),
+        ops: iterations,
+        latencies_us: latencies,
+    }
 }
 
 fn bench_point(conn: &Connection, n_orders: i64, iterations: usize, label: &str) -> BenchResult {
@@ -475,11 +611,16 @@ fn bench_point(conn: &Connection, n_orders: i64, iterations: usize, label: &str)
     for _ in 0..iterations {
         let orderkey = (idx % n_orders as u64) as i64 + 1;
         let start = Instant::now();
-        conn.query_row(Q_POINT, [orderkey], |_row| Ok(())).expect("point lookup failed");
+        conn.query_row(Q_POINT, [orderkey], |_row| Ok(()))
+            .expect("point lookup failed");
         latencies.push(start.elapsed().as_micros() as f64);
         idx = phash(idx) % n_orders as u64;
     }
-    BenchResult { label: label.to_string(), ops: iterations, latencies_us: latencies }
+    BenchResult {
+        label: label.to_string(),
+        ops: iterations,
+        latencies_us: latencies,
+    }
 }
 
 fn bench_range(conn: &Connection, iterations: usize, label: &str) -> BenchResult {
@@ -489,16 +630,24 @@ fn bench_range(conn: &Connection, iterations: usize, label: &str) -> BenchResult
         let d1 = date_from_days(day_offset as i64);
         let d2 = date_from_days(day_offset as i64 + 30);
         let start = Instant::now();
-        conn.query_row(Q_RANGE, [&d1, &d2], |_row| Ok(())).expect("range query failed");
+        conn.query_row(Q_RANGE, [&d1, &d2], |_row| Ok(()))
+            .expect("range query failed");
         latencies.push(start.elapsed().as_micros() as f64);
         day_offset = (day_offset + 60) % 2400;
     }
-    BenchResult { label: label.to_string(), ops: iterations, latencies_us: latencies }
+    BenchResult {
+        label: label.to_string(),
+        ops: iterations,
+        latencies_us: latencies,
+    }
 }
 
 fn bench_cold_query(
     rt: &tokio::runtime::Handle,
-    s3_prefix: &str, db_name: &str, label: &str, sql: &str,
+    s3_prefix: &str,
+    db_name: &str,
+    label: &str,
+    sql: &str,
     iterations: usize,
 ) -> BenchResult {
     let mut latencies = Vec::with_capacity(iterations);
@@ -511,7 +660,8 @@ fn bench_cold_query(
             config,
             s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt.clone(),
-        ).expect("cold VFS");
+        )
+        .expect("cold VFS");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let start = Instant::now();
         let conn = open_reader(db_name, &vfs_name, 1);
@@ -520,14 +670,23 @@ fn bench_cold_query(
             .query_map([], |row| {
                 let n = row.as_ref().column_count();
                 let mut vals = Vec::with_capacity(n);
-                for i in 0..n { vals.push(row.get::<_, rusqlite::types::Value>(i)?); }
+                for i in 0..n {
+                    vals.push(row.get::<_, rusqlite::types::Value>(i)?);
+                }
                 Ok(vals)
-            }).unwrap().map(|r| r.unwrap()).collect();
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
         latencies.push(start.elapsed().as_micros() as f64);
         drop(stmt);
         drop(conn);
     }
-    BenchResult { label: label.to_string(), ops: iterations, latencies_us: latencies }
+    BenchResult {
+        label: label.to_string(),
+        ops: iterations,
+        latencies_us: latencies,
+    }
 }
 
 // =========================================================================
@@ -546,7 +705,10 @@ fn main() {
     println!("Scale factor: {} (~{:.0} MB estimated)", scale, est_db_mb);
     println!("Bucket: {}", test_bucket());
     println!("Endpoint: {}", endpoint_url());
-    println!("Iterations: {} hot/warm, {} cold", cli.iterations, cli.cold_iterations);
+    println!(
+        "Iterations: {} hot/warm, {} cold",
+        cli.iterations, cli.cold_iterations
+    );
     println!();
 
     // Setup: runtime + S3 backend + writer VFS
@@ -561,7 +723,8 @@ fn main() {
         config,
         writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
-    ).expect("failed to create VFS");
+    )
+    .expect("failed to create VFS");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_name = format!("tpch_sf{}.db", scale);
@@ -569,9 +732,13 @@ fn main() {
         &db_name,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).expect("failed to open connection");
+    )
+    .expect("failed to open connection");
 
-    conn.execute_batch("PRAGMA page_size=65536; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    conn.execute_batch(
+        "PRAGMA page_size=65536; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;",
+    )
+    .unwrap();
 
     // Schema
     let schema_start = Instant::now();
@@ -586,7 +753,8 @@ fn main() {
 
     // Checkpoint
     let cp_start = Instant::now();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     println!("Checkpoint:  {:.2}s", cp_start.elapsed().as_secs_f64());
 
     // =====================================================================
@@ -595,7 +763,12 @@ fn main() {
     println!("\n--- HOT (everything in RAM) ---");
     let mut hot_results: Vec<BenchResult> = Vec::new();
     for q in &QUERIES {
-        hot_results.push(bench_query(&conn, &format!("Hot {}", q.label), q.sql, cli.iterations));
+        hot_results.push(bench_query(
+            &conn,
+            &format!("Hot {}", q.label),
+            q.sql,
+            cli.iterations,
+        ));
     }
     hot_results.push(bench_point(&conn, n_orders, cli.iterations, "Hot point"));
     hot_results.push(bench_range(&conn, cli.iterations, "Hot range"));
@@ -612,16 +785,27 @@ fn main() {
         warm_config,
         warm_s3 as Arc<dyn hadb_storage::StorageBackend>,
         rt_handle.clone(),
-    ).expect("warm VFS");
+    )
+    .expect("warm VFS");
     turbolite::tiered::register(&warm_vfs_name, warm_vfs).unwrap();
 
     let cache_pages = (est_db_mb * 1024.0 * 1024.0 * 0.2 / 65536.0) as i64;
     let warm_conn = open_reader(&db_name, &warm_vfs_name, cache_pages);
     let mut warm_results: Vec<BenchResult> = Vec::new();
     for q in &QUERIES {
-        warm_results.push(bench_query(&warm_conn, &format!("Warm {}", q.label), q.sql, cli.iterations));
+        warm_results.push(bench_query(
+            &warm_conn,
+            &format!("Warm {}", q.label),
+            q.sql,
+            cli.iterations,
+        ));
     }
-    warm_results.push(bench_point(&warm_conn, n_orders, cli.iterations, "Warm point"));
+    warm_results.push(bench_point(
+        &warm_conn,
+        n_orders,
+        cli.iterations,
+        "Warm point",
+    ));
     warm_results.push(bench_range(&warm_conn, cli.iterations, "Warm range"));
     drop(warm_conn);
 
@@ -632,7 +816,11 @@ fn main() {
     let mut cold_results: Vec<BenchResult> = Vec::new();
     for q in &QUERIES {
         cold_results.push(bench_cold_query(
-            &rt_handle, &s3_prefix, &db_name, &format!("Cold {}", q.label), q.sql,
+            &rt_handle,
+            &s3_prefix,
+            &db_name,
+            &format!("Cold {}", q.label),
+            q.sql,
             cli.cold_iterations,
         ));
     }
@@ -650,7 +838,8 @@ fn main() {
                 cfg,
                 s3 as Arc<dyn hadb_storage::StorageBackend>,
                 rt_handle.clone(),
-            ).expect("cold VFS");
+            )
+            .expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -659,7 +848,11 @@ fn main() {
             drop(c);
             idx = phash(idx) % n_orders as u64;
         }
-        cold_results.push(BenchResult { label: "Cold point".to_string(), ops: cli.cold_iterations, latencies_us: latencies });
+        cold_results.push(BenchResult {
+            label: "Cold point".to_string(),
+            ops: cli.cold_iterations,
+            latencies_us: latencies,
+        });
     }
     // Cold range
     {
@@ -676,7 +869,8 @@ fn main() {
                 cfg,
                 s3 as Arc<dyn hadb_storage::StorageBackend>,
                 rt_handle.clone(),
-            ).expect("cold VFS");
+            )
+            .expect("cold VFS");
             turbolite::tiered::register(&vn, v).unwrap();
             let start = Instant::now();
             let c = open_reader(&db_name, &vn, 1);
@@ -685,21 +879,40 @@ fn main() {
             drop(c);
             day_offset = (day_offset + 60) % 2400;
         }
-        cold_results.push(BenchResult { label: "Cold range".to_string(), ops: cli.cold_iterations, latencies_us: latencies });
+        cold_results.push(BenchResult {
+            label: "Cold range".to_string(),
+            ops: cli.cold_iterations,
+            latencies_us: latencies,
+        });
     }
 
     // =====================================================================
     // Results
     // =====================================================================
     println!("\n=== Results (SF {}, ~{:.0} MB) ===\n", scale, est_db_mb);
-    println!("  {:<20} {:>10} {:>10} {:>10} {:>10}",
-        "", "ops/sec", "p50 (us)", "p90 (us)", "p99 (us)");
-    println!("  {:-<20} {:->10} {:->10} {:->10} {:->10}", "", "", "", "", "");
+    println!(
+        "  {:<20} {:>10} {:>10} {:>10} {:>10}",
+        "", "ops/sec", "p50 (us)", "p90 (us)", "p99 (us)"
+    );
+    println!(
+        "  {:-<20} {:->10} {:->10} {:->10} {:->10}",
+        "", "", "", "", ""
+    );
 
-    for (label, results) in [("HOT", &hot_results), ("WARM", &warm_results), ("COLD", &cold_results)] {
+    for (label, results) in [
+        ("HOT", &hot_results),
+        ("WARM", &warm_results),
+        ("COLD", &cold_results),
+    ] {
         for r in results {
-            println!("  {:<20} {:>10} {:>10.0} {:>10.0} {:>10.0}",
-                r.label, format_number(r.ops_per_sec() as usize), r.p50(), r.p90(), r.p99());
+            println!(
+                "  {:<20} {:>10} {:>10.0} {:>10.0} {:>10.0}",
+                r.label,
+                format_number(r.ops_per_sec() as usize),
+                r.p50(),
+                r.p90(),
+                r.p99()
+            );
         }
         let _ = label;
         println!();
@@ -716,7 +929,10 @@ fn main() {
         let cleanup_cache = TempDir::new().unwrap();
         let cleanup_config = TurboliteConfig {
             cache_dir: cleanup_cache.path().to_path_buf(),
-            compression: CompressionConfig { level: 3, ..Default::default() },
+            compression: CompressionConfig {
+                level: 3,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
@@ -724,7 +940,8 @@ fn main() {
             cleanup_config,
             cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
             rt_handle.clone(),
-        ).expect("cleanup VFS");
+        )
+        .expect("cleanup VFS");
         cleanup_vfs.destroy_remote().expect("remote cleanup failed");
         eprintln!("done");
     }
