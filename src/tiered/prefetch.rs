@@ -69,8 +69,7 @@ impl PrefetchPool {
         // is calling `wait_idle`. Sized to comfortably absorb a wake-up backlog
         // (`num_workers * 4`); workers `try_send` and drop on full because
         // `in_flight` (atomic) is the authoritative outstanding-job count.
-        let (done_tx, done_rx) =
-            flume::bounded::<u64>(num_workers as usize * 4);
+        let (done_tx, done_rx) = flume::bounded::<u64>(num_workers as usize * 4);
         let in_flight = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(num_workers as usize);
         let shutdown = Arc::new(AtomicBool::new(false));

@@ -50,7 +50,6 @@ pub struct Manifest {
     pub strategy: GroupingStrategy,
 
     // B-tree-aware page groups
-
     /// Explicit page-to-group mapping. group_pages[gid] = ordered list of page numbers
     /// in that group. Empty for Positional strategy (computed on the fly).
     #[serde(default)]
@@ -161,9 +160,8 @@ pub(crate) fn default_pages_per_group() -> u32 {
 pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> io::Result<()> {
     let path = cache_dir.join("manifest.msgpack");
     let tmp = cache_dir.join("manifest.msgpack.tmp");
-    let data = rmp_serde::to_vec(manifest).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("serialize manifest: {e}"))
-    })?;
+    let data = rmp_serde::to_vec(manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize manifest: {e}")))?;
     fs::write(&tmp, &data)?;
     fs::rename(&tmp, &path)?;
     Ok(())
@@ -252,7 +250,10 @@ pub(crate) fn load_dirty_groups(cache_dir: &Path) -> io::Result<Vec<u64>> {
         Err(e) => return Err(e),
     };
     let dirty: Vec<u64> = rmp_serde::from_slice(&data).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("deserialize dirty_groups: {e}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("deserialize dirty_groups: {e}"),
+        )
     })?;
     Ok(dirty)
 }
@@ -314,10 +315,13 @@ impl Manifest {
 
         for (gid, pages) in self.group_pages.iter().enumerate() {
             for (idx, &page_num) in pages.iter().enumerate() {
-                self.page_index.insert(page_num, PageLocation {
-                    group_id: gid as u64,
-                    index: idx as u32,
-                });
+                self.page_index.insert(
+                    page_num,
+                    PageLocation {
+                        group_id: gid as u64,
+                        index: idx as u32,
+                    },
+                );
             }
         }
         // Build btree_groups + page_to_tree_name + tree_name_to_groups from B-tree manifest entries
@@ -335,7 +339,8 @@ impl Manifest {
                 }
             }
             // Tree name -> group IDs
-            self.tree_name_to_groups.insert(entry.name.clone(), entry.group_ids.clone());
+            self.tree_name_to_groups
+                .insert(entry.name.clone(), entry.group_ids.clone());
         }
     }
 
@@ -354,9 +359,7 @@ impl Manifest {
                     index: (page_num % ppg) as u32,
                 })
             }
-            GroupingStrategy::BTreeAware => {
-                self.page_index.get(&page_num).copied()
-            }
+            GroupingStrategy::BTreeAware => self.page_index.get(&page_num).copied(),
         }
     }
 
@@ -371,11 +374,12 @@ impl Manifest {
                 let end = std::cmp::min(start + ppg, self.page_count);
                 Cow::Owned((start..end).collect())
             }
-            GroupingStrategy::BTreeAware => {
-                Cow::Borrowed(self.group_pages.get(gid as usize)
+            GroupingStrategy::BTreeAware => Cow::Borrowed(
+                self.group_pages
+                    .get(gid as usize)
                     .expect("BTreeAware group must exist in group_pages")
-                    .as_slice())
-            }
+                    .as_slice(),
+            ),
         }
     }
 
@@ -387,9 +391,11 @@ impl Manifest {
                 let start = gid * ppg;
                 std::cmp::min(ppg, self.page_count.saturating_sub(start)) as usize
             }
-            GroupingStrategy::BTreeAware => {
-                self.group_pages.get(gid as usize).map(|v| v.len()).unwrap_or(0)
-            }
+            GroupingStrategy::BTreeAware => self
+                .group_pages
+                .get(gid as usize)
+                .map(|v| v.len())
+                .unwrap_or(0),
         }
     }
 
@@ -446,4 +452,3 @@ pub(crate) fn dirty_frames_for_group(
 #[cfg(test)]
 #[path = "test_manifest.rs"]
 mod tests;
-

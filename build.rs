@@ -14,7 +14,10 @@ fn main() {
         cc::Build::new()
             .file("src/ext_entry.c")
             .include("vendor/sqlite3")
-            .define("TURBOLITE_VERSION", Some(format!("\"{}\"", version).as_str()))
+            .define(
+                "TURBOLITE_VERSION",
+                Some(format!("\"{}\"", version).as_str()),
+            )
             .warnings(true)
             .compile("ext_entry");
 
@@ -25,9 +28,7 @@ fn main() {
             // -exported_symbol prevents dead-stripping of the entry point.
             // -undefined dynamic_lookup lets sqlite3_create_function_v2 etc.
             // resolve at dlopen time from the host process.
-            println!(
-                "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_sqlite3_turbolite_init"
-            );
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_sqlite3_turbolite_init");
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
         } else {

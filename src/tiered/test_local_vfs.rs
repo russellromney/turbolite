@@ -63,8 +63,10 @@ fn test_local_vfs_sqlite_roundtrip() {
     let conn = rusqlite::Connection::open(&db_path).expect("open");
     conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello')", []).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", [])
+        .unwrap();
 
     let val: String = conn
         .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
@@ -80,7 +82,11 @@ fn test_local_vfs_with_compression() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { compression: true, compression_level: 3, ..Default::default() },
+            cache: CacheConfig {
+                compression: true,
+                compression_level: 3,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_cmp_{}", std::process::id());
@@ -90,16 +96,23 @@ fn test_local_vfs_with_compression() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'compressed')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'compressed')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     // Cold reopen with compression
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { compression: true, compression_level: 3, ..Default::default() },
+            cache: CacheConfig {
+                compression: true,
+                compression_level: 3,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_cmp2_{}", std::process::id());
@@ -108,7 +121,9 @@ fn test_local_vfs_with_compression() {
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0)).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(val, "compressed");
     }
 }
@@ -130,30 +145,48 @@ fn test_local_vfs_schema_changes() {
     conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
 
     // Multiple tables
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-    conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)", []).unwrap();
-    conn.execute("CREATE INDEX idx_posts_user ON posts(user_id)", []).unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX idx_posts_user ON posts(user_id)", [])
+        .unwrap();
 
     // Insert data
-    conn.execute("INSERT INTO users VALUES (1, 'alice')", []).unwrap();
-    conn.execute("INSERT INTO users VALUES (2, 'bob')", []).unwrap();
-    conn.execute("INSERT INTO posts VALUES (1, 1, 'hello world')", []).unwrap();
-    conn.execute("INSERT INTO posts VALUES (2, 1, 'second post')", []).unwrap();
-    conn.execute("INSERT INTO posts VALUES (3, 2, 'bob post')", []).unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'alice')", [])
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'bob')", [])
+        .unwrap();
+    conn.execute("INSERT INTO posts VALUES (1, 1, 'hello world')", [])
+        .unwrap();
+    conn.execute("INSERT INTO posts VALUES (2, 1, 'second post')", [])
+        .unwrap();
+    conn.execute("INSERT INTO posts VALUES (3, 2, 'bob post')", [])
+        .unwrap();
 
     // Query with index
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM posts WHERE user_id = 1", [], |row| row.get(0)
-    ).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts WHERE user_id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     assert_eq!(count, 2);
 
     // Alter table
-    conn.execute("ALTER TABLE users ADD COLUMN email TEXT", []).unwrap();
-    conn.execute("UPDATE users SET email = 'alice@example.com' WHERE id = 1", []).unwrap();
+    conn.execute("ALTER TABLE users ADD COLUMN email TEXT", [])
+        .unwrap();
+    conn.execute(
+        "UPDATE users SET email = 'alice@example.com' WHERE id = 1",
+        [],
+    )
+    .unwrap();
 
-    let email: String = conn.query_row(
-        "SELECT email FROM users WHERE id = 1", [], |row| row.get(0)
-    ).unwrap();
+    let email: String = conn
+        .query_row("SELECT email FROM users WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
     assert_eq!(email, "alice@example.com");
 }
 
@@ -175,7 +208,10 @@ fn test_local_vfs_cloud_methods_error() {
 
     // flush_to_storage uses StorageClient abstraction, works on all backends
     let flush_result = vfs.flush_to_storage();
-    assert!(flush_result.is_ok(), "flush_to_storage should be a no-op on local VFS");
+    assert!(
+        flush_result.is_ok(),
+        "flush_to_storage should be a no-op on local VFS"
+    );
 
     let destroy_err = vfs.destroy_s3();
     assert!(destroy_err.is_err());
@@ -212,11 +248,17 @@ fn test_local_vfs_recover_from_page_groups() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
         for i in 0..100 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("value_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("value_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -228,7 +270,10 @@ fn test_local_vfs_recover_from_page_groups() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|ext| ext != "tmp").unwrap_or(true))
         .collect();
-    assert!(!pg_files.is_empty(), "page group files should exist in p/d/");
+    assert!(
+        !pg_files.is_empty(),
+        "page group files should exist in p/d/"
+    );
 
     // Phase 2: delete cache file + bitmap (simulate cache loss), reopen
     let _ = std::fs::remove_file(dir.path().join("data.cache"));
@@ -249,12 +294,17 @@ fn test_local_vfs_recover_from_page_groups() {
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
         // All data should be recoverable from local page groups
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 100, "all 100 rows should be recovered from page groups");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 100,
+            "all 100 rows should be recovered from page groups"
+        );
 
-        let val: String = conn.query_row(
-            "SELECT val FROM t WHERE id = 42", [], |row| row.get(0)
-        ).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 42", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(val, "value_42");
     }
 }
@@ -276,24 +326,37 @@ fn test_local_vfs_multi_checkpoint() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         // Checkpoint 1: insert 50 rows
         for i in 0..50 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v1_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v1_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Checkpoint 2: insert 50 more rows + update some existing
         for i in 50..100 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v2_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v2_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute("UPDATE t SET val = 'updated' WHERE id = 0", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'updated' WHERE id = 0", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Checkpoint 3: delete some rows
         conn.execute("DELETE FROM t WHERE id >= 80", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -317,15 +380,26 @@ fn test_local_vfs_multi_checkpoint() {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
 
         // Should see 80 rows (100 inserted - 20 deleted)
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 80, "should have 80 rows after multi-checkpoint recovery");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 80,
+            "should have 80 rows after multi-checkpoint recovery"
+        );
 
         // Row 0 should be updated
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 0", [], |row| row.get(0)).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 0", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(val, "updated");
 
         // Rows 80-99 should not exist
-        let high: i64 = conn.query_row("SELECT COUNT(*) FROM t WHERE id >= 80", [], |row| row.get(0)).unwrap();
+        let high: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE id >= 80", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(high, 0, "deleted rows should not exist");
     }
 }
@@ -348,9 +422,12 @@ fn test_local_vfs_checkpoint_reopen() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'persisted')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'persisted')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     // Cold reopen
@@ -393,7 +470,11 @@ fn test_local_vfs_override_write_cold_read() {
             cache_dir: dir.path().to_path_buf(),
             // high threshold: everything goes to override path
             // disable auto-compact
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_w_{}", id);
@@ -403,16 +484,23 @@ fn test_local_vfs_override_write_cold_read() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'override_test')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'override_test')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     // Cold reopen
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_r_{}", id);
@@ -441,7 +529,11 @@ fn test_local_vfs_override_then_full_rewrite() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr1_{}", id);
@@ -451,9 +543,12 @@ fn test_local_vfs_override_then_full_rewrite() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'first')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     // Write phase 2: update to different value (full rewrite, threshold=0)
@@ -461,7 +556,11 @@ fn test_local_vfs_override_then_full_rewrite() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // back to default, full rewrite
-            cache: CacheConfig { override_threshold: 0, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 0,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr2_{}", id);
@@ -470,8 +569,10 @@ fn test_local_vfs_override_then_full_rewrite() {
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
-        conn.execute("UPDATE t SET val = 'final' WHERE id = 1", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'final' WHERE id = 1", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
     }
 
     // Cold reopen: verify final value
@@ -507,7 +608,11 @@ fn test_local_vfs_override_compaction() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // compact after 2 overrides
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 2, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 2,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("local_cmpct1_{}", id);
@@ -517,16 +622,27 @@ fn test_local_vfs_override_compaction() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
         for i in 1..=10 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("val_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("val_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Update a few times to accumulate overrides, each followed by checkpoint
         for round in 1..=3 {
-            conn.execute("UPDATE t SET val = ?1 WHERE id = 1", rusqlite::params![format!("round_{}", round)]).unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute(
+                "UPDATE t SET val = ?1 WHERE id = 1",
+                rusqlite::params![format!("round_{}", round)],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
     }
 
@@ -576,9 +692,12 @@ fn test_cache_validation_warm_reopen_same_version() {
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'warm')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'warm')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -593,7 +712,9 @@ fn test_cache_validation_warm_reopen_same_version() {
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(val, "warm");
     }
 }
@@ -616,11 +737,17 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
         for i in 1..=5 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("v1_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v1_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -636,8 +763,10 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("UPDATE t SET val = 'updated' WHERE id = 3", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'updated' WHERE id = 3", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -656,11 +785,18 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
 
         // Should see the updated value from session 2
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 3", [], |r| r.get(0)).unwrap();
-        assert_eq!(val, "updated", "should see external write after cache validation");
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            val, "updated",
+            "should see external write after cache validation"
+        );
 
         // Unchanged rows should still be correct
-        let val1: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let val1: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(val1, "v1_1");
     }
 }
@@ -682,9 +818,12 @@ fn test_cache_validation_cold_start_after_cache_delete() {
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'persisted')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'persisted')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -705,8 +844,13 @@ fn test_cache_validation_cold_start_after_cache_delete() {
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(val, "persisted", "should recover data from page groups after cache delete");
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            val, "persisted",
+            "should recover data from page groups after cache delete"
+        );
     }
 }
 
@@ -727,26 +871,39 @@ fn test_constraint_violation_does_not_corrupt_reads() {
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'original')", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'original')", [])
+        .unwrap();
 
     // Force a checkpoint so the data is committed to page groups
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
 
     // Try to insert a duplicate value (should fail with UNIQUE constraint)
     let result = conn.execute("INSERT INTO t VALUES (2, 'original')", []);
     assert!(result.is_err(), "duplicate insert should fail");
 
     // Read should still see only the original row, not corrupted data
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1, "should have exactly 1 row after failed insert");
 
-    let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let val: String = conn
+        .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "original");
 
     // Can still write after the failed transaction
-    conn.execute("INSERT INTO t VALUES (2, 'second')", []).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'second')", [])
+        .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2);
 }
 
@@ -764,20 +921,28 @@ fn test_explicit_transaction_rollback() {
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'committed')", []).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'committed')", [])
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
 
     // Begin a transaction, write something, then rollback
     conn.execute_batch("BEGIN").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, 'will_rollback')", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'will_rollback')", [])
+        .unwrap();
     conn.execute_batch("ROLLBACK").unwrap();
 
     // After rollback, we should see only the committed row
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1, "rolled-back row should not be visible");
 
-    let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let val: String = conn
+        .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "committed");
 }
 
@@ -795,9 +960,14 @@ fn test_repeated_constraint_violations() {
 
     let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)",
+        [],
+    )
+    .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'one')", []).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
 
     // Several failing inserts
     for i in 0..5 {
@@ -806,12 +976,16 @@ fn test_repeated_constraint_violations() {
     }
 
     // Data should still be correct
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1);
 
     // Successful write after repeated failures
     conn.execute("INSERT INTO t VALUES (2, 'two')", []).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2);
 }
 
@@ -840,24 +1014,34 @@ fn test_migrate_to_s3_primary_from_wal() {
     {
         let conn = rusqlite::Connection::open(&uri).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'before_migrate')", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (2, 'second')", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'before_migrate')", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'second')", [])
+            .unwrap();
 
         // Migration returns Err when PRAGMA journal_mode=OFF fails (expected with
         // turbolite VFS), but the WAL checkpoint has already completed successfully.
         let result = crate::tiered::turbolite_migrate_to_s3_primary(&conn);
-        assert!(result.is_err(), "should return Err when PRAGMA journal_mode=OFF fails in WAL mode");
+        assert!(
+            result.is_err(),
+            "should return Err when PRAGMA journal_mode=OFF fails in WAL mode"
+        );
     }
 
     // Step 2: verify data survived the checkpoint by reopening (still WAL mode
     // in local VFS, but all data is in the main database file, not the WAL)
     {
         let conn = rusqlite::Connection::open(&uri).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2, "all rows should survive WAL checkpoint");
 
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(val, "before_migrate");
     }
 }
@@ -878,16 +1062,21 @@ fn test_migrate_from_delete_to_off() {
     let conn = rusqlite::Connection::open(&uri).unwrap();
     // Start with DELETE mode (not WAL), then migrate to OFF
     conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", []).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
 
     // Migrate should succeed and switch to OFF
     crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
 
-    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
     assert!(mode == "off" || mode == "memory", "got: {}", mode);
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1);
 }
 
@@ -906,17 +1095,22 @@ fn test_migrate_already_off() {
     let uri = format!("file:test.db?vfs={}", vfs_name);
     let conn = rusqlite::Connection::open(&uri).unwrap();
     conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", []).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
 
     // First call: switches to OFF
     crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
-    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
     assert!(mode == "off" || mode == "memory", "got: {}", mode);
 
     // Second call: should be a no-op
     crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
-    let mode2: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    let mode2: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(mode, mode2);
 }
 
@@ -939,30 +1133,48 @@ fn test_migrate_preserves_large_dataset() {
     {
         let conn = rusqlite::Connection::open(&uri).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         for i in 0..row_count {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("row_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("row_{}", i)],
+            )
+            .unwrap();
         }
 
         // Migration returns Err when PRAGMA journal_mode=OFF fails (expected with
         // turbolite VFS), but the WAL checkpoint has already completed successfully.
         let result = crate::tiered::turbolite_migrate_to_s3_primary(&conn);
-        assert!(result.is_err(), "should return Err when PRAGMA journal_mode=OFF fails in WAL mode");
+        assert!(
+            result.is_err(),
+            "should return Err when PRAGMA journal_mode=OFF fails in WAL mode"
+        );
     }
 
     // Verify all data survived
     {
         let conn = rusqlite::Connection::open(&uri).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, row_count);
 
-        let val: String = conn.query_row("SELECT val FROM t WHERE id = 250", [], |r| r.get(0)).unwrap();
+        let val: String = conn
+            .query_row("SELECT val FROM t WHERE id = 250", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(val, "row_250");
 
         // Can still write after migration
-        conn.execute("INSERT INTO t VALUES (?1, 'new')", rusqlite::params![row_count]).unwrap();
-        let new_count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (?1, 'new')",
+            rusqlite::params![row_count],
+        )
+        .unwrap();
+        let new_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(new_count, row_count + 1);
     }
 }
@@ -982,7 +1194,10 @@ fn test_stress_large_database_10k_rows() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // small groups to exercise many page groups
-            cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+            cache: CacheConfig {
+                pages_per_group: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_{}", std::process::id());
@@ -1008,7 +1223,8 @@ fn test_stress_large_database_10k_rows() {
             .unwrap();
         }
         conn.execute_batch("COMMIT").unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -1021,7 +1237,10 @@ fn test_stress_large_database_10k_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+            cache: CacheConfig {
+                pages_per_group: 4,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_r_{}", std::process::id());
@@ -1074,7 +1293,11 @@ fn test_stress_many_overrides_compaction() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // compact after 5 overrides
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 5, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 5,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_w_{}", id);
@@ -1084,7 +1307,8 @@ fn test_stress_many_overrides_compaction() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         // Initial bulk insert
         for i in 1..=50 {
@@ -1094,7 +1318,8 @@ fn test_stress_many_overrides_compaction() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // 10 sequential small updates, each with a checkpoint (creates overrides)
         for round in 1..=10 {
@@ -1103,7 +1328,8 @@ fn test_stress_many_overrides_compaction() {
                 rusqlite::params![format!("round_{}", round), round],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
 
         drop(conn);
@@ -1118,7 +1344,11 @@ fn test_stress_many_overrides_compaction() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 5, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 5,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_r_{}", id);
@@ -1131,20 +1361,40 @@ fn test_stress_many_overrides_compaction() {
         // Rows 1-10 should have latest update values
         for i in 1..=10 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(val, format!("round_{}", i), "row {} should have latest override value", i);
+            assert_eq!(
+                val,
+                format!("round_{}", i),
+                "row {} should have latest override value",
+                i
+            );
         }
 
         // Rows 11-50 should still have initial values
         for i in 11..=50 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(val, format!("initial_{}", i), "row {} should retain initial value", i);
+            assert_eq!(
+                val,
+                format!("initial_{}", i),
+                "row {} should retain initial value",
+                i
+            );
         }
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 50);
     }
 }
@@ -1163,7 +1413,13 @@ fn test_override_with_compression_roundtrip() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // disable compaction to keep overrides visible
-            cache: CacheConfig { compression: true, compression_level: 3, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                compression: true,
+                compression_level: 3,
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_w_{}", id);
@@ -1173,7 +1429,8 @@ fn test_override_with_compression_roundtrip() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         // Initial data - creates base groups
         for i in 1..=20 {
@@ -1183,7 +1440,8 @@ fn test_override_with_compression_roundtrip() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Update subset - creates overrides
         for i in 1..=5 {
@@ -1193,7 +1451,8 @@ fn test_override_with_compression_roundtrip() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -1207,7 +1466,13 @@ fn test_override_with_compression_roundtrip() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { compression: true, compression_level: 3, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                compression: true,
+                compression_level: 3,
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_r_{}", id);
@@ -1220,7 +1485,11 @@ fn test_override_with_compression_roundtrip() {
         // Updated rows should have new values
         for i in 1..=5 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(val, format!("updated_{}", i));
         }
@@ -1228,12 +1497,18 @@ fn test_override_with_compression_roundtrip() {
         // Non-updated rows should have base values
         for i in 6..=20 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(val, format!("base_{}", i));
         }
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 20);
     }
 }
@@ -1247,7 +1522,11 @@ fn test_stress_rapid_checkpoint_cycles() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 10, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 10,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("stress_rapid_{}", std::process::id());
@@ -1257,8 +1536,10 @@ fn test_stress_rapid_checkpoint_cycles() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         for i in 1..=iterations {
             conn.execute(
@@ -1266,10 +1547,13 @@ fn test_stress_rapid_checkpoint_cycles() {
                 rusqlite::params![i, format!("rapid_{}", i)],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
         }
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, iterations);
 
         drop(conn);
@@ -1293,8 +1577,14 @@ fn test_stress_rapid_checkpoint_cycles() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, iterations, "all {} rows should survive rapid checkpoint cycles", iterations);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, iterations,
+            "all {} rows should survive rapid checkpoint cycles",
+            iterations
+        );
 
         // Spot check first and last
         let val: String = conn
@@ -1303,7 +1593,11 @@ fn test_stress_rapid_checkpoint_cycles() {
         assert_eq!(val, "rapid_1");
 
         let val: String = conn
-            .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![iterations], |r| r.get(0))
+            .query_row(
+                "SELECT val FROM t WHERE id = ?1",
+                rusqlite::params![iterations],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(val, format!("rapid_{}", iterations));
     }
@@ -1330,8 +1624,10 @@ fn test_edge_empty_database_reopen() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -1360,8 +1656,11 @@ fn test_edge_empty_database_reopen() {
         assert_eq!(count, 0, "empty table should have 0 rows after cold reopen");
 
         // Should be able to insert after cold reopen
-        conn.execute("INSERT INTO t VALUES (1, 'after_reopen')", []).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'after_reopen')", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 }
@@ -1383,9 +1682,12 @@ fn test_edge_single_row_database() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'only_row')", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'only_row')", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -1407,7 +1709,9 @@ fn test_edge_single_row_database() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
 
         let val: String = conn
@@ -1427,7 +1731,10 @@ fn test_edge_group_boundary_pages() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { pages_per_group, ..Default::default() },
+            cache: CacheConfig {
+                pages_per_group,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_w_{}", std::process::id());
@@ -1452,12 +1759,16 @@ fn test_edge_group_boundary_pages() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Update last page of one group and first page of next by updating scattered rows
-        conn.execute("UPDATE t SET val = 'boundary_first' WHERE id = 0", []).unwrap();
-        conn.execute("UPDATE t SET val = 'boundary_last' WHERE id = 199", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'boundary_first' WHERE id = 0", [])
+            .unwrap();
+        conn.execute("UPDATE t SET val = 'boundary_last' WHERE id = 199", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -1471,7 +1782,10 @@ fn test_edge_group_boundary_pages() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { pages_per_group, ..Default::default() },
+            cache: CacheConfig {
+                pages_per_group,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_r_{}", std::process::id());
@@ -1481,7 +1795,9 @@ fn test_edge_group_boundary_pages() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 200);
 
         let val: String = conn
@@ -1546,7 +1862,8 @@ fn test_edge_override_at_frame_boundary() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Update rows scattered across different pages to hit multiple frames
         for i in (0..300).step_by(25) {
@@ -1556,7 +1873,8 @@ fn test_edge_override_at_frame_boundary() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -1570,7 +1888,13 @@ fn test_edge_override_at_frame_boundary() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { pages_per_group: 8, sub_pages_per_frame: 4, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                pages_per_group: 8,
+                sub_pages_per_frame: 4,
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_frame_r_{}", id);
@@ -1580,15 +1904,26 @@ fn test_edge_override_at_frame_boundary() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 300);
 
         // Verify overridden rows
         for i in (0..300).step_by(25) {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(val, format!("frame_ovr_{}", i), "override row {} mismatch", i);
+            assert_eq!(
+                val,
+                format!("frame_ovr_{}", i),
+                "override row {} mismatch",
+                i
+            );
         }
 
         // Verify non-overridden rows
@@ -1607,7 +1942,10 @@ fn test_rollback_multi_group_dirty_pages() {
 
     let config = TurboliteConfig {
         cache_dir: dir.path().to_path_buf(),
-        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let vfs_name = format!("edge_rollback_mg_{}", std::process::id());
@@ -1631,7 +1969,8 @@ fn test_rollback_multi_group_dirty_pages() {
         )
         .unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
 
     // Begin transaction, update rows across many groups, then ROLLBACK
     conn.execute_batch("BEGIN").unwrap();
@@ -1647,7 +1986,11 @@ fn test_rollback_multi_group_dirty_pages() {
     // All rows should have original values
     for i in (0..200).step_by(10) {
         let val: String = conn
-            .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+            .query_row(
+                "SELECT val FROM t WHERE id = ?1",
+                rusqlite::params![i],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             val,
@@ -1657,12 +2000,17 @@ fn test_rollback_multi_group_dirty_pages() {
         );
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 200, "row count should be unchanged after rollback");
 
     // Verify we can still write after rollback
-    conn.execute("INSERT INTO t VALUES (999, 'after_rollback', 'ok')", []).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    conn.execute("INSERT INTO t VALUES (999, 'after_rollback', 'ok')", [])
+        .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 201);
 }
 
@@ -1679,7 +2027,11 @@ fn test_override_then_delete_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_w_{}", id);
@@ -1689,7 +2041,8 @@ fn test_override_then_delete_rows() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         // Insert 100 rows, checkpoint (base groups)
         for i in 1..=100 {
@@ -1699,11 +2052,13 @@ fn test_override_then_delete_rows() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Delete odd rows (50 rows), checkpoint (creates overrides for pages with deletions)
         conn.execute("DELETE FROM t WHERE id % 2 = 1", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -1717,7 +2072,11 @@ fn test_override_then_delete_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_r_{}", id);
@@ -1727,7 +2086,9 @@ fn test_override_then_delete_rows() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 50, "only even rows should remain");
 
         // Odd rows should not exist
@@ -1762,7 +2123,11 @@ fn test_compaction_threshold_one() {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
             // compact after every single override
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 1, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_w_{}", id);
@@ -1772,7 +2137,8 @@ fn test_compaction_threshold_one() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
 
         // Initial data
         for i in 1..=10 {
@@ -1782,15 +2148,20 @@ fn test_compaction_threshold_one() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Update + checkpoint (should trigger immediate compaction)
-        conn.execute("UPDATE t SET val = 'compacted_1' WHERE id = 1", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'compacted_1' WHERE id = 1", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         // Another update + checkpoint
-        conn.execute("UPDATE t SET val = 'compacted_2' WHERE id = 2", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'compacted_2' WHERE id = 2", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
 
         drop(conn);
     }
@@ -1804,7 +2175,11 @@ fn test_compaction_threshold_one() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 1, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_r_{}", id);
@@ -1830,7 +2205,9 @@ fn test_compaction_threshold_one() {
             .unwrap();
         assert_eq!(val5, "init_5");
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 10);
     }
 }
@@ -1850,7 +2227,11 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s1_{}", id);
@@ -1860,7 +2241,8 @@ fn test_cache_validation_override_changes_between_sessions() {
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open");
         conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+            .unwrap();
         for i in 1..=10 {
             conn.execute(
                 "INSERT INTO t VALUES (?1, ?2)",
@@ -1868,7 +2250,8 @@ fn test_cache_validation_override_changes_between_sessions() {
             )
             .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -1876,7 +2259,11 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s2_{}", id);
@@ -1885,8 +2272,10 @@ fn test_cache_validation_override_changes_between_sessions() {
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
         let conn = rusqlite::Connection::open(&db_path).expect("open session 2");
-        conn.execute("UPDATE t SET val = 'session2_updated' WHERE id <= 3", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("UPDATE t SET val = 'session2_updated' WHERE id <= 3", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         drop(conn);
     }
 
@@ -1894,7 +2283,11 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
+            cache: CacheConfig {
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s3_{}", id);
@@ -1907,20 +2300,39 @@ fn test_cache_validation_override_changes_between_sessions() {
         // Rows 1-3 should have session 2 updates
         for i in 1..=3 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(val, "session2_updated", "row {} should have session 2 value", i);
+            assert_eq!(
+                val, "session2_updated",
+                "row {} should have session 2 value",
+                i
+            );
         }
 
         // Rows 4-10 should still have session 1 values
         for i in 4..=10 {
             let val: String = conn
-                .query_row("SELECT val FROM t WHERE id = ?1", rusqlite::params![i], |r| r.get(0))
+                .query_row(
+                    "SELECT val FROM t WHERE id = ?1",
+                    rusqlite::params![i],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(val, format!("session1_{}", i), "row {} should retain session 1 value", i);
+            assert_eq!(
+                val,
+                format!("session1_{}", i),
+                "row {} should retain session 1 value",
+                i
+            );
         }
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 10);
     }
 }
@@ -1960,17 +2372,20 @@ fn test_settings_set_round_trip() {
         .expect("set prefetch_search on active handle");
     crate::tiered::settings::set("prefetch_lookup", "0.0,0.0,0.0")
         .expect("set prefetch_lookup on active handle");
-    crate::tiered::settings::set("plan_aware", "true")
-        .expect("set plan_aware on active handle");
+    crate::tiered::settings::set("plan_aware", "true").expect("set plan_aware on active handle");
 
     // Next read drains the queue. No observable field from outside for
     // local VFS, but the drain path must not crash and queries must
     // continue to work.
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2);
 
     crate::tiered::settings::set("prefetch_reset", "").expect("reset");
-    let v: String = conn.query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    let v: String = conn
+        .query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(v, "hello");
 }
 
@@ -1986,8 +2401,14 @@ fn test_settings_set_without_handle_errors() {
 fn test_settings_set_per_connection_isolation() {
     let dir_a = TempDir::new().unwrap();
     let dir_b = TempDir::new().unwrap();
-    let cfg_a = TurboliteConfig { cache_dir: dir_a.path().to_path_buf(), ..Default::default() };
-    let cfg_b = TurboliteConfig { cache_dir: dir_b.path().to_path_buf(), ..Default::default() };
+    let cfg_a = TurboliteConfig {
+        cache_dir: dir_a.path().to_path_buf(),
+        ..Default::default()
+    };
+    let cfg_b = TurboliteConfig {
+        cache_dir: dir_b.path().to_path_buf(),
+        ..Default::default()
+    };
 
     let vfs_a_name = format!("settings_iso_a_{}", std::process::id());
     let vfs_b_name = format!("settings_iso_b_{}", std::process::id());
@@ -1996,11 +2417,17 @@ fn test_settings_set_per_connection_isolation() {
     crate::tiered::register(&vfs_b_name, TurboliteVfs::new_local(cfg_b).expect("vfs B"))
         .expect("reg B");
 
-    let conn_a = rusqlite::Connection::open(&format!("file:a.db?vfs={}", vfs_a_name)).expect("open A");
-    conn_a.execute_batch("CREATE TABLE a (id INTEGER); INSERT INTO a VALUES (1);").unwrap();
+    let conn_a =
+        rusqlite::Connection::open(&format!("file:a.db?vfs={}", vfs_a_name)).expect("open A");
+    conn_a
+        .execute_batch("CREATE TABLE a (id INTEGER); INSERT INTO a VALUES (1);")
+        .unwrap();
 
-    let conn_b = rusqlite::Connection::open(&format!("file:b.db?vfs={}", vfs_b_name)).expect("open B");
-    conn_b.execute_batch("CREATE TABLE b (id INTEGER); INSERT INTO b VALUES (2);").unwrap();
+    let conn_b =
+        rusqlite::Connection::open(&format!("file:b.db?vfs={}", vfs_b_name)).expect("open B");
+    conn_b
+        .execute_batch("CREATE TABLE b (id INTEGER); INSERT INTO b VALUES (2);")
+        .unwrap();
 
     // B is on top; push lands on B's queue.
     crate::tiered::settings::set("prefetch_search", "1.0").expect("set while B on top");
@@ -2012,6 +2439,8 @@ fn test_settings_set_per_connection_isolation() {
     crate::tiered::settings::set("prefetch_search", "0.5,0.5").expect("set while A on top");
 
     // A's next read drains A's queue, query still works.
-    let n: i64 = conn_a.query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0)).unwrap();
+    let n: i64 = conn_a
+        .query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 1);
 }

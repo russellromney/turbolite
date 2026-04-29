@@ -17,18 +17,17 @@ fn test_btree_groups_single_btree_multiple_groups() {
         page_size: 4096,
         pages_per_group: 4,
         page_group_keys: vec!["a".into(), "b".into(), "c".into()],
-        group_pages: vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-            vec![8, 9, 10, 11],
-        ],
+        group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "users".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0, 1, 2],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1, 2],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -57,16 +56,22 @@ fn test_btree_groups_multiple_btrees_disjoint() {
         ],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "table_a".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0, 1],
-            });
-            h.insert(8, BTreeManifestEntry {
-                name: "table_b".into(),
-                obj_type: "table".into(),
-                group_ids: vec![2, 3],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "table_a".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1],
+                },
+            );
+            h.insert(
+                8,
+                BTreeManifestEntry {
+                    name: "table_b".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![2, 3],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -95,11 +100,14 @@ fn test_btree_groups_single_group_btree_has_self_only() {
         group_pages: vec![vec![0, 1, 2, 3]],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "small_table".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "small_table".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -143,11 +151,14 @@ fn test_btree_groups_group_not_in_any_btree() {
         ],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "users".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0, 1], // only groups 0 and 1
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1], // only groups 0 and 1
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -156,7 +167,10 @@ fn test_btree_groups_group_not_in_any_btree() {
 
     assert!(m.btree_groups.get(&0).is_some());
     assert!(m.btree_groups.get(&1).is_some());
-    assert!(m.btree_groups.get(&2).is_none(), "orphan group should not be in btree_groups");
+    assert!(
+        m.btree_groups.get(&2).is_none(),
+        "orphan group should not be in btree_groups"
+    );
 }
 
 #[test]
@@ -170,11 +184,14 @@ fn test_btree_groups_rebuild_clears_stale() {
         group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "v1".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0, 1],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "v1".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0, 1],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -185,16 +202,22 @@ fn test_btree_groups_rebuild_clears_stale() {
 
     // Change btrees: group 1 is now a separate B-tree
     m.btrees.clear();
-    m.btrees.insert(0, BTreeManifestEntry {
-        name: "v2_a".into(),
-        obj_type: "table".into(),
-        group_ids: vec![0],
-    });
-    m.btrees.insert(4, BTreeManifestEntry {
-        name: "v2_b".into(),
-        obj_type: "table".into(),
-        group_ids: vec![1],
-    });
+    m.btrees.insert(
+        0,
+        BTreeManifestEntry {
+            name: "v2_a".into(),
+            obj_type: "table".into(),
+            group_ids: vec![0],
+        },
+    );
+    m.btrees.insert(
+        4,
+        BTreeManifestEntry {
+            name: "v2_b".into(),
+            obj_type: "table".into(),
+            group_ids: vec![1],
+        },
+    );
     m.build_page_index();
 
     // Now group 0 and group 1 are in separate B-trees
@@ -217,16 +240,22 @@ fn test_btree_groups_overwrite_when_group_in_multiple_btrees() {
         btrees: {
             let mut h = HashMap::new();
             // Both B-trees claim group 0
-            h.insert(0, BTreeManifestEntry {
-                name: "tree_a".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0],
-            });
-            h.insert(4, BTreeManifestEntry {
-                name: "tree_b".into(),
-                obj_type: "index".into(),
-                group_ids: vec![0, 1], // group 0 also here
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "tree_a".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                },
+            );
+            h.insert(
+                4,
+                BTreeManifestEntry {
+                    name: "tree_b".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![0, 1], // group 0 also here
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -270,7 +299,11 @@ fn test_fraction_prefetch_second_miss_66_percent() {
 fn test_fraction_prefetch_third_miss_all() {
     let hops = vec![0.33f32, 0.33];
     let hop_idx = 2usize; // consecutive_misses=3, beyond hops.len()
-    let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+    let fraction = if hop_idx < hops.len() {
+        hops[hop_idx]
+    } else {
+        1.0
+    };
     assert_eq!(fraction, 1.0);
     let eligible = 10;
     let max_submit = ((eligible as f32) * fraction).ceil() as usize;
@@ -302,7 +335,11 @@ fn test_fraction_prefetch_empty_hops_fetches_all() {
     // Empty hops vec -> fraction = 1.0 -> fetch all on first miss
     let hops: Vec<f32> = vec![];
     let hop_idx = 0usize;
-    let fraction = if hop_idx < hops.len() { hops[hop_idx] } else { 1.0 };
+    let fraction = if hop_idx < hops.len() {
+        hops[hop_idx]
+    } else {
+        1.0
+    };
     assert_eq!(fraction, 1.0);
     let eligible = 10;
     let max_submit = ((eligible as f32) * fraction).ceil() as usize;
@@ -373,8 +410,11 @@ fn test_read_path_range_get_before_prefetch() {
     let page_data = vec![42u8; 64];
     cache.write_pages_scattered(&[0], &page_data, 0, 0).unwrap();
     assert!(cache.is_present(0));
-    assert_eq!(cache.group_state(0), GroupState::None,
-        "group state should remain None until prefetch is submitted");
+    assert_eq!(
+        cache.group_state(0),
+        GroupState::None,
+        "group state should remain None until prefetch is submitted"
+    );
 
     // Now the read path would claim and submit to pool
     assert!(cache.try_claim_group(0));

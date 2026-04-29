@@ -224,7 +224,11 @@ impl PredictionTable {
                 .filter(|r| !seen.contains(r.as_str()))
                 .cloned()
                 .collect();
-            if extras.is_empty() { None } else { Some(extras) }
+            if extras.is_empty() {
+                None
+            } else {
+                Some(extras)
+            }
         })
     }
 
@@ -328,7 +332,11 @@ impl AccessHistory {
     pub fn top_trees(&self, n: usize) -> Vec<String> {
         let mut entries: Vec<(&String, &f32)> = self.freq.iter().collect();
         entries.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-        entries.into_iter().take(n).map(|(k, _)| k.clone()).collect()
+        entries
+            .into_iter()
+            .take(n)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 }
 

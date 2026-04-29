@@ -133,17 +133,24 @@ pub fn compact_btree(
     let walk = crate::btree_walker::walk_all_btrees(manifest.page_count, page_size, read_page);
 
     let walk_entry = walk.btrees.get(&btree_root).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("B-tree root {} not found", btree_root))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("B-tree root {} not found", btree_root),
+        )
     })?;
 
     let manifest_entry = manifest.btrees.get(&btree_root).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("B-tree root {} not in manifest", btree_root))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("B-tree root {} not in manifest", btree_root),
+        )
     })?;
 
     let live_pages: HashSet<u64> = walk_entry.pages.iter().copied().collect();
 
     let old_group_ids: Vec<u64> = manifest_entry.group_ids.clone();
-    let old_keys: Vec<String> = old_group_ids.iter()
+    let old_keys: Vec<String> = old_group_ids
+        .iter()
         .filter_map(|&gid| manifest.page_group_keys.get(gid as usize).cloned())
         .filter(|k| !k.is_empty())
         .collect();
@@ -160,7 +167,8 @@ pub fn compact_btree(
     sorted_live.sort_unstable();
     sorted_live.dedup();
 
-    let new_groups: Vec<Vec<u64>> = sorted_live.chunks(ppg as usize)
+    let new_groups: Vec<Vec<u64>> = sorted_live
+        .chunks(ppg as usize)
         .map(|chunk| chunk.to_vec())
         .collect();
 
@@ -169,7 +177,9 @@ pub fn compact_btree(
         old_group_ids,
         old_keys,
         new_groups,
-        pages_before: manifest_entry.group_ids.iter()
+        pages_before: manifest_entry
+            .group_ids
+            .iter()
             .map(|&gid| manifest.group_size(gid))
             .sum(),
         pages_after: sorted_live.len(),
@@ -261,10 +271,14 @@ fn compact_overrides_inner(
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
     let manifest_snap = (**shared_manifest.load()).clone();
-    let groups_to_compact: Vec<u64> = manifest_snap.subframe_overrides.iter()
+    let groups_to_compact: Vec<u64> = manifest_snap
+        .subframe_overrides
+        .iter()
         .enumerate()
         .filter(|(_, ovs)| {
-            if ovs.is_empty() { return false; }
+            if ovs.is_empty() {
+                return false;
+            }
             match threshold {
                 Some(t) => ovs.len() >= t as usize,
                 None => true,
@@ -273,10 +287,13 @@ fn compact_overrides_inner(
         .map(|(gid, _)| gid as u64)
         .collect();
 
-    if groups_to_compact.is_empty() { return Ok(0); }
+    if groups_to_compact.is_empty() {
+        return Ok(0);
+    }
 
     #[cfg(feature = "zstd")]
-    let encoder_dict = dictionary.map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
+    let encoder_dict =
+        dictionary.map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
     #[cfg(feature = "zstd")]
     let decoder_dict = dictionary.map(zstd::dict::DecoderDictionary::copy);
 
@@ -293,8 +310,10 @@ fn compact_overrides_inner(
             runtime,
             next_version,
             compression_level,
-            #[cfg(feature = "zstd")] encoder_dict.as_ref(),
-            #[cfg(feature = "zstd")] decoder_dict.as_ref(),
+            #[cfg(feature = "zstd")]
+            encoder_dict.as_ref(),
+            #[cfg(feature = "zstd")]
+            decoder_dict.as_ref(),
             encryption_key.as_ref(),
         ) {
             Ok(result) => {
@@ -302,22 +321,32 @@ fn compact_overrides_inner(
                 all_replaced_keys.extend(result.replaced_keys.iter().cloned());
                 compaction_results.push(result);
             }
-            Err(e) => { eprintln!("[compact] group {} failed: {}", gid, e); }
+            Err(e) => {
+                eprintln!("[compact] group {} failed: {}", gid, e);
+            }
         }
     }
 
-    if compaction_results.is_empty() { return Ok(0); }
+    if compaction_results.is_empty() {
+        return Ok(0);
+    }
 
     storage_helpers::put_page_groups(backend, runtime, &uploads)?;
 
     {
         let mut m = (**shared_manifest.load()).clone();
         for result in &compaction_results {
-            while m.page_group_keys.len() <= result.gid as usize { m.page_group_keys.push(String::new()); }
+            while m.page_group_keys.len() <= result.gid as usize {
+                m.page_group_keys.push(String::new());
+            }
             m.page_group_keys[result.gid as usize] = result.new_key.clone();
-            while m.frame_tables.len() <= result.gid as usize { m.frame_tables.push(Vec::new()); }
+            while m.frame_tables.len() <= result.gid as usize {
+                m.frame_tables.push(Vec::new());
+            }
             m.frame_tables[result.gid as usize] = result.new_frame_table.clone();
-            if let Some(ovs) = m.subframe_overrides.get_mut(result.gid as usize) { ovs.clear(); }
+            if let Some(ovs) = m.subframe_overrides.get_mut(result.gid as usize) {
+                ovs.clear();
+            }
         }
         m.version = next_version;
         shared_manifest.store(Arc::new(m));
@@ -350,16 +379,32 @@ pub(crate) fn compact_override_group(
     let pages_in_group = manifest.group_page_nums(gid);
     let group_size = pages_in_group.len();
 
-    let overrides = manifest.subframe_overrides.get(gid as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("no overrides for gid={}", gid)))?;
+    let overrides = manifest
+        .subframe_overrides
+        .get(gid as usize)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no overrides for gid={}", gid),
+            )
+        })?;
     if overrides.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("empty overrides for gid={}", gid)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("empty overrides for gid={}", gid),
+        ));
     }
 
-    let base_key = manifest.page_group_keys.get(gid as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no key for gid={}", gid)))?;
-    let base_data = storage_helpers::get_page_group(backend, runtime, base_key)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("base group not found: {}", base_key)))?;
+    let base_key = manifest.page_group_keys.get(gid as usize).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no key for gid={}", gid))
+    })?;
+    let base_data =
+        storage_helpers::get_page_group(backend, runtime, base_key)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("base group not found: {}", base_key),
+            )
+        })?;
 
     let ft = manifest.frame_tables.get(gid as usize);
     let has_ft = sub_ppf > 0 && ft.map(|f| !f.is_empty()).unwrap_or(false);
@@ -368,23 +413,35 @@ pub(crate) fn compact_override_group(
 
     if has_ft {
         let (_pc, _ps, bulk_data) = decode_page_group_seekable_full(
-            &base_data, ft.expect("checked"), page_size, group_size as u32,
-            manifest.page_count, 0,
-            #[cfg(feature = "zstd")] decoder_dict, encryption_key,
+            &base_data,
+            ft.expect("checked"),
+            page_size,
+            group_size as u32,
+            manifest.page_count,
+            0,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
+            encryption_key,
         )?;
         let ps = page_size as usize;
         for i in 0..group_size {
             let start = i * ps;
             let end = start + ps;
-            if end <= bulk_data.len() { page_buffers[i] = Some(bulk_data[start..end].to_vec()); }
+            if end <= bulk_data.len() {
+                page_buffers[i] = Some(bulk_data[start..end].to_vec());
+            }
         }
     } else {
         let (_pc, _ps, pages) = decode_page_group(
             &base_data,
-            #[cfg(feature = "zstd")] decoder_dict, encryption_key,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
+            encryption_key,
         )?;
         for (i, page) in pages.into_iter().enumerate() {
-            if i < group_size { page_buffers[i] = Some(page); }
+            if i < group_size {
+                page_buffers[i] = Some(page);
+            }
         }
     }
 
@@ -392,11 +449,18 @@ pub(crate) fn compact_override_group(
 
     for (&frame_idx, ovr) in overrides {
         replaced_keys.push(ovr.key.clone());
-        let ovr_data = storage_helpers::get_page_group(backend, runtime, &ovr.key)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("override not found: {}", ovr.key)))?;
+        let ovr_data =
+            storage_helpers::get_page_group(backend, runtime, &ovr.key)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("override not found: {}", ovr.key),
+                )
+            })?;
         let decompressed = decode_seekable_subchunk(
             &ovr_data,
-            #[cfg(feature = "zstd")] decoder_dict, encryption_key,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
+            encryption_key,
         )?;
         let frame_start = frame_idx * sub_ppf as usize;
         let frame_end = std::cmp::min(frame_start + sub_ppf as usize, group_size);
@@ -404,7 +468,9 @@ pub(crate) fn compact_override_group(
         for pos in frame_start..frame_end {
             let offset_in_frame = (pos - frame_start) * ps;
             let end = offset_in_frame + ps;
-            if end <= decompressed.len() { page_buffers[pos] = Some(decompressed[offset_in_frame..end].to_vec()); }
+            if end <= decompressed.len() {
+                page_buffers[pos] = Some(decompressed[offset_in_frame..end].to_vec());
+            }
         }
     }
 
@@ -412,15 +478,36 @@ pub(crate) fn compact_override_group(
 
     if sub_ppf > 0 {
         let (encoded, new_ft) = encode_page_group_seekable(
-            &page_buffers, page_size, sub_ppf, compression_level,
-            #[cfg(feature = "zstd")] encoder_dict, encryption_key,
+            &page_buffers,
+            page_size,
+            sub_ppf,
+            compression_level,
+            #[cfg(feature = "zstd")]
+            encoder_dict,
+            encryption_key,
         )?;
-        Ok(OverrideCompactResult { gid, new_key, new_frame_table: new_ft, encoded, replaced_keys })
+        Ok(OverrideCompactResult {
+            gid,
+            new_key,
+            new_frame_table: new_ft,
+            encoded,
+            replaced_keys,
+        })
     } else {
         let encoded = encode_page_group(
-            &page_buffers, page_size, compression_level,
-            #[cfg(feature = "zstd")] encoder_dict, encryption_key,
+            &page_buffers,
+            page_size,
+            compression_level,
+            #[cfg(feature = "zstd")]
+            encoder_dict,
+            encryption_key,
         )?;
-        Ok(OverrideCompactResult { gid, new_key, new_frame_table: Vec::new(), encoded, replaced_keys })
+        Ok(OverrideCompactResult {
+            gid,
+            new_key,
+            new_frame_table: Vec::new(),
+            encoded,
+            replaced_keys,
+        })
     }
 }

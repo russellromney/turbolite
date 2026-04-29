@@ -43,8 +43,12 @@ pub(crate) fn range_get(
     start: u64,
     len: u32,
 ) -> io::Result<Option<Vec<u8>>> {
-    block_on(runtime, backend.range_get(key, start, len))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage range_get {key}: {e}")))
+    block_on(runtime, backend.range_get(key, start, len)).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("storage range_get {key}: {e}"),
+        )
+    })
 }
 
 /// Upload a batch of `(key, bytes)`. Uses the backend's native `put_many`
@@ -104,7 +108,9 @@ pub(crate) fn list_all_keys_with_prefix(
         let mut out: Vec<String> = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let batch = backend.list(prefix, after.as_deref()).await
+            let batch = backend
+                .list(prefix, after.as_deref())
+                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage list: {e}")))?;
             if batch.is_empty() {
                 break;
@@ -121,7 +127,10 @@ pub(crate) fn list_all_keys_with_prefix(
             // Guard against pathological backends that always return at
             // least one key.
             if out.len() > 10_000_000 {
-                return Err(io::Error::new(io::ErrorKind::Other, "list overran 10M keys"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "list overran 10M keys",
+                ));
             }
             // One-shot backends (like LocalStorage's single-pass walk) will
             // return the full list in one call; the second `list` with the
@@ -177,9 +186,8 @@ pub(crate) fn put_manifest(
     runtime: &TokioHandle,
     manifest: &Manifest,
 ) -> io::Result<()> {
-    let bytes = rmp_serde::to_vec(manifest).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("encode manifest: {e}"))
-    })?;
+    let bytes = rmp_serde::to_vec(manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode manifest: {e}")))?;
     put(backend, runtime, keys::MANIFEST_KEY, &bytes)
 }
 

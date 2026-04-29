@@ -1,8 +1,8 @@
 use super::*;
 use crate::tiered::*;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use parking_lot::RwLock;
 
 // =========================================================================
 // Manifest
@@ -130,12 +130,24 @@ fn test_seekable_manifest_serde_with_frames() {
         page_group_keys: vec!["p/d/0_v1".to_string(), "p/d/1_v1".to_string()],
         frame_tables: vec![
             vec![
-                FrameEntry { offset: 0, len: 500 },
-                FrameEntry { offset: 500, len: 600 },
+                FrameEntry {
+                    offset: 0,
+                    len: 500,
+                },
+                FrameEntry {
+                    offset: 500,
+                    len: 600,
+                },
             ],
             vec![
-                FrameEntry { offset: 0, len: 450 },
-                FrameEntry { offset: 450, len: 550 },
+                FrameEntry {
+                    offset: 0,
+                    len: 450,
+                },
+                FrameEntry {
+                    offset: 450,
+                    len: 550,
+                },
             ],
         ],
         sub_pages_per_frame: 32,
@@ -167,10 +179,7 @@ fn test_assign_new_pages_to_groups_basic() {
         page_count: 10,
         page_size: 4096,
         pages_per_group: 4,
-        group_pages: vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-        ],
+        group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
         ..Manifest::empty()
     };
     manifest.build_page_index();
@@ -286,7 +295,7 @@ fn test_build_page_index_roundtrip() {
         page_size: 4096,
         pages_per_group: 4,
         group_pages: vec![
-            vec![5, 0, 3, 8],  // non-sequential
+            vec![5, 0, 3, 8], // non-sequential
             vec![1, 7, 2],
             vec![9, 4, 6],
         ],
@@ -296,9 +305,14 @@ fn test_build_page_index_roundtrip() {
 
     // Every page 0-9 should have a location
     for p in 0..10 {
-        let loc = manifest.page_location(p).unwrap_or_else(|| panic!("missing page {}", p));
+        let loc = manifest
+            .page_location(p)
+            .unwrap_or_else(|| panic!("missing page {}", p));
         // Verify the reverse: group_pages[gid][index] == p
-        assert_eq!(manifest.group_pages[loc.group_id as usize][loc.index as usize], p);
+        assert_eq!(
+            manifest.group_pages[loc.group_id as usize][loc.index as usize],
+            p
+        );
     }
 }
 
@@ -319,8 +333,11 @@ fn test_total_groups_btree_vs_positional() {
         page_count: 100,
         pages_per_group: 32,
         group_pages: vec![
-            vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9, 10, 11],
-            vec![12, 13, 14, 15, 16, 17, 18, 19],  // extra group from B-tree packing
+            vec![0, 1, 2],
+            vec![3, 4, 5],
+            vec![6, 7, 8],
+            vec![9, 10, 11],
+            vec![12, 13, 14, 15, 16, 17, 18, 19], // extra group from B-tree packing
         ],
         ..Manifest::empty()
     };
@@ -340,9 +357,9 @@ fn test_manifest_btree_page_location_non_sequential() {
         page_size: 4096,
         pages_per_group: 8,
         group_pages: vec![
-            vec![0, 5, 10, 15],     // gid=0: scattered pages from B-tree A
-            vec![1, 2, 3, 4],       // gid=1: sequential pages from B-tree B
-            vec![6, 7, 8, 9],       // gid=2: sequential from B-tree C
+            vec![0, 5, 10, 15],                   // gid=0: scattered pages from B-tree A
+            vec![1, 2, 3, 4],                     // gid=1: sequential pages from B-tree B
+            vec![6, 7, 8, 9],                     // gid=2: sequential from B-tree C
             vec![11, 12, 13, 14, 16, 17, 18, 19], // gid=3: remaining pages
         ],
         ..Manifest::empty()
@@ -374,26 +391,30 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         page_count: 20,
         page_size: 4096,
         pages_per_group: 8,
-        page_group_keys: vec![
-            "p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into(),
-        ],
+        page_group_keys: vec!["p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into()],
         group_pages: vec![
-            vec![0, 5, 10, 15],     // B-tree A (scattered)
-            vec![1, 2, 3, 4],       // B-tree B (sequential)
+            vec![0, 5, 10, 15], // B-tree A (scattered)
+            vec![1, 2, 3, 4],   // B-tree B (sequential)
             vec![6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19],
         ],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "users".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0],
-            });
-            h.insert(5, BTreeManifestEntry {
-                name: "idx_users_name".into(),
-                obj_type: "index".into(),
-                group_ids: vec![1],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                },
+            );
+            h.insert(
+                5,
+                BTreeManifestEntry {
+                    name: "idx_users_name".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![1],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -410,7 +431,10 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert_eq!(m.btrees[&0].name, m2.btrees[&0].name);
     assert_eq!(m.btrees[&5].group_ids, m2.btrees[&5].group_ids);
     // page_index is NOT serialized (skip)
-    assert!(m2.page_index.is_empty(), "page_index should be empty after deserialize");
+    assert!(
+        m2.page_index.is_empty(),
+        "page_index should be empty after deserialize"
+    );
     // Rebuild and verify
     m2.build_page_index();
     assert_eq!(m2.page_location(10).unwrap().group_id, 0);
@@ -426,21 +450,42 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert!(m2.btree_groups.get(&2).is_none());
     // Page_to_tree_name reverse index rebuilt from btrees
     // B-tree root=0 ("users") owns group 0 with pages [0, 5, 10, 15]
-    assert_eq!(m2.page_to_tree_name.get(&0).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&5).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&10).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&15).map(|s| s.as_str()), Some("users"));
+    assert_eq!(
+        m2.page_to_tree_name.get(&0).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&5).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&10).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&15).map(|s| s.as_str()),
+        Some("users")
+    );
     // B-tree root=5 ("idx_users_name") owns group 1 with pages [1, 2, 3, 4]
-    assert_eq!(m2.page_to_tree_name.get(&1).map(|s| s.as_str()), Some("idx_users_name"));
-    assert_eq!(m2.page_to_tree_name.get(&4).map(|s| s.as_str()), Some("idx_users_name"));
+    assert_eq!(
+        m2.page_to_tree_name.get(&1).map(|s| s.as_str()),
+        Some("idx_users_name")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&4).map(|s| s.as_str()),
+        Some("idx_users_name")
+    );
     // Pages in group 2 (no btree entry) should NOT be in page_to_tree_name
     assert!(m2.page_to_tree_name.get(&6).is_none());
     assert!(m2.page_to_tree_name.get(&19).is_none());
     // page_to_tree_name is skip-serialized (rebuilt, not persisted)
     assert!(!m2.page_to_tree_name.is_empty()); // rebuilt by build_page_index
-    // tree_name_to_groups also rebuilt
+                                               // tree_name_to_groups also rebuilt
     assert_eq!(m2.tree_name_to_groups.get("users").unwrap(), &vec![0u64]);
-    assert_eq!(m2.tree_name_to_groups.get("idx_users_name").unwrap(), &vec![1u64]);
+    assert_eq!(
+        m2.tree_name_to_groups.get("idx_users_name").unwrap(),
+        &vec![1u64]
+    );
 }
 
 // =========================================================================
@@ -456,9 +501,9 @@ fn test_manifest_btree_group_partial_last_group() {
         page_size: 4096,
         pages_per_group: 4,
         group_pages: vec![
-            vec![0, 1, 2, 3],   // full group
-            vec![4, 5, 6, 7],   // full group
-            vec![8, 9],         // partial group (2 of 4)
+            vec![0, 1, 2, 3], // full group
+            vec![4, 5, 6, 7], // full group
+            vec![8, 9],       // partial group (2 of 4)
         ],
         ..Manifest::empty()
     };
@@ -570,18 +615,17 @@ fn test_btreeaware_group_page_nums_borrows() {
     let mut m = Manifest {
         page_count: 10,
         pages_per_group: 4,
-        group_pages: vec![
-            vec![0, 5, 10],
-            vec![1, 2, 3, 4],
-        ],
+        group_pages: vec![vec![0, 5, 10], vec![1, 2, 3, 4]],
         ..Manifest::empty()
     };
     m.build_page_index();
 
     let gp = m.group_page_nums(0);
     // BTreeAware should return Cow::Borrowed (zero-allocation)
-    assert!(matches!(gp, std::borrow::Cow::Borrowed(_)),
-        "BTreeAware should borrow, not allocate");
+    assert!(
+        matches!(gp, std::borrow::Cow::Borrowed(_)),
+        "BTreeAware should borrow, not allocate"
+    );
     assert_eq!(gp.as_ref(), &[0, 5, 10]);
 }
 
@@ -596,8 +640,10 @@ fn test_positional_group_page_nums_owned() {
 
     let gp = m.group_page_nums(0);
     // Positional must allocate (Cow::Owned)
-    assert!(matches!(gp, std::borrow::Cow::Owned(_)),
-        "Positional should allocate Cow::Owned");
+    assert!(
+        matches!(gp, std::borrow::Cow::Owned(_)),
+        "Positional should allocate Cow::Owned"
+    );
     assert_eq!(gp.as_ref(), &[0, 1, 2, 3]);
 }
 
@@ -619,10 +665,7 @@ fn test_btreeaware_group_size() {
     let mut m = Manifest {
         page_count: 10,
         pages_per_group: 4,
-        group_pages: vec![
-            vec![0, 5, 10],
-            vec![1, 2, 3, 4],
-        ],
+        group_pages: vec![vec![0, 5, 10], vec![1, 2, 3, 4]],
         ..Manifest::empty()
     };
     m.build_page_index();
@@ -635,11 +678,7 @@ fn test_prefetch_siblings() {
     let mut m = Manifest {
         page_count: 20,
         pages_per_group: 8,
-        group_pages: vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-            vec![8, 9, 10, 11],
-        ],
+        group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]],
         btrees: HashMap::from([(
             0,
             BTreeManifestEntry {
@@ -656,7 +695,10 @@ fn test_prefetch_siblings() {
     assert_eq!(m.prefetch_siblings(0), vec![0, 1]);
 
     // gid=2 is NOT in any btree
-    assert!(m.prefetch_siblings(2).is_empty(), "non-btree group should have empty siblings");
+    assert!(
+        m.prefetch_siblings(2).is_empty(),
+        "non-btree group should have empty siblings"
+    );
 }
 
 #[test]
@@ -686,8 +728,11 @@ fn test_build_page_index_auto_detects_btreeaware() {
     };
     assert_eq!(m.strategy, GroupingStrategy::Positional);
     m.build_page_index();
-    assert_eq!(m.strategy, GroupingStrategy::BTreeAware,
-        "build_page_index should auto-detect BTreeAware from non-empty group_pages");
+    assert_eq!(
+        m.strategy,
+        GroupingStrategy::BTreeAware,
+        "build_page_index should auto-detect BTreeAware from non-empty group_pages"
+    );
     assert!(m.page_location(0).is_some());
 }
 
@@ -772,8 +817,14 @@ use crate::tiered::manifest::{dirty_frames_for_group, SubframeOverride};
 fn test_dirty_frames_single_page_correct_frame() {
     let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
     let ft = vec![
-        FrameEntry { offset: 0, len: 100 },
-        FrameEntry { offset: 100, len: 100 },
+        FrameEntry {
+            offset: 0,
+            len: 100,
+        },
+        FrameEntry {
+            offset: 100,
+            len: 100,
+        },
     ];
     // Page 10 is at position 0, frame 0 (sub_ppf=4, 0/4=0)
     let result = dirty_frames_for_group(&[10], &group_pages, &ft, 4);
@@ -784,8 +835,14 @@ fn test_dirty_frames_single_page_correct_frame() {
 fn test_dirty_frames_multiple_in_same_frame() {
     let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
     let ft = vec![
-        FrameEntry { offset: 0, len: 100 },
-        FrameEntry { offset: 100, len: 100 },
+        FrameEntry {
+            offset: 0,
+            len: 100,
+        },
+        FrameEntry {
+            offset: 100,
+            len: 100,
+        },
     ];
     // Pages 10, 11, 12 all in frame 0
     let result = dirty_frames_for_group(&[10, 11, 12], &group_pages, &ft, 4);
@@ -796,8 +853,14 @@ fn test_dirty_frames_multiple_in_same_frame() {
 fn test_dirty_frames_across_frames() {
     let group_pages = vec![10, 11, 12, 13, 14, 15, 16, 17];
     let ft = vec![
-        FrameEntry { offset: 0, len: 100 },
-        FrameEntry { offset: 100, len: 100 },
+        FrameEntry {
+            offset: 0,
+            len: 100,
+        },
+        FrameEntry {
+            offset: 100,
+            len: 100,
+        },
     ];
     // Page 10 in frame 0, page 14 in frame 1
     let result = dirty_frames_for_group(&[10, 14], &group_pages, &ft, 4);
@@ -807,7 +870,10 @@ fn test_dirty_frames_across_frames() {
 #[test]
 fn test_dirty_frames_no_dirty_pages() {
     let group_pages = vec![10, 11, 12, 13];
-    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    let ft = vec![FrameEntry {
+        offset: 0,
+        len: 100,
+    }];
     let result = dirty_frames_for_group(&[], &group_pages, &ft, 4);
     assert!(result.is_empty());
 }
@@ -815,7 +881,10 @@ fn test_dirty_frames_no_dirty_pages() {
 #[test]
 fn test_dirty_frames_page_not_in_group() {
     let group_pages = vec![10, 11, 12, 13];
-    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    let ft = vec![FrameEntry {
+        offset: 0,
+        len: 100,
+    }];
     // Page 99 is not in the group
     let result = dirty_frames_for_group(&[99], &group_pages, &ft, 4);
     assert!(result.is_empty());
@@ -824,7 +893,10 @@ fn test_dirty_frames_page_not_in_group() {
 #[test]
 fn test_dirty_frames_zero_sub_ppf() {
     let group_pages = vec![10, 11, 12, 13];
-    let ft = vec![FrameEntry { offset: 0, len: 100 }];
+    let ft = vec![FrameEntry {
+        offset: 0,
+        len: 100,
+    }];
     let result = dirty_frames_for_group(&[10], &group_pages, &ft, 0);
     assert!(result.is_empty());
 }
@@ -845,7 +917,10 @@ fn test_dirty_frames_beyond_frame_table() {
     let group_pages = vec![0, 1, 2, 3, 4, 5, 6];
     let ft = vec![
         // Only 1 frame entry from the original base (covers pages 0-4)
-        FrameEntry { offset: 0, len: 100 },
+        FrameEntry {
+            offset: 0,
+            len: 100,
+        },
     ];
     // Pages 5 and 6 are at positions 5-6, frame_idx = 5/5 = 1 (beyond ft.len())
     // Page 3 is at position 3, frame_idx = 3/5 = 0 (within ft.len())
@@ -858,9 +933,10 @@ fn test_dirty_frames_beyond_frame_table() {
 fn test_dirty_frames_all_beyond_frame_table() {
     // All dirty pages are in frames beyond the frame table
     let group_pages = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    let ft = vec![
-        FrameEntry { offset: 0, len: 100 },
-    ];
+    let ft = vec![FrameEntry {
+        offset: 0,
+        len: 100,
+    }];
     // Pages 5-9 at positions 5-9, frame_idx = 1 and 2 (both beyond ft)
     let result = dirty_frames_for_group(&[5, 6, 7, 8, 9], &group_pages, &ft, 5);
     assert_eq!(result, vec![1]);
@@ -874,7 +950,10 @@ fn test_dirty_frames_all_beyond_frame_table() {
 fn test_subframe_override_json_roundtrip() {
     let ovr = SubframeOverride {
         key: "p/d/0_f1_v5".to_string(),
-        entry: FrameEntry { offset: 0, len: 1234 },
+        entry: FrameEntry {
+            offset: 0,
+            len: 1234,
+        },
     };
     let json = serde_json::to_string(&ovr).expect("json serialize");
     let ovr2: SubframeOverride = serde_json::from_str(&json).expect("json deserialize");
@@ -885,7 +964,10 @@ fn test_subframe_override_json_roundtrip() {
 fn test_subframe_override_msgpack_roundtrip() {
     let ovr = SubframeOverride {
         key: "p/d/3_f2_v10".to_string(),
-        entry: FrameEntry { offset: 0, len: 5678 },
+        entry: FrameEntry {
+            offset: 0,
+            len: 5678,
+        },
     };
     let bytes = rmp_serde::to_vec(&ovr).expect("msgpack serialize");
     let ovr2: SubframeOverride = rmp_serde::from_slice(&bytes).expect("msgpack deserialize");
@@ -903,10 +985,16 @@ fn test_manifest_backward_compat_no_overrides() {
 #[test]
 fn test_manifest_with_overrides_serde_roundtrip() {
     let mut overrides = HashMap::new();
-    overrides.insert(1, SubframeOverride {
-        key: "p/d/0_f1_v5".to_string(),
-        entry: FrameEntry { offset: 0, len: 1000 },
-    });
+    overrides.insert(
+        1,
+        SubframeOverride {
+            key: "p/d/0_f1_v5".to_string(),
+            entry: FrameEntry {
+                offset: 0,
+                len: 1000,
+            },
+        },
+    );
     let m = Manifest {
         version: 5,
         page_count: 100,
@@ -928,10 +1016,16 @@ fn test_manifest_with_overrides_serde_roundtrip() {
 #[test]
 fn test_vacuum_clears_overrides() {
     let mut overrides = HashMap::new();
-    overrides.insert(0, SubframeOverride {
-        key: "p/d/0_f0_v3".to_string(),
-        entry: FrameEntry { offset: 0, len: 500 },
-    });
+    overrides.insert(
+        0,
+        SubframeOverride {
+            key: "p/d/0_f0_v3".to_string(),
+            entry: FrameEntry {
+                offset: 0,
+                len: 500,
+            },
+        },
+    );
     let mut m = Manifest {
         version: 3,
         page_count: 100,
@@ -975,14 +1069,26 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
     // Test that a full Manifest with subframe_overrides roundtrips through msgpack.
     // This catches issues with HashMap<usize, SubframeOverride> serialization.
     let mut overrides_g0 = HashMap::new();
-    overrides_g0.insert(2usize, manifest::SubframeOverride {
-        key: "p/d/0_f2_v3".to_string(),
-        entry: FrameEntry { offset: 0, len: 500 },
-    });
-    overrides_g0.insert(5usize, manifest::SubframeOverride {
-        key: "p/d/0_f5_v3".to_string(),
-        entry: FrameEntry { offset: 0, len: 800 },
-    });
+    overrides_g0.insert(
+        2usize,
+        manifest::SubframeOverride {
+            key: "p/d/0_f2_v3".to_string(),
+            entry: FrameEntry {
+                offset: 0,
+                len: 500,
+            },
+        },
+    );
+    overrides_g0.insert(
+        5usize,
+        manifest::SubframeOverride {
+            key: "p/d/0_f5_v3".to_string(),
+            entry: FrameEntry {
+                offset: 0,
+                len: 800,
+            },
+        },
+    );
 
     let m = Manifest {
         version: 3,
@@ -992,23 +1098,48 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
         sub_pages_per_frame: 8,
         page_group_keys: vec!["p/d/0_v2".to_string(), "p/d/1_v2".to_string()],
         frame_tables: vec![
-            vec![FrameEntry { offset: 0, len: 100 }, FrameEntry { offset: 100, len: 200 }],
-            vec![FrameEntry { offset: 0, len: 150 }],
+            vec![
+                FrameEntry {
+                    offset: 0,
+                    len: 100,
+                },
+                FrameEntry {
+                    offset: 100,
+                    len: 200,
+                },
+            ],
+            vec![FrameEntry {
+                offset: 0,
+                len: 150,
+            }],
         ],
         subframe_overrides: vec![overrides_g0, HashMap::new()],
         ..Manifest::empty()
     };
 
     let bytes = rmp_serde::to_vec(&m).expect("msgpack serialize full manifest with overrides");
-    let m2: Manifest = rmp_serde::from_slice(&bytes).expect("msgpack deserialize full manifest with overrides");
+    let m2: Manifest =
+        rmp_serde::from_slice(&bytes).expect("msgpack deserialize full manifest with overrides");
 
     assert_eq!(m2.version, 3);
     assert_eq!(m2.subframe_overrides.len(), 2);
-    assert_eq!(m2.subframe_overrides[0].len(), 2, "group 0 should have 2 overrides");
-    assert!(m2.subframe_overrides[0].contains_key(&2), "should have override for frame 2");
-    assert!(m2.subframe_overrides[0].contains_key(&5), "should have override for frame 5");
+    assert_eq!(
+        m2.subframe_overrides[0].len(),
+        2,
+        "group 0 should have 2 overrides"
+    );
+    assert!(
+        m2.subframe_overrides[0].contains_key(&2),
+        "should have override for frame 2"
+    );
+    assert!(
+        m2.subframe_overrides[0].contains_key(&5),
+        "should have override for frame 5"
+    );
     assert_eq!(m2.subframe_overrides[0][&2].key, "p/d/0_f2_v3");
     assert_eq!(m2.subframe_overrides[0][&5].entry.len, 800);
-    assert!(m2.subframe_overrides[1].is_empty(), "group 1 should have no overrides");
+    assert!(
+        m2.subframe_overrides[1].is_empty(),
+        "group 1 should have no overrides"
+    );
 }
-

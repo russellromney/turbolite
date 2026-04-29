@@ -47,14 +47,26 @@ impl CacheIndex {
     /// Returns the offset where the page was written.
     pub(crate) fn insert(&mut self, page_num: u64, compressed_len: u32) -> u64 {
         let offset = self.next_offset;
-        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        self.entries.insert(
+            page_num,
+            CacheIndexEntry {
+                offset,
+                compressed_len,
+            },
+        );
         self.next_offset = offset + compressed_len as u64;
         offset
     }
 
     /// Record a page at a specific offset (for bulk writes where offset is pre-computed).
     pub(crate) fn insert_at(&mut self, page_num: u64, offset: u64, compressed_len: u32) {
-        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        self.entries.insert(
+            page_num,
+            CacheIndexEntry {
+                offset,
+                compressed_len,
+            },
+        );
         let end = offset + compressed_len as u64;
         if end > self.next_offset {
             self.next_offset = end;
@@ -82,8 +94,12 @@ impl CacheIndex {
         let data = serde_json::to_vec(&PersistableCacheIndex {
             entries: &self.entries,
             next_offset: self.next_offset,
-        }).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serialize cache index: {}", e))
+        })
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("serialize cache index: {}", e),
+            )
         })?;
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, &data)?;
@@ -214,11 +230,27 @@ pub(crate) static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 impl DiskCache {
-    pub(crate) fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>) -> io::Result<Self> {
+    pub(crate) fn new(
+        cache_dir: &Path,
+        ttl_secs: u64,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        page_size: u32,
+        page_count: u64,
+        encryption_key: Option<[u8; 32]>,
+        group_pages: Vec<Vec<u64>>,
+    ) -> io::Result<Self> {
         Self::new_with_compression(
-            cache_dir, ttl_secs, pages_per_group, sub_pages_per_frame,
-            page_size, page_count, encryption_key, group_pages,
-            false, 3,
+            cache_dir,
+            ttl_secs,
+            pages_per_group,
+            sub_pages_per_frame,
+            page_size,
+            page_count,
+            encryption_key,
+            group_pages,
+            false,
+            3,
             #[cfg(feature = "zstd")]
             None,
             0, // mem_cache_budget: disabled by default
@@ -226,9 +258,16 @@ impl DiskCache {
     }
 
     pub(crate) fn new_with_compression(
-        cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32,
-        page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>,
-        cache_compression: bool, cache_compression_level: i32,
+        cache_dir: &Path,
+        ttl_secs: u64,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        page_size: u32,
+        page_count: u64,
+        encryption_key: Option<[u8; 32]>,
+        group_pages: Vec<Vec<u64>>,
+        cache_compression: bool,
+        cache_compression_level: i32,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         mem_cache_budget: u64,
     ) -> io::Result<Self> {
@@ -271,7 +310,11 @@ impl DiskCache {
         }
 
         // Sub-chunk tracker (primary tracking mechanism)
-        let spf = if sub_pages_per_frame > 0 { sub_pages_per_frame } else { pages_per_group };
+        let spf = if sub_pages_per_frame > 0 {
+            sub_pages_per_frame
+        } else {
+            pages_per_group
+        };
         let tracker_path = cache_dir.join("sub_chunk_tracker");
         #[cfg(feature = "encryption")]
         let mut tracker = if encryption_key.is_some() {
@@ -331,7 +374,9 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
-            cache_file_len: std::sync::atomic::AtomicU64::new(cache_file.metadata().map(|m| m.len()).unwrap_or(0)),
+            cache_file_len: std::sync::atomic::AtomicU64::new(
+                cache_file.metadata().map(|m| m.len()).unwrap_or(0),
+            ),
             cache_file,
             cache_file_extend: parking_lot::Mutex::new(()),
             mem_cache: if mem_cache_budget > 0 && page_count > 0 && page_size > 0 {
@@ -380,9 +425,9 @@ impl DiskCache {
     /// Create a zstd encoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn encoder_dict(&self) -> Option<zstd::dict::EncoderDictionary<'static>> {
-        self.dictionary.as_ref().map(|d| {
-            zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level)
-        })
+        self.dictionary
+            .as_ref()
+            .map(|d| zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level))
     }
 
     /// Bump the generation counter. Called by sync() after writing dirty pages.
@@ -394,13 +439,20 @@ impl DiskCache {
     /// Promote contiguous decoded pages directly into mem_cache (zero extra I/O).
     /// Called after write_pages_bulk/write_pages_scattered when pages are decoded from S3.
     /// The data is already in `raw_data` at page-size offsets, so we just memcpy into the cache.
-    pub(crate) fn promote_bulk_to_mem_cache(&self, start_page: u64, raw_data: &[u8], num_pages: u64) {
+    pub(crate) fn promote_bulk_to_mem_cache(
+        &self,
+        start_page: u64,
+        raw_data: &[u8],
+        num_pages: u64,
+    ) {
         let mc = match self.mem_cache {
             Some(ref mc) => mc,
             None => return,
         };
         let ps = self.page_size.load(Ordering::Relaxed) as usize;
-        if ps == 0 { return; }
+        if ps == 0 {
+            return;
+        }
 
         for i in 0..num_pages as usize {
             let pnum = start_page + i as u64;
@@ -410,21 +462,37 @@ impl DiskCache {
                     // Already cached, update in place
                     let src_start = i * ps;
                     let copy_len = ps.min(raw_data.len() - src_start);
-                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, copy_len); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            raw_data[src_start..].as_ptr(),
+                            ptr,
+                            copy_len,
+                        );
+                    }
                 } else {
                     let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 > self.mem_cache_budget { return; } // budget exhausted
+                    if current + ps as u64 > self.mem_cache_budget {
+                        return;
+                    } // budget exhausted
                     let src_start = i * ps;
                     let src_end = (src_start + ps).min(raw_data.len());
                     let mut page_buf = vec![0u8; ps].into_boxed_slice();
                     page_buf[..src_end - src_start].copy_from_slice(&raw_data[src_start..src_end]);
                     let new_ptr = Box::into_raw(page_buf) as *mut u8;
-                    if slot.compare_exchange(
-                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
-                    ).is_ok() {
+                    if slot
+                        .compare_exchange(
+                            std::ptr::null_mut(),
+                            new_ptr,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                        }
                     }
                 }
             }
@@ -438,27 +506,43 @@ impl DiskCache {
             None => return,
         };
         let ps = self.page_size.load(Ordering::Relaxed) as usize;
-        if ps == 0 { return; }
+        if ps == 0 {
+            return;
+        }
 
         for (i, &pnum) in page_nums.iter().enumerate() {
             if let Some(slot) = mc.get(pnum as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 let src_start = i * ps;
-                if src_start + ps > raw_data.len() { break; }
+                if src_start + ps > raw_data.len() {
+                    break;
+                }
                 if !ptr.is_null() {
-                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps);
+                    }
                 } else {
                     let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 > self.mem_cache_budget { return; }
+                    if current + ps as u64 > self.mem_cache_budget {
+                        return;
+                    }
                     let mut page_buf = vec![0u8; ps].into_boxed_slice();
                     page_buf.copy_from_slice(&raw_data[src_start..src_start + ps]);
                     let new_ptr = Box::into_raw(page_buf) as *mut u8;
-                    if slot.compare_exchange(
-                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
-                    ).is_ok() {
+                    if slot
+                        .compare_exchange(
+                            std::ptr::null_mut(),
+                            new_ptr,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                        }
                     }
                 }
             }
@@ -484,9 +568,9 @@ impl DiskCache {
     /// Create a zstd decoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn decoder_dict(&self) -> Option<zstd::dict::DecoderDictionary<'static>> {
-        self.dictionary.as_ref().map(|d| {
-            zstd::dict::DecoderDictionary::copy(d)
-        })
+        self.dictionary
+            .as_ref()
+            .map(|d| zstd::dict::DecoderDictionary::copy(d))
     }
 
     /// Read a single page from the cache file.
@@ -508,7 +592,9 @@ impl DiskCache {
                 if !ptr.is_null() {
                     let ps = self.page_size.load(Ordering::Relaxed) as usize;
                     let copy_len = buf.len().min(ps);
-                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
+                    }
                     return Ok(());
                 }
             }
@@ -533,16 +619,19 @@ impl DiskCache {
             let index = self.cache_index.lock();
             match index.get(page_num) {
                 Some(e) => *e,
-                None => return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("page {} not in compressed cache index", page_num),
-                )),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("page {} not in compressed cache index", page_num),
+                    ))
+                }
             }
         };
 
         // Read the compressed (and optionally encrypted) blob
         let mut compressed = vec![0u8; entry.compressed_len as usize];
-        self.cache_file.read_exact_at(&mut compressed, entry.offset)?;
+        self.cache_file
+            .read_exact_at(&mut compressed, entry.offset)?;
 
         // Decrypt if encrypted (CTR, same size)
         #[cfg(feature = "encryption")]
@@ -571,7 +660,9 @@ impl DiskCache {
                     io::ErrorKind::InvalidData,
                     format!(
                         "decompressed page {} too small: need {} bytes, got {}",
-                        page_num, buf.len(), decompressed.len()
+                        page_num,
+                        buf.len(),
+                        decompressed.len()
                     ),
                 ));
             }
@@ -614,8 +705,12 @@ impl DiskCache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 if !ptr.is_null() {
-                    let copy_len = data.len().min(self.page_size.load(Ordering::Relaxed) as usize);
-                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len); }
+                    let copy_len = data
+                        .len()
+                        .min(self.page_size.load(Ordering::Relaxed) as usize);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
+                    }
                 }
             }
         }
@@ -630,7 +725,8 @@ impl DiskCache {
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
         let blob = compress::compress(
-            data, self.cache_compression_level,
+            data,
+            self.cache_compression_level,
             #[cfg(feature = "zstd")]
             ed.as_ref(),
             #[cfg(not(feature = "zstd"))]
@@ -662,7 +758,12 @@ impl DiskCache {
     /// Write a contiguous range of pages to the cache file in a single I/O operation.
     /// `start_page` is the first page number, `data` is the raw concatenated page data.
     /// Uses RwLock: read lock for pwrite (concurrent), write lock only if file needs extending.
-    pub(crate) fn write_pages_bulk(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
+    pub(crate) fn write_pages_bulk(
+        &self,
+        start_page: u64,
+        data: &[u8],
+        num_pages: u64,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
 
@@ -680,7 +781,11 @@ impl DiskCache {
             for i in 0..num_pages {
                 let start = i as usize * page_sz;
                 let end = (start + page_sz).min(data.len());
-                encrypted.extend_from_slice(&compress::encrypt_ctr(&data[start..end], start_page + i, key)?);
+                encrypted.extend_from_slice(&compress::encrypt_ctr(
+                    &data[start..end],
+                    start_page + i,
+                    key,
+                )?);
             }
             encrypted
         } else {
@@ -726,7 +831,12 @@ impl DiskCache {
     }
 
     /// Compressed bulk write: compress each page individually, concatenate, single pwrite.
-    fn write_pages_bulk_compressed(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
+    fn write_pages_bulk_compressed(
+        &self,
+        start_page: u64,
+        data: &[u8],
+        num_pages: u64,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
 
@@ -744,7 +854,8 @@ impl DiskCache {
             let page_data = &data[start..end];
 
             let compressed = compress::compress(
-                page_data, self.cache_compression_level,
+                page_data,
+                self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
                 #[cfg(not(feature = "zstd"))]
@@ -808,7 +919,13 @@ impl DiskCache {
 
     /// Write pages to the cache at non-consecutive positions (B-tree-packed groups).
     /// `page_nums` maps position in `data` to actual page number.
-    pub(crate) fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
+    pub(crate) fn write_pages_scattered(
+        &self,
+        page_nums: &[u64],
+        data: &[u8],
+        gid: u64,
+        start_index_in_group: u32,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
         if page_nums.is_empty() || page_sz == 0 {
@@ -816,7 +933,9 @@ impl DiskCache {
         }
 
         // Track how many pages we actually write (data may be shorter than page_nums)
-        let writable_count = page_nums.iter().enumerate()
+        let writable_count = page_nums
+            .iter()
+            .enumerate()
             .take_while(|(i, _)| (i + 1) * page_sz <= data.len())
             .count();
         let written_pages = &page_nums[..writable_count];
@@ -825,7 +944,13 @@ impl DiskCache {
         }
 
         if self.cache_compression {
-            return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
+            return self.write_pages_scattered_compressed(
+                written_pages,
+                data,
+                page_sz,
+                gid,
+                start_index_in_group,
+            );
         }
 
         // Promote decoded pages to mem_cache before encryption
@@ -901,7 +1026,8 @@ impl DiskCache {
             let page_data = &data[src_start..src_start + page_sz];
 
             let compressed = compress::compress(
-                page_data, self.cache_compression_level,
+                page_data,
+                self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
                 #[cfg(not(feature = "zstd"))]
@@ -1037,7 +1163,8 @@ impl DiskCache {
         }
         // Track peak cache size
         let current = self.tracker.lock().current_cache_bytes;
-        self.stat_peak_cache_bytes.fetch_max(current, Ordering::Relaxed);
+        self.stat_peak_cache_bytes
+            .fetch_max(current, Ordering::Relaxed);
         // Wake any threads waiting on this group
         self.group_condvar.notify_all();
         // Lazy eviction check
@@ -1099,7 +1226,8 @@ impl DiskCache {
                 continue;
             }
             // state == None. Worker may not have picked up job yet.
-            self.group_condvar.wait_for(&mut guard, Duration::from_millis(5));
+            self.group_condvar
+                .wait_for(&mut guard, Duration::from_millis(5));
             return;
         }
     }
@@ -1110,14 +1238,22 @@ impl DiskCache {
         // Also touch all sub-chunks in this group.
         // Use actual page count from group_pages (not positional ppg).
         let gp = self.group_pages.read();
-        let num_pages = gp.get(gid as usize).map(|v| v.len() as u32).unwrap_or(self.pages_per_group);
+        let num_pages = gp
+            .get(gid as usize)
+            .map(|v| v.len() as u32)
+            .unwrap_or(self.pages_per_group);
         drop(gp);
         let mut tracker = self.tracker.lock();
         let frames = if self.sub_pages_per_frame > 0 {
             (num_pages + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
-        } else { 1 };
+        } else {
+            1
+        };
         for fi in 0..frames {
-            let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
+            let id = SubChunkId {
+                group_id: gid as u32,
+                frame_index: fi as u16,
+            };
             tracker.touch(id);
         }
     }
@@ -1230,7 +1366,8 @@ impl DiskCache {
                     let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
                     if !old.is_null() && ps > 0 {
                         // Reconstruct the Box to defer its drop (no UAF risk)
-                        let boxed = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
+                        let boxed =
+                            unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
                         self.deferred_frees.lock().push(boxed);
                         self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                     }
@@ -1360,7 +1497,8 @@ impl DiskCache {
             self.stat_bytes_evicted.fetch_add(scbs, Ordering::Relaxed);
             evicted += 1;
         }
-        self.stat_last_eviction_count.store(evicted as u64, Ordering::Relaxed);
+        self.stat_last_eviction_count
+            .store(evicted as u64, Ordering::Relaxed);
 
         // Churn detection: if >50% of cache was evicted, warn
         if evicted > 0 {
@@ -1370,7 +1508,9 @@ impl DiskCache {
                 eprintln!(
                     "[cache] WARNING: high churn detected. Evicted {} of {} sub-chunks ({}%). \
                      Consider increasing cache_limit.",
-                    evicted, total_before, evicted as u64 * 100 / total_before,
+                    evicted,
+                    total_before,
+                    evicted as u64 * 100 / total_before,
                 );
             }
         }
@@ -1384,7 +1524,9 @@ impl DiskCache {
             return;
         }
         let mut index = self.cache_index.lock();
-        let to_remove: Vec<u64> = index.entries.keys()
+        let to_remove: Vec<u64> = index
+            .entries
+            .keys()
             .copied()
             .filter(|p| !keep_pages.contains(p))
             .collect();
@@ -1447,7 +1589,9 @@ impl Drop for DiskCache {
                 for slot in mc.iter() {
                     let ptr = slot.swap(std::ptr::null_mut(), Ordering::Relaxed);
                     if !ptr.is_null() {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps)));
+                        }
                     }
                 }
             }
@@ -1460,4 +1604,3 @@ impl Drop for DiskCache {
 #[cfg(test)]
 #[path = "test_disk_cache.rs"]
 mod tests;
-

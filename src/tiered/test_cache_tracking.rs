@@ -1,12 +1,14 @@
 use super::*;
 use crate::tiered::*;
-use tempfile::TempDir;
 use std::time::Duration;
+use tempfile::TempDir;
 
 #[cfg(feature = "encryption")]
 fn test_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = i as u8;
+    }
     key
 }
 
@@ -25,18 +27,66 @@ fn test_sub_chunk_for_page_basic() {
     let t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
     // ppg=8, spf=2: group has 4 frames (0..3), each covering 2 pages
     // Page 0,1 → group 0, frame 0
-    assert_eq!(t.sub_chunk_for_page(0), SubChunkId { group_id: 0, frame_index: 0 });
-    assert_eq!(t.sub_chunk_for_page(1), SubChunkId { group_id: 0, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(0),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }
+    );
+    assert_eq!(
+        t.sub_chunk_for_page(1),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }
+    );
     // Page 2,3 → group 0, frame 1
-    assert_eq!(t.sub_chunk_for_page(2), SubChunkId { group_id: 0, frame_index: 1 });
-    assert_eq!(t.sub_chunk_for_page(3), SubChunkId { group_id: 0, frame_index: 1 });
+    assert_eq!(
+        t.sub_chunk_for_page(2),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1
+        }
+    );
+    assert_eq!(
+        t.sub_chunk_for_page(3),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1
+        }
+    );
     // Page 6,7 → group 0, frame 3
-    assert_eq!(t.sub_chunk_for_page(6), SubChunkId { group_id: 0, frame_index: 3 });
-    assert_eq!(t.sub_chunk_for_page(7), SubChunkId { group_id: 0, frame_index: 3 });
+    assert_eq!(
+        t.sub_chunk_for_page(6),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 3
+        }
+    );
+    assert_eq!(
+        t.sub_chunk_for_page(7),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 3
+        }
+    );
     // Page 8 → group 1, frame 0
-    assert_eq!(t.sub_chunk_for_page(8), SubChunkId { group_id: 1, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(8),
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0
+        }
+    );
     // Page 15 → group 1, frame 3
-    assert_eq!(t.sub_chunk_for_page(15), SubChunkId { group_id: 1, frame_index: 3 });
+    assert_eq!(
+        t.sub_chunk_for_page(15),
+        SubChunkId {
+            group_id: 1,
+            frame_index: 3
+        }
+    );
 }
 
 #[test]
@@ -45,15 +95,45 @@ fn test_sub_chunk_for_page_large_config() {
     // 64KB pages: ppg=256, spf=4 (production defaults)
     let t = SubChunkTracker::new(dir.path().join("t"), 256, 4);
     // Page 0 → group 0, frame 0
-    assert_eq!(t.sub_chunk_for_page(0), SubChunkId { group_id: 0, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(0),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }
+    );
     // Page 3 → group 0, frame 0 (still within first 4 pages)
-    assert_eq!(t.sub_chunk_for_page(3), SubChunkId { group_id: 0, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(3),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }
+    );
     // Page 4 → group 0, frame 1
-    assert_eq!(t.sub_chunk_for_page(4), SubChunkId { group_id: 0, frame_index: 1 });
+    assert_eq!(
+        t.sub_chunk_for_page(4),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1
+        }
+    );
     // Page 255 → group 0, frame 63
-    assert_eq!(t.sub_chunk_for_page(255), SubChunkId { group_id: 0, frame_index: 63 });
+    assert_eq!(
+        t.sub_chunk_for_page(255),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 63
+        }
+    );
     // Page 256 → group 1, frame 0
-    assert_eq!(t.sub_chunk_for_page(256), SubChunkId { group_id: 1, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(256),
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0
+        }
+    );
 }
 
 #[test]
@@ -61,14 +141,23 @@ fn test_sub_chunk_for_page_zero_config() {
     let dir = TempDir::new().unwrap();
     let t = SubChunkTracker::new(dir.path().join("t"), 0, 0);
     // Edge: zero config should not panic, returns (0, 0)
-    assert_eq!(t.sub_chunk_for_page(100), SubChunkId { group_id: 0, frame_index: 0 });
+    assert_eq!(
+        t.sub_chunk_for_page(100),
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }
+    );
 }
 
 #[test]
 fn test_sub_chunk_tracker_mark_and_present() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let id = SubChunkId { group_id: 0, frame_index: 1 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
     assert!(!t.is_sub_chunk_present(&id));
     assert!(!t.is_present(2)); // page 2 maps to this sub-chunk
 
@@ -84,7 +173,10 @@ fn test_sub_chunk_tracker_mark_and_present() {
 fn test_sub_chunk_tracker_tier_promotion_respects_priority() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
 
     // Start as Data
     t.mark_present(id, SubChunkTier::Data);
@@ -111,7 +203,10 @@ fn test_sub_chunk_tracker_tier_promotion_respects_priority() {
 fn test_sub_chunk_tracker_mark_present_does_not_demote() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
 
     // Set as Index
     t.mark_present(id, SubChunkTier::Index);
@@ -130,8 +225,14 @@ fn test_sub_chunk_tracker_mark_present_does_not_demote() {
 fn test_sub_chunk_tracker_evict_one_prefers_data_over_index() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let data_id = SubChunkId { group_id: 0, frame_index: 0 };
-    let index_id = SubChunkId { group_id: 0, frame_index: 1 };
+    let data_id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index_id = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
 
     t.mark_present(index_id, SubChunkTier::Index);
     t.mark_present(data_id, SubChunkTier::Data);
@@ -147,8 +248,14 @@ fn test_sub_chunk_tracker_evict_one_prefers_data_over_index() {
 fn test_sub_chunk_tracker_evict_one_never_evicts_pinned() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let data = SubChunkId { group_id: 0, frame_index: 1 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
 
     t.mark_present(pinned, SubChunkTier::Data);
     t.mark_pinned(pinned);
@@ -167,8 +274,14 @@ fn test_sub_chunk_tracker_evict_one_never_evicts_pinned() {
 fn test_sub_chunk_tracker_evict_one_lru_within_tier() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let old = SubChunkId { group_id: 0, frame_index: 0 };
-    let new = SubChunkId { group_id: 0, frame_index: 1 };
+    let old = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let new = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
 
     t.mark_present(old, SubChunkTier::Data);
     std::thread::sleep(Duration::from_millis(10));
@@ -183,10 +296,22 @@ fn test_sub_chunk_tracker_evict_one_lru_within_tier() {
 fn test_sub_chunk_tracker_evict_cascade_data_then_index() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 0, frame_index: 1 };
-    let data1 = SubChunkId { group_id: 0, frame_index: 2 };
-    let data2 = SubChunkId { group_id: 0, frame_index: 3 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
+    let data1 = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
+    let data2 = SubChunkId {
+        group_id: 0,
+        frame_index: 3,
+    };
 
     t.mark_present(pinned, SubChunkTier::Data);
     t.mark_pinned(pinned);
@@ -218,25 +343,61 @@ fn test_sub_chunk_tracker_remove_group() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
     // Add sub-chunks across two groups
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Pinned);
-    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Data);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1,
+        },
+        SubChunkTier::Pinned,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
 
     t.remove_group(0);
     // Group 0 sub-chunks gone (even pinned)
-    assert!(!t.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 0 }));
-    assert!(!t.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 1 }));
+    assert!(!t.is_sub_chunk_present(&SubChunkId {
+        group_id: 0,
+        frame_index: 0
+    }));
+    assert!(!t.is_sub_chunk_present(&SubChunkId {
+        group_id: 0,
+        frame_index: 1
+    }));
     // Group 1 unaffected
-    assert!(t.is_sub_chunk_present(&SubChunkId { group_id: 1, frame_index: 0 }));
+    assert!(t.is_sub_chunk_present(&SubChunkId {
+        group_id: 1,
+        frame_index: 0
+    }));
 }
 
 #[test]
 fn test_sub_chunk_tracker_clear_data_keeps_pinned() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 0, frame_index: 1 };
-    let data = SubChunkId { group_id: 0, frame_index: 2 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
 
     t.mark_present(pinned, SubChunkTier::Data);
     t.mark_pinned(pinned);
@@ -255,9 +416,18 @@ fn test_sub_chunk_tracker_clear_data_keeps_pinned() {
 fn test_sub_chunk_tracker_clear_data_only_keeps_index_and_pinned() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 0, frame_index: 1 };
-    let data = SubChunkId { group_id: 0, frame_index: 2 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
 
     t.mark_present(pinned, SubChunkTier::Data);
     t.mark_pinned(pinned);
@@ -276,10 +446,31 @@ fn test_sub_chunk_tracker_clear_data_only_keeps_index_and_pinned() {
 fn test_sub_chunk_tracker_clear_all() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
-    t.mark_pinned(SubChunkId { group_id: 0, frame_index: 0 });
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 2 }, SubChunkTier::Data);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
+    t.mark_pinned(SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    });
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1,
+        },
+        SubChunkTier::Index,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 2,
+        },
+        SubChunkTier::Data,
+    );
 
     t.clear_all();
     assert_eq!(t.present.len(), 0);
@@ -291,9 +482,18 @@ fn test_sub_chunk_tracker_clear_all() {
 fn test_sub_chunk_tracker_clear_index_and_data_keeps_pinned() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 0, frame_index: 1 };
-    let data = SubChunkId { group_id: 0, frame_index: 2 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
 
     t.mark_present(pinned, SubChunkTier::Data);
     t.mark_pinned(pinned);
@@ -314,20 +514,65 @@ fn test_sub_chunk_tracker_persist_and_reload() {
     let path = dir.path().join("tracker_persist");
     {
         let mut t = SubChunkTracker::new(path.clone(), 8, 2);
-        t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
-        t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
-        t.mark_present(SubChunkId { group_id: 1, frame_index: 2 }, SubChunkTier::Data);
+        t.mark_present(
+            SubChunkId {
+                group_id: 0,
+                frame_index: 0,
+            },
+            SubChunkTier::Pinned,
+        );
+        t.mark_present(
+            SubChunkId {
+                group_id: 0,
+                frame_index: 1,
+            },
+            SubChunkTier::Index,
+        );
+        t.mark_present(
+            SubChunkId {
+                group_id: 1,
+                frame_index: 2,
+            },
+            SubChunkTier::Data,
+        );
         t.persist().unwrap();
     }
     // Reload
     let t2 = SubChunkTracker::new(path, 8, 2);
-    assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 0 }));
-    assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 1 }));
-    assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 1, frame_index: 2 }));
+    assert!(t2.is_sub_chunk_present(&SubChunkId {
+        group_id: 0,
+        frame_index: 0
+    }));
+    assert!(t2.is_sub_chunk_present(&SubChunkId {
+        group_id: 0,
+        frame_index: 1
+    }));
+    assert!(t2.is_sub_chunk_present(&SubChunkId {
+        group_id: 1,
+        frame_index: 2
+    }));
     // Tiers survive persistence
-    assert_eq!(t2.tiers.get(&SubChunkId { group_id: 0, frame_index: 0 }), Some(&SubChunkTier::Pinned));
-    assert_eq!(t2.tiers.get(&SubChunkId { group_id: 0, frame_index: 1 }), Some(&SubChunkTier::Index));
-    assert_eq!(t2.tiers.get(&SubChunkId { group_id: 1, frame_index: 2 }), Some(&SubChunkTier::Data));
+    assert_eq!(
+        t2.tiers.get(&SubChunkId {
+            group_id: 0,
+            frame_index: 0
+        }),
+        Some(&SubChunkTier::Pinned)
+    );
+    assert_eq!(
+        t2.tiers.get(&SubChunkId {
+            group_id: 0,
+            frame_index: 1
+        }),
+        Some(&SubChunkTier::Index)
+    );
+    assert_eq!(
+        t2.tiers.get(&SubChunkId {
+            group_id: 1,
+            frame_index: 2
+        }),
+        Some(&SubChunkTier::Data)
+    );
 }
 
 #[test]
@@ -336,10 +581,34 @@ fn test_sub_chunk_tracker_len_and_count_tier() {
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
     assert_eq!(t.len(), 0);
 
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 2 }, SubChunkTier::Data);
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 3 }, SubChunkTier::Data);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Pinned,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 1,
+        },
+        SubChunkTier::Index,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 2,
+        },
+        SubChunkTier::Data,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 3,
+        },
+        SubChunkTier::Data,
+    );
 
     assert_eq!(t.len(), 4);
     assert_eq!(t.count_tier(SubChunkTier::Pinned), 1);
@@ -351,8 +620,14 @@ fn test_sub_chunk_tracker_len_and_count_tier() {
 fn test_sub_chunk_tracker_touch_updates_lru_order() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
-    let old = SubChunkId { group_id: 0, frame_index: 0 };
-    let new = SubChunkId { group_id: 0, frame_index: 1 };
+    let old = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let new = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
 
     t.mark_present(old, SubChunkTier::Data);
     std::thread::sleep(Duration::from_millis(10));
@@ -373,16 +648,40 @@ fn test_sub_chunk_tracker_pages_for_sub_chunk() {
     let t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
     let page_count = 16u64;
     // Frame 0 of group 0: pages 0..2
-    let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 0, frame_index: 0 }, page_count);
+    let pages = t.pages_for_sub_chunk(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        page_count,
+    );
     assert_eq!(pages, 0..2);
     // Frame 2 of group 0: pages 4..6
-    let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 0, frame_index: 2 }, page_count);
+    let pages = t.pages_for_sub_chunk(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 2,
+        },
+        page_count,
+    );
     assert_eq!(pages, 4..6);
     // Frame 0 of group 1: pages 8..10
-    let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 1, frame_index: 0 }, page_count);
+    let pages = t.pages_for_sub_chunk(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0,
+        },
+        page_count,
+    );
     assert_eq!(pages, 8..10);
     // Boundary: last frame clamped to page_count
-    let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 1, frame_index: 3 }, page_count);
+    let pages = t.pages_for_sub_chunk(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 3,
+        },
+        page_count,
+    );
     assert_eq!(pages, 14..16);
 }
 
@@ -396,18 +695,27 @@ fn test_evict_one_no_access_time_treated_as_oldest() {
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
     // Insert a sub-chunk via present set and tier, but no access time
-    let orphan = SubChunkId { group_id: 0, frame_index: 0 };
+    let orphan = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.present.insert(orphan);
     t.tiers.insert(orphan, SubChunkTier::Data);
     // Intentionally no access_times entry
 
     // Insert a normal sub-chunk with access time
-    let normal = SubChunkId { group_id: 0, frame_index: 1 };
+    let normal = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
     t.mark_present(normal, SubChunkTier::Data);
 
     // The orphan (no access time) should be evicted first — it gets epoch (oldest)
     let evicted = t.evict_one().unwrap();
-    assert_eq!(evicted, orphan, "sub-chunk without access time should be evicted first");
+    assert_eq!(
+        evicted, orphan,
+        "sub-chunk without access time should be evicted first"
+    );
     // Normal one should still be present
     assert!(t.is_sub_chunk_present(&normal));
 }
@@ -421,7 +729,10 @@ fn test_evict_one_multiple_missing_access_times_all_evictable() {
 
     // Insert 3 sub-chunks with no access times
     for i in 0..3u16 {
-        let id = SubChunkId { group_id: 0, frame_index: i };
+        let id = SubChunkId {
+            group_id: 0,
+            frame_index: i,
+        };
         t.present.insert(id);
         t.tiers.insert(id, SubChunkTier::Data);
     }
@@ -440,14 +751,23 @@ fn test_mark_pinned_adds_to_present_set() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
 
     // Before fix: mark_pinned without prior mark_present left sub-chunk not in present
     t.mark_pinned(id);
 
-    assert!(t.is_sub_chunk_present(&id), "mark_pinned must add to present set");
+    assert!(
+        t.is_sub_chunk_present(&id),
+        "mark_pinned must add to present set"
+    );
     assert_eq!(t.tiers[&id], SubChunkTier::Pinned);
-    assert!(t.access_times.contains_key(&id), "mark_pinned must set access time");
+    assert!(
+        t.access_times.contains_key(&id),
+        "mark_pinned must set access time"
+    );
     assert_eq!(t.len(), 1);
     assert_eq!(t.count_tier(SubChunkTier::Pinned), 1);
 }
@@ -458,13 +778,22 @@ fn test_mark_index_adds_to_present_set() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
 
     t.mark_index(id);
 
-    assert!(t.is_sub_chunk_present(&id), "mark_index must add to present set");
+    assert!(
+        t.is_sub_chunk_present(&id),
+        "mark_index must add to present set"
+    );
     assert_eq!(t.tiers[&id], SubChunkTier::Index);
-    assert!(t.access_times.contains_key(&id), "mark_index must set access time");
+    assert!(
+        t.access_times.contains_key(&id),
+        "mark_index must set access time"
+    );
     assert_eq!(t.len(), 1);
     assert_eq!(t.count_tier(SubChunkTier::Index), 1);
 }
@@ -475,7 +804,10 @@ fn test_mark_pinned_does_not_duplicate_when_already_present() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.mark_present(id, SubChunkTier::Data);
     assert_eq!(t.len(), 1);
 
@@ -490,11 +822,18 @@ fn test_mark_index_respects_pinned_priority() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.mark_pinned(id);
     t.mark_index(id);
 
-    assert_eq!(t.tiers[&id], SubChunkTier::Pinned, "mark_index must not demote from Pinned");
+    assert_eq!(
+        t.tiers[&id],
+        SubChunkTier::Pinned,
+        "mark_index must not demote from Pinned"
+    );
 }
 
 #[test]
@@ -504,9 +843,18 @@ fn test_clear_data_removes_index_and_data() {
     let dir = TempDir::new().unwrap();
     let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
 
-    let pinned = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 0, frame_index: 1 };
-    let data = SubChunkId { group_id: 0, frame_index: 2 };
+    let pinned = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
 
     t.mark_present(pinned, SubChunkTier::Pinned);
     t.mark_present(index, SubChunkTier::Index);
@@ -514,9 +862,18 @@ fn test_clear_data_removes_index_and_data() {
 
     t.clear_data();
 
-    assert!(t.is_sub_chunk_present(&pinned), "Pinned must survive clear_data");
-    assert!(!t.is_sub_chunk_present(&index), "Index must be removed by clear_data");
-    assert!(!t.is_sub_chunk_present(&data), "Data must be removed by clear_data");
+    assert!(
+        t.is_sub_chunk_present(&pinned),
+        "Pinned must survive clear_data"
+    );
+    assert!(
+        !t.is_sub_chunk_present(&index),
+        "Index must be removed by clear_data"
+    );
+    assert!(
+        !t.is_sub_chunk_present(&data),
+        "Data must be removed by clear_data"
+    );
 }
 
 // ===== SubChunkTracker persistence encryption tests =====
@@ -531,8 +888,14 @@ fn test_sub_chunk_tracker_encrypted_persist_roundtrip() {
     // Create tracker with encryption, add some sub-chunks
     {
         let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
-        let id1 = SubChunkId { group_id: 0, frame_index: 0 };
-        let id2 = SubChunkId { group_id: 1, frame_index: 2 };
+        let id1 = SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        };
+        let id2 = SubChunkId {
+            group_id: 1,
+            frame_index: 2,
+        };
         t.mark_present(id1, SubChunkTier::Pinned);
         t.mark_present(id2, SubChunkTier::Data);
         t.persist().unwrap();
@@ -540,12 +903,32 @@ fn test_sub_chunk_tracker_encrypted_persist_roundtrip() {
 
     // Reload with same key — data must survive
     let t2 = SubChunkTracker::new_encrypted(path, 8, 2, Some(key));
-    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
-    let id2 = SubChunkId { group_id: 1, frame_index: 2 };
-    assert!(t2.is_sub_chunk_present(&id1), "sub-chunk 0:0 must survive persist+reload");
-    assert!(t2.is_sub_chunk_present(&id2), "sub-chunk 1:2 must survive persist+reload");
-    assert_eq!(t2.tiers.get(&id1).copied(), Some(SubChunkTier::Pinned), "tier must survive");
-    assert_eq!(t2.tiers.get(&id2).copied(), Some(SubChunkTier::Data), "tier must survive");
+    let id1 = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let id2 = SubChunkId {
+        group_id: 1,
+        frame_index: 2,
+    };
+    assert!(
+        t2.is_sub_chunk_present(&id1),
+        "sub-chunk 0:0 must survive persist+reload"
+    );
+    assert!(
+        t2.is_sub_chunk_present(&id2),
+        "sub-chunk 1:2 must survive persist+reload"
+    );
+    assert_eq!(
+        t2.tiers.get(&id1).copied(),
+        Some(SubChunkTier::Pinned),
+        "tier must survive"
+    );
+    assert_eq!(
+        t2.tiers.get(&id2).copied(),
+        Some(SubChunkTier::Data),
+        "tier must survive"
+    );
 }
 
 #[test]
@@ -556,14 +939,20 @@ fn test_sub_chunk_tracker_encrypted_on_disk_not_plaintext() {
     let key = test_key();
 
     let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
-    let id = SubChunkId { group_id: 5, frame_index: 3 };
+    let id = SubChunkId {
+        group_id: 5,
+        frame_index: 3,
+    };
     t.mark_present(id, SubChunkTier::Index);
     t.persist().unwrap();
 
     // Raw file should not be valid JSON (it's encrypted)
     let raw = std::fs::read(&path).unwrap();
     let parse_result: Result<Vec<(SubChunkId, u8)>, _> = serde_json::from_slice(&raw);
-    assert!(parse_result.is_err(), "encrypted tracker file must not be valid JSON");
+    assert!(
+        parse_result.is_err(),
+        "encrypted tracker file must not be valid JSON"
+    );
 }
 
 #[test]
@@ -576,15 +965,24 @@ fn test_sub_chunk_tracker_wrong_key_returns_empty() {
     // Write with correct key
     {
         let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
-        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        let id = SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        };
         t.mark_present(id, SubChunkTier::Pinned);
         t.persist().unwrap();
     }
 
     // Load with wrong key — should fail gracefully (empty tracker, not crash)
     let t2 = SubChunkTracker::new_encrypted(path, 8, 2, Some(wrong_key()));
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
-    assert!(!t2.is_sub_chunk_present(&id), "wrong key must not load data");
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    assert!(
+        !t2.is_sub_chunk_present(&id),
+        "wrong key must not load data"
+    );
 }
 
 #[test]
@@ -595,14 +993,20 @@ fn test_sub_chunk_tracker_no_encryption_stays_plaintext() {
     let path = dir.path().join("tracker_plain");
 
     let mut t = SubChunkTracker::new(path.clone(), 8, 2);
-    let id = SubChunkId { group_id: 2, frame_index: 1 };
+    let id = SubChunkId {
+        group_id: 2,
+        frame_index: 1,
+    };
     t.mark_present(id, SubChunkTier::Data);
     t.persist().unwrap();
 
     // Raw file should be valid JSON (v2 format: id, tier, count)
     let raw = std::fs::read(&path).unwrap();
     let parse_result: Result<Vec<(SubChunkId, u8, u32)>, _> = serde_json::from_slice(&raw);
-    assert!(parse_result.is_ok(), "unencrypted tracker file must be valid JSON");
+    assert!(
+        parse_result.is_ok(),
+        "unencrypted tracker file must be valid JSON"
+    );
 }
 
 // Cache byte tracking tests
@@ -616,8 +1020,14 @@ fn test_current_cache_bytes_tracks_mark_present() {
 
     assert_eq!(t.current_cache_bytes, 0);
 
-    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
-    let id2 = SubChunkId { group_id: 0, frame_index: 1 };
+    let id1 = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let id2 = SubChunkId {
+        group_id: 0,
+        frame_index: 1,
+    };
     t.mark_present(id1, SubChunkTier::Data);
     assert_eq!(t.current_cache_bytes, 256 * 1024);
 
@@ -636,8 +1046,14 @@ fn test_current_cache_bytes_tracks_remove() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
-    let id2 = SubChunkId { group_id: 1, frame_index: 0 };
+    let id1 = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let id2 = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
     t.mark_present(id1, SubChunkTier::Data);
     t.mark_present(id2, SubChunkTier::Data);
     assert_eq!(t.current_cache_bytes, 200);
@@ -658,7 +1074,13 @@ fn test_current_cache_bytes_clear_all_resets() {
     t.set_sub_chunk_byte_size(100);
 
     for i in 0..10 {
-        t.mark_present(SubChunkId { group_id: i, frame_index: 0 }, SubChunkTier::Data);
+        t.mark_present(
+            SubChunkId {
+                group_id: i,
+                frame_index: 0,
+            },
+            SubChunkTier::Data,
+        );
     }
     assert_eq!(t.current_cache_bytes, 1000);
 
@@ -673,8 +1095,14 @@ fn test_mark_pinned_and_index_track_bytes() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let id1 = SubChunkId { group_id: 0, frame_index: 0 };
-    let id2 = SubChunkId { group_id: 1, frame_index: 0 };
+    let id1 = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let id2 = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
 
     // mark_pinned on new sub-chunk increments bytes
     t.mark_pinned(id1);
@@ -696,9 +1124,27 @@ fn test_pinned_bytes() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
-    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Index);
-    t.mark_present(SubChunkId { group_id: 2, frame_index: 0 }, SubChunkTier::Data);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Pinned,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0,
+        },
+        SubChunkTier::Index,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 2,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
 
     assert_eq!(t.pinned_bytes(), 100);
     assert_eq!(t.current_cache_bytes, 300);
@@ -711,9 +1157,18 @@ fn test_evict_one_skipping() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let id_skip = SubChunkId { group_id: 0, frame_index: 0 };
-    let id_keep = SubChunkId { group_id: 1, frame_index: 0 };
-    let id_evict = SubChunkId { group_id: 2, frame_index: 0 };
+    let id_skip = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let id_keep = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
+    let id_evict = SubChunkId {
+        group_id: 2,
+        frame_index: 0,
+    };
 
     // All Data tier, stagger access times
     t.mark_present(id_skip, SubChunkTier::Data);
@@ -743,8 +1198,20 @@ fn test_evict_one_skipping_all_skipped_returns_none() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
-    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Pinned);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0,
+        },
+        SubChunkTier::Pinned,
+    );
 
     let mut skip = HashSet::new();
     skip.insert(0u64); // skip the only Data sub-chunk
@@ -762,8 +1229,20 @@ fn test_set_sub_chunk_byte_size_recomputes() {
     let mut t = SubChunkTracker::new(path, 8, 4);
 
     // Add sub-chunks before byte size is known
-    t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
-    t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Data);
+    t.mark_present(
+        SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
+    t.mark_present(
+        SubChunkId {
+            group_id: 1,
+            frame_index: 0,
+        },
+        SubChunkTier::Data,
+    );
     assert_eq!(t.current_cache_bytes, 0); // byte size unknown
 
     // Now set byte size: recomputes from present.len()
@@ -779,7 +1258,10 @@ fn test_access_counts_persisted_and_loaded() {
     // Create tracker, add sub-chunks, touch them, persist
     {
         let mut t = SubChunkTracker::new(path.clone(), 8, 4);
-        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        let id = SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        };
         t.mark_present(id, SubChunkTier::Data);
         for _ in 0..15 {
             t.touch(id);
@@ -791,10 +1273,16 @@ fn test_access_counts_persisted_and_loaded() {
     // Load fresh tracker from disk, verify count survived
     {
         let t = SubChunkTracker::new(path.clone(), 8, 4);
-        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        let id = SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        };
         assert!(t.present.contains(&id));
-        assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 15,
-            "access count should survive persist/load cycle");
+        assert_eq!(
+            t.access_counts.get(&id).copied().unwrap_or(0),
+            15,
+            "access count should survive persist/load cycle"
+        );
     }
 }
 
@@ -804,7 +1292,10 @@ fn test_v1_format_backward_compat() {
     let path = dir.path().join("tracker.json");
 
     // Write v1 format manually: Vec<(SubChunkId, u8)>
-    let id = SubChunkId { group_id: 5, frame_index: 2 };
+    let id = SubChunkId {
+        group_id: 5,
+        frame_index: 2,
+    };
     let v1_data: Vec<(SubChunkId, u8)> = vec![(id, 2)]; // tier=Data
     let json = serde_json::to_vec(&v1_data).unwrap();
     std::fs::write(&path, &json).unwrap();
@@ -825,7 +1316,10 @@ fn test_touch_increments_access_count() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.mark_present(id, SubChunkTier::Data);
 
     assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 0);
@@ -841,7 +1335,10 @@ fn test_access_count_capped() {
     let path = dir.path().join("tracker.json");
     let mut t = SubChunkTracker::new(path, 8, 4);
 
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.mark_present(id, SubChunkTier::Data);
 
     for _ in 0..200 {
@@ -858,8 +1355,14 @@ fn test_weighted_eviction_frequency_matters() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let rarely = SubChunkId { group_id: 0, frame_index: 0 };
-    let often = SubChunkId { group_id: 1, frame_index: 0 };
+    let rarely = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let often = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
 
     // Both Data tier, same recency (close enough)
     t.mark_present(rarely, SubChunkTier::Data);
@@ -874,7 +1377,11 @@ fn test_weighted_eviction_frequency_matters() {
 
     // Evict should pick `rarely` (lower frequency = lower score)
     let evicted = t.evict_one();
-    assert_eq!(evicted, Some(rarely), "rarely-accessed should be evicted first");
+    assert_eq!(
+        evicted,
+        Some(rarely),
+        "rarely-accessed should be evicted first"
+    );
 }
 
 #[test]
@@ -884,8 +1391,14 @@ fn test_weighted_eviction_tier_dominates_frequency() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let data_hot = SubChunkId { group_id: 0, frame_index: 0 };
-    let index_cold = SubChunkId { group_id: 1, frame_index: 0 };
+    let data_hot = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index_cold = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
 
     t.mark_present(data_hot, SubChunkTier::Data);
     t.mark_present(index_cold, SubChunkTier::Index);
@@ -903,8 +1416,11 @@ fn test_weighted_eviction_tier_dominates_frequency() {
     // Data max score ~2.0, Index min score ~10.0
     // Tier dominates: hottest Data evicts before coldest Index
     let evicted = t.evict_one();
-    assert_eq!(evicted, Some(data_hot),
-        "Data tier should be evicted before Index regardless of frequency");
+    assert_eq!(
+        evicted,
+        Some(data_hot),
+        "Data tier should be evicted before Index regardless of frequency"
+    );
 }
 
 #[test]
@@ -916,8 +1432,14 @@ fn test_weighted_eviction_cold_index_survives_hot_data() {
     let mut t = SubChunkTracker::new(path, 8, 4);
     t.set_sub_chunk_byte_size(100);
 
-    let data = SubChunkId { group_id: 0, frame_index: 0 };
-    let index = SubChunkId { group_id: 1, frame_index: 0 };
+    let data = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
+    let index = SubChunkId {
+        group_id: 1,
+        frame_index: 0,
+    };
 
     t.mark_present(data, SubChunkTier::Data);
     t.mark_present(index, SubChunkTier::Index);
@@ -929,5 +1451,9 @@ fn test_weighted_eviction_cold_index_survives_hot_data() {
     }
 
     let evicted = t.evict_one();
-    assert_eq!(evicted, Some(data), "Data evicts before Index even when Data is hot");
+    assert_eq!(
+        evicted,
+        Some(data),
+        "Data evicts before Index even when Data is hot"
+    );
 }

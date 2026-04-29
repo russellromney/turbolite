@@ -81,7 +81,11 @@ impl PageBitmap {
 
     pub(crate) fn persist(&self) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
-        let raw: Vec<u8> = self.bits.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        let raw: Vec<u8> = self
+            .bits
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
         fs::write(&tmp, &raw)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -162,7 +166,8 @@ impl SubChunkTracker {
     pub(crate) fn new(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32) -> Self {
         let (present, tiers, access_counts) = Self::load_from_disk(&path, None);
         let now = Instant::now();
-        let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
+        let access_times: HashMap<SubChunkId, Instant> =
+            present.iter().map(|id| (*id, now)).collect();
         Self {
             present,
             tiers,
@@ -179,10 +184,16 @@ impl SubChunkTracker {
     }
 
     #[cfg(feature = "encryption")]
-    pub(crate) fn new_encrypted(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32, encryption_key: Option<[u8; 32]>) -> Self {
+    pub(crate) fn new_encrypted(
+        path: PathBuf,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        encryption_key: Option<[u8; 32]>,
+    ) -> Self {
         let (present, tiers, access_counts) = Self::load_from_disk(&path, encryption_key.as_ref());
         let now = Instant::now();
-        let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
+        let access_times: HashMap<SubChunkId, Instant> =
+            present.iter().map(|id| (*id, now)).collect();
         Self {
             present,
             tiers,
@@ -204,12 +215,18 @@ impl SubChunkTracker {
         let ppg = self.pages_per_group;
         let spf = self.sub_pages_per_frame;
         if ppg == 0 || spf == 0 {
-            return SubChunkId { group_id: 0, frame_index: 0 };
+            return SubChunkId {
+                group_id: 0,
+                frame_index: 0,
+            };
         }
         let gid = (page_num / ppg as u64) as u32;
         let page_in_group = (page_num % ppg as u64) as u32;
         let frame_idx = page_in_group / spf;
-        SubChunkId { group_id: gid, frame_index: frame_idx as u16 }
+        SubChunkId {
+            group_id: gid,
+            frame_index: frame_idx as u16,
+        }
     }
 
     /// Compute SubChunkId from manifest-aware group ID and index within group.
@@ -217,7 +234,10 @@ impl SubChunkTracker {
     pub(crate) fn sub_chunk_id_for(&self, gid: u64, index_in_group: u32) -> SubChunkId {
         let spf = self.sub_pages_per_frame;
         let frame_idx = if spf > 0 { index_in_group / spf } else { 0 };
-        SubChunkId { group_id: gid as u32, frame_index: frame_idx as u16 }
+        SubChunkId {
+            group_id: gid as u32,
+            frame_index: frame_idx as u16,
+        }
     }
 
     /// Check if the sub-chunk containing this page is cached.
@@ -254,7 +274,9 @@ impl SubChunkTracker {
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(t) if t <= tier => {} // already at equal or higher priority
-            _ => { self.tiers.insert(id, tier); }
+            _ => {
+                self.tiers.insert(id, tier);
+            }
         }
         self.access_times.insert(id, Instant::now());
     }
@@ -281,7 +303,9 @@ impl SubChunkTracker {
         let existing = self.tiers.get(&id).copied();
         match existing {
             Some(SubChunkTier::Pinned) => {} // don't demote from pinned
-            _ => { self.tiers.insert(id, SubChunkTier::Index); }
+            _ => {
+                self.tiers.insert(id, SubChunkTier::Index);
+            }
         }
         self.access_times.entry(id).or_insert_with(Instant::now);
     }
@@ -409,12 +433,20 @@ impl SubChunkTracker {
 
     /// Evict all sub-chunks in a specific tier that are older than `ttl`.
     #[allow(dead_code)]
-    pub(crate) fn evict_expired_in_tier(&mut self, tier: SubChunkTier, ttl: Duration) -> Vec<SubChunkId> {
+    pub(crate) fn evict_expired_in_tier(
+        &mut self,
+        tier: SubChunkTier,
+        ttl: Duration,
+    ) -> Vec<SubChunkId> {
         let now = Instant::now();
-        let expired: Vec<SubChunkId> = self.present.iter()
+        let expired: Vec<SubChunkId> = self
+            .present
+            .iter()
             .filter(|id| {
                 let t = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
-                if t != tier { return false; }
+                if t != tier {
+                    return false;
+                }
                 let access = self.access_times.get(id).copied().unwrap_or(now);
                 now.duration_since(access) > ttl
             })
@@ -429,7 +461,9 @@ impl SubChunkTracker {
     /// Remove a sub-chunk from tracking (does NOT zero disk).
     pub(crate) fn remove(&mut self, id: SubChunkId) {
         if self.present.remove(&id) {
-            self.current_cache_bytes = self.current_cache_bytes.saturating_sub(self.sub_chunk_byte_size);
+            self.current_cache_bytes = self
+                .current_cache_bytes
+                .saturating_sub(self.sub_chunk_byte_size);
         }
         self.tiers.remove(&id);
         self.access_times.remove(&id);
@@ -438,7 +472,9 @@ impl SubChunkTracker {
 
     /// Remove all sub-chunks for a given group.
     pub(crate) fn remove_group(&mut self, group_id: u32) {
-        let to_remove: Vec<SubChunkId> = self.present.iter()
+        let to_remove: Vec<SubChunkId> = self
+            .present
+            .iter()
             .filter(|id| id.group_id == group_id)
             .copied()
             .collect();
@@ -450,7 +486,9 @@ impl SubChunkTracker {
     /// Clear all non-pinned sub-chunks (for cold benchmarks).
     #[allow(dead_code)]
     pub(crate) fn clear_data(&mut self) {
-        let to_remove: Vec<SubChunkId> = self.present.iter()
+        let to_remove: Vec<SubChunkId> = self
+            .present
+            .iter()
             .filter(|id| {
                 let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
                 tier != SubChunkTier::Pinned
@@ -464,7 +502,9 @@ impl SubChunkTracker {
 
     /// Clear all non-pinned, non-index sub-chunks (data only).
     pub(crate) fn clear_data_only(&mut self) {
-        let to_remove: Vec<SubChunkId> = self.present.iter()
+        let to_remove: Vec<SubChunkId> = self
+            .present
+            .iter()
             .filter(|id| {
                 let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
                 tier == SubChunkTier::Data
@@ -478,7 +518,9 @@ impl SubChunkTracker {
 
     /// Clear Index + Data sub-chunks, keep Pinned only.
     pub(crate) fn clear_index_and_data(&mut self) {
-        let to_remove: Vec<SubChunkId> = self.present.iter()
+        let to_remove: Vec<SubChunkId> = self
+            .present
+            .iter()
             .filter(|id| {
                 let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
                 tier != SubChunkTier::Pinned
@@ -507,7 +549,8 @@ impl SubChunkTracker {
 
     /// Number of sub-chunks in a specific tier.
     pub(crate) fn count_tier(&self, tier: SubChunkTier) -> usize {
-        self.present.iter()
+        self.present
+            .iter()
             .filter(|id| self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data) == tier)
             .count()
     }
@@ -517,7 +560,9 @@ impl SubChunkTracker {
     /// Backward-compatible: load_from_disk also reads v1 format (SubChunkId, tier_u8).
     /// CTR-encrypted with random nonce if key present.
     pub(crate) fn persist(&self) -> io::Result<()> {
-        let entries: Vec<(SubChunkId, u8, u32)> = self.present.iter()
+        let entries: Vec<(SubChunkId, u8, u32)> = self
+            .present
+            .iter()
             .map(|id| {
                 let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data) as u8;
                 let count = self.access_counts.get(id).copied().unwrap_or(0);
@@ -525,7 +570,10 @@ impl SubChunkTracker {
             })
             .collect();
         let data = serde_json::to_vec(&entries).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serialize sub-chunk tracker: {}", e))
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("serialize sub-chunk tracker: {}", e),
+            )
         })?;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
@@ -551,7 +599,14 @@ impl SubChunkTracker {
     /// Load tracker state from disk. Decrypts with CTR if key provided.
     /// Tries v2 format (id, tier, count) first, falls back to v1 (id, tier).
     /// Encrypted format: [8-byte random nonce][CTR-encrypted JSON]
-    pub(crate) fn load_from_disk(path: &Path, _encryption_key: Option<&[u8; 32]>) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>, HashMap<SubChunkId, u32>) {
+    pub(crate) fn load_from_disk(
+        path: &Path,
+        _encryption_key: Option<&[u8; 32]>,
+    ) -> (
+        HashSet<SubChunkId>,
+        HashMap<SubChunkId, SubChunkTier>,
+        HashMap<SubChunkId, u32>,
+    ) {
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(_) => return (HashSet::new(), HashMap::new(), HashMap::new()),
@@ -610,13 +665,14 @@ impl SubChunkTracker {
     }
 
     /// Get all pages covered by a sub-chunk (for cache invalidation / hole punching).
-    pub(crate) fn pages_for_sub_chunk(&self, id: SubChunkId, page_count: u64) -> std::ops::Range<u64> {
+    pub(crate) fn pages_for_sub_chunk(
+        &self,
+        id: SubChunkId,
+        page_count: u64,
+    ) -> std::ops::Range<u64> {
         let start = id.group_id as u64 * self.pages_per_group as u64
             + id.frame_index as u64 * self.sub_pages_per_frame as u64;
-        let end = std::cmp::min(
-            start + self.sub_pages_per_frame as u64,
-            page_count,
-        );
+        let end = std::cmp::min(start + self.sub_pages_per_frame as u64, page_count);
         start..end
     }
 }
@@ -624,4 +680,3 @@ impl SubChunkTracker {
 #[cfg(test)]
 #[path = "test_cache_tracking.rs"]
 mod tests;
-

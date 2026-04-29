@@ -86,8 +86,18 @@ fn test_queue_push_drain() {
     drain_planned_accesses();
 
     push_planned_accesses(vec![
-        PlannedAccess { tree_name: "users".into(), access_type: AccessType::Scan, table_name: None, constraint_columns: vec![] },
-        PlannedAccess { tree_name: "idx_posts_id".into(), access_type: AccessType::Search, table_name: None, constraint_columns: vec![] },
+        PlannedAccess {
+            tree_name: "users".into(),
+            access_type: AccessType::Scan,
+            table_name: None,
+            constraint_columns: vec![],
+        },
+        PlannedAccess {
+            tree_name: "idx_posts_id".into(),
+            access_type: AccessType::Search,
+            table_name: None,
+            constraint_columns: vec![],
+        },
     ]);
 
     let drained = drain_planned_accesses();
@@ -107,8 +117,18 @@ fn test_queue_accumulates_multiple_pushes() {
     queue.clear();
 
     // Simulate two pushes by extending directly
-    queue.push(PlannedAccess { tree_name: "users".into(), access_type: AccessType::Scan, table_name: None, constraint_columns: vec![] });
-    queue.push(PlannedAccess { tree_name: "posts".into(), access_type: AccessType::Search, table_name: None, constraint_columns: vec![] });
+    queue.push(PlannedAccess {
+        tree_name: "users".into(),
+        access_type: AccessType::Scan,
+        table_name: None,
+        constraint_columns: vec![],
+    });
+    queue.push(PlannedAccess {
+        tree_name: "posts".into(),
+        access_type: AccessType::Search,
+        table_name: None,
+        constraint_columns: vec![],
+    });
 
     assert_eq!(queue.len(), 2);
     queue.clear();
@@ -236,9 +256,12 @@ fn test_end_query_signal_independent_of_plan_queue() {
     drain_planned_accesses();
 
     signal_end_query();
-    push_planned_accesses(vec![
-        PlannedAccess { tree_name: "users".into(), access_type: AccessType::Scan, table_name: None, constraint_columns: vec![] },
-    ]);
+    push_planned_accesses(vec![PlannedAccess {
+        tree_name: "users".into(),
+        access_type: AccessType::Scan,
+        table_name: None,
+        constraint_columns: vec![],
+    }]);
 
     assert!(check_and_clear_end_query());
     let planned = drain_planned_accesses();

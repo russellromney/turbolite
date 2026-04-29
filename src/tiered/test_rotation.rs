@@ -1,14 +1,16 @@
 use super::*;
 use crate::tiered::*;
-use tempfile::TempDir;
 use std::collections::HashMap;
+use tempfile::TempDir;
 
 // ===== Key rotation tests =====
 
 #[cfg(feature = "encryption")]
 fn test_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = i as u8;
+    }
     key
 }
 
@@ -33,9 +35,7 @@ fn test_rotate_page_group_non_seekable() {
     let key_a = test_key();
     let key_b = test_key_2();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..4)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..4).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let encoded = encode_page_group(
         &pages,
@@ -82,9 +82,7 @@ fn test_rotate_page_group_seekable() {
     let key_a = test_key();
     let key_b = test_key_2();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..8)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..8).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let (encoded, frame_table) = encode_page_group_seekable(
         &pages,
@@ -118,7 +116,10 @@ fn test_rotate_page_group_seekable() {
 
     // Frame table offsets should be preserved (GCM overhead is constant)
     for (old, new) in frame_table.iter().zip(new_frames.iter()) {
-        assert_eq!(old.len, new.len, "frame size must be identical after rotation");
+        assert_eq!(
+            old.len, new.len,
+            "frame size must be identical after rotation"
+        );
     }
 
     // Decrypt each frame with B
@@ -258,9 +259,7 @@ fn test_rotate_same_key_idempotent() {
     // Rotating to the same key should produce valid (but different) ciphertext
     let key = test_key();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..4)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..4).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let encoded = encode_page_group(
         &pages,
@@ -300,11 +299,7 @@ fn test_rotate_empty_page_group_vec() {
     let key_b = test_key_2();
 
     // Simulate what rotate_encryption_key does: skip empty keys
-    let page_group_keys: Vec<String> = vec![
-        String::new(),
-        "p/d/1_v1".to_string(),
-        String::new(),
-    ];
+    let page_group_keys: Vec<String> = vec![String::new(), "p/d/1_v1".to_string(), String::new()];
 
     let non_empty: Vec<&String> = page_group_keys.iter().filter(|k| !k.is_empty()).collect();
     assert_eq!(non_empty.len(), 1);
@@ -398,9 +393,7 @@ fn test_add_encryption_non_seekable() {
     // Encode without encryption, then encrypt (None -> Some)
     let key = test_key();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..4)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..4).map(|i| Some(vec![i as u8; 4096])).collect();
 
     // Encode without encryption
     let encoded = encode_page_group(
@@ -437,9 +430,7 @@ fn test_remove_encryption_non_seekable() {
     // Encode with encryption, then decrypt (Some -> None)
     let key = test_key();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..4)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..4).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let encoded = encode_page_group(
         &pages,
@@ -475,9 +466,7 @@ fn test_add_encryption_seekable() {
     // Encode seekable without encryption, add encryption, decrypt with key
     let key = test_key();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..8)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..8).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let (encoded, frame_table) = encode_page_group_seekable(
         &pages,
@@ -535,9 +524,7 @@ fn test_remove_encryption_seekable() {
     // Encode seekable with encryption, remove encryption, decode without key
     let key = test_key();
 
-    let pages: Vec<Option<Vec<u8>>> = (0..8)
-        .map(|i| Some(vec![i as u8; 4096]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0..8).map(|i| Some(vec![i as u8; 4096])).collect();
 
     let (encoded, frame_table) = encode_page_group_seekable(
         &pages,
@@ -691,10 +678,7 @@ fn test_assign_new_pages_to_groups_basic() {
         page_count: 10,
         page_size: 4096,
         pages_per_group: 4,
-        group_pages: vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-        ],
+        group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
         ..Manifest::empty()
     };
     manifest.build_page_index();
@@ -810,7 +794,7 @@ fn test_build_page_index_roundtrip() {
         page_size: 4096,
         pages_per_group: 4,
         group_pages: vec![
-            vec![5, 0, 3, 8],  // non-sequential
+            vec![5, 0, 3, 8], // non-sequential
             vec![1, 7, 2],
             vec![9, 4, 6],
         ],
@@ -820,9 +804,14 @@ fn test_build_page_index_roundtrip() {
 
     // Every page 0-9 should have a location
     for p in 0..10 {
-        let loc = manifest.page_location(p).unwrap_or_else(|| panic!("missing page {}", p));
+        let loc = manifest
+            .page_location(p)
+            .unwrap_or_else(|| panic!("missing page {}", p));
         // Verify the reverse: group_pages[gid][index] == p
-        assert_eq!(manifest.group_pages[loc.group_id as usize][loc.index as usize], p);
+        assert_eq!(
+            manifest.group_pages[loc.group_id as usize][loc.index as usize],
+            p
+        );
     }
 }
 
@@ -843,8 +832,11 @@ fn test_total_groups_btree_vs_positional() {
         page_count: 100,
         pages_per_group: 32,
         group_pages: vec![
-            vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9, 10, 11],
-            vec![12, 13, 14, 15, 16, 17, 18, 19],  // extra group from B-tree packing
+            vec![0, 1, 2],
+            vec![3, 4, 5],
+            vec![6, 7, 8],
+            vec![9, 10, 11],
+            vec![12, 13, 14, 15, 16, 17, 18, 19], // extra group from B-tree packing
         ],
         ..Manifest::empty()
     };
@@ -861,14 +853,22 @@ fn test_write_pages_scattered_only_marks_written_pages() {
     // Provide data for 2 pages but page_nums has 4
     let page_nums = vec![0u64, 1, 5, 10];
     let data = vec![0xAA; 128]; // only 2 pages worth (2 * 64)
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // Pages 0 and 1 should be present (data written)
     assert!(cache.is_present(0), "page 0 should be present");
     assert!(cache.is_present(1), "page 1 should be present");
     // Pages 5 and 10 should NOT be present (data was too short)
-    assert!(!cache.bitmap.read().is_present(5), "page 5 should NOT be present (no data)");
-    assert!(!cache.bitmap.read().is_present(10), "page 10 should NOT be present (no data)");
+    assert!(
+        !cache.bitmap.read().is_present(5),
+        "page 5 should NOT be present (no data)"
+    );
+    assert!(
+        !cache.bitmap.read().is_present(10),
+        "page 10 should NOT be present (no data)"
+    );
 }
 
 #[test]
@@ -879,7 +879,9 @@ fn test_write_pages_scattered_exact_data_marks_all() {
     // Data exactly matches page_nums length
     let page_nums = vec![3u64, 7, 12];
     let data = vec![0xBB; 192]; // 3 * 64
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     for &p in &page_nums {
         assert!(cache.is_present(p), "page {} should be present", p);
@@ -897,7 +899,9 @@ fn test_write_pages_scattered_no_tracker_pollution() {
     // Write page 5 via scattered (simulates B-tree group write)
     let page_nums = vec![5u64];
     let data = vec![0xCC; 64];
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // Page 5 should be present (bitmap)
     assert!(cache.bitmap.read().is_present(5));
@@ -910,7 +914,10 @@ fn test_write_pages_scattered_no_tracker_pollution() {
     // But tracker sub-chunk (0, 0) IS marked (gid=0, index_in_group=0 -> frame 0)
     let tracker = cache.tracker.lock();
     let id = tracker.sub_chunk_id_for(0, 0);
-    assert!(tracker.is_sub_chunk_present(&id), "sub-chunk must be marked after write");
+    assert!(
+        tracker.is_sub_chunk_present(&id),
+        "sub-chunk must be marked after write"
+    );
 }
 
 #[test]
@@ -924,7 +931,9 @@ fn test_write_pages_scattered_data_integrity() {
     for (i, &pnum) in page_nums.iter().enumerate() {
         data.extend(std::iter::repeat(((pnum + 1) as u8) * 10 + i as u8).take(64));
     }
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // Read back each page and verify data
     for (i, &pnum) in page_nums.iter().enumerate() {
@@ -932,7 +941,11 @@ fn test_write_pages_scattered_data_integrity() {
         cache.read_page(pnum, &mut buf).unwrap();
         let expected_byte = ((pnum + 1) as u8) * 10 + i as u8;
         assert_eq!(buf[0], expected_byte, "page {} data mismatch", pnum);
-        assert!(buf.iter().all(|&b| b == expected_byte), "page {} not uniform", pnum);
+        assert!(
+            buf.iter().all(|&b| b == expected_byte),
+            "page {} not uniform",
+            pnum
+        );
     }
 }
 
@@ -944,9 +957,9 @@ fn test_manifest_btree_page_location_non_sequential() {
         page_size: 4096,
         pages_per_group: 8,
         group_pages: vec![
-            vec![0, 5, 10, 15],     // gid=0: scattered pages from B-tree A
-            vec![1, 2, 3, 4],       // gid=1: sequential pages from B-tree B
-            vec![6, 7, 8, 9],       // gid=2: sequential from B-tree C
+            vec![0, 5, 10, 15],                   // gid=0: scattered pages from B-tree A
+            vec![1, 2, 3, 4],                     // gid=1: sequential pages from B-tree B
+            vec![6, 7, 8, 9],                     // gid=2: sequential from B-tree C
             vec![11, 12, 13, 14, 16, 17, 18, 19], // gid=3: remaining pages
         ],
         ..Manifest::empty()
@@ -977,11 +990,11 @@ fn test_manifest_total_groups_with_btree_exceeds_positional() {
         page_count: 10,
         pages_per_group: 4,
         group_pages: vec![
-            vec![0, 1],      // B-tree A (2 pages)
-            vec![2, 3],      // B-tree B (2 pages)
-            vec![4, 5],      // B-tree C (2 pages)
-            vec![6, 7],      // B-tree D (2 pages)
-            vec![8, 9],      // unowned (2 pages)
+            vec![0, 1], // B-tree A (2 pages)
+            vec![2, 3], // B-tree B (2 pages)
+            vec![4, 5], // B-tree C (2 pages)
+            vec![6, 7], // B-tree D (2 pages)
+            vec![8, 9], // unowned (2 pages)
         ],
         ..Manifest::empty()
     };
@@ -1017,7 +1030,9 @@ fn test_write_pages_scattered_empty_data() {
     // Empty data but non-empty page_nums: should be a no-op
     let page_nums = vec![0u64, 1, 2];
     let data: Vec<u8> = vec![];
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // No pages should be marked
     assert!(!cache.is_present(0));
@@ -1033,11 +1048,19 @@ fn test_write_pages_scattered_partial_page_data() {
     // Data for 1.5 pages (not enough for second page)
     let page_nums = vec![0u64, 1];
     let data = vec![0xDD; 96]; // 64 + 32 (not enough for page 1)
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // Only page 0 should be marked (page 1 had partial data)
-    assert!(cache.is_present(0), "page 0 with full data should be present");
-    assert!(!cache.bitmap.read().is_present(1), "page 1 with partial data should not be present");
+    assert!(
+        cache.is_present(0),
+        "page 0 with full data should be present"
+    );
+    assert!(
+        !cache.bitmap.read().is_present(1),
+        "page 1 with partial data should not be present"
+    );
 }
 
 #[test]
@@ -1049,26 +1072,30 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         page_count: 20,
         page_size: 4096,
         pages_per_group: 8,
-        page_group_keys: vec![
-            "p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into(),
-        ],
+        page_group_keys: vec!["p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into()],
         group_pages: vec![
-            vec![0, 5, 10, 15],     // B-tree A (scattered)
-            vec![1, 2, 3, 4],       // B-tree B (sequential)
+            vec![0, 5, 10, 15], // B-tree A (scattered)
+            vec![1, 2, 3, 4],   // B-tree B (sequential)
             vec![6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19],
         ],
         btrees: {
             let mut h = HashMap::new();
-            h.insert(0, BTreeManifestEntry {
-                name: "users".into(),
-                obj_type: "table".into(),
-                group_ids: vec![0],
-            });
-            h.insert(5, BTreeManifestEntry {
-                name: "idx_users_name".into(),
-                obj_type: "index".into(),
-                group_ids: vec![1],
-            });
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                },
+            );
+            h.insert(
+                5,
+                BTreeManifestEntry {
+                    name: "idx_users_name".into(),
+                    obj_type: "index".into(),
+                    group_ids: vec![1],
+                },
+            );
             h
         },
         ..Manifest::empty()
@@ -1085,7 +1112,10 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert_eq!(m.btrees[&0].name, m2.btrees[&0].name);
     assert_eq!(m.btrees[&5].group_ids, m2.btrees[&5].group_ids);
     // page_index is NOT serialized (skip)
-    assert!(m2.page_index.is_empty(), "page_index should be empty after deserialize");
+    assert!(
+        m2.page_index.is_empty(),
+        "page_index should be empty after deserialize"
+    );
     // Rebuild and verify
     m2.build_page_index();
     assert_eq!(m2.page_location(10).unwrap().group_id, 0);
@@ -1101,21 +1131,42 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert!(m2.btree_groups.get(&2).is_none());
     // Page_to_tree_name reverse index rebuilt from btrees
     // B-tree root=0 ("users") owns group 0 with pages [0, 5, 10, 15]
-    assert_eq!(m2.page_to_tree_name.get(&0).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&5).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&10).map(|s| s.as_str()), Some("users"));
-    assert_eq!(m2.page_to_tree_name.get(&15).map(|s| s.as_str()), Some("users"));
+    assert_eq!(
+        m2.page_to_tree_name.get(&0).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&5).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&10).map(|s| s.as_str()),
+        Some("users")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&15).map(|s| s.as_str()),
+        Some("users")
+    );
     // B-tree root=5 ("idx_users_name") owns group 1 with pages [1, 2, 3, 4]
-    assert_eq!(m2.page_to_tree_name.get(&1).map(|s| s.as_str()), Some("idx_users_name"));
-    assert_eq!(m2.page_to_tree_name.get(&4).map(|s| s.as_str()), Some("idx_users_name"));
+    assert_eq!(
+        m2.page_to_tree_name.get(&1).map(|s| s.as_str()),
+        Some("idx_users_name")
+    );
+    assert_eq!(
+        m2.page_to_tree_name.get(&4).map(|s| s.as_str()),
+        Some("idx_users_name")
+    );
     // Pages in group 2 (no btree entry) should NOT be in page_to_tree_name
     assert!(m2.page_to_tree_name.get(&6).is_none());
     assert!(m2.page_to_tree_name.get(&19).is_none());
     // page_to_tree_name is skip-serialized (rebuilt, not persisted)
     assert!(!m2.page_to_tree_name.is_empty()); // rebuilt by build_page_index
-    // tree_name_to_groups also rebuilt
+                                               // tree_name_to_groups also rebuilt
     assert_eq!(m2.tree_name_to_groups.get("users").unwrap(), &vec![0u64]);
-    assert_eq!(m2.tree_name_to_groups.get("idx_users_name").unwrap(), &vec![1u64]);
+    assert_eq!(
+        m2.tree_name_to_groups.get("idx_users_name").unwrap(),
+        &vec![1u64]
+    );
 }
 
 #[test]
@@ -1124,10 +1175,7 @@ fn test_page_location_missing_page_returns_none() {
         page_count: 10,
         page_size: 4096,
         pages_per_group: 4,
-        group_pages: vec![
-            vec![0, 1, 2, 3],
-            vec![4, 5, 6, 7],
-        ],
+        group_pages: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
         ..Manifest::empty()
     };
     manifest.build_page_index();
@@ -1135,9 +1183,15 @@ fn test_page_location_missing_page_returns_none() {
     // Pages 0-7 are assigned, 8-9 are NOT (unassigned gap)
     assert!(manifest.page_location(0).is_some());
     assert!(manifest.page_location(7).is_some());
-    assert!(manifest.page_location(8).is_none(), "unassigned page should return None");
+    assert!(
+        manifest.page_location(8).is_none(),
+        "unassigned page should return None"
+    );
     assert!(manifest.page_location(9).is_none());
-    assert!(manifest.page_location(100).is_none(), "way out of bounds should return None");
+    assert!(
+        manifest.page_location(100).is_none(),
+        "way out of bounds should return None"
+    );
 }
 
 #[test]
@@ -1158,13 +1212,17 @@ fn test_concurrent_scattered_writes_no_tracker_pollution() {
     // Thread A writes B-tree group A
     let handle_a = std::thread::spawn(move || {
         let data_a = vec![0xAA; 128]; // 2 pages * 64
-        cache_a.write_pages_scattered(&[0, 4], &data_a, 0, 0).unwrap();
+        cache_a
+            .write_pages_scattered(&[0, 4], &data_a, 0, 0)
+            .unwrap();
     });
 
     // Thread B writes B-tree group B
     let handle_b = std::thread::spawn(move || {
         let data_b = vec![0xBB; 128]; // 2 pages * 64
-        cache_b.write_pages_scattered(&[1, 5], &data_b, 0, 0).unwrap();
+        cache_b
+            .write_pages_scattered(&[1, 5], &data_b, 0, 0)
+            .unwrap();
     });
 
     handle_a.join().unwrap();
@@ -1185,16 +1243,34 @@ fn test_concurrent_scattered_writes_no_tracker_pollution() {
 
     // CRITICAL: pages 2, 3, 6, 7 were NEVER written. They must NOT be present.
     // Before the fix, tracker pollution would report them as present.
-    assert!(!cache.is_present(2), "page 2 never written, must not be present");
-    assert!(!cache.is_present(3), "page 3 never written, must not be present");
-    assert!(!cache.is_present(6), "page 6 never written, must not be present");
-    assert!(!cache.is_present(7), "page 7 never written, must not be present");
+    assert!(
+        !cache.is_present(2),
+        "page 2 never written, must not be present"
+    );
+    assert!(
+        !cache.is_present(3),
+        "page 3 never written, must not be present"
+    );
+    assert!(
+        !cache.is_present(6),
+        "page 6 never written, must not be present"
+    );
+    assert!(
+        !cache.is_present(7),
+        "page 7 never written, must not be present"
+    );
 
     // And reading unwritten pages must return zeros, not stale data
     cache.read_page(2, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0), "unwritten page 2 must be zeros");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "unwritten page 2 must be zeros"
+    );
     cache.read_page(6, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0), "unwritten page 6 must be zeros");
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "unwritten page 6 must be zeros"
+    );
 }
 
 #[test]
@@ -1211,7 +1287,9 @@ fn test_write_pages_scattered_sparse_page_distribution() {
     for &pnum in &page_nums {
         data.extend(std::iter::repeat((pnum % 256) as u8).take(64));
     }
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     // Verify each page has correct data
     for &pnum in &page_nums {
@@ -1219,8 +1297,13 @@ fn test_write_pages_scattered_sparse_page_distribution() {
         let mut buf = vec![0u8; 64];
         cache.read_page(pnum, &mut buf).unwrap();
         let expected = (pnum % 256) as u8;
-        assert!(buf.iter().all(|&b| b == expected),
-            "page {} data mismatch: expected 0x{:02x}, got 0x{:02x}", pnum, expected, buf[0]);
+        assert!(
+            buf.iter().all(|&b| b == expected),
+            "page {} data mismatch: expected 0x{:02x}, got 0x{:02x}",
+            pnum,
+            expected,
+            buf[0]
+        );
     }
 
     // Pages between sparse entries must NOT be present
@@ -1239,7 +1322,9 @@ fn test_btree_group_single_page() {
 
     let page_nums = vec![42u64];
     let data = vec![0xFF; 64];
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     assert!(cache.is_present(42));
     let mut buf = vec![0u8; 64];
@@ -1263,18 +1348,32 @@ fn test_write_pages_scattered_populates_tracker_subchunks() {
     // Write all 8 pages (2 frames worth)
     let page_nums = vec![10u64, 20, 30, 5, 15, 25, 35, 45];
     let data = vec![0xAA; 8 * 64];
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     let tracker = cache.tracker.lock();
     // Frame 0: indices 0-3 -> SubChunkId { group_id: 0, frame_index: 0 }
     let f0 = tracker.sub_chunk_id_for(0, 0);
-    assert!(tracker.is_sub_chunk_present(&f0), "frame 0 must be marked present");
+    assert!(
+        tracker.is_sub_chunk_present(&f0),
+        "frame 0 must be marked present"
+    );
     // Frame 1: indices 4-7 -> SubChunkId { group_id: 0, frame_index: 1 }
     let f1 = tracker.sub_chunk_id_for(0, 4);
-    assert!(tracker.is_sub_chunk_present(&f1), "frame 1 must be marked present");
+    assert!(
+        tracker.is_sub_chunk_present(&f1),
+        "frame 1 must be marked present"
+    );
     // Non-existent frame 2 should not be present
-    let f2 = SubChunkId { group_id: 0, frame_index: 2 };
-    assert!(!tracker.is_sub_chunk_present(&f2), "frame 2 must not be present");
+    let f2 = SubChunkId {
+        group_id: 0,
+        frame_index: 2,
+    };
+    assert!(
+        !tracker.is_sub_chunk_present(&f2),
+        "frame 2 must not be present"
+    );
     drop(tracker);
 
     // Bitmap should have all 8 pages
@@ -1296,7 +1395,9 @@ fn test_write_pages_scattered_subframe_offset() {
     // Write 4 pages starting at index 4 in group 0 (frame 1)
     let page_nums = vec![100u64, 200, 300, 400];
     let data = vec![0xBB; 4 * 64];
-    cache.write_pages_scattered(&page_nums, &data, 0, 4).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 4)
+        .unwrap();
 
     let tracker = cache.tracker.lock();
     // These pages are at indices 4,5,6,7 -> frame 1
@@ -1304,7 +1405,10 @@ fn test_write_pages_scattered_subframe_offset() {
     assert!(tracker.is_sub_chunk_present(&f1), "frame 1 must be marked");
     // Frame 0 should NOT be marked (we only wrote frame 1)
     let f0 = tracker.sub_chunk_id_for(0, 0);
-    assert!(!tracker.is_sub_chunk_present(&f0), "frame 0 must not be marked");
+    assert!(
+        !tracker.is_sub_chunk_present(&f0),
+        "frame 0 must not be marked"
+    );
 }
 
 #[test]
@@ -1316,9 +1420,9 @@ fn test_manifest_btree_group_partial_last_group() {
         page_size: 4096,
         pages_per_group: 4,
         group_pages: vec![
-            vec![0, 1, 2, 3],   // full group
-            vec![4, 5, 6, 7],   // full group
-            vec![8, 9],         // partial group (2 of 4)
+            vec![0, 1, 2, 3], // full group
+            vec![4, 5, 6, 7], // full group
+            vec![8, 9],       // partial group (2 of 4)
         ],
         ..Manifest::empty()
     };

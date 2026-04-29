@@ -1,7 +1,5 @@
 //! Encryption key rotation: re-encrypt all backend data with a new key.
 
-
-
 /// Re-encrypt, encrypt, or decrypt all backend data.
 ///
 /// Three modes based on `config.encryption.key` (old) and `new_key`:
@@ -96,12 +94,13 @@ pub fn rotate_encryption_key(
             continue;
         }
 
-        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Page group {} not found", old_s3_key),
-            )
-        })?;
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Page group {} not found", old_s3_key),
+                )
+            })?;
 
         // Validate old key on first page group (fail fast before uploading anything)
         if !validated_old_key {
@@ -114,7 +113,13 @@ pub fn rotate_encryption_key(
                 &blob[..]
             };
             // old_key is Some here (validated_old_key starts true when old_key is None)
-            compress::decrypt_gcm_random_nonce(test_data, old_key.as_ref().expect("old_key must be Some for validation")).map_err(|_| {
+            compress::decrypt_gcm_random_nonce(
+                test_data,
+                old_key
+                    .as_ref()
+                    .expect("old_key must be Some for validation"),
+            )
+            .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Old encryption key failed to decrypt existing data. Wrong key?",
@@ -146,7 +151,11 @@ pub fn rotate_encryption_key(
             }
 
             let new_s3_key = keys::page_group_key(gid as u64, new_version);
-            storage_helpers::put_page_groups(backend_ref, runtime_ref, &[(new_s3_key.clone(), new_blob)])?;
+            storage_helpers::put_page_groups(
+                backend_ref,
+                runtime_ref,
+                &[(new_s3_key.clone(), new_blob)],
+            )?;
 
             replaced_keys.push(old_s3_key.clone());
             new_manifest.page_group_keys[gid] = new_s3_key;
@@ -157,7 +166,11 @@ pub fn rotate_encryption_key(
             let output = maybe_encrypt(&compressed)?;
 
             let new_s3_key = keys::page_group_key(gid as u64, new_version);
-            storage_helpers::put_page_groups(backend_ref, runtime_ref, &[(new_s3_key.clone(), output)])?;
+            storage_helpers::put_page_groups(
+                backend_ref,
+                runtime_ref,
+                &[(new_s3_key.clone(), output)],
+            )?;
 
             replaced_keys.push(old_s3_key.clone());
             new_manifest.page_group_keys[gid] = new_s3_key;
@@ -180,12 +193,13 @@ pub fn rotate_encryption_key(
         .map(|(&id, k)| (id, k.clone()))
         .collect();
     for (chunk_id, old_s3_key) in &interior_keys {
-        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Interior chunk {} not found", old_s3_key),
-            )
-        })?;
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Interior chunk {} not found", old_s3_key),
+                )
+            })?;
         let compressed = maybe_decrypt(&blob)?;
         let output = maybe_encrypt(&compressed)?;
 
@@ -207,12 +221,13 @@ pub fn rotate_encryption_key(
         .map(|(&id, k)| (id, k.clone()))
         .collect();
     for (chunk_id, old_s3_key) in &index_keys {
-        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Index chunk {} not found", old_s3_key),
-            )
-        })?;
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Index chunk {} not found", old_s3_key),
+                )
+            })?;
         let compressed = maybe_decrypt(&blob)?;
         let output = maybe_encrypt(&compressed)?;
 
@@ -220,9 +235,7 @@ pub fn rotate_encryption_key(
         s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
         replaced_keys.push(old_s3_key.clone());
-        new_manifest
-            .index_chunk_keys
-            .insert(*chunk_id, new_s3_key);
+        new_manifest.index_chunk_keys.insert(*chunk_id, new_s3_key);
     }
 
     turbolite_debug!("[rotate] processed {} index chunks", index_keys.len());
@@ -230,12 +243,13 @@ pub fn rotate_encryption_key(
     // VERIFY: re-download and decode one new page group before committing.
     // Guards against silent S3 corruption or encode bugs.
     if let Some(verify_key) = new_manifest.page_group_keys.iter().find(|k| !k.is_empty()) {
-        let verify_blob = storage_helpers::get_page_group(backend_ref, runtime_ref, verify_key)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "verification failed: newly uploaded page group not found in S3",
-            )
-        })?;
+        let verify_blob = storage_helpers::get_page_group(backend_ref, runtime_ref, verify_key)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "verification failed: newly uploaded page group not found in S3",
+                )
+            })?;
         // Find the gid for this key to check frame table
         let verify_gid = new_manifest
             .page_group_keys
@@ -296,7 +310,10 @@ pub fn rotate_encryption_key(
     // GC old objects
     if !replaced_keys.is_empty() {
         storage_helpers::delete_objects(backend_ref, runtime_ref, &replaced_keys)?;
-        turbolite_debug!("[rotate] deleted {} old backend objects", replaced_keys.len());
+        turbolite_debug!(
+            "[rotate] deleted {} old backend objects",
+            replaced_keys.len()
+        );
     }
 
     // Clear local cache (simpler than re-encrypting, cache repopulates on next open)
@@ -309,7 +326,6 @@ pub fn rotate_encryption_key(
     turbolite_debug!("[rotate] {} complete", mode);
     Ok(())
 }
-
 
 #[cfg(test)]
 #[path = "test_rotation.rs"]

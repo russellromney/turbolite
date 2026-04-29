@@ -134,9 +134,7 @@ unsafe fn install(db: *mut ffi::sqlite3) {
     );
     if rc != ffi::SQLITE_OK {
         // Reclaim the Arc refcount since SQLite didn't take ownership.
-        drop(Arc::from_raw(
-            queue_ptr as *const Mutex<Vec<SettingUpdate>>,
-        ));
+        drop(Arc::from_raw(queue_ptr as *const Mutex<Vec<SettingUpdate>>));
         tracing::error!(
             target: "turbolite",
             db = ?db,
@@ -211,9 +209,7 @@ unsafe extern "C" fn scalar(
 /// or when the connection closes.
 unsafe extern "C" fn destroy(ptr: *mut std::ffi::c_void) {
     if !ptr.is_null() {
-        drop(Arc::from_raw(
-            ptr as *const Mutex<Vec<SettingUpdate>>,
-        ));
+        drop(Arc::from_raw(ptr as *const Mutex<Vec<SettingUpdate>>));
     }
 }
 

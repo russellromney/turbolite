@@ -152,7 +152,10 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
         }
 
         // Check for USING [COVERING] INDEX <index_name>
-        if let Some(idx_pos) = rest.find("USING INDEX").or_else(|| rest.find("USING COVERING INDEX")) {
+        if let Some(idx_pos) = rest
+            .find("USING INDEX")
+            .or_else(|| rest.find("USING COVERING INDEX"))
+        {
             let after_using = &rest[idx_pos..];
             // Skip "USING INDEX " or "USING COVERING INDEX "
             let idx_name_start = if after_using.starts_with("USING COVERING INDEX") {
@@ -160,7 +163,8 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
             } else {
                 "USING INDEX ".len()
             };
-            if let Some(idx_name) = after_using.get(idx_name_start..)
+            if let Some(idx_name) = after_using
+                .get(idx_name_start..)
                 .and_then(|s| s.split_whitespace().next())
             {
                 let idx_access = match access_type {

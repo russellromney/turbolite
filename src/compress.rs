@@ -19,9 +19,8 @@ pub fn compress(
     use zstd::encode_all;
 
     if let Some(encoder_dict) = encoder_dict {
-        let mut encoder =
-            zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         encoder.write_all(data)?;
         encoder
             .finish()
@@ -61,8 +60,7 @@ pub fn compress(data: &[u8], _level: i32, _: Option<&()>) -> io::Result<Vec<u8>>
 #[cfg(all(feature = "lz4", not(feature = "zstd")))]
 pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     use lz4_flex::decompress_size_prepended;
-    decompress_size_prepended(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    decompress_size_prepended(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ===== Snappy Compression =====
@@ -122,12 +120,22 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
 
 // ===== No Compression (fallback) =====
 
-#[cfg(not(any(feature = "zstd", feature = "lz4", feature = "snappy", feature = "gzip")))]
+#[cfg(not(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "gzip"
+)))]
 pub fn compress(data: &[u8], _level: i32, _: Option<&()>) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 
-#[cfg(not(any(feature = "zstd", feature = "lz4", feature = "snappy", feature = "gzip")))]
+#[cfg(not(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "gzip"
+)))]
 pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }
@@ -192,7 +200,10 @@ pub fn decrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u
     use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
 
     if data.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "encrypted data too short for nonce"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "encrypted data too short for nonce",
+        ));
     }
 
     let nonce = Nonce::from_slice(&data[..12]);

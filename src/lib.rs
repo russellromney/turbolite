@@ -36,13 +36,13 @@ macro_rules! turbolite_debug {
 pub mod compress;
 pub mod dict;
 pub mod tiered;
-pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
+pub use tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteHandle, TurboliteVfs};
 pub mod btree_walker;
 
 #[cfg(feature = "bundled-sqlite")]
 mod install_hook;
-pub use tiered::ManifestSource;
 pub use hadb_storage::StorageBackend;
+pub use tiered::ManifestSource;
 
 /// Open a turbolite-backed SQLite connection.
 ///
@@ -63,8 +63,13 @@ pub use hadb_storage::StorageBackend;
 pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connection, anyhow::Error> {
     use rusqlite::{Connection, OpenFlags};
 
-    let vfs_name = format!("turbolite_{:x}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let vfs_name = format!(
+        "turbolite_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let read_only = config.read_only;
 
     let vfs = TurboliteVfs::new_local(config)?;
@@ -212,9 +217,19 @@ struct SlotState {
     exclusive: Option<u64>,
 }
 
-pub(crate) fn try_lock_inprocess(path: &Path, offset: usize, len: usize, exclusive: bool, conn_id: u64) -> bool {
+pub(crate) fn try_lock_inprocess(
+    path: &Path,
+    offset: usize,
+    len: usize,
+    exclusive: bool,
+    conn_id: u64,
+) -> bool {
     let mut map = IN_PROCESS_LOCKS.lock();
-    let locks = map.entry(path.to_path_buf()).or_insert_with(|| InProcessLocks { slots: HashMap::new() });
+    let locks = map
+        .entry(path.to_path_buf())
+        .or_insert_with(|| InProcessLocks {
+            slots: HashMap::new(),
+        });
 
     // Check all bytes in range first
     for byte in offset..offset + len {
@@ -236,7 +251,10 @@ pub(crate) fn try_lock_inprocess(path: &Path, offset: usize, len: usize, exclusi
 
     // All checks passed, commit
     for byte in offset..offset + len {
-        let slot = locks.slots.get_mut(&byte).expect("slot must exist after check");
+        let slot = locks
+            .slots
+            .get_mut(&byte)
+            .expect("slot must exist after check");
         if exclusive {
             slot.exclusive = Some(conn_id);
             slot.shared.remove(&conn_id);
@@ -353,7 +371,9 @@ impl FileWalIndex {
                 .open(&self.path)?;
             self.lock_file = Some(std::sync::Arc::new(file));
         }
-        Ok(std::sync::Arc::clone(self.lock_file.as_ref().expect("lock_file was just set")))
+        Ok(std::sync::Arc::clone(
+            self.lock_file.as_ref().expect("lock_file was just set"),
+        ))
     }
 
     /// Ensure region is mmap'd. Returns a pointer to the region's 32KB.
@@ -721,8 +741,10 @@ mod tests {
 
         // Verify the lock is actually held
         let conn_b = next_conn();
-        assert!(!try_lock_inprocess(&path, 0, 1, true, conn_b),
-            "lock should be held before clear");
+        assert!(
+            !try_lock_inprocess(&path, 0, 1, true, conn_b),
+            "lock should be held before clear"
+        );
 
         // Clear only our test's path entry from the global map
         {
@@ -732,8 +754,10 @@ mod tests {
 
         // After clearing, a different conn should be able to lock the same path
         let conn_c = next_conn();
-        assert!(try_lock_inprocess(&path, 0, 1, true, conn_c),
-            "lock should be available after clearing path from lock map");
+        assert!(
+            try_lock_inprocess(&path, 0, 1, true, conn_c),
+            "lock should be available after clearing path from lock map"
+        );
         unlock_inprocess(&path, 0, 1, conn_c);
     }
 
@@ -835,9 +859,13 @@ mod tests {
         let _ = idx_a.map(0).expect("map a");
         let _ = idx_b.map(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Shared).expect("lock a shared");
+        let ok_a = idx_a
+            .lock(0..1, WalIndexLock::Shared)
+            .expect("lock a shared");
         assert!(ok_a);
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Shared).expect("lock b shared");
+        let ok_b = idx_b
+            .lock(0..1, WalIndexLock::Shared)
+            .expect("lock b shared");
         assert!(ok_b);
 
         // Cleanup
@@ -856,12 +884,19 @@ mod tests {
         let _ = idx_a.map(0).expect("map a");
         let _ = idx_b.map(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
+        let ok_a = idx_a
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock a excl");
         assert!(ok_a);
 
         // B should fail to get shared
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Shared).expect("lock b shared");
-        assert!(!ok_b, "shared lock should fail when another holds exclusive");
+        let ok_b = idx_b
+            .lock(0..1, WalIndexLock::Shared)
+            .expect("lock b shared");
+        assert!(
+            !ok_b,
+            "shared lock should fail when another holds exclusive"
+        );
 
         idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
     }
@@ -877,11 +912,18 @@ mod tests {
         let _ = idx_a.map(0).expect("map a");
         let _ = idx_b.map(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
+        let ok_a = idx_a
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock a excl");
         assert!(ok_a);
 
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
-        assert!(!ok_b, "exclusive lock should fail when another holds exclusive");
+        let ok_b = idx_b
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock b excl");
+        assert!(
+            !ok_b,
+            "exclusive lock should fail when another holds exclusive"
+        );
 
         idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
     }
@@ -897,11 +939,18 @@ mod tests {
         let _ = idx_a.map(0).expect("map a");
         let _ = idx_b.map(0).expect("map b");
 
-        let ok_a = idx_a.lock(0..1, WalIndexLock::Shared).expect("lock a shared");
+        let ok_a = idx_a
+            .lock(0..1, WalIndexLock::Shared)
+            .expect("lock a shared");
         assert!(ok_a);
 
-        let ok_b = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
-        assert!(!ok_b, "exclusive lock should fail when another holds shared");
+        let ok_b = idx_b
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock b excl");
+        assert!(
+            !ok_b,
+            "exclusive lock should fail when another holds shared"
+        );
 
         idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
     }
@@ -918,18 +967,24 @@ mod tests {
         let _ = idx_b.map(0).expect("map b");
 
         // A takes exclusive
-        let ok = idx_a.lock(0..1, WalIndexLock::Exclusive).expect("lock a excl");
+        let ok = idx_a
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock a excl");
         assert!(ok);
 
         // B blocked
-        let ok = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl");
+        let ok = idx_b
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock b excl");
         assert!(!ok);
 
         // A releases
         idx_a.lock(0..1, WalIndexLock::None).expect("unlock a");
 
         // B succeeds now
-        let ok = idx_b.lock(0..1, WalIndexLock::Exclusive).expect("lock b excl after unlock");
+        let ok = idx_b
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("lock b excl after unlock");
         assert!(ok);
 
         idx_b.lock(0..1, WalIndexLock::None).expect("unlock b");
@@ -946,7 +1001,9 @@ mod tests {
         let ok = idx.lock(0..1, WalIndexLock::Shared).expect("shared");
         assert!(ok);
 
-        let ok = idx.lock(0..1, WalIndexLock::Exclusive).expect("upgrade to exclusive");
+        let ok = idx
+            .lock(0..1, WalIndexLock::Exclusive)
+            .expect("upgrade to exclusive");
         assert!(ok);
 
         idx.lock(0..1, WalIndexLock::None).expect("unlock");
@@ -962,6 +1019,9 @@ mod tests {
         assert!(shm_path.exists(), "shm file should exist after map");
 
         idx.delete().expect("delete");
-        assert!(!shm_path.exists(), "shm file should be removed after delete");
+        assert!(
+            !shm_path.exists(),
+            "shm file should be removed after delete"
+        );
     }
 }

@@ -14,10 +14,10 @@
 
 #![cfg(feature = "wal")]
 
+use parking_lot::Mutex;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use parking_lot::Mutex;
 
 /// block_on that works from inside or outside a tokio runtime.
 /// Same pattern as S3Client::block_on.
@@ -78,13 +78,14 @@ impl WalReplicationState {
         };
 
         let handle = runtime_handle.spawn(async move {
-            let storage = match hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[wal-replication] ERROR: S3 backend: {}", e);
-                    return;
-                }
-            };
+            let storage =
+                match hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[wal-replication] ERROR: S3 backend: {}", e);
+                        return;
+                    }
+                };
 
             let mut state = match walrust_core::SyncState::new(db_path) {
                 Ok(s) => s,
@@ -96,15 +97,27 @@ impl WalReplicationState {
 
             turbolite_debug!(
                 "[wal-replication] starting (db={}, txid={}, interval={}ms)",
-                state.name, initial_txid, sync_interval_ms,
+                state.name,
+                initial_txid,
+                sync_interval_ms,
             );
 
             if let Err(e) = walrust_core::run_wal_replication(
-                &storage, &wal_prefix, &mut state, initial_txid, config, cancel_rx,
-            ).await {
+                &storage,
+                &wal_prefix,
+                &mut state,
+                initial_txid,
+                config,
+                cancel_rx,
+            )
+            .await
+            {
                 eprintln!("[wal-replication] ERROR: {}", e);
             } else {
-                turbolite_debug!("[wal-replication] stopped (final txid={})", state.current_txid);
+                turbolite_debug!(
+                    "[wal-replication] stopped (final txid={})",
+                    state.current_txid
+                );
             }
         });
 
@@ -155,24 +168,40 @@ pub(crate) fn recover_wal_from_shared_state(
 
     // Step 1: check for WAL segments before doing expensive materialization
     let incr_keys = safe_block_on(runtime_handle, async {
-        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint).await
+        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint)
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
         use hadb_storage::StorageBackend;
-        let db_name = wal_prefix.trim_end_matches('/').rsplit('/').next().unwrap_or("db");
+        let db_name = wal_prefix
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("db");
         let incr_prefix = format!("{}{}/0000/", wal_prefix, db_name);
-        let start_key = format!("{}{:016x}-{:016x}.hadbp", incr_prefix, manifest_version, manifest_version);
+        let start_key = format!(
+            "{}{:016x}-{:016x}.hadbp",
+            incr_prefix, manifest_version, manifest_version
+        );
 
-        storage.list(&incr_prefix, Some(&start_key)).await
+        storage
+            .list(&incr_prefix, Some(&start_key))
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("list WAL: {}", e)))
     })?;
 
     if incr_keys.is_empty() {
-        turbolite_debug!("[wal-recovery] no WAL segments newer than version {}", manifest_version);
+        turbolite_debug!(
+            "[wal-recovery] no WAL segments newer than version {}",
+            manifest_version
+        );
         return Ok(0);
     }
 
-    turbolite_debug!("[wal-recovery] found {} WAL segments to replay", incr_keys.len());
+    turbolite_debug!(
+        "[wal-recovery] found {} WAL segments to replay",
+        incr_keys.len()
+    );
 
     // Step 2: materialize page groups to temp file
     let recovery_path = cache_dir.join("recovery.db");
@@ -180,7 +209,8 @@ pub(crate) fn recover_wal_from_shared_state(
 
     // Step 3: download and apply WAL segments
     let applied = safe_block_on(runtime_handle, async {
-        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint).await
+        let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint)
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
 
         use hadb_storage::StorageBackend;
@@ -191,24 +221,35 @@ pub(crate) fn recover_wal_from_shared_state(
             // The list() above filtered by prefix + `after`, so a missing key here
             // means the object was deleted between list and get — treat as a hard
             // error so the caller knows recovery is incomplete.
-            let data = storage.get(key).await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e)))?
-                .ok_or_else(|| io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("WAL segment {} disappeared between list and get", key),
-                ))?;
+            let data = storage
+                .get(key)
+                .await
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e))
+                })?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("WAL segment {} disappeared between list and get", key),
+                    )
+                })?;
             match walrust_core::ltx::apply_changeset_to_db(&data, &recovery_path, prev_checksum) {
                 Ok(result) => {
                     prev_checksum = result.checksum;
                     count += 1;
                     turbolite_debug!("[wal-recovery] applied {}", key);
                 }
-                Err(e) if e.to_string().contains("checksum") || e.to_string().contains("Checksum") => {
+                Err(e)
+                    if e.to_string().contains("checksum") || e.to_string().contains("Checksum") =>
+                {
                     turbolite_debug!("[wal-recovery] stopping at stale lineage: {}", e);
                     break;
                 }
                 Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("apply {}: {}", key, e)));
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("apply {}: {}", key, e),
+                    ));
                 }
             }
         }
@@ -221,7 +262,10 @@ pub(crate) fn recover_wal_from_shared_state(
     }
 
     // Step 4: read recovered pages into VFS cache
-    turbolite_debug!("[wal-recovery] loading {} WAL-recovered pages into cache...", applied);
+    turbolite_debug!(
+        "[wal-recovery] loading {} WAL-recovered pages into cache...",
+        applied
+    );
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(&recovery_path)?;
     let file_size = file.metadata()?.len();
@@ -230,7 +274,10 @@ pub(crate) fn recover_wal_from_shared_state(
     let mut pages_loaded = 0u64;
     for pnum in 0..recovered_page_count {
         let mut buf = vec![0u8; page_size as usize];
-        if file.read_exact_at(&mut buf, pnum * page_size as u64).is_ok() {
+        if file
+            .read_exact_at(&mut buf, pnum * page_size as u64)
+            .is_ok()
+        {
             if cache.write_page(pnum, &buf).is_ok() {
                 pages_loaded += 1;
             }
@@ -238,6 +285,9 @@ pub(crate) fn recover_wal_from_shared_state(
     }
 
     let _ = std::fs::remove_file(&recovery_path);
-    turbolite_debug!("[wal-recovery] loaded {} pages from WAL recovery", pages_loaded);
+    turbolite_debug!(
+        "[wal-recovery] loaded {} pages from WAL recovery",
+        pages_loaded
+    );
     Ok(pages_loaded)
 }

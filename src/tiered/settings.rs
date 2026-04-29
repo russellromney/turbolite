@@ -115,7 +115,11 @@ pub fn peek_top_for_key(key: &str) -> Option<String> {
         let stack = s.borrow();
         let q = stack.last()?;
         let queue = q.lock().expect("settings queue poisoned");
-        queue.iter().rev().find(|u| u.key == key).map(|u| u.value.clone())
+        queue
+            .iter()
+            .rev()
+            .find(|u| u.key == key)
+            .map(|u| u.value.clone())
     })
 }
 
@@ -135,10 +139,7 @@ pub fn drain_queue(q: &SettingsQueue) -> Vec<SettingUpdate> {
 /// Parse a comma-separated hop schedule string into `Vec<f32>`. Returns
 /// `None` on parse failure or empty input.
 pub fn parse_hops(value: &str) -> Option<Vec<f32>> {
-    let hops: Result<Vec<f32>, _> = value
-        .split(',')
-        .map(|s| s.trim().parse::<f32>())
-        .collect();
+    let hops: Result<Vec<f32>, _> = value.split(',').map(|s| s.trim().parse::<f32>()).collect();
     hops.ok().filter(|v| !v.is_empty())
 }
 
@@ -230,7 +231,10 @@ mod tests {
     #[test]
     fn parse_hops_valid() {
         assert_eq!(parse_hops("0.3,0.3,0.4"), Some(vec![0.3, 0.3, 0.4]));
-        assert_eq!(parse_hops("0,0,0.2,0.3,0.5"), Some(vec![0.0, 0.0, 0.2, 0.3, 0.5]));
+        assert_eq!(
+            parse_hops("0,0,0.2,0.3,0.5"),
+            Some(vec![0.0, 0.0, 0.2, 0.3, 0.5])
+        );
         assert_eq!(parse_hops("1.0"), Some(vec![1.0]));
     }
 
@@ -267,7 +271,10 @@ mod tests {
     #[test]
     fn set_without_active_handle_errors() {
         // No TurboliteHandle on this thread; `set()` must refuse.
-        assert_eq!(set("prefetch", "0.5,0.5"), Err("no active turbolite handle on this thread"));
+        assert_eq!(
+            set("prefetch", "0.5,0.5"),
+            Err("no active turbolite handle on this thread")
+        );
     }
 
     #[test]
@@ -276,26 +283,38 @@ mod tests {
         let q2 = new_queue();
 
         enter_handle(q1.clone());
-        assert!(push_to_current(SettingUpdate { key: "k1".into(), value: "v1".into() }));
+        assert!(push_to_current(SettingUpdate {
+            key: "k1".into(),
+            value: "v1".into()
+        }));
         // Now q1 has one update.
         assert_eq!(q1.lock().unwrap().len(), 1);
         assert_eq!(q2.lock().unwrap().len(), 0);
 
         enter_handle(q2.clone());
-        assert!(push_to_current(SettingUpdate { key: "k2".into(), value: "v2".into() }));
+        assert!(push_to_current(SettingUpdate {
+            key: "k2".into(),
+            value: "v2".into()
+        }));
         // q2 is now top-of-stack; update went there.
         assert_eq!(q1.lock().unwrap().len(), 1);
         assert_eq!(q2.lock().unwrap().len(), 1);
 
         leave_handle(&q2);
-        assert!(push_to_current(SettingUpdate { key: "k3".into(), value: "v3".into() }));
+        assert!(push_to_current(SettingUpdate {
+            key: "k3".into(),
+            value: "v3".into()
+        }));
         // q1 is back on top.
         assert_eq!(q1.lock().unwrap().len(), 2);
         assert_eq!(q2.lock().unwrap().len(), 1);
 
         leave_handle(&q1);
         // Stack empty.
-        assert!(!push_to_current(SettingUpdate { key: "k4".into(), value: "v4".into() }));
+        assert!(!push_to_current(SettingUpdate {
+            key: "k4".into(),
+            value: "v4".into()
+        }));
     }
 
     #[test]
@@ -314,7 +333,10 @@ mod tests {
         leave_handle(&q2);
 
         // Push: top of remaining stack is q3.
-        assert!(push_to_current(SettingUpdate { key: "x".into(), value: "y".into() }));
+        assert!(push_to_current(SettingUpdate {
+            key: "x".into(),
+            value: "y".into()
+        }));
         assert_eq!(q3.lock().unwrap().len(), 1);
         assert_eq!(q1.lock().unwrap().len(), 0);
 
@@ -325,8 +347,14 @@ mod tests {
     #[test]
     fn drain_queue_transfers_ownership() {
         let q = new_queue();
-        q.lock().unwrap().push(SettingUpdate { key: "a".into(), value: "b".into() });
-        q.lock().unwrap().push(SettingUpdate { key: "c".into(), value: "d".into() });
+        q.lock().unwrap().push(SettingUpdate {
+            key: "a".into(),
+            value: "b".into(),
+        });
+        q.lock().unwrap().push(SettingUpdate {
+            key: "c".into(),
+            value: "d".into(),
+        });
 
         let drained = drain_queue(&q);
         assert_eq!(drained.len(), 2);
@@ -364,8 +392,14 @@ mod tests {
 
     #[test]
     fn parse_byte_size_fractional() {
-        assert_eq!(parse_byte_size("1.5GB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
-        assert_eq!(parse_byte_size("0.5M"), Some((0.5 * 1024.0 * 1024.0) as u64));
+        assert_eq!(
+            parse_byte_size("1.5GB"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(
+            parse_byte_size("0.5M"),
+            Some((0.5 * 1024.0 * 1024.0) as u64)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::tiered::*;
-use tempfile::TempDir;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 /// Build a positional group_pages vec for tests: group g contains pages [g*ppg .. (g+1)*ppg).
 fn positional_group_pages(pages_per_group: u32, page_count: u64) -> Vec<Vec<u64>> {
@@ -78,7 +78,7 @@ fn test_bitmap_byte_boundaries() {
     let dir = TempDir::new().unwrap();
     let mut bm = PageBitmap::new(dir.path().join("bm"));
     bm.ensure_capacity(15); // max page checked is 15 (bit + 8 where bit=7)
-    // Test at every bit in a byte
+                            // Test at every bit in a byte
     for bit in 0..8 {
         bm.mark_present(bit);
         assert!(bm.is_present(bit));
@@ -127,7 +127,7 @@ fn test_bitmap_resize_explicit() {
     let mut bm = PageBitmap::new(dir.path().join("bm"));
     bm.resize(1000);
     assert!(bm.bits.len() >= 125); // ceil(1000/8)
-    // Resize with smaller value should not shrink
+                                   // Resize with smaller value should not shrink
     let len_before = bm.bits.len();
     bm.resize(10);
     assert_eq!(bm.bits.len(), len_before);
@@ -257,7 +257,7 @@ fn test_disk_cache_write_page_overwrite() {
 fn test_disk_cache_write_extends_file() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None, Vec::new()).unwrap(); // page_count=0
-    // Writing page 10 should extend the file
+                                                                                          // Writing page 10 should extend the file
     cache.write_page(10, &vec![42u8; 64]).unwrap();
     assert!(cache.is_present(10));
     let mut buf = vec![0u8; 64];
@@ -318,7 +318,7 @@ fn test_disk_cache_try_claim_present_fails() {
 fn test_disk_cache_group_state_out_of_bounds() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap(); // 2 groups
-    // Out of bounds should return None
+                                                                                          // Out of bounds should return None
     assert_eq!(cache.group_state(100), GroupState::None);
     assert_eq!(cache.group_state(u64::MAX), GroupState::None);
 }
@@ -664,7 +664,10 @@ fn test_disk_cache_concurrent_claim() {
     let claimed1 = cache.try_claim_group(0);
     let claimed2 = cache.try_claim_group(0);
     // Exactly one should succeed
-    assert!(claimed1 ^ claimed2, "exactly one thread should claim the group");
+    assert!(
+        claimed1 ^ claimed2,
+        "exactly one thread should claim the group"
+    );
 }
 
 #[test]
@@ -691,7 +694,17 @@ fn test_encode_cache_read_roundtrip() {
     let dir = TempDir::new().unwrap();
     let ppg = 4u32;
     let page_size = 64u32;
-    let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64, None, Vec::new()).unwrap();
+    let cache = DiskCache::new(
+        dir.path(),
+        3600,
+        ppg,
+        2,
+        page_size,
+        ppg as u64,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
 
     // Create page group with known data
     let pages: Vec<Option<Vec<u8>>> = (0..ppg)
@@ -916,7 +929,11 @@ fn test_concurrent_group_claim_exactly_one_wins() {
         h.join().unwrap();
     }
 
-    assert_eq!(winners.load(Ordering::Relaxed), 1, "exactly one thread should win the claim");
+    assert_eq!(
+        winners.load(Ordering::Relaxed),
+        1,
+        "exactly one thread should win the claim"
+    );
     assert_eq!(cache.group_state(0), GroupState::Fetching);
 }
 
@@ -1002,8 +1019,10 @@ fn test_prefetch_worker_skips_already_present_group() {
     // Worker logic: if state is not None and not Fetching, skip
     let current = cache.group_state(0);
     assert_eq!(current, GroupState::Present);
-    assert!(current != GroupState::None && current != GroupState::Fetching,
-        "worker should skip this group");
+    assert!(
+        current != GroupState::None && current != GroupState::Fetching,
+        "worker should skip this group"
+    );
 }
 
 #[test]
@@ -1085,8 +1104,11 @@ fn test_read_path_range_get_before_prefetch() {
     let page_data = vec![42u8; 64];
     cache.write_pages_scattered(&[0], &page_data, 0, 0).unwrap();
     assert!(cache.is_present(0));
-    assert_eq!(cache.group_state(0), GroupState::None,
-        "group state should remain None until prefetch is submitted");
+    assert_eq!(
+        cache.group_state(0),
+        GroupState::None,
+        "group state should remain None until prefetch is submitted"
+    );
 
     // Now the read path would claim and submit to pool
     assert!(cache.try_claim_group(0));
@@ -1143,7 +1165,11 @@ fn test_unclaim_group_wakes_waiters() {
     cache.unclaim_group(0);
 
     let elapsed = waiter.join().unwrap();
-    assert!(elapsed.as_millis() < 500, "waiter should unblock quickly, took {}ms", elapsed.as_millis());
+    assert!(
+        elapsed.as_millis() < 500,
+        "waiter should unblock quickly, took {}ms",
+        elapsed.as_millis()
+    );
 }
 
 #[test]
@@ -1189,9 +1215,15 @@ fn test_claim_before_submit_prevents_double_work() {
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 
-    assert_eq!(claims.load(AtOrd::Relaxed), 1, "exactly one submitter should win");
+    assert_eq!(
+        claims.load(AtOrd::Relaxed),
+        1,
+        "exactly one submitter should win"
+    );
     assert_eq!(cache.group_state(0), GroupState::Fetching);
 }
 
@@ -1218,12 +1250,16 @@ fn test_claim_unclaim_cycle_under_contention() {
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 
     // At least some claims should have succeeded across 400 attempts
-    assert!(total_claims.load(AtOrd::Relaxed) > 10,
+    assert!(
+        total_claims.load(AtOrd::Relaxed) > 10,
         "expected many successful claim/unclaim cycles, got {}",
-        total_claims.load(AtOrd::Relaxed));
+        total_claims.load(AtOrd::Relaxed)
+    );
     // Final state should be None (all unclaimed)
     assert_eq!(cache.group_state(0), GroupState::None);
 }
@@ -1272,7 +1308,11 @@ fn test_evict_to_budget_shrinks_cache() {
     assert!(evicted > 0, "should have evicted at least one sub-chunk");
 
     let after = cache.cache_bytes();
-    assert!(after <= 512, "cache should be at or below budget: got {} bytes", after);
+    assert!(
+        after <= 512,
+        "cache should be at or below budget: got {} bytes",
+        after
+    );
 }
 
 #[test]
@@ -1296,7 +1336,10 @@ fn test_evict_to_budget_respects_skip_groups() {
     skip.insert(0u64);
     skip.insert(1u64);
     let evicted = cache.evict_to_budget(0, &skip);
-    assert_eq!(evicted, 0, "all groups are skipped, nothing should be evicted");
+    assert_eq!(
+        evicted, 0,
+        "all groups are skipped, nothing should be evicted"
+    );
     assert_eq!(cache.cache_bytes(), 512);
 }
 
@@ -1316,8 +1359,14 @@ fn test_evict_to_budget_never_evicts_pinned() {
     // Pin all sub-chunks in group 0 (mark as interior pages)
     {
         let mut tracker = cache.tracker.lock();
-        let id0 = SubChunkId { group_id: 0, frame_index: 0 };
-        let id1 = SubChunkId { group_id: 0, frame_index: 1 };
+        let id0 = SubChunkId {
+            group_id: 0,
+            frame_index: 0,
+        };
+        let id1 = SubChunkId {
+            group_id: 0,
+            frame_index: 1,
+        };
         tracker.mark_pinned(id0);
         tracker.mark_pinned(id1);
     }
@@ -1356,12 +1405,21 @@ fn test_evict_to_budget_already_under() {
 /// Helper: create a DiskCache with compression enabled.
 fn compressed_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
     DiskCache::new_with_compression(
-        dir, 3600, 4, 2, page_size, page_count, None, Vec::new(),
-        true, 3,
+        dir,
+        3600,
+        4,
+        2,
+        page_size,
+        page_count,
+        None,
+        Vec::new(),
+        true,
+        3,
         #[cfg(feature = "zstd")]
         None,
-            0,
-        ).expect("compressed cache creation failed")
+        0,
+    )
+    .expect("compressed cache creation failed")
 }
 
 #[test]
@@ -1441,11 +1499,15 @@ fn test_compressed_scattered_write_roundtrip() {
     let page_nums = vec![1u64, 5, 10];
     let mut data = Vec::new();
     for &pn in &page_nums {
-        let page: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i)).collect();
+        let page: Vec<u8> = (0..64)
+            .map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i))
+            .collect();
         data.extend_from_slice(&page);
     }
 
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     for &pn in &page_nums {
         assert!(cache.is_present(pn), "page {} should be present", pn);
@@ -1455,7 +1517,9 @@ fn test_compressed_scattered_write_roundtrip() {
 
     // Read each back
     for &pn in &page_nums {
-        let expected: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i)).collect();
+        let expected: Vec<u8> = (0..64)
+            .map(|i| (pn as u8).wrapping_mul(7).wrapping_add(i))
+            .collect();
         let mut buf = vec![0u8; 64];
         cache.read_page(pn, &mut buf).unwrap();
         assert_eq!(buf, expected, "page {} mismatch", pn);
@@ -1493,13 +1557,15 @@ fn test_compressed_space_savings() {
     assert!(
         file_size < uncompressed_size,
         "compressed cache ({} bytes) should be smaller than uncompressed ({} bytes)",
-        file_size, uncompressed_size,
+        file_size,
+        uncompressed_size,
     );
     // Zeros compress extremely well, expect >90% savings
     assert!(
         file_size < uncompressed_size / 10,
         "all-zero pages should compress >90%: got {} vs {}",
-        file_size, uncompressed_size,
+        file_size,
+        uncompressed_size,
     );
 }
 
@@ -1547,13 +1613,21 @@ fn test_compressed_evict_group() {
     cache.mark_group_present(0);
 
     for p in 0..4 {
-        assert!(cache.is_present(p), "page {} should be present before evict", p);
+        assert!(
+            cache.is_present(p),
+            "page {} should be present before evict",
+            p
+        );
     }
 
     cache.evict_group(0);
 
     for p in 0..4 {
-        assert!(!cache.is_present(p), "page {} should be absent after evict", p);
+        assert!(
+            !cache.is_present(p),
+            "page {} should be absent after evict",
+            p
+        );
     }
 }
 
@@ -1575,7 +1649,11 @@ fn test_compressed_index_persistence() {
     {
         let cache = compressed_cache(dir.path(), 64, 16);
         for p in 0..4u64 {
-            assert!(cache.is_present(p), "page {} should be present after reopen", p);
+            assert!(
+                cache.is_present(p),
+                "page {} should be present after reopen",
+                p
+            );
             let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
             let mut buf = vec![0u8; 64];
             cache.read_page(p, &mut buf).unwrap();
@@ -1603,7 +1681,10 @@ fn test_compressed_corrupt_index_resets() {
     // Re-open: should start with empty index (graceful rebuild)
     let cache = compressed_cache(dir.path(), 64, 16);
     // Page 0 is in bitmap but NOT in cache index, so is_present returns false
-    assert!(!cache.is_present(0), "corrupt index should make page absent");
+    assert!(
+        !cache.is_present(0),
+        "corrupt index should make page absent"
+    );
 }
 
 #[test]
@@ -1624,7 +1705,10 @@ fn test_compressed_cache_file_cleared_but_index_survives() {
 
     // Re-open: constructor detects empty file + non-empty index, resets index
     let cache = compressed_cache(dir.path(), 64, 16);
-    assert!(!cache.is_present(0), "should detect stale index from empty cache file");
+    assert!(
+        !cache.is_present(0),
+        "should detect stale index from empty cache file"
+    );
 }
 
 #[test]
@@ -1760,13 +1844,21 @@ fn wrong_key() -> [u8; 32] {
 #[cfg(feature = "encryption")]
 fn compressed_encrypted_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
     DiskCache::new_with_compression(
-        dir, 3600, 4, 2, page_size, page_count,
-        Some(test_key()), Vec::new(),
-        true, 3,
+        dir,
+        3600,
+        4,
+        2,
+        page_size,
+        page_count,
+        Some(test_key()),
+        Vec::new(),
+        true,
+        3,
         #[cfg(feature = "zstd")]
         None,
-            0,
-        ).expect("compressed+encrypted cache creation failed")
+        0,
+    )
+    .expect("compressed+encrypted cache creation failed")
 }
 
 #[test]
@@ -1815,14 +1907,20 @@ fn test_compressed_encrypted_scattered_roundtrip() {
     let page_nums = vec![2u64, 7, 13];
     let mut data = Vec::new();
     for &pn in &page_nums {
-        let page: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i)).collect();
+        let page: Vec<u8> = (0..64)
+            .map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i))
+            .collect();
         data.extend_from_slice(&page);
     }
 
-    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache
+        .write_pages_scattered(&page_nums, &data, 0, 0)
+        .unwrap();
 
     for &pn in &page_nums {
-        let expected: Vec<u8> = (0..64).map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i)).collect();
+        let expected: Vec<u8> = (0..64)
+            .map(|i| (pn as u8).wrapping_mul(3).wrapping_add(i))
+            .collect();
         let mut buf = vec![0u8; 64];
         cache.read_page(pn, &mut buf).unwrap();
         assert_eq!(buf, expected, "page {} mismatch", pn);
@@ -1847,7 +1945,10 @@ fn test_compressed_encrypted_data_not_plaintext() {
     file.read_exact_at(&mut raw, entry.offset).unwrap();
 
     // Raw disk bytes must differ from plaintext
-    assert_ne!(raw, page_data, "encrypted+compressed data must not match plaintext");
+    assert_ne!(
+        raw, page_data,
+        "encrypted+compressed data must not match plaintext"
+    );
 }
 
 #[test]
@@ -1861,19 +1962,30 @@ fn test_compressed_encrypted_wrong_key_fails() {
 
     // Create a new cache with wrong key, same index
     let bad_cache = DiskCache::new_with_compression(
-        dir.path(), 3600, 4, 2, 64, 16,
-        Some(wrong_key()), Vec::new(),
-        true, 3,
+        dir.path(),
+        3600,
+        4,
+        2,
+        64,
+        16,
+        Some(wrong_key()),
+        Vec::new(),
+        true,
+        3,
         #[cfg(feature = "zstd")]
         None,
-            0,
-        ).unwrap();
+        0,
+    )
+    .unwrap();
 
     let mut buf = vec![0u8; 64];
     // With wrong key, either read fails or returns garbage (CTR mode returns garbage, not error)
     let result = bad_cache.read_page(0, &mut buf);
     if result.is_ok() {
-        assert_ne!(buf, page_data, "wrong key must not produce correct plaintext");
+        assert_ne!(
+            buf, page_data,
+            "wrong key must not produce correct plaintext"
+        );
     }
 }
 
@@ -1886,13 +1998,21 @@ fn test_compressed_encrypted_persistence_roundtrip() {
     // Write and persist
     {
         let cache = DiskCache::new_with_compression(
-            dir.path(), 3600, 4, 2, 64, 16,
-            Some(key), Vec::new(),
-            true, 3,
+            dir.path(),
+            3600,
+            4,
+            2,
+            64,
+            16,
+            Some(key),
+            Vec::new(),
+            true,
+            3,
             #[cfg(feature = "zstd")]
             None,
             0,
-        ).unwrap();
+        )
+        .unwrap();
         for p in 0..4u64 {
             let data: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
             cache.write_page(p, &data).unwrap();
@@ -1903,15 +2023,27 @@ fn test_compressed_encrypted_persistence_roundtrip() {
     // Reopen with same key and verify
     {
         let cache = DiskCache::new_with_compression(
-            dir.path(), 3600, 4, 2, 64, 16,
-            Some(key), Vec::new(),
-            true, 3,
+            dir.path(),
+            3600,
+            4,
+            2,
+            64,
+            16,
+            Some(key),
+            Vec::new(),
+            true,
+            3,
             #[cfg(feature = "zstd")]
             None,
             0,
-        ).unwrap();
+        )
+        .unwrap();
         for p in 0..4u64 {
-            assert!(cache.is_present(p), "page {} should be present after reopen", p);
+            assert!(
+                cache.is_present(p),
+                "page {} should be present after reopen",
+                p
+            );
             let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
             let mut buf = vec![0u8; 64];
             cache.read_page(p, &mut buf).unwrap();
@@ -1980,15 +2112,29 @@ fn test_prune_noop_when_uncompressed() {
 // Mem_cache tests
 // =========================================================================
 
-fn cache_with_mem_budget(dir: &std::path::Path, page_size: u32, page_count: u64, budget: u64) -> DiskCache {
+fn cache_with_mem_budget(
+    dir: &std::path::Path,
+    page_size: u32,
+    page_count: u64,
+    budget: u64,
+) -> DiskCache {
     let gp = positional_group_pages(256, page_count);
     DiskCache::new_with_compression(
-        dir, 3600, 256, 4, page_size, page_count, None, gp,
-        false, 3,
+        dir,
+        3600,
+        256,
+        4,
+        page_size,
+        page_count,
+        None,
+        gp,
+        false,
+        3,
         #[cfg(feature = "zstd")]
         None,
         budget,
-    ).expect("cache with mem budget")
+    )
+    .expect("cache with mem budget")
 }
 
 #[test]
@@ -2025,12 +2171,20 @@ fn test_mem_cache_eviction_frees_memory() {
     cache.clear_pages_from_disk(&[0, 1, 2, 3]);
 
     // mem_cache_bytes should be decremented
-    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 0, "mem_cache_bytes should be 0 after eviction");
+    assert_eq!(
+        cache.mem_cache_bytes.load(Ordering::Relaxed),
+        0,
+        "mem_cache_bytes should be 0 after eviction"
+    );
 
     // Verify AtomicPtr slots are null
     if let Some(ref mc) = cache.mem_cache {
         for p in 0..4 {
-            assert!(mc[p].load(Ordering::Relaxed).is_null(), "slot {} should be null after eviction", p);
+            assert!(
+                mc[p].load(Ordering::Relaxed).is_null(),
+                "slot {} should be null after eviction",
+                p
+            );
         }
     }
 }
@@ -2046,8 +2200,11 @@ fn test_mem_cache_budget_respected() {
     cache.write_pages_bulk(0, &data, 4).expect("bulk write");
 
     // Should have promoted exactly 2 pages (budget = 128 = 2 * 64)
-    assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) <= 128,
-        "mem_cache_bytes {} exceeds budget 128", cache.mem_cache_bytes.load(Ordering::Relaxed));
+    assert!(
+        cache.mem_cache_bytes.load(Ordering::Relaxed) <= 128,
+        "mem_cache_bytes {} exceeds budget 128",
+        cache.mem_cache_bytes.load(Ordering::Relaxed)
+    );
 }
 
 #[test]
@@ -2055,7 +2212,10 @@ fn test_mem_cache_disabled_when_budget_zero() {
     let dir = TempDir::new().unwrap();
     let cache = cache_with_mem_budget(dir.path(), 64, 16, 0);
 
-    assert!(cache.mem_cache.is_none(), "mem_cache should be None when budget=0");
+    assert!(
+        cache.mem_cache.is_none(),
+        "mem_cache should be None when budget=0"
+    );
 
     // Write and read should still work via pread
     let data = vec![42u8; 64];
@@ -2126,12 +2286,21 @@ fn test_mem_cache_invalidated_on_write() {
     let budget = 1024 * 1024; // 1MB mem_cache
 
     let cache = DiskCache::new_with_compression(
-        dir.path(), 0, ppg, 1, ps, page_count, None, gp,
-        false, 3,
+        dir.path(),
+        0,
+        ppg,
+        1,
+        ps,
+        page_count,
+        None,
+        gp,
+        false,
+        3,
         #[cfg(feature = "zstd")]
         None,
         budget,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Simulate S3 fetch: write page 0 to disk cache.
     let original = vec![0xAAu8; ps as usize];
@@ -2153,7 +2322,10 @@ fn test_mem_cache_invalidated_on_write() {
     // Read should return the NEW version, not the stale mem_cache copy.
     let mut buf2 = vec![0u8; ps as usize];
     cache.read_page(0, &mut buf2).unwrap();
-    assert_eq!(buf2[0], 0xBB, "should read updated data after write invalidated mem_cache");
+    assert_eq!(
+        buf2[0], 0xBB,
+        "should read updated data after write invalidated mem_cache"
+    );
 }
 
 #[test]
@@ -2168,12 +2340,21 @@ fn test_mem_cache_invalidated_on_evict_group() {
     let budget = 1024 * 1024;
 
     let cache = DiskCache::new_with_compression(
-        dir.path(), 0, ppg, 1, ps, page_count, None, gp,
-        false, 3,
+        dir.path(),
+        0,
+        ppg,
+        1,
+        ps,
+        page_count,
+        None,
+        gp,
+        false,
+        3,
         #[cfg(feature = "zstd")]
         None,
         budget,
-    ).unwrap();
+    )
+    .unwrap();
     cache.ensure_group_capacity(2);
 
     // Write pages 0-3 (group 0) and promote to mem_cache.
@@ -2191,8 +2372,11 @@ fn test_mem_cache_invalidated_on_evict_group() {
     cache.evict_group(0);
 
     // mem_cache should be cleared for those pages.
-    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 0,
-        "evict_group should clear mem_cache entries");
+    assert_eq!(
+        cache.mem_cache_bytes.load(Ordering::Relaxed),
+        0,
+        "evict_group should clear mem_cache entries"
+    );
 
     // Write NEW data for page 0 (simulates follower receiving updated page from S3).
     let new_data = vec![0xFFu8; ps as usize];
@@ -2201,5 +2385,8 @@ fn test_mem_cache_invalidated_on_evict_group() {
     // Read should return the NEW data, not the evicted stale mem_cache copy.
     let mut buf = vec![0u8; ps as usize];
     cache.read_page(0, &mut buf).unwrap();
-    assert_eq!(buf[0], 0xFF, "after evict_group + new write, should read new data");
+    assert_eq!(
+        buf[0], 0xFF,
+        "after evict_group + new write, should read new data"
+    );
 }

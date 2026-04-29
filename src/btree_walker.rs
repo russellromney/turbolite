@@ -59,12 +59,15 @@ pub fn walk_all_btrees(
     // Add it explicitly since it doesn't appear in its own records
     let master_pages = walk_btree(0, page_size, read_page);
     all_owned.extend(&master_pages);
-    btrees.insert(0, BTreeEntry {
-        obj_type: "table".to_string(),
-        name: "sqlite_master".to_string(),
-        root_page: 0,
-        pages: master_pages,
-    });
+    btrees.insert(
+        0,
+        BTreeEntry {
+            obj_type: "table".to_string(),
+            name: "sqlite_master".to_string(),
+            root_page: 0,
+            pages: master_pages,
+        },
+    );
 
     for entry in &master_entries {
         if entry.root_page == 0 {
@@ -74,12 +77,15 @@ pub fn walk_all_btrees(
         let root_0based = entry.root_page - 1;
         let pages = walk_btree(root_0based, page_size, read_page);
         all_owned.extend(&pages);
-        btrees.insert(root_0based, BTreeEntry {
-            obj_type: entry.obj_type.clone(),
-            name: entry.name.clone(),
-            root_page: root_0based,
-            pages,
-        });
+        btrees.insert(
+            root_0based,
+            BTreeEntry {
+                obj_type: entry.obj_type.clone(),
+                name: entry.name.clone(),
+                root_page: root_0based,
+                pages,
+            },
+        );
     }
 
     // Step 3: Find unowned pages
@@ -90,7 +96,10 @@ pub fn walk_all_btrees(
         }
     }
 
-    BTreeWalkResult { btrees, unowned_pages }
+    BTreeWalkResult {
+        btrees,
+        unowned_pages,
+    }
 }
 
 /// Walk a single B-tree from its root page, returning all page numbers (0-based).
@@ -135,7 +144,8 @@ fn walk_btree(
             }
             // Leaf pages: collect overflow pages from cells
             0x0A | 0x0D => {
-                let overflow_pages = extract_leaf_overflow_pages(&buf, hdr_off, page_size, type_byte);
+                let overflow_pages =
+                    extract_leaf_overflow_pages(&buf, hdr_off, page_size, type_byte);
                 for ovfl_1based in overflow_pages {
                     if ovfl_1based == 0 {
                         continue;
@@ -147,7 +157,10 @@ fn walk_btree(
                         if let Some(ovfl_buf) = read_page(ovfl) {
                             if ovfl_buf.len() >= 4 {
                                 let next = u32::from_be_bytes([
-                                    ovfl_buf[0], ovfl_buf[1], ovfl_buf[2], ovfl_buf[3],
+                                    ovfl_buf[0],
+                                    ovfl_buf[1],
+                                    ovfl_buf[2],
+                                    ovfl_buf[3],
                                 ]);
                                 if next == 0 {
                                     break;
@@ -187,7 +200,10 @@ fn extract_interior_children(buf: &[u8], hdr_off: usize, _page_size: u32) -> Vec
 
     // Right-most child pointer (4 bytes at hdr_off + 8)
     let right_child = u32::from_be_bytes([
-        buf[hdr_off + 8], buf[hdr_off + 9], buf[hdr_off + 10], buf[hdr_off + 11],
+        buf[hdr_off + 8],
+        buf[hdr_off + 9],
+        buf[hdr_off + 10],
+        buf[hdr_off + 11],
     ]);
     children.push(right_child);
 
@@ -204,7 +220,10 @@ fn extract_interior_children(buf: &[u8], hdr_off: usize, _page_size: u32) -> Vec
             continue;
         }
         let left_child = u32::from_be_bytes([
-            buf[cell_off], buf[cell_off + 1], buf[cell_off + 2], buf[cell_off + 3],
+            buf[cell_off],
+            buf[cell_off + 1],
+            buf[cell_off + 2],
+            buf[cell_off + 3],
         ]);
         children.push(left_child);
     }
@@ -282,8 +301,10 @@ fn extract_leaf_overflow_pages(
             let ovfl_ptr_off = pos + local_size;
             if ovfl_ptr_off + 4 <= buf.len() {
                 let ovfl = u32::from_be_bytes([
-                    buf[ovfl_ptr_off], buf[ovfl_ptr_off + 1],
-                    buf[ovfl_ptr_off + 2], buf[ovfl_ptr_off + 3],
+                    buf[ovfl_ptr_off],
+                    buf[ovfl_ptr_off + 1],
+                    buf[ovfl_ptr_off + 2],
+                    buf[ovfl_ptr_off + 3],
                 ]);
                 if ovfl != 0 {
                     overflow_pages.push(ovfl);
@@ -486,16 +507,16 @@ fn read_varint(buf: &[u8]) -> (u64, usize) {
 /// Get the storage size of a column value given its serial type.
 fn serial_type_size(serial_type: u64) -> usize {
     match serial_type {
-        0 => 0,            // NULL
-        1 => 1,            // 8-bit int
-        2 => 2,            // 16-bit int
-        3 => 3,            // 24-bit int
-        4 => 4,            // 32-bit int
-        5 => 6,            // 48-bit int
-        6 => 8,            // 64-bit int
-        7 => 8,            // IEEE float
-        8 | 9 => 0,        // 0 or 1 (in-type value)
-        10 | 11 => 0,      // reserved
+        0 => 0,                                                // NULL
+        1 => 1,                                                // 8-bit int
+        2 => 2,                                                // 16-bit int
+        3 => 3,                                                // 24-bit int
+        4 => 4,                                                // 32-bit int
+        5 => 6,                                                // 48-bit int
+        6 => 8,                                                // 64-bit int
+        7 => 8,                                                // IEEE float
+        8 | 9 => 0,                                            // 0 or 1 (in-type value)
+        10 | 11 => 0,                                          // reserved
         n if n >= 12 && n % 2 == 0 => ((n - 12) / 2) as usize, // BLOB
         n if n >= 13 && n % 2 == 1 => ((n - 13) / 2) as usize, // TEXT
         _ => 0,
@@ -559,16 +580,20 @@ mod tests {
 
         // Create a database with known schema
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
             CREATE INDEX idx_users_name ON users(name);
             CREATE INDEX idx_users_email ON users(email);
             INSERT INTO users VALUES (1, 'alice', 'alice@example.com');
             INSERT INTO users VALUES (2, 'bob', 'bob@example.com');
             INSERT INTO users VALUES (3, 'carol', 'carol@example.com');
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         // Force WAL checkpoint to ensure all pages are in the main DB file
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(conn);
 
         let file = std::fs::read(&db_path).unwrap();
@@ -585,7 +610,11 @@ mod tests {
 
         // Should find sqlite_master + users table + 2 indexes = 4 B-trees
         // (plus potentially sqlite_sequence if autoincrement, but we're not using it)
-        assert!(result.btrees.len() >= 4, "expected at least 4 btrees, got {}", result.btrees.len());
+        assert!(
+            result.btrees.len() >= 4,
+            "expected at least 4 btrees, got {}",
+            result.btrees.len()
+        );
 
         // sqlite_master should be at root page 0
         assert!(result.btrees.contains_key(&0), "missing sqlite_master");
@@ -609,11 +638,17 @@ mod tests {
             total_owned + result.unowned_pages.len(),
             page_count as usize,
             "owned ({}) + unowned ({}) should equal page_count ({})",
-            total_owned, result.unowned_pages.len(), page_count,
+            total_owned,
+            result.unowned_pages.len(),
+            page_count,
         );
 
         // No page should appear in two different B-trees
-        let mut all_pages: Vec<u64> = result.btrees.values().flat_map(|e| e.pages.iter().copied()).collect();
+        let mut all_pages: Vec<u64> = result
+            .btrees
+            .values()
+            .flat_map(|e| e.pages.iter().copied())
+            .collect();
         all_pages.sort_unstable();
         for w in all_pages.windows(2) {
             assert_ne!(w[0], w[1], "page {} appears in multiple B-trees", w[0]);
@@ -627,21 +662,26 @@ mod tests {
         let db_path = dir.path().join("test_large.db");
 
         let mut conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA page_size = 4096;
             CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);
             CREATE INDEX idx_data_val ON data(val);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         // Insert enough rows to force multi-level B-trees with 4KB pages
         let tx = conn.transaction().unwrap();
         for i in 0..5000 {
             tx.execute(
                 "INSERT INTO data VALUES (?1, ?2)",
                 rusqlite::params![i, format!("value_{:06}", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(conn);
 
         let file = std::fs::read(&db_path).unwrap();
@@ -661,18 +701,37 @@ mod tests {
 
         // The data table should have many pages (5000 rows in 4KB pages)
         let data_table = result.btrees.values().find(|e| e.name == "data").unwrap();
-        assert!(data_table.pages.len() > 10, "data table should have many pages, got {}", data_table.pages.len());
+        assert!(
+            data_table.pages.len() > 10,
+            "data table should have many pages, got {}",
+            data_table.pages.len()
+        );
 
         // The index should also have multiple pages
-        let idx = result.btrees.values().find(|e| e.name == "idx_data_val").unwrap();
-        assert!(idx.pages.len() > 5, "index should have multiple pages, got {}", idx.pages.len());
+        let idx = result
+            .btrees
+            .values()
+            .find(|e| e.name == "idx_data_val")
+            .unwrap();
+        assert!(
+            idx.pages.len() > 5,
+            "index should have multiple pages, got {}",
+            idx.pages.len()
+        );
 
         // Verify complete coverage
         let total_owned: usize = result.btrees.values().map(|e| e.pages.len()).sum();
-        assert_eq!(total_owned + result.unowned_pages.len(), page_count as usize);
+        assert_eq!(
+            total_owned + result.unowned_pages.len(),
+            page_count as usize
+        );
 
         // No duplicates
-        let mut all_pages: Vec<u64> = result.btrees.values().flat_map(|e| e.pages.iter().copied()).collect();
+        let mut all_pages: Vec<u64> = result
+            .btrees
+            .values()
+            .flat_map(|e| e.pages.iter().copied())
+            .collect();
         all_pages.sort_unstable();
         for w in all_pages.windows(2) {
             assert_ne!(w[0], w[1], "page {} appears in multiple B-trees", w[0]);
@@ -686,19 +745,24 @@ mod tests {
         let db_path = dir.path().join("test_overflow.db");
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA page_size = 4096;
             CREATE TABLE big (id INTEGER PRIMARY KEY, data TEXT);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         // Insert values large enough to trigger overflow pages (> ~4000 bytes at 4KB page size)
         let big_val = "x".repeat(10000);
         for i in 0..20 {
             conn.execute(
                 "INSERT INTO big VALUES (?1, ?2)",
                 rusqlite::params![i, big_val],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(conn);
 
         let file = std::fs::read(&db_path).unwrap();
@@ -716,12 +780,18 @@ mod tests {
         // The big table should have many pages (overflow pages for 10KB values)
         let big_table = result.btrees.values().find(|e| e.name == "big").unwrap();
         // 20 rows * ~10KB each = ~200KB. At 4KB pages that's ~50 pages minimum.
-        assert!(big_table.pages.len() > 30,
-            "big table should have overflow pages, got {} pages", big_table.pages.len());
+        assert!(
+            big_table.pages.len() > 30,
+            "big table should have overflow pages, got {} pages",
+            big_table.pages.len()
+        );
 
         // Complete coverage
         let total_owned: usize = result.btrees.values().map(|e| e.pages.len()).sum();
-        assert_eq!(total_owned + result.unowned_pages.len(), page_count as usize);
+        assert_eq!(
+            total_owned + result.unowned_pages.len(),
+            page_count as usize
+        );
     }
 
     #[test]
@@ -740,13 +810,13 @@ mod tests {
 
     #[test]
     fn test_serial_type_size() {
-        assert_eq!(serial_type_size(0), 0);  // NULL
-        assert_eq!(serial_type_size(1), 1);  // 8-bit int
-        assert_eq!(serial_type_size(4), 4);  // 32-bit int
-        assert_eq!(serial_type_size(6), 8);  // 64-bit int
-        assert_eq!(serial_type_size(7), 8);  // float
-        assert_eq!(serial_type_size(8), 0);  // constant 0
-        assert_eq!(serial_type_size(9), 0);  // constant 1
+        assert_eq!(serial_type_size(0), 0); // NULL
+        assert_eq!(serial_type_size(1), 1); // 8-bit int
+        assert_eq!(serial_type_size(4), 4); // 32-bit int
+        assert_eq!(serial_type_size(6), 8); // 64-bit int
+        assert_eq!(serial_type_size(7), 8); // float
+        assert_eq!(serial_type_size(8), 0); // constant 0
+        assert_eq!(serial_type_size(9), 0); // constant 1
         assert_eq!(serial_type_size(13), 0); // TEXT len 0
         assert_eq!(serial_type_size(15), 1); // TEXT len 1
         assert_eq!(serial_type_size(17), 2); // TEXT len 2

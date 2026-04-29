@@ -40,7 +40,11 @@ pub fn import_sqlite_file(
     let mut header = [0u8; 100];
     file.read_exact_at(&mut header, 0)?;
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
-    let page_size: u32 = if raw_page_size == 1 { 65536 } else { raw_page_size as u32 };
+    let page_size: u32 = if raw_page_size == 1 {
+        65536
+    } else {
+        raw_page_size as u32
+    };
     let page_count = (file_len / page_size as u64) as u64;
     let ppg = config.cache.pages_per_group;
     let total_groups = (page_count + ppg as u64 - 1) / ppg as u64;
@@ -62,90 +66,100 @@ pub fn import_sqlite_file(
     assert!(version > 0, "file change counter must be > 0 for import (is this a valid SQLite DB with committed data?)");
     eprintln!(
         "[import] encoding: {} (sub_ppf={})",
-        if use_seekable { "seekable multi-frame" } else { "legacy single-frame" },
+        if use_seekable {
+            "seekable multi-frame"
+        } else {
+            "legacy single-frame"
+        },
         sub_ppf,
     );
 
     // Walk B-trees to discover page ownership and build groups
     let (group_pages_list, btrees_manifest) = {
-            // Walk B-trees to discover page ownership
-            eprintln!("[import] walking B-trees...");
-            let walk_result = crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
+        // Walk B-trees to discover page ownership
+        eprintln!("[import] walking B-trees...");
+        let walk_result =
+            crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
                 let mut buf = vec![0u8; page_size as usize];
-                file.read_exact_at(&mut buf, page_num * page_size as u64).ok()?;
+                file.read_exact_at(&mut buf, page_num * page_size as u64)
+                    .ok()?;
                 Some(buf)
             });
-            eprintln!(
-                "[import] found {} B-trees, {} unowned pages",
-                walk_result.btrees.len(),
-                walk_result.unowned_pages.len(),
-            );
+        eprintln!(
+            "[import] found {} B-trees, {} unowned pages",
+            walk_result.btrees.len(),
+            walk_result.unowned_pages.len(),
+        );
 
-            // Pack pages by B-tree into groups.
-            // Large B-trees (>= ppg/4 pages) get their own groups.
-            // Small B-trees + unowned pages are bin-packed into shared groups.
-            let mut group_pages_list: Vec<Vec<u64>> = Vec::new();
+        // Pack pages by B-tree into groups.
+        // Large B-trees (>= ppg/4 pages) get their own groups.
+        // Small B-trees + unowned pages are bin-packed into shared groups.
+        let mut group_pages_list: Vec<Vec<u64>> = Vec::new();
 
-            // Sort B-trees by size descending (large first)
-            let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
-                walk_result.btrees.iter().collect();
-            btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+        // Sort B-trees by size descending (large first)
+        let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
+            walk_result.btrees.iter().collect();
+        btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
 
-            let threshold = std::cmp::max(ppg as usize / 4, 1);
-            let mut small_pages: Vec<u64> = Vec::new();
+        let threshold = std::cmp::max(ppg as usize / 4, 1);
+        let mut small_pages: Vec<u64> = Vec::new();
 
-            for (_root, entry) in &btree_list {
-                let mut sorted_pages = entry.pages.clone();
-                sorted_pages.sort_unstable();
+        for (_root, entry) in &btree_list {
+            let mut sorted_pages = entry.pages.clone();
+            sorted_pages.sort_unstable();
 
-                if sorted_pages.len() >= threshold {
-                    for chunk in sorted_pages.chunks(ppg as usize) {
-                        group_pages_list.push(chunk.to_vec());
-                    }
-                } else {
-                    small_pages.extend_from_slice(&sorted_pages);
+            if sorted_pages.len() >= threshold {
+                for chunk in sorted_pages.chunks(ppg as usize) {
+                    group_pages_list.push(chunk.to_vec());
+                }
+            } else {
+                small_pages.extend_from_slice(&sorted_pages);
+            }
+        }
+
+        let mut sorted_unowned = walk_result.unowned_pages.clone();
+        sorted_unowned.sort_unstable();
+        small_pages.extend_from_slice(&sorted_unowned);
+
+        for chunk in small_pages.chunks(ppg as usize) {
+            group_pages_list.push(chunk.to_vec());
+        }
+
+        eprintln!(
+            "[import] packed into {} groups (was {} positional)",
+            group_pages_list.len(),
+            total_groups,
+        );
+
+        // Build btrees manifest map
+        let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
+        for (gid, pages) in group_pages_list.iter().enumerate() {
+            for &p in pages {
+                page_to_gid.insert(p, gid as u64);
+            }
+        }
+
+        let mut btrees_manifest: HashMap<u64, BTreeManifestEntry> = HashMap::new();
+        for (&root_page, entry) in &walk_result.btrees {
+            let mut gid_set: HashSet<u64> = HashSet::new();
+            for &p in &entry.pages {
+                if let Some(&gid) = page_to_gid.get(&p) {
+                    gid_set.insert(gid);
                 }
             }
-
-            let mut sorted_unowned = walk_result.unowned_pages.clone();
-            sorted_unowned.sort_unstable();
-            small_pages.extend_from_slice(&sorted_unowned);
-
-            for chunk in small_pages.chunks(ppg as usize) {
-                group_pages_list.push(chunk.to_vec());
-            }
-
-            eprintln!(
-                "[import] packed into {} groups (was {} positional)",
-                group_pages_list.len(), total_groups,
-            );
-
-            // Build btrees manifest map
-            let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
-            for (gid, pages) in group_pages_list.iter().enumerate() {
-                for &p in pages {
-                    page_to_gid.insert(p, gid as u64);
-                }
-            }
-
-            let mut btrees_manifest: HashMap<u64, BTreeManifestEntry> = HashMap::new();
-            for (&root_page, entry) in &walk_result.btrees {
-                let mut gid_set: HashSet<u64> = HashSet::new();
-                for &p in &entry.pages {
-                    if let Some(&gid) = page_to_gid.get(&p) {
-                        gid_set.insert(gid);
-                    }
-                }
-                let mut gids: Vec<u64> = gid_set.into_iter().collect();
-                gids.sort_unstable();
-                btrees_manifest.insert(root_page, BTreeManifestEntry {
+            let mut gids: Vec<u64> = gid_set.into_iter().collect();
+            gids.sort_unstable();
+            btrees_manifest.insert(
+                root_page,
+                BTreeManifestEntry {
                     name: entry.name.clone(),
                     obj_type: entry.obj_type.clone(),
                     group_ids: gids,
-                });
-            }
+                },
+            );
+        }
 
-            (group_pages_list, btrees_manifest)
+        (group_pages_list, btrees_manifest)
     };
 
     let actual_groups = group_pages_list.len();
@@ -206,7 +220,9 @@ pub fn import_sqlite_file(
         if (gid + 1) % 50 == 0 || gid + 1 == actual_groups {
             eprintln!(
                 "[import] encoded {}/{} groups ({} interior pages so far)",
-                gid + 1, actual_groups, interior_pages.len(),
+                gid + 1,
+                actual_groups,
+                interior_pages.len(),
             );
         }
     }
@@ -245,7 +261,9 @@ pub fn import_sqlite_file(
         let key = keys::interior_chunk_key(chunk_id, version);
         eprintln!(
             "[import] interior chunk {}: {} pages, {:.1}KB",
-            chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
+            chunk_id,
+            pages.len(),
+            encoded.len() as f64 / 1024.0,
         );
         chunk_uploads.push((key.clone(), encoded));
         interior_chunk_keys.insert(chunk_id, key);
@@ -281,7 +299,9 @@ pub fn import_sqlite_file(
         let key = keys::index_chunk_key(chunk_id, version);
         eprintln!(
             "[import] index chunk {}: {} pages, {:.1}KB",
-            chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
+            chunk_id,
+            pages.len(),
+            encoded.len() as f64 / 1024.0,
         );
         ix_chunk_uploads.push((key.clone(), encoded));
         index_chunk_keys.insert(chunk_id, key);
@@ -289,7 +309,10 @@ pub fn import_sqlite_file(
 
     if !ix_chunk_uploads.is_empty() {
         storage_helpers::put_page_groups(backend_ref, runtime_ref, &ix_chunk_uploads)?;
-        eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
+        eprintln!(
+            "[import] uploaded {} index leaf chunks",
+            ix_chunk_uploads.len()
+        );
     }
 
     // Build and upload manifest (explicit B-tree-aware groups)
@@ -320,8 +343,11 @@ pub fn import_sqlite_file(
     storage_helpers::put_manifest(backend_ref, runtime_ref, &manifest)?;
     eprintln!(
         "[import] manifest uploaded: version={} pages={} groups={} interior_chunks={} seekable={}",
-        manifest.version, manifest.page_count, manifest.page_group_keys.len(),
-        manifest.interior_chunk_keys.len(), use_seekable,
+        manifest.version,
+        manifest.page_count,
+        manifest.page_group_keys.len(),
+        manifest.interior_chunk_keys.len(),
+        use_seekable,
     );
 
     Ok(manifest)

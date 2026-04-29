@@ -294,13 +294,25 @@ impl TurboliteSharedState {
         let mut tracker = self.cache.tracker.lock();
         let target_tiers: Vec<cache_tracking::SubChunkTier> = match tier {
             "data" => vec![cache_tracking::SubChunkTier::Data],
-            "index" => vec![cache_tracking::SubChunkTier::Index, cache_tracking::SubChunkTier::Data],
-            "all" => vec![cache_tracking::SubChunkTier::Index, cache_tracking::SubChunkTier::Data],
+            "index" => vec![
+                cache_tracking::SubChunkTier::Index,
+                cache_tracking::SubChunkTier::Data,
+            ],
+            "all" => vec![
+                cache_tracking::SubChunkTier::Index,
+                cache_tracking::SubChunkTier::Data,
+            ],
             _ => return 0,
         };
-        let to_evict: Vec<SubChunkId> = tracker.present.iter()
+        let to_evict: Vec<SubChunkId> = tracker
+            .present
+            .iter()
             .filter(|id| {
-                let t = tracker.tiers.get(id).copied().unwrap_or(cache_tracking::SubChunkTier::Data);
+                let t = tracker
+                    .tiers
+                    .get(id)
+                    .copied()
+                    .unwrap_or(cache_tracking::SubChunkTier::Data);
                 target_tiers.contains(&t) && !pending.contains(&(id.group_id as u64))
             })
             .copied()
@@ -315,8 +327,12 @@ impl TurboliteSharedState {
             self.cache.clear_pages_from_disk(&page_nums);
             evicted += 1;
         }
-        self.cache.stat_evictions.fetch_add(evicted as u64, Ordering::Relaxed);
-        self.cache.stat_bytes_evicted.fetch_add(evicted as u64 * scbs, Ordering::Relaxed);
+        self.cache
+            .stat_evictions
+            .fetch_add(evicted as u64, Ordering::Relaxed);
+        self.cache
+            .stat_bytes_evicted
+            .fetch_add(evicted as u64 * scbs, Ordering::Relaxed);
         evicted
     }
 
@@ -376,14 +392,22 @@ impl TurboliteSharedState {
             \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
             \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
             \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{}}}",
-            total_bytes, peak_bytes,
+            total_bytes,
+            peak_bytes,
             groups_with_data.len(),
             total_groups,
-            pinned_chunks, pinned_bytes,
-            index_chunks, index_bytes,
-            data_chunks, data_bytes,
-            hits, misses, hit_rate,
-            evictions, bytes_evicted, last_eviction,
+            pinned_chunks,
+            pinned_bytes,
+            index_chunks,
+            index_bytes,
+            data_chunks,
+            data_bytes,
+            hits,
+            misses,
+            hit_rate,
+            evictions,
+            bytes_evicted,
+            last_eviction,
         )
     }
 
@@ -407,9 +431,21 @@ impl TurboliteSharedState {
                         if key.is_empty() {
                             continue;
                         }
-                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
-                        let gp = manifest.group_pages.get(gid as usize).cloned().unwrap_or_default();
-                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                        let ft = manifest
+                            .frame_tables
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let gp = manifest
+                            .group_pages
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let ovrs = manifest
+                            .subframe_overrides
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
                         pool.submit(
                             gid,
                             key.clone(),
@@ -428,7 +464,11 @@ impl TurboliteSharedState {
 
         format!(
             "{{\"trees_warmed\":[{}],\"groups_submitted\":{}}}",
-            trees_warmed.iter().map(|n| format!("\"{}\"", n)).collect::<Vec<_>>().join(","),
+            trees_warmed
+                .iter()
+                .map(|n| format!("\"{}\"", n))
+                .collect::<Vec<_>>()
+                .join(","),
             groups_submitted,
         )
     }
@@ -483,26 +523,24 @@ impl TurboliteSharedState {
             }
 
             let root = btree_info.root_page;
-            let compact_result = match compact::compact_btree(
-                &manifest,
-                root,
-                ppg,
-                page_size,
-                &|pnum| {
+            let compact_result =
+                match compact::compact_btree(&manifest, root, ppg, page_size, &|pnum| {
                     let mut buf = vec![0u8; page_size as usize];
                     if self.cache.read_page(pnum, &mut buf).is_ok() {
                         Some(buf)
                     } else {
                         None
                     }
-                },
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[compact] ERROR compacting B-tree {}: {}", btree_info.name, e);
-                    continue;
-                }
-            };
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[compact] ERROR compacting B-tree {}: {}",
+                            btree_info.name, e
+                        );
+                        continue;
+                    }
+                };
 
             eprintln!(
                 "[compact] {} : {} pages -> {} pages ({} freed), {} groups -> {} groups",
@@ -570,7 +608,11 @@ impl TurboliteSharedState {
                 while manifest.group_pages.len() <= gid as usize {
                     manifest.group_pages.push(Vec::new());
                 }
-                let old_key = manifest.page_group_keys.get(gid as usize).cloned().unwrap_or_default();
+                let old_key = manifest
+                    .page_group_keys
+                    .get(gid as usize)
+                    .cloned()
+                    .unwrap_or_default();
                 if !old_key.is_empty() {
                     replaced_keys.push(old_key);
                 }
@@ -620,7 +662,10 @@ impl TurboliteSharedState {
         self.shared_manifest.store(Arc::new(manifest));
 
         if !replaced_keys.is_empty() && self.gc_enabled {
-            eprintln!("[compact] GC: deleting {} replaced objects", replaced_keys.len());
+            eprintln!(
+                "[compact] GC: deleting {} replaced objects",
+                replaced_keys.len()
+            );
             if let Err(e) = storage_helpers::delete_objects(
                 self.storage.as_ref(),
                 &self.runtime,
@@ -644,19 +689,27 @@ impl TurboliteSharedState {
         let page_count = manifest.page_count;
 
         if page_count == 0 || page_size == 0 {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "empty manifest, no data to materialize"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "empty manifest, no data to materialize",
+            ));
         }
 
         eprintln!(
             "[materialize] page_count={}, page_size={}, groups={}, version={}",
-            page_count, page_size, manifest.page_group_keys.len(), manifest.version,
+            page_count,
+            page_size,
+            manifest.page_group_keys.len(),
+            manifest.version,
         );
 
         let file = std::fs::File::create(output)?;
         let total_size = page_count * page_size as u64;
         file.set_len(total_size)?;
 
-        let keys_with_gids: Vec<(u64, String)> = manifest.page_group_keys.iter()
+        let keys_with_gids: Vec<(u64, String)> = manifest
+            .page_group_keys
+            .iter()
             .enumerate()
             .filter(|(_, k)| !k.is_empty())
             .map(|(gid, k)| (gid as u64, k.clone()))
@@ -678,7 +731,10 @@ impl TurboliteSharedState {
                 let pg_data = match data_map.get(key) {
                     Some(d) => d,
                     None => {
-                        eprintln!("[materialize] WARNING: missing object for group {} key {}", gid, key);
+                        eprintln!(
+                            "[materialize] WARNING: missing object for group {} key {}",
+                            gid, key
+                        );
                         continue;
                     }
                 };
@@ -743,8 +799,7 @@ impl TurboliteSharedState {
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
 
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());

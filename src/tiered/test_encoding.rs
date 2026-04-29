@@ -160,7 +160,11 @@ fn test_encode_decode_roundtrip_various_page_sizes() {
 #[test]
 fn test_page_type_detection() {
     let check = |buf: &[u8], page_num: u64| -> bool {
-        let type_byte = if page_num == 0 { buf.get(100) } else { buf.get(0) };
+        let type_byte = if page_num == 0 {
+            buf.get(100)
+        } else {
+            buf.get(0)
+        };
         matches!(type_byte, Some(&0x05) | Some(&0x02))
     };
     // Table interior (0x05)
@@ -178,7 +182,11 @@ fn test_page_type_detection() {
 #[test]
 fn test_page_type_page_zero_offset_100() {
     let check = |buf: &[u8], page_num: u64| -> bool {
-        let type_byte = if page_num == 0 { buf.get(100) } else { buf.get(0) };
+        let type_byte = if page_num == 0 {
+            buf.get(100)
+        } else {
+            buf.get(0)
+        };
         matches!(type_byte, Some(&0x05) | Some(&0x02))
     };
     let mut page0 = vec![0u8; 4096];
@@ -276,7 +284,8 @@ fn test_seekable_encode_decode_roundtrip() {
 
     // Sub-chunk decode: fetch frame 2 (pages 8-9, partial)
     let entry2 = &frame_table[2];
-    let frame_bytes2 = &blob[entry2.offset as usize..(entry2.offset as usize + entry2.len as usize)];
+    let frame_bytes2 =
+        &blob[entry2.offset as usize..(entry2.offset as usize + entry2.len as usize)];
     let subchunk2 = decode_seekable_subchunk(
         frame_bytes2,
         #[cfg(feature = "zstd")]
@@ -300,12 +309,24 @@ fn test_seekable_manifest_serde_with_frames() {
         page_group_keys: vec!["p/d/0_v1".to_string(), "p/d/1_v1".to_string()],
         frame_tables: vec![
             vec![
-                FrameEntry { offset: 0, len: 500 },
-                FrameEntry { offset: 500, len: 600 },
+                FrameEntry {
+                    offset: 0,
+                    len: 500,
+                },
+                FrameEntry {
+                    offset: 500,
+                    len: 600,
+                },
             ],
             vec![
-                FrameEntry { offset: 0, len: 450 },
-                FrameEntry { offset: 450, len: 550 },
+                FrameEntry {
+                    offset: 0,
+                    len: 450,
+                },
+                FrameEntry {
+                    offset: 450,
+                    len: 550,
+                },
             ],
         ],
         sub_pages_per_frame: 32,
@@ -327,9 +348,12 @@ fn test_valid_btree_page_real_index_leaf() {
     // Simulate a real 0x0A (leaf index) page: type=0x0A, cell_count=5, content_area=3950
     let mut page = vec![0u8; 4096];
     page[0] = 0x0A; // type
-    page[1] = 0; page[2] = 0; // freeblock = 0
-    page[3] = 0; page[4] = 5; // cell_count = 5
-    page[5] = 0x0F; page[6] = 0x6E; // content_area = 3950
+    page[1] = 0;
+    page[2] = 0; // freeblock = 0
+    page[3] = 0;
+    page[4] = 5; // cell_count = 5
+    page[5] = 0x0F;
+    page[6] = 0x6E; // content_area = 3950
     page[7] = 0; // frag = 0
     assert!(is_valid_btree_page(&page, 0));
 }
@@ -341,12 +365,17 @@ fn test_valid_btree_page_overflow_false_positive() {
     // but the "header" fields are garbage.
     let mut page = vec![0u8; 4096];
     page[0] = 0x0A; // coincidental type match
-    // bytes 1-2: "freeblock" = arbitrary
-    page[1] = 0x12; page[2] = 0x34;
+                    // bytes 1-2: "freeblock" = arbitrary
+    page[1] = 0x12;
+    page[2] = 0x34;
     // bytes 3-4: "cell_count" = 0 (overflow has no cells)
-    page[3] = 0; page[4] = 0;
+    page[3] = 0;
+    page[4] = 0;
     // Invalid: cell_count == 0
-    assert!(!is_valid_btree_page(&page, 0), "overflow page with 0 cells must fail");
+    assert!(
+        !is_valid_btree_page(&page, 0),
+        "overflow page with 0 cells must fail"
+    );
 }
 
 #[test]
@@ -354,9 +383,13 @@ fn test_valid_btree_page_overflow_nonzero_cells() {
     // Overflow page where next-page pointer bytes 3-4 happen to be nonzero
     let mut page = vec![0u8; 4096];
     page[0] = 0x0A;
-    page[3] = 0xFF; page[4] = 0xFF; // "cell_count" = 65535
-    // Invalid: cell_count > 10000
-    assert!(!is_valid_btree_page(&page, 0), "overflow with 65535 cells must fail");
+    page[3] = 0xFF;
+    page[4] = 0xFF; // "cell_count" = 65535
+                    // Invalid: cell_count > 10000
+    assert!(
+        !is_valid_btree_page(&page, 0),
+        "overflow with 65535 cells must fail"
+    );
 }
 
 #[test]
@@ -364,8 +397,10 @@ fn test_valid_btree_page_content_area_too_small() {
     // Page with valid-looking cell count but content_area in the header
     let mut page = vec![0u8; 4096];
     page[0] = 0x0A;
-    page[3] = 0; page[4] = 10; // cell_count = 10
-    page[5] = 0; page[6] = 5; // content_area = 5 (way too small, header alone is 28 bytes)
+    page[3] = 0;
+    page[4] = 10; // cell_count = 10
+    page[5] = 0;
+    page[6] = 5; // content_area = 5 (way too small, header alone is 28 bytes)
     assert!(!is_valid_btree_page(&page, 0));
 }
 
@@ -374,9 +409,11 @@ fn test_valid_btree_page_page_zero_offset() {
     // Page 0 has 100-byte SQLite header, so B-tree header starts at offset 100
     let mut page = vec![0u8; 4096];
     page[100] = 0x0A;
-    page[103] = 0; page[104] = 3; // cell_count = 3
-    // min content = 100 + 8 + 2*3 = 114
-    page[105] = 0; page[106] = 120; // content_area = 120 (valid, > 114)
+    page[103] = 0;
+    page[104] = 3; // cell_count = 3
+                   // min content = 100 + 8 + 2*3 = 114
+    page[105] = 0;
+    page[106] = 120; // content_area = 120 (valid, > 114)
     page[107] = 0;
     assert!(is_valid_btree_page(&page, 100));
 }
@@ -391,8 +428,10 @@ fn test_valid_btree_page_buffer_too_short() {
 fn test_valid_btree_page_high_frag_bytes() {
     let mut page = vec![0u8; 4096];
     page[0] = 0x0A;
-    page[3] = 0; page[4] = 1;
-    page[5] = 0x0F; page[6] = 0xF0;
+    page[3] = 0;
+    page[4] = 1;
+    page[5] = 0x0F;
+    page[6] = 0xF0;
     page[7] = 200; // frag > 128
     assert!(!is_valid_btree_page(&page, 0));
 }
@@ -424,16 +463,20 @@ fn test_write_page_does_not_mark_sub_chunk_tracker() {
     // Sub-chunk tracker should NOT mark sub-chunk as present
     let tracker = cache.tracker.lock();
     let sc = tracker.sub_chunk_for_page(0);
-    assert!(!tracker.is_sub_chunk_present(&sc),
-        "write_page must not mark sub-chunk as present in tracker");
+    assert!(
+        !tracker.is_sub_chunk_present(&sc),
+        "write_page must not mark sub-chunk as present in tracker"
+    );
     drop(tracker);
 
     // is_present should still find page 0 via bitmap fallback
     assert!(cache.is_present(0));
 
     // Page 1 (same sub-chunk) should NOT be present
-    assert!(!cache.is_present(1),
-        "adjacent page in same sub-chunk must not be reported as cached");
+    assert!(
+        !cache.is_present(1),
+        "adjacent page in same sub-chunk must not be reported as cached"
+    );
 }
 
 #[test]
@@ -485,8 +528,10 @@ fn test_mark_index_page_safe_when_sub_chunk_not_in_tracker() {
     cache.mark_index_page(0, 0, 0);
 
     // Page 1 must still NOT be present (no poisoning)
-    assert!(!cache.is_present(1),
-        "mark_index_page must not poison sub-chunk when not in tracker");
+    assert!(
+        !cache.is_present(1),
+        "mark_index_page must not poison sub-chunk when not in tracker"
+    );
 
     // Page 0 still findable via bitmap
     assert!(cache.is_present(0));
@@ -515,8 +560,10 @@ fn test_mark_interior_group_safe_when_sub_chunk_not_in_tracker() {
     assert!(cache.interior_groups.lock().contains(&0));
 
     // Page 1 must still NOT be present (no poisoning)
-    assert!(!cache.is_present(1),
-        "mark_interior_group must not poison sub-chunk when not in tracker");
+    assert!(
+        !cache.is_present(1),
+        "mark_interior_group must not poison sub-chunk when not in tracker"
+    );
 
     // Page 0 still findable via bitmap
     assert!(cache.is_present(0));
@@ -524,8 +571,10 @@ fn test_mark_interior_group_safe_when_sub_chunk_not_in_tracker() {
     // Tracker should NOT have the sub-chunk
     let tracker = cache.tracker.lock();
     let id = tracker.sub_chunk_for_page(0);
-    assert!(!tracker.is_sub_chunk_present(&id),
-        "sub-chunk must not be added to tracker by mark_interior_group");
+    assert!(
+        !tracker.is_sub_chunk_present(&id),
+        "sub-chunk must not be added to tracker by mark_interior_group"
+    );
 }
 
 #[test]
@@ -571,8 +620,10 @@ fn test_bitmap_fallback_after_clear_cache_index() {
     for b in &cache.bitmap.read().bits {
         b.store(0, std::sync::atomic::Ordering::Relaxed);
     }
-    assert!(!cache.is_present(5),
-        "after raw bitmap clear, eagerly loaded page should not be present");
+    assert!(
+        !cache.is_present(5),
+        "after raw bitmap clear, eagerly loaded page should not be present"
+    );
 }
 
 #[test]
@@ -601,10 +652,16 @@ fn test_index_pages_survive_clear_cache() {
         for b in &bitmap.bits {
             b.store(0, std::sync::atomic::Ordering::Relaxed);
         }
-        for &p in &pinned { bitmap.mark_present(p); }
-        for &p in &idx { bitmap.mark_present(p); }
+        for &p in &pinned {
+            bitmap.mark_present(p);
+        }
+        for &p in &idx {
+            bitmap.mark_present(p);
+        }
         let g0_end = ppg.min(total_pages);
-        for p in 0..g0_end { bitmap.mark_present(p); }
+        for p in 0..g0_end {
+            bitmap.mark_present(p);
+        }
     }
 
     // Index pages must still be present
@@ -612,12 +669,18 @@ fn test_index_pages_survive_clear_cache() {
     assert!(cache.is_present(9), "index page 9 must survive clear_cache");
 
     // Non-index page outside group 0 must NOT be present
-    assert!(!cache.is_present(10), "non-index page must not survive clear_cache");
+    assert!(
+        !cache.is_present(10),
+        "non-index page must not survive clear_cache"
+    );
 
     // Verify data is readable and correct
     let mut buf = vec![0u8; 64];
     cache.read_page(5, &mut buf).unwrap();
-    assert!(buf.iter().all(|&b| b == 0xEE), "index page data must be intact");
+    assert!(
+        buf.iter().all(|&b| b == 0xEE),
+        "index page data must be intact"
+    );
 }
 
 // ---- Encryption tests ----
@@ -625,7 +688,9 @@ fn test_index_pages_survive_clear_cache() {
 #[cfg(feature = "encryption")]
 fn test_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    for (i, b) in key.iter_mut().enumerate() { *b = i as u8; }
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = i as u8;
+    }
     key
 }
 
@@ -643,16 +708,22 @@ fn test_encode_override_frame_single_page_roundtrip() {
     let page_size = 64u32;
     let page_data = vec![(42u64, vec![0xAB; page_size as usize])];
     let encoded = encode_override_frame(
-        &page_data, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &page_data,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("encode");
+        None,
+    )
+    .expect("encode");
     // Decode with decode_seekable_subchunk (same format)
     let decoded = decode_seekable_subchunk(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("decode");
+        None,
+    )
+    .expect("decode");
     assert_eq!(decoded.len(), page_size as usize);
     assert_eq!(&decoded[..], &vec![0xAB; page_size as usize][..]);
 }
@@ -666,15 +737,21 @@ fn test_encode_override_frame_multiple_pages() {
         (12u64, vec![0x33; page_size as usize]),
     ];
     let encoded = encode_override_frame(
-        &pages, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("encode");
+        None,
+    )
+    .expect("encode");
     let decoded = decode_seekable_subchunk(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("decode");
+        None,
+    )
+    .expect("decode");
     assert_eq!(decoded.len(), 3 * page_size as usize);
     assert_eq!(&decoded[0..64], &vec![0x11u8; 64][..]);
     assert_eq!(&decoded[64..128], &vec![0x22u8; 64][..]);
@@ -687,15 +764,21 @@ fn test_encode_override_frame_short_page_padding() {
     let short_data = vec![0xCC; 32]; // only 32 bytes, should pad to 64
     let pages = vec![(0u64, short_data)];
     let encoded = encode_override_frame(
-        &pages, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("encode");
+        None,
+    )
+    .expect("encode");
     let decoded = decode_seekable_subchunk(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("decode");
+        None,
+    )
+    .expect("decode");
     assert_eq!(decoded.len(), page_size as usize);
     assert_eq!(&decoded[..32], &vec![0xCC; 32][..]);
     assert_eq!(&decoded[32..64], &vec![0u8; 32][..]); // zero-padded
@@ -706,15 +789,21 @@ fn test_encode_override_frame_empty() {
     let page_size = 64u32;
     let pages: Vec<(u64, Vec<u8>)> = Vec::new();
     let encoded = encode_override_frame(
-        &pages, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("encode");
+        None,
+    )
+    .expect("encode");
     let decoded = decode_seekable_subchunk(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("decode");
+        None,
+    )
+    .expect("decode");
     assert!(decoded.is_empty());
 }
 
@@ -727,12 +816,21 @@ fn test_encode_override_frame_compression_reduces_size() {
         (1u64, vec![0x00; page_size as usize]),
     ];
     let encoded = encode_override_frame(
-        &pages, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
         None,
-    ).expect("encode");
+        None,
+    )
+    .expect("encode");
     let raw_size = 2 * page_size as usize;
-    assert!(encoded.len() < raw_size, "compressed {} should be < raw {}", encoded.len(), raw_size);
+    assert!(
+        encoded.len() < raw_size,
+        "compressed {} should be < raw {}",
+        encoded.len(),
+        raw_size
+    );
 }
 
 #[test]
@@ -765,7 +863,11 @@ fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
     let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
     let mut raw = vec![0u8; 64];
     file.read_exact_at(&mut raw, 3 * 64).unwrap();
-    assert_ne!(&raw[..], &page_data[..], "on-disk data must be encrypted, not plaintext");
+    assert_ne!(
+        &raw[..],
+        &page_data[..],
+        "on-disk data must be encrypted, not plaintext"
+    );
 }
 
 #[test]
@@ -780,10 +882,23 @@ fn test_encrypted_cache_wrong_key_returns_garbage() {
     drop(cache);
 
     // Reopen with wrong key — CTR decrypts to garbage (no auth tag to reject)
-    let bad_cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(wrong_key()), Vec::new()).unwrap();
+    let bad_cache = DiskCache::new(
+        dir.path(),
+        3600,
+        4,
+        2,
+        64,
+        16,
+        Some(wrong_key()),
+        Vec::new(),
+    )
+    .unwrap();
     let mut buf = vec![0u8; 64];
     bad_cache.read_page(5, &mut buf).unwrap();
-    assert_ne!(buf, page_data, "wrong key must not produce correct plaintext");
+    assert_ne!(
+        buf, page_data,
+        "wrong key must not produce correct plaintext"
+    );
 }
 
 #[test]
@@ -827,7 +942,10 @@ fn test_encrypted_cache_different_pages_different_ciphertext() {
     let mut raw1 = vec![0u8; page_sz];
     file.read_exact_at(&mut raw0, 0).unwrap();
     file.read_exact_at(&mut raw1, page_sz as u64).unwrap();
-    assert_ne!(raw0, raw1, "same plaintext at different pages must produce different ciphertext");
+    assert_ne!(
+        raw0, raw1,
+        "same plaintext at different pages must produce different ciphertext"
+    );
 }
 
 #[test]
@@ -850,34 +968,47 @@ fn test_encode_decode_seekable_encrypted_roundtrip() {
     let spf = 2u32;
 
     // Build 4 pages as Option<Vec<u8>>
-    let pages: Vec<Option<Vec<u8>>> = (0u8..4)
-        .map(|i| Some(vec![i + 1; 64]))
-        .collect();
+    let pages: Vec<Option<Vec<u8>>> = (0u8..4).map(|i| Some(vec![i + 1; 64])).collect();
 
     let (blob, frames) = encode_page_group_seekable(
-        &pages, page_size, spf, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        spf,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Decode each frame
     for (frame_idx, fe) in frames.iter().enumerate() {
         let frame_data = &blob[fe.offset as usize..(fe.offset + fe.len as u64) as usize];
         let decoded = decode_seekable_subchunk(
             frame_data,
-            #[cfg(feature = "zstd")] None,
+            #[cfg(feature = "zstd")]
+            None,
             Some(&key),
-        ).unwrap();
+        )
+        .unwrap();
 
         // decoded is a flat vec of bytes: spf pages * page_size
         let start_page = frame_idx * spf as usize;
         for j in 0..spf as usize {
-            if start_page + j >= 4 { break; }
+            if start_page + j >= 4 {
+                break;
+            }
             let page_start = j * page_size as usize;
             let page_end = page_start + page_size as usize;
             if page_end <= decoded.len() {
                 let expected = vec![(start_page + j + 1) as u8; 64];
-                assert_eq!(&decoded[page_start..page_end], &expected[..], "frame {} page {} mismatch", frame_idx, j);
+                assert_eq!(
+                    &decoded[page_start..page_end],
+                    &expected[..],
+                    "frame {} page {} mismatch",
+                    frame_idx,
+                    j
+                );
             }
         }
     }
@@ -893,17 +1024,23 @@ fn test_encode_decode_seekable_wrong_key_fails() {
     let pages: Vec<Option<Vec<u8>>> = (0..4).map(|_| Some(vec![0xABu8; 64])).collect();
 
     let (blob, frames) = encode_page_group_seekable(
-        &pages, page_size, spf, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        spf,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Try decoding first frame with wrong key — GCM must reject
     let fe = &frames[0];
     let frame_data = &blob[fe.offset as usize..(fe.offset + fe.len as u64) as usize];
     let result = decode_seekable_subchunk(
         frame_data,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&wrong_key()),
     );
     assert!(result.is_err(), "wrong key must produce GCM auth error");
@@ -918,23 +1055,26 @@ fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
     // Interior bundle input: Vec<(page_num, page_data)>
     let page_data_0 = vec![0xDDu8; 64];
     let page_data_1 = vec![0xEEu8; 64];
-    let pages: Vec<(u64, &[u8])> = vec![
-        (10, &page_data_0),
-        (20, &page_data_1),
-    ];
+    let pages: Vec<(u64, &[u8])> = vec![(10, &page_data_0), (20, &page_data_1)];
 
     let encoded = encode_interior_bundle(
-        &pages, page_size, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
 
     // Decode
     let decoded = decode_interior_bundle(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded[0].0, 10);
     assert_eq!(decoded[0].1, page_data_0);
@@ -944,7 +1084,8 @@ fn test_encode_decode_interior_bundle_encrypted_roundtrip() {
     // Wrong key must fail
     let result = decode_interior_bundle(
         &encoded,
-        #[cfg(feature = "zstd")] None,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&wrong_key()),
     );
     assert!(result.is_err(), "wrong key must produce GCM auth error");
@@ -960,9 +1101,16 @@ fn test_gcm_random_nonce_produces_unique_ciphertext() {
     let enc2 = compress::encrypt_gcm_random_nonce(&data, &key).unwrap();
 
     // Nonce is first 12 bytes — must differ
-    assert_ne!(&enc1[..12], &enc2[..12], "random nonces must differ between encryptions");
+    assert_ne!(
+        &enc1[..12],
+        &enc2[..12],
+        "random nonces must differ between encryptions"
+    );
     // Full ciphertext must differ
-    assert_ne!(enc1, enc2, "same plaintext must produce different ciphertext");
+    assert_ne!(
+        enc1, enc2,
+        "same plaintext must produce different ciphertext"
+    );
 
     // Both must decrypt to the same original data
     let dec1 = compress::decrypt_gcm_random_nonce(&enc1, &key).unwrap();
@@ -995,7 +1143,10 @@ fn test_gcm_random_nonce_tamper_detection() {
     encrypted[20] ^= 0x01;
 
     let result = compress::decrypt_gcm_random_nonce(&encrypted, &key);
-    assert!(result.is_err(), "tampered ciphertext must fail GCM authentication");
+    assert!(
+        result.is_err(),
+        "tampered ciphertext must fail GCM authentication"
+    );
 }
 
 #[test]
@@ -1006,17 +1157,30 @@ fn test_seekable_encode_twice_produces_different_ciphertext() {
     let pages: Vec<Option<Vec<u8>>> = (0u8..4).map(|i| Some(vec![i + 1; 64])).collect();
 
     let (blob1, _) = encode_page_group_seekable(
-        &pages, 64, 2, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        64,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
     let (blob2, _) = encode_page_group_seekable(
-        &pages, 64, 2, 3,
-        #[cfg(feature = "zstd")] None,
+        &pages,
+        64,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
         Some(&key),
-    ).unwrap();
+    )
+    .unwrap();
 
-    assert_ne!(blob1, blob2, "same data encoded twice must produce different S3 blobs");
+    assert_ne!(
+        blob1, blob2,
+        "same data encoded twice must produce different S3 blobs"
+    );
 }
 
 #[test]
@@ -1028,7 +1192,10 @@ fn test_sub_chunk_tracker_persist_twice_different_ciphertext() {
     let key = test_key();
 
     let mut t = SubChunkTracker::new_encrypted(path.clone(), 8, 2, Some(key));
-    let id = SubChunkId { group_id: 0, frame_index: 0 };
+    let id = SubChunkId {
+        group_id: 0,
+        frame_index: 0,
+    };
     t.mark_present(id, SubChunkTier::Pinned);
 
     t.persist().unwrap();
@@ -1037,5 +1204,8 @@ fn test_sub_chunk_tracker_persist_twice_different_ciphertext() {
     t.persist().unwrap();
     let bytes2 = std::fs::read(&path).unwrap();
 
-    assert_ne!(bytes1, bytes2, "same tracker data persisted twice must produce different ciphertext");
+    assert_ne!(
+        bytes1, bytes2,
+        "same tracker data persisted twice must produce different ciphertext"
+    );
 }

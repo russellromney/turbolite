@@ -117,13 +117,18 @@ fn test_serialize_roundtrip() {
     let original = TurboliteConfig {
         cache_dir: PathBuf::from("/data/mydb"),
         read_only: true,
-        compression: CompressionConfig { level: 5, ..Default::default() },
-        cache: CacheConfig { ttl_secs: 1800, ..Default::default() },
+        compression: CompressionConfig {
+            level: 5,
+            ..Default::default()
+        },
+        cache: CacheConfig {
+            ttl_secs: 1800,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let json = serde_json::to_string(&original).expect("serialize");
-    let deserialized: TurboliteConfig =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: TurboliteConfig = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized.cache_dir, original.cache_dir);
     assert_eq!(deserialized.compression.level, original.compression.level);
     assert_eq!(deserialized.read_only, original.read_only);
@@ -134,15 +139,13 @@ fn test_serialize_roundtrip() {
 fn test_deserialize_encryption_key() {
     let key = [0xABu8; 32];
     let json = format!(r#"{{ "encryption": {{ "key": {:?} }} }}"#, key.to_vec());
-    let c: TurboliteConfig =
-        serde_json::from_str(&json).expect("encryption key");
+    let c: TurboliteConfig = serde_json::from_str(&json).expect("encryption key");
     assert_eq!(c.encryption.key, Some(key));
 }
 
 #[test]
 fn test_deserialize_encryption_key_null() {
     let json = r#"{ "encryption": { "key": null } }"#;
-    let c: TurboliteConfig =
-        serde_json::from_str(json).expect("null encryption key");
+    let c: TurboliteConfig = serde_json::from_str(json).expect("null encryption key");
     assert_eq!(c.encryption.key, None);
 }

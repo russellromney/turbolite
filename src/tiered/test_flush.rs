@@ -100,7 +100,7 @@ fn test_override_threshold_boundary() {
     // When dirty_frames < threshold: override path
     // When dirty_frames >= threshold: full rewrite
     let threshold = 4u32;
-    assert!(3 < threshold);   // override
+    assert!(3 < threshold); // override
     assert!(!(4 < threshold)); // full rewrite
     assert!(!(5 < threshold)); // full rewrite
 }

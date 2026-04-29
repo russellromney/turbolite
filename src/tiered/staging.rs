@@ -87,7 +87,8 @@ impl StagingWriter {
     /// The magic value distinguishes manifest trailer from page records.
     pub fn append_manifest(&mut self, manifest_bytes: &[u8]) -> io::Result<()> {
         self.writer.write_all(&MANIFEST_MAGIC.to_le_bytes())?;
-        self.writer.write_all(&(manifest_bytes.len() as u64).to_le_bytes())?;
+        self.writer
+            .write_all(&(manifest_bytes.len() as u64).to_le_bytes())?;
         self.writer.write_all(manifest_bytes)?;
         Ok(())
     }
@@ -113,10 +114,7 @@ impl StagingWriter {
 /// Read all pages from a staging log into a HashMap.
 /// Returns page_num -> page_data. The `_page_size` argument is ignored;
 /// page size is read from the 4-byte file header.
-pub(crate) fn read_staging_log(
-    path: &Path,
-    _page_size: u32,
-) -> io::Result<HashMap<u64, Vec<u8>>> {
+pub(crate) fn read_staging_log(path: &Path, _page_size: u32) -> io::Result<HashMap<u64, Vec<u8>>> {
     let file = File::open(path)?;
     if file.metadata()?.len() < 4 {
         return Ok(HashMap::new());
@@ -156,10 +154,7 @@ pub(crate) fn read_staging_log(
 /// Extract the embedded manifest from a staging log (if present).
 /// Returns None if the staging log has no manifest trailer.
 /// The `_page_size` argument is ignored; page size is read from the header.
-pub(crate) fn read_staging_manifest(
-    path: &Path,
-    _page_size: u32,
-) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_staging_manifest(path: &Path, _page_size: u32) -> io::Result<Option<Vec<u8>>> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len < 4 {
@@ -230,10 +225,7 @@ pub(crate) fn recover_staging_logs(
         // Validate file is non-empty and well-formed
         let meta = entry.metadata()?;
         if meta.len() == 0 {
-            turbolite_debug!(
-                "[staging] removing empty staging file: {}",
-                path.display()
-            );
+            turbolite_debug!("[staging] removing empty staging file: {}", path.display());
             let _ = fs::remove_file(&path);
             continue;
         }
@@ -244,7 +236,11 @@ pub(crate) fn recover_staging_logs(
                 match f.read_exact(&mut buf) {
                     Ok(()) => {
                         let ps = u32::from_le_bytes(buf);
-                        if ps > 0 && ps <= 65536 { ps } else { page_size }
+                        if ps > 0 && ps <= 65536 {
+                            ps
+                        } else {
+                            page_size
+                        }
                     }
                     Err(_) => page_size,
                 }
@@ -346,7 +342,9 @@ mod tests {
         // Create 3 staging logs with different versions
         for version in [5, 2, 10] {
             let mut writer = StagingWriter::open(&staging_dir, version, page_size).unwrap();
-            writer.append(0, &vec![version as u8; page_size as usize]).unwrap();
+            writer
+                .append(0, &vec![version as u8; page_size as usize])
+                .unwrap();
             writer.finalize().unwrap();
         }
 

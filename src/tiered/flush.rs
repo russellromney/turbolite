@@ -9,8 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use arc_swap::ArcSwap;
 use hadb_storage::StorageBackend;
@@ -18,9 +18,10 @@ use tokio::runtime::Handle as TokioHandle;
 
 use super::storage as storage_helpers;
 use super::{
-    bundle_chunk_range, compact, decode_page_group, decode_page_group_seekable_full, encode_interior_bundle,
-    encode_override_frame, encode_page_group, encode_page_group_seekable, keys, manifest, read_change_counter_from_cache,
-    staging, DiskCache, FrameEntry, Manifest, SubChunkId, SubChunkTier,
+    bundle_chunk_range, compact, decode_page_group, decode_page_group_seekable_full,
+    encode_interior_bundle, encode_override_frame, encode_page_group, encode_page_group_seekable,
+    keys, manifest, read_change_counter_from_cache, staging, DiskCache, FrameEntry, Manifest,
+    SubChunkId, SubChunkTier,
 };
 
 /// Upload locally-checkpointed dirty page groups to the backend.
@@ -79,12 +80,18 @@ pub(crate) fn flush_dirty_groups(
     );
 
     if let Err(ref e) = result {
-        eprintln!("[flush] ERROR: flush failed, restoring pending state: {}", e);
+        eprintln!(
+            "[flush] ERROR: flush failed, restoring pending state: {}",
+            e
+        );
         if !flushes.is_empty() {
             pending_flushes.lock().unwrap().extend(flushes);
         }
         if !legacy_dirty_groups.is_empty() {
-            shared_dirty_groups.lock().unwrap().extend(legacy_dirty_groups);
+            shared_dirty_groups
+                .lock()
+                .unwrap()
+                .extend(legacy_dirty_groups);
         }
     }
 
@@ -114,7 +121,9 @@ fn flush_inner(
         let pages = staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size)?;
         turbolite_debug!(
             "[flush] read staging log v{}: {} pages from {}",
-            flush_entry.version, pages.len(), flush_entry.staging_path.display(),
+            flush_entry.version,
+            pages.len(),
+            flush_entry.staging_path.display(),
         );
         staging_paths.push(flush_entry.staging_path.clone());
         staged_pages.extend(pages);
@@ -122,7 +131,9 @@ fn flush_inner(
 
     turbolite_debug!(
         "[flush] {} staged pages from {} logs, {} legacy dirty groups",
-        staged_pages.len(), flushes.len(), legacy_dirty_groups.len(),
+        staged_pages.len(),
+        flushes.len(),
+        legacy_dirty_groups.len(),
     );
 
     // 2. Snapshot manifest
@@ -139,8 +150,8 @@ fn flush_inner(
     }
 
     #[cfg(feature = "zstd")]
-    let encoder_dict = dictionary
-        .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
+    let encoder_dict =
+        dictionary.map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
     #[cfg(feature = "zstd")]
     let decoder_dict = dictionary.map(zstd::dict::DecoderDictionary::copy);
 
@@ -160,10 +171,7 @@ fn flush_inner(
         return Ok(());
     }
 
-    turbolite_debug!(
-        "[flush] uploading {} dirty groups...",
-        dirty_groups.len(),
-    );
+    turbolite_debug!("[flush] uploading {} dirty groups...", dirty_groups.len(),);
 
     let next_version = manifest_snap.version + 1;
     let change_counter = read_change_counter_from_cache(cache, manifest_snap.page_size);
@@ -204,7 +212,8 @@ fn flush_inner(
             .copied()
             .collect();
         let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
-        let has_frame_table = use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
+        let has_frame_table =
+            use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
         let dirty_frames = if has_frame_table && effective_threshold > 0 {
             manifest::dirty_frames_for_group(
                 &group_dirty_pnums,
@@ -421,7 +430,10 @@ fn flush_inner(
                     if cache.read_page(pnum, &mut buf).is_ok() {
                         all_interior.insert(pnum, buf);
                     } else {
-                        eprintln!("[flush] WARN: cache.read_page({}) failed for interior page", pnum);
+                        eprintln!(
+                            "[flush] WARN: cache.read_page({}) failed for interior page",
+                            pnum
+                        );
                     }
                 }
             }
@@ -447,7 +459,8 @@ fn flush_inner(
 
         for (&chunk_id, pages) in &chunks {
             if dirty_chunk_ids.contains(&chunk_id) || !old_chunk_keys.contains_key(&chunk_id) {
-                let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+                let refs: Vec<(u64, &[u8])> =
+                    pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
                 let encoded = encode_interior_bundle(
                     &refs,
                     page_size,
@@ -563,8 +576,11 @@ fn flush_inner(
         let mut index_chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
 
         for (&chunk_id, pages) in &index_chunks {
-            if dirty_index_chunk_ids.contains(&chunk_id) || !old_index_chunk_keys.contains_key(&chunk_id) {
-                let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+            if dirty_index_chunk_ids.contains(&chunk_id)
+                || !old_index_chunk_keys.contains_key(&chunk_id)
+            {
+                let refs: Vec<(u64, &[u8])> =
+                    pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
                 let encoded = encode_interior_bundle(
                     &refs,
                     page_size,

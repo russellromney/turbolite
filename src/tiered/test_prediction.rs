@@ -24,7 +24,9 @@ fn lock_session_two_trees_returns_pattern() {
     session.touch("users");
     assert_eq!(session.tree_count(), 2);
 
-    let pattern = session.flush().expect("should return pattern with 2+ trees");
+    let pattern = session
+        .flush()
+        .expect("should return pattern with 2+ trees");
     assert!(pattern.contains("posts"));
     assert!(pattern.contains("users"));
     assert_eq!(pattern.len(), 2);
@@ -53,7 +55,9 @@ fn prediction_table_observe_and_predict() {
     let mut table = PredictionTable::new();
 
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     // First observation: confidence = 0.3 (below threshold 0.5)
     table.observe(&pattern);
@@ -63,7 +67,9 @@ fn prediction_table_observe_and_predict() {
 
     // Should not fire yet (0.3 < 0.5)
     let seen: HashSet<String> = ["idx_posts_user", "posts"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     assert!(table.predict(&seen).is_none());
 
     // Reinforce: 0.3 + 0.25 = 0.55 > 0.5
@@ -79,8 +85,7 @@ fn prediction_table_observe_and_predict() {
 #[test]
 fn prediction_table_time_decay_with_boost() {
     let mut table = PredictionTable::new();
-    let pattern: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let pattern: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
@@ -97,8 +102,7 @@ fn prediction_table_time_decay_with_boost() {
 #[test]
 fn prediction_table_write_decay() {
     let mut table = PredictionTable::new();
-    let pattern: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let pattern: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
@@ -112,8 +116,7 @@ fn prediction_table_write_decay() {
 #[test]
 fn prediction_table_prune() {
     let mut table = PredictionTable::new();
-    let pattern: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let pattern: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     table.observe(&pattern); // 0.3
 
@@ -131,9 +134,13 @@ fn prediction_table_prune() {
 fn prediction_table_persist_roundtrip() {
     let mut table = PredictionTable::new();
     let p1: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     let p2: BTreeSet<String> = ["comments", "likes"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&p1);
     table.reinforce(&p1); // 0.55
@@ -151,25 +158,33 @@ fn prediction_table_persist_roundtrip() {
 fn prediction_pair_index_lookup() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55, fires
 
     // Pair (idx_posts_user, posts) should find the pattern
     let seen: HashSet<String> = ["idx_posts_user", "posts"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     let predicted = table.predict(&seen).expect("should predict");
     assert_eq!(predicted, vec!["users".to_string()]);
 
     // Pair (idx_posts_user, users) should also find it
     let seen2: HashSet<String> = ["idx_posts_user", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     let predicted2 = table.predict(&seen2).expect("should predict");
     assert_eq!(predicted2, vec!["posts".to_string()]);
 
     // Pair (idx_posts_user, comments) should NOT match
     let seen3: HashSet<String> = ["idx_posts_user", "comments"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     assert!(table.predict(&seen3).is_none());
 }
 
@@ -178,9 +193,10 @@ fn access_history_record_and_top() {
     let mut history = AccessHistory::new();
 
     let names1: HashSet<String> = ["posts", "users", "idx_posts_user"]
-        .into_iter().map(String::from).collect();
-    let names2: HashSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let names2: HashSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     history.record(&names1);
     history.record(&names2);
@@ -210,13 +226,11 @@ fn access_history_decay_and_prune() {
 #[test]
 fn prediction_needs_two_observations_to_fire() {
     let mut table = PredictionTable::new();
-    let pattern: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let pattern: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     // First observation: 0.3 < 0.5
     table.observe(&pattern);
-    let seen: HashSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let seen: HashSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
     assert!(table.predict(&seen).is_none());
 
     // Reinforce after first correct session: 0.3 + 0.25 = 0.55 >= 0.5
@@ -229,7 +243,9 @@ fn prediction_needs_two_observations_to_fire() {
 fn prediction_three_writes_kill_confidence() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
@@ -248,19 +264,25 @@ fn prediction_three_writes_kill_confidence() {
 fn predict_returns_none_when_all_names_seen() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
 
     // Seeing all 3 names means no extras to predict
     let seen: HashSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     assert!(table.predict(&seen).is_none());
 
     // Seeing 2 of 3 should still predict the 3rd
     let partial: HashSet<String> = ["idx_posts_user", "posts"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     let predicted = table.predict(&partial).expect("should predict");
     assert_eq!(predicted, vec!["users".to_string()]);
 }
@@ -287,15 +309,13 @@ fn shared_access_history_concurrent_record() {
 
     let t1 = std::thread::spawn(move || {
         for _ in 0..100 {
-            let names: HashSet<String> = ["posts", "users"]
-                .into_iter().map(String::from).collect();
+            let names: HashSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
             h1.write().record(&names);
         }
     });
     let t2 = std::thread::spawn(move || {
         for _ in 0..100 {
-            let names: HashSet<String> = ["users", "likes"]
-                .into_iter().map(String::from).collect();
+            let names: HashSet<String> = ["users", "likes"].into_iter().map(String::from).collect();
             h2.write().record(&names);
         }
     });
@@ -331,15 +351,16 @@ fn access_history_from_manifest_freq() {
 #[test]
 fn prediction_table_prune_on_checkpoint() {
     let mut table = PredictionTable::new();
-    let p1: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let p1: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
     let p2: BTreeSet<String> = ["comments", "likes"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&p1); // 0.3
     table.observe(&p2); // 0.3
     table.reinforce(&p1); // p1 -> 0.55
-    // p2 stays at 0.3
+                          // p2 stays at 0.3
 
     // Apply heavy write decay to p2 to push below prune threshold
     for _ in 0..10 {
@@ -387,7 +408,9 @@ fn prediction_firing_end_to_end() {
     // Then on a new session touching A and B, predict C.
     let prediction: SharedPrediction = Arc::new(RwLock::new(PredictionTable::new()));
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     // First session: observe
     prediction.write().observe(&pattern);
@@ -414,7 +437,9 @@ fn prediction_firing_end_to_end() {
 fn prediction_reinforcement_on_correct_fire() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern); // 0.3
     table.reinforce(&pattern); // 0.55
@@ -429,7 +454,11 @@ fn prediction_reinforcement_on_correct_fire() {
     session.fired_pattern = Some(pattern.clone());
 
     // Reinforce because all names were touched
-    assert!(session.fired_pattern.as_ref().unwrap().iter()
+    assert!(session
+        .fired_pattern
+        .as_ref()
+        .unwrap()
+        .iter()
         .all(|r| session.btrees.contains(r.as_str())));
     table.reinforce(&pattern); // 0.55 + 0.25 = 0.80
 
@@ -441,7 +470,9 @@ fn prediction_reinforcement_on_correct_fire() {
 fn prediction_no_reinforcement_on_partial_touch() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern); // 0.3
     table.reinforce(&pattern); // 0.55
@@ -456,7 +487,11 @@ fn prediction_no_reinforcement_on_partial_touch() {
     session.fired_pattern = Some(pattern.clone());
 
     // Should NOT reinforce because "users" was not touched
-    assert!(!session.fired_pattern.as_ref().unwrap().iter()
+    assert!(!session
+        .fired_pattern
+        .as_ref()
+        .unwrap()
+        .iter()
         .all(|r| session.btrees.contains(r.as_str())));
 
     // Confidence stays at 0.55
@@ -470,8 +505,7 @@ fn two_name_pattern_does_not_decay_below_threshold() {
     // so they never get reinforced. Without the observation boost, they would
     // decay below threshold after ~3 observations.
     let mut table = PredictionTable::new();
-    let pattern: BTreeSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let pattern: BTreeSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
 
     table.observe(&pattern); // 0.3
     table.reinforce(&pattern); // 0.55
@@ -483,14 +517,20 @@ fn two_name_pattern_does_not_decay_below_threshold() {
 
     let conf = table.patterns.get(&pattern).unwrap().confidence;
     // Should converge to a stable value above threshold, not decay to zero
-    assert!(conf > 0.9, "confidence should converge near 1.0 but was {}", conf);
+    assert!(
+        conf > 0.9,
+        "confidence should converge near 1.0 but was {}",
+        conf
+    );
 }
 
 #[test]
 fn shared_prediction_concurrent_access() {
     let prediction: SharedPrediction = Arc::new(RwLock::new(PredictionTable::new()));
     let pattern: BTreeSet<String> = ["idx_posts_user", "posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     // Writer thread
     let p1 = Arc::clone(&prediction);
@@ -507,7 +547,9 @@ fn shared_prediction_concurrent_access() {
     let p2 = Arc::clone(&prediction);
     let reader = std::thread::spawn(move || {
         let seen: HashSet<String> = ["idx_posts_user", "posts"]
-            .into_iter().map(String::from).collect();
+            .into_iter()
+            .map(String::from)
+            .collect();
         for _ in 0..50 {
             let table = p2.read();
             let _ = table.predict(&seen);
@@ -531,15 +573,18 @@ fn name_based_pattern_survives_conceptual_vacuum() {
     // Simulate: same tree names, different "root IDs" (not tracked anymore).
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["posts", "users", "idx_posts_user"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
 
     // After conceptual VACUUM: pattern still exists because names are stable
-    let seen: HashSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
-    let predicted = table.predict(&seen).expect("pattern survives name-based keying");
+    let seen: HashSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
+    let predicted = table
+        .predict(&seen)
+        .expect("pattern survives name-based keying");
     assert_eq!(predicted, vec!["idx_posts_user".to_string()]);
 }
 
@@ -547,7 +592,9 @@ fn name_based_pattern_survives_conceptual_vacuum() {
 fn rename_table_old_patterns_become_dead() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["old_posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
@@ -557,7 +604,9 @@ fn rename_table_old_patterns_become_dead() {
     // (name mismatch), and prune() applies global time decay each checkpoint.
     // After enough checkpoints (prune calls), it decays below PRUNE_THRESHOLD.
     let seen: HashSet<String> = ["new_posts", "users"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
     // Should NOT match old pattern (old_posts != new_posts)
     assert!(table.predict(&seen).is_none());
 
@@ -566,22 +615,26 @@ fn rename_table_old_patterns_become_dead() {
     for _ in 0..50 {
         table.prune();
     }
-    assert!(table.patterns.get(&pattern).is_none(), "stale pattern should be pruned after enough checkpoints");
+    assert!(
+        table.patterns.get(&pattern).is_none(),
+        "stale pattern should be pruned after enough checkpoints"
+    );
 }
 
 #[test]
 fn drop_create_same_name_carries_over() {
     let mut table = PredictionTable::new();
     let pattern: BTreeSet<String> = ["posts", "users", "idx_posts_user"]
-        .into_iter().map(String::from).collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
     table.observe(&pattern);
     table.reinforce(&pattern); // 0.55
 
     // DROP TABLE posts; CREATE TABLE posts(...);
     // Same name, different root page ID. But we key by name, so pattern persists.
-    let seen: HashSet<String> = ["posts", "users"]
-        .into_iter().map(String::from).collect();
+    let seen: HashSet<String> = ["posts", "users"].into_iter().map(String::from).collect();
     let predicted = table.predict(&seen).expect("same-name table carries over");
     assert_eq!(predicted, vec!["idx_posts_user".to_string()]);
 }

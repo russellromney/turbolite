@@ -95,13 +95,22 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Decoded> {
     match bytes[0] {
         TAG_PURE => {
             let manifest: Manifest = rmp_serde::from_slice(&bytes[1..]).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("pure manifest decode: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pure manifest decode: {e}"),
+                )
             })?;
-            Ok(Decoded { manifest, walrust: None })
+            Ok(Decoded {
+                manifest,
+                walrust: None,
+            })
         }
         TAG_HYBRID => {
             let payload: HybridPayload = rmp_serde::from_slice(&bytes[1..]).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("hybrid manifest decode: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("hybrid manifest decode: {e}"),
+                )
             })?;
             Ok(Decoded {
                 manifest: payload.turbolite,

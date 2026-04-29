@@ -11,7 +11,10 @@ use super::*;
 // (page_count tells us how many pages are in the group).
 
 /// Decrypt data if an encryption key is provided, otherwise return as-is (zero-copy).
-pub(crate) fn decrypt_if_needed(data: &[u8], encryption_key: Option<&[u8; 32]>) -> io::Result<Vec<u8>> {
+pub(crate) fn decrypt_if_needed(
+    data: &[u8],
+    encryption_key: Option<&[u8; 32]>,
+) -> io::Result<Vec<u8>> {
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
         return compress::decrypt_gcm_random_nonce(data, key);
@@ -188,7 +191,12 @@ pub(crate) fn decode_page_group_seekable_full(
         if end > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("frame extends beyond data: {}..{} > {}", start, end, data.len()),
+                format!(
+                    "frame extends beyond data: {}..{} > {}",
+                    start,
+                    end,
+                    data.len()
+                ),
             ));
         }
         let decrypted = decrypt_if_needed(&data[start..end], encryption_key)?;
@@ -391,7 +399,8 @@ pub(crate) fn decode_interior_bundle(
             io::ErrorKind::InvalidData,
             format!(
                 "interior bundle truncated: expected {} bytes, got {}",
-                expected_len, raw.len()
+                expected_len,
+                raw.len()
             ),
         ));
     }
@@ -428,9 +437,12 @@ pub(crate) fn encode_override_frame(
         }
     }
     let frame_data = compress::compress(
-        &raw, compression_level,
-        #[cfg(feature = "zstd")] encoder_dict,
-        #[cfg(not(feature = "zstd"))] None,
+        &raw,
+        compression_level,
+        #[cfg(feature = "zstd")]
+        encoder_dict,
+        #[cfg(not(feature = "zstd"))]
+        None,
     )?;
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
@@ -443,4 +455,3 @@ pub(crate) fn encode_override_frame(
 #[cfg(test)]
 #[path = "test_encoding.rs"]
 mod tests;
-
