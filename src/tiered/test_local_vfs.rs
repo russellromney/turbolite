@@ -1021,13 +1021,11 @@ fn test_migrate_to_s3_primary_from_wal() {
         conn.execute("INSERT INTO t VALUES (2, 'second')", [])
             .unwrap();
 
-        // Migration returns Err when PRAGMA journal_mode=OFF fails (expected with
-        // turbolite VFS), but the WAL checkpoint has already completed successfully.
-        let result = crate::tiered::turbolite_migrate_to_s3_primary(&conn);
-        assert!(
-            result.is_err(),
-            "should return Err when PRAGMA journal_mode=OFF fails in WAL mode"
-        );
+        crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert!(mode == "off" || mode == "memory", "got: {}", mode);
     }
 
     // Step 2: verify data survived the checkpoint by reopening (still WAL mode
@@ -1144,13 +1142,11 @@ fn test_migrate_preserves_large_dataset() {
             .unwrap();
         }
 
-        // Migration returns Err when PRAGMA journal_mode=OFF fails (expected with
-        // turbolite VFS), but the WAL checkpoint has already completed successfully.
-        let result = crate::tiered::turbolite_migrate_to_s3_primary(&conn);
-        assert!(
-            result.is_err(),
-            "should return Err when PRAGMA journal_mode=OFF fails in WAL mode"
-        );
+        crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert!(mode == "off" || mode == "memory", "got: {}", mode);
     }
 
     // Verify all data survived

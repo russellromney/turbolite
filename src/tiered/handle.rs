@@ -2902,7 +2902,7 @@ impl DatabaseHandle for TurboliteHandle {
             LockKind::Exclusive => {
                 if !matches!(
                     current,
-                    LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
+                    LockKind::Shared | LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
                 ) {
                     return Ok(false);
                 }

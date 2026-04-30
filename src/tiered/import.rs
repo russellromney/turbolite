@@ -125,6 +125,10 @@ pub fn import_sqlite_file(
             group_pages_list.push(chunk.to_vec());
         }
 
+        if let Some(page0_group) = group_pages_list.iter().position(|pages| pages.contains(&0)) {
+            group_pages_list.swap(0, page0_group);
+        }
+
         eprintln!(
             "[import] packed into {} groups (was {} positional)",
             group_pages_list.len(),

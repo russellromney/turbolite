@@ -830,6 +830,10 @@ impl TurboliteVfs {
             file_path,
         )?;
         manifest.detect_and_normalize_strategy();
+        let current_version = self.manifest().version;
+        if manifest.version <= current_version {
+            manifest.version = current_version + 1;
+        }
         self.set_manifest(manifest.clone());
         manifest::persist_manifest_local(&self.config.cache_dir, &manifest)?;
         Ok(manifest)
@@ -884,6 +888,15 @@ impl TurboliteVfs {
         let decoded = super::wire::decode(bytes)?;
         self.set_manifest(decoded.manifest);
         Ok(decoded.walrust)
+    }
+
+    /// Decode manifest wire bytes without mutating local VFS state.
+    ///
+    /// Useful for higher layers that need to inspect the currently published
+    /// hybrid cursor before deciding what to publish next.
+    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<(Manifest, Option<(u64, String)>)> {
+        let decoded = super::wire::decode(bytes)?;
+        Ok((decoded.manifest, decoded.walrust))
     }
 
     /// Fetch the latest manifest from the backend and apply it via `set_manifest`.
@@ -995,9 +1008,52 @@ impl TurboliteVfs {
         self.config.cache_dir.join("data.cache")
     }
 
+    /// Replace the local cache contents from a materialized SQLite file.
+    ///
+    /// Used by external restore flows that rebuild a plain SQLite database file
+    /// first, then need turbolite's own cache file descriptor and in-memory page
+    /// state to adopt those bytes before the next VFS-backed connection opens.
+    pub fn replace_cache_from_sqlite_file(&self, input: &Path) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let manifest = self.manifest();
+        if manifest.page_count == 0 || manifest.page_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "empty manifest, no data to restore into cache",
+            ));
+        }
+
+        let page_size = manifest.page_size as usize;
+        let mut page = vec![0u8; page_size];
+        let input_file = std::fs::File::open(input)?;
+        for page_num in 0..manifest.page_count {
+            input_file.read_exact_at(&mut page, page_num * page_size as u64)?;
+            self.cache.write_page(page_num, &page)?;
+        }
+
+        self.cache.mark_all_pages_present(manifest.page_count);
+        self.page_count
+            .store(manifest.page_count, Ordering::Release);
+        self.cache.bump_generation();
+        if let Err(e) = self.cache.persist_bitmap() {
+            eprintln!(
+                "[replace_cache_from_sqlite_file] warning: failed to persist bitmap: {}",
+                e,
+            );
+        }
+        Ok(())
+    }
+
     /// Sync VFS state after an external process (walrust restore) wrote pages
     /// directly to the cache file.
     pub fn sync_after_external_restore(&self, page_count: u64) {
+        // The external restore rewrote data.cache behind the VFS's back. Any
+        // in-memory decoded pages from an earlier manifest version are now stale
+        // and must be dropped so the next VFS open/read sees the restored bytes.
+        let page_nums: Vec<u64> = (0..page_count).collect();
+        self.cache.clear_pages_from_mem_cache(&page_nums);
+        self.cache.bump_generation();
         self.cache.mark_all_pages_present(page_count);
         self.page_count.store(page_count, Ordering::Release);
         if let Err(e) = self.cache.persist_bitmap() {
