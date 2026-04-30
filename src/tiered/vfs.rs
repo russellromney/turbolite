@@ -1082,6 +1082,7 @@ impl TurboliteVfs {
         let ctx = crate::tiered::replay::ReplayContext {
             cache: self.cache.clone(),
             shared_manifest: self.shared_manifest.clone(),
+            vfs_page_count: self.page_count.clone(),
             pending_flushes: self.pending_flushes.clone(),
             staging_seq: self.staging_seq.clone(),
             flush_lock: self.flush_lock.clone(),
