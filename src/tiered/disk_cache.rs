@@ -674,6 +674,43 @@ impl DiskCache {
     /// Write a single page to the cache file.
     /// Uncompressed mode: encrypt with CTR if key set, pwrite at fixed offset.
     /// Compressed mode: zstd compress, CTR encrypt, append at index offset.
+    /// Raw page write: pwrite bytes only, **no** bitmap mark, **no**
+    /// mem_cache update. Used by direct hybrid page replay
+    /// (`tiered::replay`): replay finalize must hold every bit flip
+    /// for the end of the install so a mid-batch failure leaves the
+    /// pages unreachable through the VFS read path. Compressed mode
+    /// is unsupported (it allocates offsets via `cache_index.insert`
+    /// which is stateful and can't be cleanly rolled back); the
+    /// caller (replay) is gated to uncompressed cache.
+    pub(crate) fn write_page_no_visibility(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        if self.cache_compression {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (Phase 004 cinch-cloud SingleWriter does not enable compression)",
+            ));
+        }
+
+        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+
+        // CTR encryption: same size, no overhead. Encrypt before
+        // pwrite. The bitmap and mem_cache are NOT touched.
+        let _enc_buf: Vec<u8>;
+        #[cfg(feature = "encryption")]
+        let data = if let Some(ref key) = self.encryption_key {
+            _enc_buf = compress::encrypt_ctr(data, page_num, key)?;
+            _enc_buf.as_slice()
+        } else {
+            data
+        };
+
+        let needed = offset + data.len() as u64;
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
+        Ok(())
+    }
+
     pub(crate) fn write_page(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
