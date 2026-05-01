@@ -118,6 +118,17 @@ impl PrefetchPool {
                     let _ = done_tx.try_send(gid);
                 };
 
+                // Worker error / stale paths use `unclaim_if_fetching`
+                // (CAS Fetching → None) rather than the unconditional
+                // `unclaim_group`. Replay finalize calls
+                // `mark_pages_present` on the group's pages, which
+                // also flips the group state to Present. If a worker
+                // is still in flight when that happens (e.g., it
+                // captured an old manifest version, or its
+                // captured replay_epoch was bumped), it must not
+                // reset Present → None: that would force a re-fetch
+                // against a stale manifest key and could re-install
+                // pre-replay bytes over the freshly-replayed ones.
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
 
@@ -144,7 +155,7 @@ impl PrefetchPool {
                             if !shutdown.load(Ordering::Acquire) {
                                 eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
                             }
-                            cache.unclaim_group(gid);
+                            cache.unclaim_if_fetching(gid);
                             finish(gid);
                             continue;
                         }
@@ -190,7 +201,7 @@ impl PrefetchPool {
                             if !shutdown.load(Ordering::Acquire) {
                                 eprintln!("[prefetch] gid={} decode error: {}", gid, e);
                             }
-                            cache.unclaim_group(gid);
+                            cache.unclaim_if_fetching(gid);
                             finish(gid);
                             continue;
                         }

@@ -2080,6 +2080,100 @@ mod tests {
         );
     }
 
+    /// PrefetchPool worker error/stale paths use the same CAS
+    /// `unclaim_if_fetching` primitive as the eager-fetch path.
+    /// Reproduce the worker's stale-detection sequence directly:
+    ///   1. claim group via try_claim_group (state goes
+    ///      None → Fetching).
+    ///   2. simulate fetch + decode succeeding.
+    ///   3. replay finalize runs: bumps epoch and calls
+    ///      mark_pages_present which flips the group's state
+    ///      Fetching → Present.
+    ///   4. stale path: capture epoch, see mismatch, call
+    ///      unclaim_if_fetching. Since state is now Present (not
+    ///      Fetching), the CAS fails and the state stays Present.
+    ///   5. Without the CAS, the unconditional unclaim would have
+    ///      stomped Present → None, opening a re-fetch window that
+    ///      could re-install stale bytes over the replayed ones.
+    #[test]
+    fn prefetch_stale_path_does_not_stomp_present_set_by_finalize() {
+        use crate::tiered::GroupState;
+
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let epoch = vfs_replay_epoch(&vfs);
+
+        // Step 1: a "prefetch worker" claims group 0.
+        // (group 0 is None at this point — even though the import
+        // wrote pages, mark_pages_present was not called for group
+        // 0 in the test fixture.) If for some reason the cache
+        // already has it Present, refresh by clearing first.
+        let initial_state = cache.group_state(0);
+        if initial_state != GroupState::None {
+            // Force back to None to model a fresh prefetch claim.
+            // unclaim_if_fetching only works from Fetching, so use
+            // unconditional unclaim here as test setup (we are NOT
+            // testing the unclaim, we are testing what happens AFTER
+            // a claim).
+            cache.unclaim_group(0);
+        }
+        assert!(
+            cache.try_claim_group(0),
+            "test setup: prefetch worker must be able to claim group 0"
+        );
+        assert_eq!(
+            cache.group_state(0),
+            GroupState::Fetching,
+            "after claim: state Fetching"
+        );
+
+        // Step 2 (skipped — we don't actually fetch bytes; the
+        // test focuses on the state-machine race, not bytes).
+
+        // Capture epoch before the race, like the prefetch worker
+        // does at submission time.
+        let captured_epoch = epoch.load(Ordering::Acquire);
+
+        // Step 3: replay finalize runs. It calls mark_pages_present
+        // which sets the group's state to Present, AND it bumps the
+        // epoch. Page 0 lives in group 0, so a finalize that
+        // touches page 0 forces group 0 → Present.
+        let new_bytes = vec![0xBBu8; page_size as usize];
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &new_bytes).unwrap();
+        handle.commit_changeset(1).unwrap();
+        handle.finalize().unwrap();
+
+        // After finalize: group 0 must be Present (replay marked
+        // it), and the epoch must have advanced.
+        assert_eq!(
+            cache.group_state(0),
+            GroupState::Present,
+            "after finalize: state Present"
+        );
+        assert_ne!(
+            epoch.load(Ordering::Acquire),
+            captured_epoch,
+            "after finalize: epoch advanced"
+        );
+
+        // Step 4: stale prefetch path resumes — the worker compares
+        // epochs, sees mismatch, and calls unclaim_if_fetching.
+        // Since the state is now Present (not Fetching), the CAS
+        // must fail and the state must stay Present.
+        let unclaimed = cache.unclaim_if_fetching(0);
+        assert!(
+            !unclaimed,
+            "unclaim_if_fetching must NOT reset Present back to None"
+        );
+        assert_eq!(
+            cache.group_state(0),
+            GroupState::Present,
+            "Present must survive a stale prefetch's unclaim attempt"
+        );
+    }
+
     /// Mirror of the above for the success case: when the epoch has
     /// NOT advanced between capture and helper call, the install
     /// closure runs and the helper returns true.
