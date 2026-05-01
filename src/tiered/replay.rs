@@ -46,6 +46,51 @@ use crate::tiered::staging::{PendingFlush, StagingWriter};
 /// manifest gets the post-replay header without re-fetching.
 const SQLITE_DB_HEADER_LEN: usize = 100;
 
+/// Best-effort rollback of pre-images captured during replay
+/// finalize's commit phase.
+///
+/// Called when a mid-batch write or pre-image read fails. Walks the
+/// captured pre-images in REVERSE order (so the first-overwritten
+/// page is restored last, matching the order it would have been
+/// observed by a concurrent reader) and writes each old_bytes back.
+///
+/// "Best-effort" semantics: if a rollback write itself fails (e.g.
+/// disk full, I/O error), the failure is logged via tracing and the
+/// loop continues for remaining pages. Returning Err from rollback
+/// would mask the primary error and leave the caller with no clear
+/// signal. The staging log is also kept on disk as a durable
+/// post-image (when caller leaves it) so restart-time recovery can
+/// converge the cache even if rollback was partial — but in this
+/// commit's flow the caller deletes the staging log after rollback,
+/// so a partial-rollback failure does leak some new bytes into the
+/// cache. That's a tradeoff: avoiding the leak would require a
+/// pre-flight side-cache file (rejected by Plan Review 3 B5 because
+/// `DiskCache.cache_file` is held open and a path-rename install
+/// would not update the descriptor).
+///
+/// Test-only failure injection on `write_page_no_visibility` is
+/// reset to MAX inside this function so rollback writes are NOT
+/// subject to the same forward-write injection — rollback is a
+/// recovery action. Production builds compile this reset out via
+/// `#[cfg(test)]`.
+fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) {
+    #[cfg(test)]
+    {
+        cache
+            .fail_no_visibility_after
+            .store(i64::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+    for (page_num, old_bytes) in pre_images.iter().rev() {
+        if let Err(e) = cache.write_page_no_visibility(*page_num, old_bytes) {
+            tracing::error!(
+                "replay finalize rollback: failed to restore pre-image for page {}: {}",
+                page_num,
+                e
+            );
+        }
+    }
+}
+
 /// Extend a manifest for replay-driven growth.
 ///
 /// Branches on strategy because the two encodings have incompatible
@@ -370,33 +415,86 @@ impl ReplayHandle {
             .lock()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush_lock poisoned: {e}")))?;
 
-        // 4. Write pages to data.cache via the no-visibility helper.
-        //    Bits NOT yet flipped (write_page_no_visibility skips
-        //    bitmap_mark and mem_cache update), so any
-        //    partially-written page is invisible to readers via
-        //    bitmap-gated paths.
+        // 4. Write pages to data.cache via the no-visibility helper,
+        //    capturing the pre-image of any **already-present** page
+        //    so a mid-batch failure can roll back its bytes.
+        //
+        //    Why: write_page_no_visibility skips bitmap_mark, but for
+        //    pages that were ALREADY present pre-replay (the common
+        //    overwrite case in WAL replay), the bitmap already says
+        //    "present" and a reader doing pread on data.cache will
+        //    observe the new bytes immediately. The bitmap-gate trick
+        //    only hides newly-allocated pages; for overwrites we need
+        //    explicit pre-image rollback.
+        //
+        //    Memory cost: page_size × num_overwritten_pages held
+        //    until step 5. For typical follower replay this is
+        //    bounded by the WAL frame count, well under tens of MB.
+        let page_size_bytes = self.page_size as usize;
         let mut written: Vec<u64> = Vec::with_capacity(self.staged.len());
-        for (&page_num, bytes) in &self.staged {
-            if let Err(e) = self.ctx.cache.write_page_no_visibility(page_num, bytes) {
-                // Roll back the staging-log artifact. Cache may have
-                // partial bytes at written page offsets, but the
-                // bitmap was never updated for any of them, so the
-                // partial bytes are unreachable through the VFS read
-                // path and will be overwritten by future cache fills.
+        // (page_num, old_bytes) for every overwrite that needs
+        // rollback if a later write fails. Newly-allocated pages
+        // (was_present=false) don't need rollback — bitmap was
+        // never flipped for them.
+        let mut pre_images: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        for (&page_num, new_bytes) in &self.staged {
+            let was_present = self.ctx.cache.is_present(page_num);
+
+            // Capture the pre-image BEFORE the write so a later
+            // failure can restore the byte-level pre-replay state
+            // for already-present pages.
+            let pre_image = if was_present {
+                let mut buf = vec![0u8; page_size_bytes];
+                if let Err(e) = self.ctx.cache.read_page(page_num, &mut buf) {
+                    // Reading the pre-image failed. Best-effort
+                    // rollback of any pre-images we already
+                    // captured, then bail.
+                    rollback_pre_images(&self.ctx.cache, &pre_images);
+                    let _ = std::fs::remove_file(&staging_log_path);
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "replay finalize: pre-image read of page {} failed after writing {} of {} pages: {} (rolled back {} pages; staging log {} removed)",
+                            page_num,
+                            written.len(),
+                            self.staged.len(),
+                            e,
+                            pre_images.len(),
+                            staging_log_path.display(),
+                        ),
+                    ));
+                }
+                Some(buf)
+            } else {
+                None
+            };
+
+            if let Err(e) = self.ctx.cache.write_page_no_visibility(page_num, new_bytes) {
+                // Mid-batch write failure. Roll back every
+                // already-present page we successfully overwrote
+                // before this point. Newly-allocated pages were
+                // never visible (bitmap not flipped) so they need
+                // no rollback. Then delete the staging log artifact.
+                rollback_pre_images(&self.ctx.cache, &pre_images);
                 let _ = std::fs::remove_file(&staging_log_path);
                 return Err(io::Error::new(
                     e.kind(),
                     format!(
-                        "replay finalize: cache.write_page_no_visibility({}) failed after writing {} of {} pages: {} (staging log {} removed; live state unchanged)",
+                        "replay finalize: cache.write_page_no_visibility({}) failed after writing {} of {} pages: {} (rolled back {} pre-images; staging log {} removed)",
                         page_num,
                         written.len(),
                         self.staged.len(),
                         e,
+                        pre_images.len(),
                         staging_log_path.display(),
                     ),
                 ));
             }
             written.push(page_num);
+            if let Some(buf) = pre_image {
+                pre_images.push((page_num, buf));
+            }
         }
 
         // 5. Atomically flip the bitmap and bump generation. After
@@ -1133,6 +1231,123 @@ mod tests {
                 "positional page_location({p}) must resolve after growth"
             );
         }
+    }
+
+    /// Plan Review post-2a fix-3 (B21): the load-bearing test for
+    /// the atomicity contract. Replays new bytes onto a page that
+    /// is **already present** in the cache, injects a write failure
+    /// on the second page, asserts:
+    ///   1. finalize returns Err
+    ///   2. the first page (which had succeeded its forward write)
+    ///      reads back its OLD pre-replay bytes through the VFS read
+    ///      path (rollback worked)
+    ///   3. the bitmap is unchanged for already-present pages,
+    ///      mem_cache is unchanged, and no PendingFlush was queued
+    ///   4. the staging log was deleted
+    ///
+    /// Without pre-image rollback this test fails: the first page's
+    /// new bytes would be visible after Err. The earlier 2a-fix-2
+    /// claim that "bitmap-gate makes mid-batch failure invisible"
+    /// only holds for pages that were not previously present;
+    /// overwrites of already-present pages need explicit rollback.
+    #[test]
+    fn finalize_rolls_back_overwrites_of_already_present_pages_on_mid_batch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+
+        // Use a page that we explicitly seed as present. Import does
+        // NOT mark every page locally present (pages are
+        // backend-resident until first read). To exercise the
+        // overwrite-rollback path we need at least one page that
+        // actually has its bitmap bit set, so we directly seed page
+        // 0 by writing arbitrary pre-replay bytes through the
+        // standard write_page API (which DOES mark the bitmap and
+        // updates mem_cache as a side effect).
+        let target_sqlite_id: u32 = 1;
+        let target_turbolite_page: u64 = 0;
+        let pre_replay_bytes = vec![0xAAu8; page_size as usize];
+        cache
+            .write_page(target_turbolite_page, &pre_replay_bytes)
+            .unwrap();
+        assert!(
+            cache.is_present(target_turbolite_page),
+            "precondition: turbolite page 0 must be present after seed"
+        );
+
+        let pre_pending = pending_flush_count(&vfs);
+
+        // Stage two new pages. The injection will let the first
+        // forward write succeed (target_sqlite_id=1) and fail on
+        // the second (sqlite_page_id=2 -> turbolite page 1).
+        let new_page_1 = vec![0xBBu8; page_size as usize];
+        let new_page_2 = vec![0xCCu8; page_size as usize];
+
+        // Arm injection: 1 successful forward write, then fail on the
+        // 2nd. Rollback writes are not subject to this counter
+        // (rollback_pre_images resets it to i64::MAX before writing).
+        cache
+            .fail_no_visibility_after
+            .store(1, Ordering::SeqCst);
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(target_sqlite_id, &new_page_1).unwrap();
+        handle.apply_page(2, &new_page_2).unwrap();
+        handle.commit_changeset(1).unwrap();
+
+        let result = handle.finalize();
+        assert!(
+            result.is_err(),
+            "finalize must Err when mid-batch write fails"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("test-injected") || err_msg.contains("write_page_no_visibility"),
+            "expected mid-batch write failure error, got: {err_msg}"
+        );
+
+        // (1) The first page's bytes must roll back to pre-replay.
+        // Bypass mem_cache by reading page 0's bytes directly off
+        // disk — write_page_no_visibility never touched mem_cache,
+        // so a normal cache.read_page would consult mem_cache first
+        // and might return a stale older snapshot. The disk is the
+        // ground truth for the rollback assertion.
+        use std::os::unix::fs::FileExt;
+        let cache_path = vfs.cache_file_path();
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut on_disk = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut on_disk, target_turbolite_page * page_size as u64)
+            .unwrap();
+        assert_eq!(
+            on_disk, pre_replay_bytes,
+            "rollback must restore page 0's pre-replay bytes on disk after a mid-batch failure"
+        );
+
+        // (3) No PendingFlush was queued.
+        let post_pending = pending_flush_count(&vfs);
+        assert_eq!(
+            post_pending, pre_pending,
+            "no PendingFlush may be enqueued when commit phase fails"
+        );
+
+        // The bitmap for page 0 was already true and stays true; the
+        // bitmap for page 1 (new) was never flipped, stays false.
+        assert!(
+            cache.is_present(target_turbolite_page),
+            "page 0 was already present; remains present after rollback"
+        );
+        assert!(
+            !cache.is_present(1),
+            "page 1 was not present; must NOT have been flipped to present on commit-phase failure"
+        );
+
+        // (4) staging log file was deleted (no orphan ".log" left).
+        let staging_dir = tmp.path().join("cache").join("staging");
+        let logs = list_staging_logs(&staging_dir);
+        assert!(
+            logs.is_empty(),
+            "staging log must be removed after commit-phase failure (found: {logs:?})"
+        );
     }
 
     fn vfs_cache(vfs: &TurboliteVfs) -> Arc<DiskCache> {

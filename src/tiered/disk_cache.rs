@@ -223,6 +223,14 @@ pub(crate) struct DiskCache {
     /// Sub-chunks evicted in the last between-query eviction pass.
     /// Used for churn detection (>50% of cache evicted = high churn).
     pub(crate) stat_last_eviction_count: AtomicU64,
+
+    /// Test-only failure injection for `write_page_no_visibility`.
+    /// When the counter reaches zero, the next call returns Err.
+    /// Decremented atomically per call so tests can drive a failure
+    /// at an exact ordinal write within a replay batch and prove the
+    /// pre-image rollback contract.
+    #[cfg(test)]
+    pub(crate) fail_no_visibility_after: std::sync::atomic::AtomicI64,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -419,6 +427,8 @@ impl DiskCache {
             stat_bytes_evicted: AtomicU64::new(0),
             stat_peak_cache_bytes: AtomicU64::new(0),
             stat_last_eviction_count: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_no_visibility_after: std::sync::atomic::AtomicI64::new(i64::MAX),
         })
     }
 
@@ -690,6 +700,24 @@ impl DiskCache {
                 io::ErrorKind::Unsupported,
                 "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (Phase 004 cinch-cloud SingleWriter does not enable compression)",
             ));
+        }
+
+        // Test-only failure injection. Production builds compile
+        // this check out via #[cfg(test)] on the counter.
+        #[cfg(test)]
+        {
+            let remaining = self
+                .fail_no_visibility_after
+                .fetch_sub(1, Ordering::SeqCst);
+            if remaining <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "test-injected write_page_no_visibility failure on page {}",
+                        page_num
+                    ),
+                ));
+            }
         }
 
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
