@@ -430,10 +430,15 @@ impl ReplayHandle {
 
         // 2. Compute the post-replay manifest. Includes page_count
         //    growth, BTreeAware group-pages extension for any
-        //    newly-replayed pages, and a refreshed db_header if page
-        //    0 was replayed (Plan Review post-2a B16). The manifest
-        //    is built but NOT yet stored; we publish it atomically
-        //    in step 6.
+        //    newly-replayed pages, a refreshed db_header if page 0
+        //    was replayed (Plan Review post-2a B16), and an
+        //    incremented version so restart-time recovery
+        //    (vfs.rs:194-217) actually adopts the trailer manifest
+        //    instead of seeing trailer.version == loaded.version
+        //    and skipping it (Plan Review post-2a fix-4 B23).
+        //
+        //    The manifest is built but NOT yet stored; we publish it
+        //    atomically in step 6.
         let mut post_manifest = pre_manifest.clone();
         if new_page_count != pre_page_count {
             extend_for_growth(&mut post_manifest, pre_page_count, new_page_count);
@@ -449,6 +454,23 @@ impl ReplayHandle {
                 post_manifest.db_header = Some(page0.clone());
             }
         }
+        // Version bump (Plan Review post-2a fix-4 B23). This is the
+        // key signal recovery uses to decide a staging-log trailer
+        // is newer than the on-disk/remote manifest. Without this
+        // bump, restart after a tainted-cache scenario would replay
+        // the staging log's pages but skip its manifest changes —
+        // group_pages, page_index, db_header — leaving a fresh
+        // follower's flush_dirty_groups unable to resolve replayed
+        // pages via manifest.page_location and silently dropping
+        // them.
+        //
+        // Multiple back-to-back finalizes without an intervening
+        // flush each bump version monotonically. The next flush
+        // advances version once more (flush.rs:176
+        // `next_version = manifest_snap.version + 1`); the
+        // intermediate versions never reach remote storage, only
+        // shared_manifest in-memory.
+        post_manifest.version = pre_manifest.version + 1;
 
         // 3. Pre-flight the staging log to disk. This is the most
         //    fallible part of the operation; doing it before any live
@@ -1482,6 +1504,156 @@ mod tests {
         assert!(
             read_err.to_string().contains("tainted"),
             "tainted-cache read error must mention tainted; got: {read_err}"
+        );
+    }
+
+    /// Plan Review post-2a fix-4 (B23): the load-bearing
+    /// restart-recovery test. After a rollback-failure scenario
+    /// leaves the cache tainted and the staging log on disk, a
+    /// fresh VFS open at the same cache_dir must converge the cache
+    /// AND the manifest shape (page_count, group_pages,
+    /// page_index, db_header) to the post-replay state.
+    ///
+    /// The staging log's manifest trailer carries the post-replay
+    /// shape; recovery (vfs.rs:194-217) only adopts it when
+    /// `trailer.version > loaded.version`, so finalize bumps the
+    /// version (this commit's fix). Without the bump, recovery would
+    /// replay the bytes but skip the manifest changes.
+    #[test]
+    fn finalize_rollback_failure_recovers_manifest_and_bytes_on_restart() {
+        let tmp = TempDir::new().unwrap();
+        // Use a separate cache_dir under tmp so the new VFS in the
+        // restart phase can re-open the same path.
+        let cache_dir = tmp.path().join("cache");
+
+        // Build initial VFS + import.
+        let (page_size, target_growth_sqlite_id) = {
+            let seed_path = tmp.path().join("seed.db");
+            let conn = rusqlite::Connection::open(&seed_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size=4096;\
+                 CREATE TABLE t (id INTEGER PRIMARY KEY, val BLOB);",
+            )
+            .unwrap();
+            let payload: Vec<u8> = (0..1024).map(|i| i as u8).collect();
+            for i in 0..16 {
+                conn.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    rusqlite::params![i, &payload],
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            let config = TurboliteConfig {
+                cache_dir: cache_dir.clone(),
+                ..Default::default()
+            };
+            let vfs = TurboliteVfs::new_local(config).unwrap();
+            let manifest = vfs.import_sqlite_file(&seed_path).unwrap();
+            let page_size = manifest.page_size;
+            let cache = vfs_cache(&vfs);
+
+            // Seed page 0 so it's marked present pre-replay (rollback
+            // capture path).
+            let seed_page0 = vec![0xAAu8; page_size as usize];
+            cache.write_page(0, &seed_page0).unwrap();
+
+            // Distinctive new page 0 bytes (db_header changes).
+            let mut new_page0 = vec![0u8; page_size as usize];
+            for i in 0..100 {
+                new_page0[i] = (0xC0 ^ i) as u8;
+            }
+
+            // Distinctive growth-page bytes well past current page_count.
+            let target_growth_sqlite_id: u32 = manifest.page_count as u32 + 5;
+            let new_grown = vec![0xEEu8; page_size as usize];
+
+            // Arm BOTH fault domains so this is a rollback-failure
+            // restart-recovery scenario.
+            cache.fail_no_visibility_after.store(1, Ordering::SeqCst);
+            cache.fail_rollback_after.store(0, Ordering::SeqCst);
+
+            let mut handle = vfs.begin_replay().unwrap();
+            handle.apply_page(1, &new_page0).unwrap(); // overwrite page 0
+            handle.apply_page(target_growth_sqlite_id, &new_grown).unwrap(); // grow
+            handle.commit_changeset(1).unwrap();
+            let result = handle.finalize();
+            assert!(result.is_err());
+
+            // Sanity: cache should be tainted and the staging log
+            // should still be present.
+            assert!(cache.tainted.load(Ordering::Acquire));
+            let staging_dir = cache_dir.join("staging");
+            let pre_restart_logs: Vec<_> = std::fs::read_dir(&staging_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("log"))
+                .collect();
+            assert_eq!(pre_restart_logs.len(), 1, "staging log must remain pre-restart");
+
+            (page_size, target_growth_sqlite_id)
+        }; // <- old VFS dropped here
+
+        // Restart: open a fresh VFS at the same cache_dir. Recovery
+        // should adopt the staging log's trailer manifest AND
+        // replay its pages.
+        let config = TurboliteConfig {
+            cache_dir: cache_dir.clone(),
+            ..Default::default()
+        };
+        let restarted = TurboliteVfs::new_local(config).unwrap();
+
+        // (1) Tainted flag is reset on the new instance.
+        let restarted_cache = vfs_cache(&restarted);
+        assert!(
+            !restarted_cache.tainted.load(Ordering::Acquire),
+            "fresh VFS instance must start untainted"
+        );
+
+        // (2) Manifest version bumped — recovery adopted the trailer.
+        let post_manifest = restarted.manifest();
+        assert!(
+            post_manifest.page_count >= target_growth_sqlite_id as u64,
+            "post-restart page_count must include replay growth (got {}, expected >= {})",
+            post_manifest.page_count,
+            target_growth_sqlite_id
+        );
+
+        // (3) db_header reflects the replayed page 0. The trailer
+        // adopt path stores the full page 0 (~page_size bytes); the
+        // first 100 bytes are the SQLite header span.
+        let header = post_manifest
+            .db_header
+            .as_ref()
+            .expect("db_header must be set after restart recovery");
+        for i in 0..100 {
+            assert_eq!(
+                header[i],
+                (0xC0u8 ^ i as u8),
+                "db_header byte {i} must equal the replayed page 0 bytes"
+            );
+        }
+
+        // (4) page_index resolves the grown page (BTreeAware).
+        let grown_turbolite_page = (target_growth_sqlite_id - 1) as u64;
+        assert!(
+            post_manifest.page_location(grown_turbolite_page).is_some(),
+            "page_location({grown_turbolite_page}) must resolve after restart recovery"
+        );
+
+        // (5) Cache holds the replayed bytes for the grown page.
+        // Recovery replayed staging log pages via cache.write_page,
+        // which marks the bitmap, so a normal read should succeed.
+        let mut buf = vec![0u8; page_size as usize];
+        restarted_cache
+            .read_page(grown_turbolite_page, &mut buf)
+            .expect("read grown page");
+        assert_eq!(
+            buf,
+            vec![0xEEu8; page_size as usize],
+            "restart recovery must place grown-page bytes in cache"
         );
     }
 
