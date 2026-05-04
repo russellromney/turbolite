@@ -875,23 +875,15 @@ fn cmd_export(
 ) -> Result<()> {
     let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true)?;
     let vfs_name = format!("turbolite-export-{}", std::process::id());
-    let src_conn = open_connection(&db, vfs, &vfs_name)?;
+    let (shared, _conn) = open_shared(&db, vfs, &vfs_name)?;
 
-    // Open a plain SQLite destination (no VFS) and use the backup API
-    // to copy all pages. This produces a standard SQLite file.
-    let mut dst_conn =
-        rusqlite::Connection::open(&output).context("failed to create output file")?;
-
-    let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
-        .context("failed to initialize backup")?;
-
-    backup
-        .run_to_completion(100, std::time::Duration::from_millis(0), None)
-        .context("backup failed")?;
-
-    drop(backup);
+    shared
+        .shared_state()
+        .materialize_to_file(&output)
+        .context("failed to materialize export")?;
 
     // Verify the output is a valid SQLite file
+    let dst_conn = rusqlite::Connection::open(&output).context("failed to open exported file")?;
     let integrity: String = dst_conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .context("integrity check failed")?;
