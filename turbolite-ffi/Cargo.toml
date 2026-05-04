@@ -44,8 +44,8 @@ serde_json = "1"
 rusqlite = { version = "0.35", features = ["backup"], optional = true }
 # cli-s3 only; resolved by the feature above.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
-hadb-storage = { path = "../../hadb/hadb-storage", version = "0.4", optional = true }
-hadb-storage-s3 = { path = "../../hadb/hadb-storage-s3", version = "0.4", optional = true }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage", optional = true }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-s3", optional = true }
 
 [build-dependencies]
 cc = "1"
