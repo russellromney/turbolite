@@ -18,6 +18,8 @@ If you have one database per server, use a volume. turbolite explores how to hav
 
 turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Any S3-compatible storage works (AWS S3, Tigris, R2, MinIO, etc.). It's a standard SQLite VFS operating at the page level, so most SQLite features should work: FTS, R-tree, JSON, WAL mode, etc.
 
+turbolite is also part of the broader [`hadb`](https://github.com/russellromney/hadb) ecosystem. Standalone turbolite is a storage VFS with one safe writer; if you want HA leader election plus continuous WAL replication, use it through [`haqlite-turbolite`](https://github.com/russellromney/haqlite/tree/main/haqlite-turbolite), which layers HaQLite and [`walrust`](https://github.com/russellromney/walrust) on top. That HA path is very experimental, but it is where multi-node/failover work belongs.
+
 If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
 ## Performance
@@ -205,7 +207,8 @@ If encryption is enabled, turbolite encrypts everything: S3 objects, local cache
 
 ### Current limitations
 
-- **Single writer only.** Two machines writing to the same prefix will corrupt the manifest.
+- **Standalone turbolite is single-writer.** Two machines writing directly to the same prefix will corrupt the manifest.
+- **HA/failover mode is experimental and lives in `haqlite-turbolite`.** That stack combines HaQLite leases, turbolite page tiering, and walrust continuous WAL replication. It is the intended path for multi-node deployments, not direct multi-writer access to one turbolite prefix.
 - **WAL shipping is experimental.** Requires the `wal` feature flag + walrust. See [Durability](#durability).
 
 SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mode, VACUUM, autovacuum.
