@@ -2297,21 +2297,16 @@ mod tests {
         assert_eq!(buf, bytes, "install closure's bytes must land on disk");
     }
 
-    /// `publish_replayed_base` returns hybrid manifest bytes that
-    /// round-trip through `decode_manifest_bytes` and carry the
-    /// supplied walrust cursor and prefix.
+    /// `publish_replayed_base` returns pure page/base manifest bytes.
     #[test]
-    fn publish_replayed_base_round_trips_walrust_delta_when_no_pending_state() {
+    fn publish_replayed_base_round_trips_pure_manifest_when_no_pending_state() {
         let tmp = TempDir::new().unwrap();
         let (vfs, _page_size) = fresh_vfs_with_pages(&tmp, 4);
 
         let bytes = vfs
-            .publish_replayed_base(42, "test-prefix/")
+            .publish_replayed_base()
             .expect("publish_replayed_base on empty pending state");
-        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode round-trip");
-        let (seq, prefix) = walrust.expect("walrust delta extension must be present");
-        assert_eq!(seq, 42);
-        assert_eq!(prefix, "test-prefix/");
+        let m = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode round-trip");
         assert!(
             m.page_count > 0,
             "manifest must carry a real page count from the import-seeded fixture"
@@ -2324,8 +2319,7 @@ mod tests {
     /// for every replayed group is encoded by the flush primitive,
     /// not by this test directly; here we assert the simpler shape
     /// invariant: the published manifest version >= the post-finalize
-    /// manifest version, page_count covers the replayed pages, and
-    /// the returned bytes carry the supplied walrust cursor.
+    /// manifest version, and page_count covers the replayed pages.
     #[test]
     fn publish_replayed_base_after_replay_carries_post_replay_state() {
         let tmp = TempDir::new().unwrap();
@@ -2346,12 +2340,9 @@ mod tests {
         // no-op upload-wise but still bumps the manifest. Tests for
         // remote-mode flush behaviour live in flush.rs's own suite.
         let bytes = vfs
-            .publish_replayed_base(13, "p/")
+            .publish_replayed_base()
             .expect("publish_replayed_base after replay");
-        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
-        let (seq, prefix) = walrust.expect("walrust extension");
-        assert_eq!(seq, 13);
-        assert_eq!(prefix, "p/");
+        let m = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
         assert!(
             m.version >= post_finalize_version,
             "published manifest version must be >= post-finalize version (post={post_finalize_version}, published={})",

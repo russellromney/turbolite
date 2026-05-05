@@ -33,6 +33,7 @@ fn make_manifest(
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
+        epoch: 0,
     }
 }
 
@@ -239,6 +240,7 @@ proptest! {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
+            epoch: 0,
         };
         manifest.build_page_index();
 

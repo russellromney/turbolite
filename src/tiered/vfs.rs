@@ -898,38 +898,20 @@ impl TurboliteVfs {
         super::wire::encode_pure(&m)
     }
 
-    /// Serialize the current manifest + a walrust WAL delta position.
-    /// Used by "Turbolite + walrust" deployments where turbolite holds
-    /// the page-group base state and walrust ships incremental WAL
-    /// frames since the last checkpoint.
-    pub fn manifest_bytes_with_walrust_delta(
-        &self,
-        walrust_txid: u64,
-        walrust_changeset_prefix: &str,
-    ) -> io::Result<Vec<u8>> {
-        let m = self.manifest();
-        super::wire::encode_hybrid(&m, walrust_txid, walrust_changeset_prefix)
-    }
-
-    /// Decode wire bytes produced by `manifest_bytes` /
-    /// `manifest_bytes_with_walrust_delta` and apply the resulting
-    /// manifest via `set_manifest()`. If the bytes were hybrid, returns
-    /// `Some((walrust_txid, walrust_changeset_prefix))` so the caller
-    /// can hand that delta position to walrust. Pure payloads return
-    /// `Ok(None)`.
-    pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<Option<(u64, String)>> {
-        let decoded = super::wire::decode(bytes)?;
-        self.set_manifest(decoded.manifest);
-        Ok(decoded.walrust)
+    /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
+    /// page/base manifest via `set_manifest()`.
+    pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        let manifest = super::wire::decode(bytes)?;
+        self.set_manifest(manifest);
+        Ok(())
     }
 
     /// Decode manifest wire bytes without mutating local VFS state.
     ///
     /// Useful for higher layers that need to inspect the currently published
-    /// hybrid cursor before deciding what to publish next.
-    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<(Manifest, Option<(u64, String)>)> {
-        let decoded = super::wire::decode(bytes)?;
-        Ok((decoded.manifest, decoded.walrust))
+    /// base manifest before deciding what to publish next.
+    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<Manifest> {
+        super::wire::decode(bytes)
     }
 
     /// Clone of the VFS-level replay gate. Higher layers (haqlite-turbolite
@@ -1157,17 +1139,12 @@ impl TurboliteVfs {
     ///
     /// Drives `flush_dirty_groups` over whatever staging logs and
     /// dirty groups have accumulated since the last flush, encodes
-    /// the resulting manifest as hybrid bytes carrying the supplied
-    /// walrust cursor, and returns those bytes for the caller to
-    /// CAS-publish under its manifest key. If no replay state is
-    /// pending, the call still returns a hybrid payload built from
-    /// the current manifest with the new cursor — that covers the
+    /// the resulting manifest as pure page/base manifest bytes, and
+    /// returns those bytes for the caller to CAS-publish under its
+    /// manifest key. If no replay state is pending, the call still
+    /// returns the current pure manifest payload — that covers the
     /// "follower already caught up before promotion" case.
-    pub fn publish_replayed_base(
-        &self,
-        walrust_seq: u64,
-        walrust_prefix: &str,
-    ) -> io::Result<Vec<u8>> {
+    pub fn publish_replayed_base(&self) -> io::Result<Vec<u8>> {
         // Drive a flush over any pending replay state. flush_to_storage
         // drains pending_flushes + shared_dirty_groups together and
         // resolves dirty groups via manifest.page_location, which
@@ -1188,10 +1165,10 @@ impl TurboliteVfs {
             self.flush_to_storage()?;
         }
         // Whether we flushed or not, the in-memory manifest is the
-        // source of truth for the published payload. Encode it with
-        // the walrust delta extension so the caller (haqlite-turbolite)
-        // can CAS it under its manifest key.
-        self.manifest_bytes_with_walrust_delta(walrust_seq, walrust_prefix)
+        // source of truth for the published payload. Delta replay is
+        // discoverable from the integration layer's configured delta
+        // storage, not encoded into the page/base manifest.
+        self.manifest_bytes()
     }
 }
 
