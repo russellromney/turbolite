@@ -3,6 +3,8 @@
   "format_version": 1,
   "tenant_scope": "tenant-a/scope-a",
   "database_id": "db-alpha",
+  "database_incarnation_id": "incarnation-0001",
+  "object_prefix": "tenant-a/scope-a/db-alpha",
   "writer_id": "writer-a",
   "lease_epoch": 7,
   "checkpoint_id": "chk-0001",
@@ -14,7 +16,7 @@
     {
       "first_page": 0,
       "page_count": 2,
-      "key": "checkpoints/chk-0001/pages-0000-0001",
+      "key": "tenant-a/scope-a/db-alpha/checkpoints/chk-0001/pages-0000-0001",
       "checksum": 1234
     }
   ]

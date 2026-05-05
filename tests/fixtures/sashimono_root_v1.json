@@ -3,6 +3,8 @@
   "format_version": 1,
   "tenant_scope": "tenant-a/scope-a",
   "database_id": "db-alpha",
+  "database_incarnation_id": "incarnation-0001",
+  "object_prefix": "tenant-a/scope-a/db-alpha",
   "root_generation": 1,
   "writer_id": "writer-a",
   "lease_epoch": 7,

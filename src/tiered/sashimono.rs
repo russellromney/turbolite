@@ -33,6 +33,8 @@ pub struct RootPointerV1 {
     pub format_version: u16,
     pub tenant_scope: String,
     pub database_id: String,
+    pub database_incarnation_id: String,
+    pub object_prefix: String,
     pub root_generation: u64,
     pub writer_id: String,
     pub lease_epoch: u64,
@@ -49,6 +51,8 @@ pub struct CheckpointV1 {
     pub format_version: u16,
     pub tenant_scope: String,
     pub database_id: String,
+    pub database_incarnation_id: String,
+    pub object_prefix: String,
     pub writer_id: String,
     pub lease_epoch: u64,
     pub checkpoint_id: String,
@@ -75,6 +79,8 @@ pub struct DeltaV1 {
     pub format_version: u16,
     pub tenant_scope: String,
     pub database_id: String,
+    pub database_incarnation_id: String,
+    pub object_prefix: String,
     pub writer_id: String,
     pub lease_epoch: u64,
     pub base_database_version: u64,
@@ -108,6 +114,7 @@ pub enum ContractError {
     RootRollback,
     StaleLeaseEpoch,
     RootIdentityMismatch,
+    WrongObjectPrefix,
     NonContiguousDelta {
         expected: u64,
         actual: u64,
@@ -173,6 +180,8 @@ impl RootPointerV1 {
             self.format_version,
             &self.tenant_scope,
             &self.database_id,
+            &self.database_incarnation_id,
+            &self.object_prefix,
             &self.writer_id,
             self.lease_epoch,
         )?;
@@ -187,6 +196,8 @@ impl RootPointerV1 {
         previous.validate()?;
         if self.tenant_scope != previous.tenant_scope
             || self.database_id != previous.database_id
+            || self.database_incarnation_id != previous.database_incarnation_id
+            || self.object_prefix != previous.object_prefix
             || self.checkpoint_id.is_empty()
         {
             return Err(ContractError::RootIdentityMismatch);
@@ -208,6 +219,8 @@ impl CheckpointV1 {
             self.format_version,
             &self.tenant_scope,
             &self.database_id,
+            &self.database_incarnation_id,
+            &self.object_prefix,
             &self.writer_id,
             self.lease_epoch,
         )?;
@@ -219,7 +232,7 @@ impl CheckpointV1 {
             return Err(ContractError::EmptyField("page_objects"));
         }
         for page_object in &self.page_objects {
-            page_object.validate(self.database_page_count)?;
+            page_object.validate(self.database_page_count, &self.object_prefix)?;
         }
         Ok(())
     }
@@ -287,10 +300,13 @@ pub fn select_recovery_plan(
 }
 
 impl PageObjectRefV1 {
-    pub fn validate(&self, database_page_count: u64) -> ContractResult<()> {
+    pub fn validate(&self, database_page_count: u64, object_prefix: &str) -> ContractResult<()> {
         require_nonempty("page_object.key", &self.key)?;
         require_nonzero("page_object.page_count", self.page_count)?;
         require_nonzero("page_object.checksum", self.checksum)?;
+        if !key_has_object_prefix(&self.key, object_prefix) {
+            return Err(ContractError::WrongObjectPrefix);
+        }
         let end = self.first_page.checked_add(self.page_count).ok_or(
             ContractError::PageObjectOutOfRange {
                 first_page: self.first_page,
@@ -316,6 +332,8 @@ fn validate_checkpoint_for_root(
     checkpoint.validate()?;
     if checkpoint.tenant_scope != root.tenant_scope
         || checkpoint.database_id != root.database_id
+        || checkpoint.database_incarnation_id != root.database_incarnation_id
+        || checkpoint.object_prefix != root.object_prefix
         || checkpoint.writer_id != root.writer_id
         || checkpoint.lease_epoch != root.lease_epoch
         || checkpoint.checkpoint_id != root.checkpoint_id
@@ -341,6 +359,8 @@ fn validate_delta_after_state(
     delta.validate()?;
     if delta.tenant_scope != root.tenant_scope
         || delta.database_id != root.database_id
+        || delta.database_incarnation_id != root.database_incarnation_id
+        || delta.object_prefix != root.object_prefix
         || delta.writer_id != root.writer_id
         || delta.lease_epoch != root.lease_epoch
     {
@@ -374,6 +394,8 @@ impl DeltaV1 {
             self.format_version,
             &self.tenant_scope,
             &self.database_id,
+            &self.database_incarnation_id,
+            &self.object_prefix,
             &self.writer_id,
             self.lease_epoch,
         )?;
@@ -406,6 +428,8 @@ impl DeltaV1 {
         root.validate()?;
         if self.tenant_scope != root.tenant_scope
             || self.database_id != root.database_id
+            || self.database_incarnation_id != root.database_incarnation_id
+            || self.object_prefix != root.object_prefix
             || self.lease_epoch != root.lease_epoch
         {
             return Err(ContractError::RootIdentityMismatch);
@@ -429,6 +453,8 @@ impl DeltaV1 {
         let mut sum = 0u64;
         sum = add_str(sum, &self.tenant_scope);
         sum = add_str(sum, &self.database_id);
+        sum = add_str(sum, &self.database_incarnation_id);
+        sum = add_str(sum, &self.object_prefix);
         sum = add_str(sum, &self.writer_id);
         sum = sum.wrapping_add(self.lease_epoch);
         sum = sum.wrapping_add(self.base_database_version);
@@ -465,6 +491,11 @@ fn add_str(mut sum: u64, value: &str) -> u64 {
     sum
 }
 
+fn key_has_object_prefix(key: &str, object_prefix: &str) -> bool {
+    key.strip_prefix(object_prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 impl DeltaPageV1 {
     pub fn validate(&self, page_size: u32, end_page_count: u64) -> ContractResult<()> {
         if self.page_number >= end_page_count {
@@ -490,6 +521,8 @@ fn validate_common(
     format_version: u16,
     tenant_scope: &str,
     database_id: &str,
+    database_incarnation_id: &str,
+    object_prefix: &str,
     writer_id: &str,
     lease_epoch: u64,
 ) -> ContractResult<()> {
@@ -498,6 +531,8 @@ fn validate_common(
     }
     require_nonempty("tenant_scope", tenant_scope)?;
     require_nonempty("database_id", database_id)?;
+    require_nonempty("database_incarnation_id", database_incarnation_id)?;
+    require_nonempty("object_prefix", object_prefix)?;
     require_nonempty("writer_id", writer_id)?;
     require_nonzero("lease_epoch", lease_epoch)?;
     Ok(())
@@ -712,6 +747,58 @@ mod tests {
             .validate_after_root(&root)
             .expect_err("wrong tenant must fail");
         assert_eq!(err, ContractError::RootIdentityMismatch);
+    }
+
+    #[test]
+    fn recovery_plan_rejects_copied_database_incarnation_mismatch() {
+        let root = root_fixture();
+        let mut checkpoint = checkpoint_fixture();
+        checkpoint.database_incarnation_id = "incarnation-copy".to_string();
+
+        let err = select_recovery_plan(&root, &[checkpoint], &[], 128)
+            .expect_err("copied/restored database identity mismatch must fail before replay");
+
+        assert_eq!(err, ContractError::RootIdentityMismatch);
+    }
+
+    #[test]
+    fn recovery_plan_rejects_wrong_object_prefix() {
+        let root = root_fixture();
+        let mut checkpoint = checkpoint_fixture();
+        checkpoint.object_prefix = "tenant-a/scope-a/db-beta".to_string();
+        checkpoint.page_objects[0].key =
+            "tenant-a/scope-a/db-beta/checkpoints/chk-0001/pages-0000-0001".to_string();
+
+        let err = select_recovery_plan(&root, &[checkpoint], &[], 128)
+            .expect_err("wrong object prefix must fail before replay");
+
+        assert_eq!(err, ContractError::RootIdentityMismatch);
+    }
+
+    #[test]
+    fn checkpoint_rejects_page_object_outside_prefix() {
+        let mut checkpoint = checkpoint_fixture();
+        checkpoint.page_objects[0].key =
+            "tenant-b/scope-a/db-alpha/checkpoints/chk-0001/pages-0000-0001".to_string();
+
+        let err = checkpoint
+            .validate()
+            .expect_err("page object key outside checkpoint prefix must fail closed");
+
+        assert_eq!(err, ContractError::WrongObjectPrefix);
+    }
+
+    #[test]
+    fn checkpoint_rejects_page_object_with_prefix_sibling() {
+        let mut checkpoint = checkpoint_fixture();
+        checkpoint.page_objects[0].key =
+            "tenant-a/scope-a/db-alpha-copy/checkpoints/chk-0001/pages-0000-0001".to_string();
+
+        let err = checkpoint
+            .validate()
+            .expect_err("sibling prefix must not satisfy object prefix validation");
+
+        assert_eq!(err, ContractError::WrongObjectPrefix);
     }
 
     #[test]

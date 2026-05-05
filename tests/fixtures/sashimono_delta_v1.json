@@ -3,6 +3,8 @@
   "format_version": 1,
   "tenant_scope": "tenant-a/scope-a",
   "database_id": "db-alpha",
+  "database_incarnation_id": "incarnation-0001",
+  "object_prefix": "tenant-a/scope-a/db-alpha",
   "writer_id": "writer-a",
   "lease_epoch": 7,
   "base_database_version": 1,
@@ -22,6 +24,6 @@
       "bytes": [9, 9, 9, 9]
     }
   ],
-  "checksum": 4142,
+  "checksum": 7881,
   "replay_idempotency_key": "db-alpha:7:1"
 }
