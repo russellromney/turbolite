@@ -52,6 +52,7 @@ pub struct CheckpointV1 {
     pub writer_id: String,
     pub lease_epoch: u64,
     pub checkpoint_id: String,
+    pub checkpoint_delta_sequence: u64,
     pub database_version: u64,
     pub page_size: u32,
     pub database_page_count: u64,
@@ -123,6 +124,12 @@ pub enum ContractError {
         expected: u64,
         actual: u64,
     },
+    MissingCheckpoint(String),
+    MissingDelta(u64),
+    ReplayChainTooLong {
+        max: u64,
+        actual: u64,
+    },
     DeltaPageOutOfRange {
         page_number: u64,
         end_page_count: u64,
@@ -152,6 +159,12 @@ impl fmt::Display for ContractError {
 impl std::error::Error for ContractError {}
 
 pub type ContractResult<T> = Result<T, ContractError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPlanV1 {
+    pub checkpoint: CheckpointV1,
+    pub deltas: Vec<DeltaV1>,
+}
 
 impl RootPointerV1 {
     pub fn validate(&self) -> ContractResult<()> {
@@ -212,6 +225,67 @@ impl CheckpointV1 {
     }
 }
 
+pub fn select_recovery_plan(
+    root: &RootPointerV1,
+    checkpoints: &[CheckpointV1],
+    deltas: &[DeltaV1],
+    max_delta_replay: u64,
+) -> ContractResult<RecoveryPlanV1> {
+    root.validate()?;
+    let checkpoint = checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == root.checkpoint_id)
+        .ok_or_else(|| ContractError::MissingCheckpoint(root.checkpoint_id.clone()))?;
+    validate_checkpoint_for_root(checkpoint, root)?;
+
+    if checkpoint.checkpoint_delta_sequence > root.latest_delta_sequence {
+        return Err(ContractError::NonContiguousDelta {
+            expected: checkpoint.checkpoint_delta_sequence,
+            actual: root.latest_delta_sequence,
+        });
+    }
+    let replay_len = root.latest_delta_sequence - checkpoint.checkpoint_delta_sequence;
+    if replay_len > max_delta_replay {
+        return Err(ContractError::ReplayChainTooLong {
+            max: max_delta_replay,
+            actual: replay_len,
+        });
+    }
+
+    let mut planned = Vec::with_capacity(replay_len as usize);
+    let mut expected_version = checkpoint.database_version;
+    let mut expected_page_count = checkpoint.database_page_count;
+
+    for expected_sequence in checkpoint.checkpoint_delta_sequence + 1..=root.latest_delta_sequence {
+        let delta = deltas
+            .iter()
+            .find(|delta| delta.sequence == expected_sequence)
+            .ok_or(ContractError::MissingDelta(expected_sequence))?;
+        validate_delta_after_state(
+            delta,
+            root,
+            expected_sequence,
+            expected_version,
+            expected_page_count,
+        )?;
+        expected_version = delta.end_database_version;
+        expected_page_count = delta.end_database_page_count;
+        planned.push(delta.clone());
+    }
+
+    if expected_version != root.latest_database_version {
+        return Err(ContractError::VersionMismatch {
+            expected: root.latest_database_version,
+            actual: expected_version,
+        });
+    }
+
+    Ok(RecoveryPlanV1 {
+        checkpoint: checkpoint.clone(),
+        deltas: planned,
+    })
+}
+
 impl PageObjectRefV1 {
     pub fn validate(&self, database_page_count: u64) -> ContractResult<()> {
         require_nonempty("page_object.key", &self.key)?;
@@ -233,6 +307,64 @@ impl PageObjectRefV1 {
         }
         Ok(())
     }
+}
+
+fn validate_checkpoint_for_root(
+    checkpoint: &CheckpointV1,
+    root: &RootPointerV1,
+) -> ContractResult<()> {
+    checkpoint.validate()?;
+    if checkpoint.tenant_scope != root.tenant_scope
+        || checkpoint.database_id != root.database_id
+        || checkpoint.writer_id != root.writer_id
+        || checkpoint.lease_epoch != root.lease_epoch
+        || checkpoint.checkpoint_id != root.checkpoint_id
+    {
+        return Err(ContractError::RootIdentityMismatch);
+    }
+    if checkpoint.database_version > root.latest_database_version {
+        return Err(ContractError::VersionMismatch {
+            expected: root.latest_database_version,
+            actual: checkpoint.database_version,
+        });
+    }
+    Ok(())
+}
+
+fn validate_delta_after_state(
+    delta: &DeltaV1,
+    root: &RootPointerV1,
+    expected_sequence: u64,
+    expected_version: u64,
+    expected_page_count: u64,
+) -> ContractResult<()> {
+    delta.validate()?;
+    if delta.tenant_scope != root.tenant_scope
+        || delta.database_id != root.database_id
+        || delta.writer_id != root.writer_id
+        || delta.lease_epoch != root.lease_epoch
+    {
+        return Err(ContractError::RootIdentityMismatch);
+    }
+    if delta.sequence != expected_sequence {
+        return Err(ContractError::NonContiguousDelta {
+            expected: expected_sequence,
+            actual: delta.sequence,
+        });
+    }
+    if delta.base_database_version != expected_version {
+        return Err(ContractError::VersionMismatch {
+            expected: expected_version,
+            actual: delta.base_database_version,
+        });
+    }
+    if delta.base_database_page_count != expected_page_count {
+        return Err(ContractError::DatabaseSizeMismatch {
+            expected: expected_page_count,
+            actual: delta.base_database_page_count,
+        });
+    }
+    Ok(())
 }
 
 impl DeltaV1 {
@@ -443,6 +575,108 @@ mod tests {
         let delta = delta_fixture();
         assert_eq!(delta.checksum, delta.content_checksum());
         delta.validate().expect("delta fixture validates");
+    }
+
+    #[test]
+    fn recovery_plan_uses_root_reachable_checkpoint_and_ordered_deltas() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let delta = delta_fixture();
+        let plan = select_recovery_plan(&root, &[checkpoint.clone()], &[delta.clone()], 128)
+            .expect("root reachable checkpoint plus contiguous delta plans");
+
+        assert_eq!(plan.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+        assert_eq!(plan.deltas, vec![delta]);
+    }
+
+    #[test]
+    fn recovery_plan_ignores_complete_but_root_unreachable_checkpoint() {
+        let mut root = root_fixture();
+        root.checkpoint_id = "chk-0002".to_string();
+        let checkpoint = checkpoint_fixture();
+
+        let err = select_recovery_plan(&root, &[checkpoint], &[], 128)
+            .expect_err("complete but root-unreachable checkpoint must not be current");
+
+        assert_eq!(
+            err,
+            ContractError::MissingCheckpoint("chk-0002".to_string())
+        );
+    }
+
+    #[test]
+    fn recovery_plan_does_not_let_listing_order_select_newer_checkpoint() {
+        let root = root_fixture();
+        let checkpoint = checkpoint_fixture();
+        let mut unreachable = checkpoint.clone();
+        unreachable.checkpoint_id = "chk-9999".to_string();
+        unreachable.checkpoint_delta_sequence = 99;
+        unreachable.database_version = 100;
+
+        let plan = select_recovery_plan(&root, &[unreachable, checkpoint.clone()], &[], 128)
+            .expect("root pointer, not listing order, chooses current checkpoint");
+
+        assert_eq!(plan.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+        assert!(plan.deltas.is_empty());
+    }
+
+    #[test]
+    fn recovery_plan_rejects_missing_delta_gap() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 2;
+        root.latest_database_version = 3;
+
+        let checkpoint = checkpoint_fixture();
+        let delta = delta_fixture();
+        let err = select_recovery_plan(&root, &[checkpoint], &[delta], 128)
+            .expect_err("missing sequence 2 must fail closed");
+
+        assert_eq!(err, ContractError::MissingDelta(2));
+    }
+
+    #[test]
+    fn recovery_plan_rejects_replay_chain_over_budget() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 129;
+        root.latest_database_version = 130;
+
+        let checkpoint = checkpoint_fixture();
+        let err = select_recovery_plan(&root, &[checkpoint], &[], 128)
+            .expect_err("too many deltas since checkpoint must force checkpoint/compaction");
+
+        assert_eq!(
+            err,
+            ContractError::ReplayChainTooLong {
+                max: 128,
+                actual: 129
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_plan_rejects_wrong_base_page_count() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let mut delta = delta_fixture();
+        delta.base_database_page_count = checkpoint.database_page_count + 1;
+        delta.checksum = delta.content_checksum();
+
+        let err = select_recovery_plan(&root, &[checkpoint.clone()], &[delta], 128)
+            .expect_err("delta must start from checkpoint page count");
+
+        assert_eq!(
+            err,
+            ContractError::DatabaseSizeMismatch {
+                expected: checkpoint.database_page_count,
+                actual: checkpoint.database_page_count + 1
+            }
+        );
     }
 
     #[test]

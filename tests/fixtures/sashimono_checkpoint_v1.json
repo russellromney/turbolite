@@ -6,6 +6,7 @@
   "writer_id": "writer-a",
   "lease_epoch": 7,
   "checkpoint_id": "chk-0001",
+  "checkpoint_delta_sequence": 0,
   "database_version": 1,
   "page_size": 4,
   "database_page_count": 2,
