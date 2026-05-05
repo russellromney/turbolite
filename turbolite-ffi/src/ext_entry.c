@@ -40,9 +40,12 @@ extern void turbolite_trace_end_query(void);
 /* Rust bench functions -- cache control and S3 counters.
  * Defined in src/ext.rs. Available when built with tiered feature. */
 extern int turbolite_bench_clear_cache(int mode);
+extern int turbolite_bench_flush_to_storage(void);
 extern int turbolite_bench_reset_s3(void);
 extern long long turbolite_bench_s3_gets(void);
 extern long long turbolite_bench_s3_bytes(void);
+extern long long turbolite_bench_s3_puts(void);
+extern long long turbolite_bench_s3_put_bytes(void);
 
 /* Rust function -- full GC scan. Defined in src/ext.rs. */
 extern int turbolite_gc(void);
@@ -138,6 +141,18 @@ static void turbolite_clear_cache_func(
     sqlite3_result_int(ctx, rc);
 }
 
+/* turbolite_flush_to_storage() -- drain local-then-flush staging logs. */
+static void turbolite_flush_to_storage_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    int rc = turbolite_bench_flush_to_storage();
+    sqlite3_result_int(ctx, rc);
+}
+
 /* turbolite_reset_s3_counters() -- reset S3 GET/byte counters. */
 static void turbolite_reset_s3_func(
     sqlite3_context *ctx,
@@ -170,6 +185,28 @@ static void turbolite_s3_bytes_func(
     (void)argc;
     (void)argv;
     sqlite3_result_int64(ctx, turbolite_bench_s3_bytes());
+}
+
+/* turbolite_s3_puts() -- return S3 PUT count since last reset. */
+static void turbolite_s3_puts_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int64(ctx, turbolite_bench_s3_puts());
+}
+
+/* turbolite_s3_put_bytes() -- return S3 bytes uploaded since last reset. */
+static void turbolite_s3_put_bytes_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    sqlite3_result_int64(ctx, turbolite_bench_s3_put_bytes());
 }
 
 /*
@@ -471,6 +508,10 @@ int sqlite3_turbolite_init(
         SQLITE_UTF8, 0, turbolite_clear_cache_func, 0, 0, 0
     );
     sqlite3_create_function_v2(
+        db, "turbolite_flush_to_storage", 0,
+        SQLITE_UTF8, 0, turbolite_flush_to_storage_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
         db, "turbolite_reset_s3_counters", 0,
         SQLITE_UTF8, 0, turbolite_reset_s3_func, 0, 0, 0
     );
@@ -481,6 +522,14 @@ int sqlite3_turbolite_init(
     sqlite3_create_function_v2(
         db, "turbolite_s3_bytes", 0,
         SQLITE_UTF8, 0, turbolite_s3_bytes_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_s3_puts", 0,
+        SQLITE_UTF8, 0, turbolite_s3_puts_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_s3_put_bytes", 0,
+        SQLITE_UTF8, 0, turbolite_s3_put_bytes_func, 0, 0, 0
     );
 
     /* cache eviction + observability. */

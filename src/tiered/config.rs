@@ -197,6 +197,14 @@ impl CacheConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.compression_level),
+            pages_per_group: std::env::var("TURBOLITE_PAGES_PER_GROUP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.pages_per_group),
+            sub_pages_per_frame: std::env::var("TURBOLITE_SUB_PAGES_PER_FRAME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.sub_pages_per_frame),
             override_threshold: std::env::var("TURBOLITE_OVERRIDE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -255,10 +263,24 @@ impl PrefetchConfig {
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
+            search: std::env::var("TURBOLITE_PREFETCH_SEARCH")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_hops(&v))
+                .unwrap_or(d.search),
+            lookup: std::env::var("TURBOLITE_PREFETCH_LOOKUP")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_hops(&v))
+                .unwrap_or(d.lookup),
             threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.threads),
+            query_plan: std::env::var("TURBOLITE_PLAN_AWARE")
+                .map(|v| !matches!(v.as_str(), "false" | "0"))
+                .unwrap_or(d.query_plan),
+            prediction: std::env::var("TURBOLITE_PREDICTION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(d.prediction),
             manifest_source: std::env::var("TURBOLITE_MANIFEST_SOURCE")
                 .ok()
                 .map(|v| match v.to_lowercase().as_str() {

@@ -30,12 +30,208 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static LOCAL_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "cli-s3")]
+static FLUSH_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
 #[cfg(feature = "cli-s3")]
 static BENCH_HANDLE: std::sync::OnceLock<turbolite::tiered::TurboliteSharedState> =
     std::sync::OnceLock::new();
+
+#[cfg(feature = "cli-s3")]
+#[derive(Default)]
+struct StorageCounters {
+    gets: std::sync::atomic::AtomicU64,
+    get_bytes: std::sync::atomic::AtomicU64,
+    puts: std::sync::atomic::AtomicU64,
+    put_bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "cli-s3")]
+struct CounterBaselines {
+    counters: Option<std::sync::Arc<StorageCounters>>,
+    base_gets: u64,
+    base_get_bytes: u64,
+    base_puts: u64,
+    base_put_bytes: u64,
+}
+
+#[cfg(feature = "cli-s3")]
+impl Default for CounterBaselines {
+    fn default() -> Self {
+        Self {
+            counters: None,
+            base_gets: 0,
+            base_get_bytes: 0,
+            base_puts: 0,
+            base_put_bytes: 0,
+        }
+    }
+}
+
+#[cfg(feature = "cli-s3")]
+struct CountingStorageBackend {
+    inner: std::sync::Arc<dyn hadb_storage::StorageBackend>,
+    counters: std::sync::Arc<StorageCounters>,
+}
+
+#[cfg(feature = "cli-s3")]
+impl CountingStorageBackend {
+    fn new(
+        inner: std::sync::Arc<dyn hadb_storage::StorageBackend>,
+    ) -> (Self, std::sync::Arc<StorageCounters>) {
+        let counters = std::sync::Arc::new(StorageCounters::default());
+        (
+            Self {
+                inner,
+                counters: counters.clone(),
+            },
+            counters,
+        )
+    }
+}
+
+#[cfg(feature = "cli-s3")]
+#[async_trait::async_trait]
+impl hadb_storage::StorageBackend for CountingStorageBackend {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = self.inner.get(key).await?;
+        if let Some(bytes) = &result {
+            self.counters
+                .gets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .get_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put(key, data).await?;
+        self.counters
+            .puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters
+            .put_bytes
+            .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> anyhow::Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> anyhow::Result<hadb_storage::CasResult> {
+        let result = self.inner.put_if_absent(key, data).await?;
+        if result.success {
+            self.counters
+                .puts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .put_bytes
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> anyhow::Result<hadb_storage::CasResult> {
+        let result = self.inner.put_if_match(key, data, etag).await?;
+        if result.success {
+            self.counters
+                .puts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .put_bytes
+                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = self.inner.range_get(key, start, len).await?;
+        if let Some(bytes) = &result {
+            self.counters
+                .gets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .get_bytes
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    async fn delete_many(&self, keys: &[String]) -> anyhow::Result<usize> {
+        self.inner.delete_many(keys).await
+    }
+
+    async fn put_many(&self, entries: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
+        self.inner.put_many(entries).await?;
+        let bytes = entries
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
+        self.counters
+            .puts
+            .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.counters
+            .put_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn backend_name(&self) -> &str {
+        self.inner.backend_name()
+    }
+}
+
+#[cfg(feature = "cli-s3")]
+static S3_COUNTERS: std::sync::OnceLock<std::sync::Mutex<CounterBaselines>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "cli-s3")]
+fn s3_counters() -> &'static std::sync::Mutex<CounterBaselines> {
+    S3_COUNTERS.get_or_init(|| std::sync::Mutex::new(CounterBaselines::default()))
+}
+
+#[cfg(feature = "cli-s3")]
+fn start_background_flush(interval_ms: u64) {
+    if interval_ms == 0 || FLUSH_THREAD_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let interval = std::time::Duration::from_millis(interval_ms);
+        loop {
+            std::thread::sleep(interval);
+            if let Some(handle) = BENCH_HANDLE.get() {
+                if handle.has_pending_flush() {
+                    if let Err(e) = handle.flush_to_storage() {
+                        eprintln!("turbolite: background flush failed: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -87,15 +283,61 @@ fn register_local() -> Result<(), std::io::Error> {
 
 #[cfg(feature = "cli-s3")]
 fn register_tiered() -> Result<(), std::io::Error> {
-    // The loadable-extension's S3 wiring used the old bucket / prefix /
-    // endpoint_url fields on TurboliteConfig. With the backend-agnostic
-    // refactor those fields live on the hadb_storage_s3 construction path
-    // (the Rust API exposes with_backend). Rewiring the extension
-    // entrypoint is tracked under Phase Turbogenesis c5.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "turbolite loadable-extension S3 mode is being rewired in Phase Turbogenesis c5",
-    ))
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+
+    let bucket =
+        std::env::var("TURBOLITE_BUCKET").expect("TURBOLITE_BUCKET must be set for tiered mode");
+    let prefix = std::env::var("TURBOLITE_PREFIX").unwrap_or_else(|_| "turbolite".into());
+    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/turbolite"));
+    let endpoint_url = std::env::var("TURBOLITE_ENDPOINT_URL")
+        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+        .ok();
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let handle = runtime.handle().clone();
+    let backend = handle
+        .block_on(async {
+            hadb_storage_s3::S3Storage::from_env(bucket, endpoint_url.as_deref())
+                .await
+                .map(|storage| storage.with_prefix(prefix))
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(backend);
+    let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
+    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
+    {
+        let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+        counters.counters = Some(counters_handle);
+        counters.base_gets = 0;
+        counters.base_get_bytes = 0;
+        counters.base_puts = 0;
+        counters.base_put_bytes = 0;
+    }
+
+    let config = TurboliteConfig {
+        cache_dir,
+        ..TurboliteConfig::from_env()
+    };
+    turbolite::tiered::set_local_checkpoint_only(
+        std::env::var("TURBOLITE_LOCAL_THEN_FLUSH")
+            .map(|v| !matches!(v.as_str(), "false" | "0"))
+            .unwrap_or(true),
+    );
+    let vfs = TurboliteVfs::with_backend(config, backend, handle)?;
+    let _ = BENCH_HANDLE.set(vfs.shared_state());
+    let flush_interval_ms = std::env::var("TURBOLITE_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15_000);
+    start_background_flush(flush_interval_ms);
+    // The VFS holds a runtime handle for async storage work. Keep the owned
+    // runtime alive for the process lifetime, matching the standalone FFI path.
+    std::mem::forget(runtime);
+    turbolite::tiered::register("turbolite-s3", vfs)
 }
 
 // ── Bench SQL functions (FFI, called from ext_entry.c) ──────────────────
@@ -119,12 +361,45 @@ pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
     }
 }
 
+#[cfg(feature = "cli-s3")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
+    match BENCH_HANDLE.get() {
+        Some(h) => match h.flush_to_storage() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("turbolite: flush_to_storage failed: {e}");
+                1
+            }
+        },
+        None => 1,
+    }
+}
+
 /// Reset S3 counters. Always returns 0; counters are now backend-impl
 /// specific and not exposed through the generic trait.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
-    0
+    let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+    match counters.counters.clone() {
+        Some(storage_counters) => {
+            counters.base_gets = storage_counters
+                .gets
+                .load(std::sync::atomic::Ordering::Relaxed);
+            counters.base_get_bytes = storage_counters
+                .get_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            counters.base_puts = storage_counters
+                .puts
+                .load(std::sync::atomic::Ordering::Relaxed);
+            counters.base_put_bytes = storage_counters
+                .put_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        None => 1,
+    }
 }
 
 /// Get S3 GET count. Returns 0: not surfaced through the generic
@@ -133,14 +408,56 @@ pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
-    0
+    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+    counters.counters.as_ref().map_or(0, |storage_counters| {
+        storage_counters
+            .gets
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(counters.base_gets) as i64
+    })
 }
 
 /// Get S3 GET bytes. Always 0; see above.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
-    0
+    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+    counters.counters.as_ref().map_or(0, |storage_counters| {
+        storage_counters
+            .get_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(counters.base_get_bytes) as i64
+    })
+}
+
+#[cfg(feature = "cli-s3")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_s3_puts() -> i64 {
+    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+    counters.counters.as_ref().map_or(0, |storage_counters| {
+        storage_counters
+            .puts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(counters.base_puts) as i64
+    })
+}
+
+#[cfg(feature = "cli-s3")]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_s3_put_bytes() -> i64 {
+    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+    counters.counters.as_ref().map_or(0, |storage_counters| {
+        storage_counters
+            .put_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(counters.base_put_bytes) as i64
+    })
+}
+
+#[cfg(not(feature = "cli-s3"))]
+#[no_mangle]
+pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
+    1
 }
 
 // Cache eviction + observability
