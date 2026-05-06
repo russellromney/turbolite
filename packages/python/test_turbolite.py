@@ -94,6 +94,21 @@ def test_local_relative_path():
     print("  PASS")
 
 
+def test_local_rejects_nonexistent_parent_dir():
+    """connect() must surface a clear error when the parent directory
+    doesn't exist, instead of producing a confusing SQLite error from
+    inside the VFS."""
+    print("test: file-first rejects nonexistent parent dir...")
+    bogus = "/this-path-does-not-exist-12345/app.db"
+    raised = False
+    try:
+        turbolite.connect(bogus)
+    except FileNotFoundError as e:
+        raised = "directory does not exist" in str(e)
+    assert raised, "must raise FileNotFoundError for missing parent dir"
+    print("  PASS")
+
+
 def test_local_two_databases_isolated():
     """Local mode: two app.db files in different directories get distinct
     sidecars and do not share manifest state."""
@@ -238,6 +253,7 @@ if __name__ == "__main__":
     test_local_basic_crud()
     test_local_file_first_layout()
     test_local_relative_path()
+    test_local_rejects_nonexistent_parent_dir()
     test_local_two_databases_isolated()
     test_local_export_to_stock_sqlite()
     test_s3_requires_bucket()

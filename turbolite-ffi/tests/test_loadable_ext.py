@@ -494,6 +494,155 @@ def _():
         conn.close()
 
 
+# ── File-first SQL function: turbolite_register_file_first_vfs ────
+
+
+@test("turbolite_register_file_first_vfs(name, db_path) registers a file-first VFS")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "app.db")
+        boot = sqlite3.connect(":memory:")
+        load_ext(boot)
+        rc = boot.execute(
+            "SELECT turbolite_register_file_first_vfs(?, ?)",
+            (f"file-first-sql-{os.getpid()}", db_path),
+        ).fetchone()[0]
+        assert rc == 0, f"register failed with rc={rc}"
+        boot.close()
+
+        # Open through the registered VFS and write data.
+        conn = sqlite3.connect(
+            f"file:{db_path}?vfs=file-first-sql-{os.getpid()}", uri=True
+        )
+        conn.execute("CREATE TABLE t (i INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        conn.close()
+
+        assert os.path.isfile(db_path)
+        sidecar = db_path + "-turbolite"
+        assert os.path.isdir(sidecar)
+        assert os.path.isfile(os.path.join(sidecar, "local_state.msgpack"))
+
+
+@test("turbolite_register_file_first_vfs requires both name and db_path")
+def _():
+    boot = sqlite3.connect(":memory:")
+    load_ext(boot)
+    # Both args required — passing NULL surfaces as a SQL error.
+    raised = False
+    try:
+        boot.execute(
+            "SELECT turbolite_register_file_first_vfs(NULL, '/tmp/x')"
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        raised = "name and db_path required" in str(e)
+    assert raised, "NULL name must surface error"
+
+    raised = False
+    try:
+        boot.execute(
+            "SELECT turbolite_register_file_first_vfs('x', NULL)"
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        raised = "name and db_path required" in str(e)
+    assert raised, "NULL db_path must surface error"
+    boot.close()
+
+
+# ── TURBOLITE_DATABASE_PATH env var (file-first default VFS) ──────
+
+
+@test("TURBOLITE_DATABASE_PATH respects other TURBOLITE_* env knobs (read-only)")
+def _():
+    # Regression test: file-first registration must keep applying
+    # TurboliteConfig::from_env() so other env vars (TURBOLITE_READ_ONLY,
+    # compression, prefetch) are still honored. Verify by setting
+    # TURBOLITE_READ_ONLY=true and confirming writes are rejected.
+    import subprocess
+    import textwrap
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "ro.db")
+
+        seed_src = textwrap.dedent(f"""
+            import os, sqlite3
+            os.environ['TURBOLITE_DATABASE_PATH'] = {db_path!r}
+            boot = sqlite3.connect(':memory:')
+            boot.enable_load_extension(True)
+            boot.load_extension({EXT_PATH!r})
+            boot.close()
+            app = sqlite3.connect('file:{db_path}?vfs=turbolite', uri=True)
+            app.execute('CREATE TABLE t (v INTEGER)')
+            app.execute('INSERT INTO t VALUES (1)')
+            app.commit()
+            app.close()
+            """)
+        rc = subprocess.run(
+            [sys.executable, "-c", seed_src], capture_output=True, text=True
+        )
+        assert rc.returncode == 0, f"seed failed: {rc.stderr}"
+
+        ro_src = textwrap.dedent(f"""
+            import os, sqlite3, sys
+            os.environ['TURBOLITE_DATABASE_PATH'] = {db_path!r}
+            os.environ['TURBOLITE_READ_ONLY'] = 'true'
+            boot = sqlite3.connect(':memory:')
+            boot.enable_load_extension(True)
+            boot.load_extension({EXT_PATH!r})
+            boot.close()
+            app = sqlite3.connect('file:{db_path}?vfs=turbolite', uri=True)
+            ok = False
+            try:
+                app.execute('INSERT INTO t VALUES (2)')
+                app.commit()
+            except sqlite3.OperationalError:
+                # Any failure to write under TURBOLITE_READ_ONLY=true is a
+                # signal that the env var was applied to the file-first config.
+                # Turbolite surfaces read-only writes as "disk I/O error".
+                ok = True
+            app.close()
+            sys.exit(0 if ok else 1)
+            """)
+        rc = subprocess.run(
+            [sys.executable, "-c", ro_src], capture_output=True, text=True
+        )
+        assert rc.returncode == 0, (
+            f"read-only env var was not honored in file-first mode: "
+            f"stderr={rc.stderr} stdout={rc.stdout}"
+        )
+
+
+@test("TURBOLITE_DATABASE_PATH triggers file-first layout for default VFS")
+def _():
+    # The extension is process-loaded once; env vars only matter on first
+    # init. This test forks a fresh Python so it sees a clean process.
+    with tempfile.TemporaryDirectory() as d:
+        db_path = os.path.join(d, "envapp.db")
+        script = (
+            "import os, sqlite3, sys; "
+            f"os.environ['TURBOLITE_DATABASE_PATH'] = {db_path!r}; "
+            "conn = sqlite3.connect(':memory:'); "
+            "conn.enable_load_extension(True); "
+            f"conn.load_extension({EXT_PATH!r}); "
+            "conn.close(); "
+            f"app = sqlite3.connect('file:{db_path}?vfs=turbolite', uri=True); "
+            "app.execute('CREATE TABLE t (i INTEGER)'); "
+            "app.execute('INSERT INTO t VALUES (42)'); "
+            "app.commit(); app.close(); "
+            f"assert os.path.isfile({db_path!r}), 'app.db missing'; "
+            f"assert os.path.isdir({db_path!r} + '-turbolite'), 'sidecar missing'"
+        )
+        import subprocess
+        rc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+        assert rc.returncode == 0, (
+            f"subprocess failed: {rc.stderr}\nstdout: {rc.stdout}"
+        )
+
+
 # ── Summary ───────────────────────────────────────────────────────
 
 

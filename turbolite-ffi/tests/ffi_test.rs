@@ -260,6 +260,88 @@ fn test_register_local_file_first_layout() {
 }
 
 #[test]
+fn test_register_local_file_first_null_name_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = CString::new(dir.path().join("app.db").to_str().unwrap()).unwrap();
+    let rc = turbolite_register_local_file_first(std::ptr::null(), db_path.as_ptr(), 3);
+    assert_eq!(rc, -1);
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("name"), "expected 'name' in error: {msg}");
+}
+
+#[test]
+fn test_register_local_file_first_null_database_path_fails() {
+    let name = CString::new("ffi-file-first-null-path").unwrap();
+    let rc = turbolite_register_local_file_first(name.as_ptr(), std::ptr::null(), 3);
+    assert_eq!(rc, -1);
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(
+        msg.contains("database_path"),
+        "expected 'database_path' in error: {msg}"
+    );
+}
+
+#[test]
+fn test_register_local_file_first_honors_compression_level() {
+    // Regression test: the file-first FFI helper must apply the
+    // compression_level argument the same way the lower-level helper does.
+    // Build with two different levels and confirm both succeed end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    for (suffix, level) in [("a", 1), ("b", 22)] {
+        let db_path = dir.path().join(format!("app-{suffix}.db"));
+        let vfs = CString::new(format!("ffi-file-first-comp-{suffix}")).unwrap();
+        let dbp = CString::new(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            turbolite_register_local_file_first(vfs.as_ptr(), dbp.as_ptr(), level),
+            0,
+            "level={level} must succeed"
+        );
+        let db = turbolite_open(dbp.as_ptr(), vfs.as_ptr());
+        assert!(!db.is_null());
+        let sql = CString::new("CREATE TABLE t (i INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+        turbolite_close(db);
+        assert!(db_path.is_file());
+    }
+}
+
+#[test]
+fn test_register_local_file_first_rejects_alias_open() {
+    // File-first VFS identity contract: opening a different filename
+    // through the same VFS must be rejected. This proves the binding
+    // layer can rely on per-VFS path identity for isolation.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("app.db");
+    let other_path = dir.path().join("other.db");
+    let vfs_name = CString::new("ffi-file-first-alias").unwrap();
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let other_path_c = CString::new(other_path.to_str().unwrap()).unwrap();
+
+    assert_eq!(
+        turbolite_register_local_file_first(vfs_name.as_ptr(), db_path_c.as_ptr(), 3),
+        0
+    );
+
+    // Opening the registered path is fine.
+    let db = turbolite_open(db_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null(), "registered path must open");
+    turbolite_close(db);
+
+    // Opening a different path through the same VFS must fail.
+    let aliased = turbolite_open(other_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(
+        aliased.is_null(),
+        "file-first VFS must reject mismatched alias open"
+    );
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+}
+
+#[test]
 fn test_state_dir_for_database_path_helper() {
     let path = CString::new("/tmp/app.db").unwrap();
     let ptr = turbolite_state_dir_for_database_path(path.as_ptr());
