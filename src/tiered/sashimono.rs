@@ -133,6 +133,7 @@ pub enum ContractError {
     },
     MissingCheckpoint(String),
     MissingDelta(u64),
+    DuplicateDelta(u64),
     ReplayChainTooLong {
         max: u64,
         actual: u64,
@@ -273,18 +274,27 @@ pub fn select_recovery_plan(
     let mut planned = Vec::with_capacity(replay_len as usize);
     let mut expected_version = checkpoint.database_version;
     let mut expected_page_count = checkpoint.database_page_count;
+    let expected_page_size = checkpoint.page_size;
 
     for expected_sequence in checkpoint.checkpoint_delta_sequence + 1..=root.latest_delta_sequence {
-        let delta = deltas
+        let candidates: Vec<&DeltaV1> = deltas
             .iter()
-            .find(|delta| delta.sequence == expected_sequence)
-            .ok_or(ContractError::MissingDelta(expected_sequence))?;
+            .filter(|delta| {
+                delta.sequence == expected_sequence && delta_has_root_identity(delta, root)
+            })
+            .collect();
+        let delta = match candidates.as_slice() {
+            [] => return Err(ContractError::MissingDelta(expected_sequence)),
+            [delta] => *delta,
+            _ => return Err(ContractError::DuplicateDelta(expected_sequence)),
+        };
         validate_delta_after_state(
             delta,
             root,
             expected_sequence,
             expected_version,
             expected_page_count,
+            expected_page_size,
         )?;
         expected_version = delta.end_database_version;
         expected_page_count = delta.end_database_page_count;
@@ -360,6 +370,7 @@ fn validate_delta_after_state(
     expected_sequence: u64,
     expected_version: u64,
     expected_page_count: u64,
+    expected_page_size: u32,
 ) -> ContractResult<()> {
     delta.validate()?;
     if delta.tenant_scope != root.tenant_scope
@@ -389,7 +400,22 @@ fn validate_delta_after_state(
             actual: delta.base_database_page_count,
         });
     }
+    if delta.page_size != expected_page_size {
+        return Err(ContractError::PageSizeMismatch {
+            expected: expected_page_size,
+            actual: delta.page_size,
+        });
+    }
     Ok(())
+}
+
+fn delta_has_root_identity(delta: &DeltaV1, root: &RootPointerV1) -> bool {
+    delta.tenant_scope == root.tenant_scope
+        && delta.database_id == root.database_id
+        && delta.database_incarnation_id == root.database_incarnation_id
+        && delta.object_prefix == root.object_prefix
+        && delta.writer_id == root.writer_id
+        && delta.lease_epoch == root.lease_epoch
 }
 
 impl DeltaV1 {
@@ -418,7 +444,7 @@ impl DeltaV1 {
         for page in &self.changed_pages {
             page.validate(self.page_size, self.end_database_page_count)?;
         }
-        let expected = self.content_checksum();
+        let expected = self.fixture_checksum();
         if self.checksum != expected {
             return Err(ContractError::DeltaChecksumMismatch {
                 expected,
@@ -435,6 +461,7 @@ impl DeltaV1 {
             || self.database_id != root.database_id
             || self.database_incarnation_id != root.database_incarnation_id
             || self.object_prefix != root.object_prefix
+            || self.writer_id != root.writer_id
             || self.lease_epoch != root.lease_epoch
         {
             return Err(ContractError::RootIdentityMismatch);
@@ -454,7 +481,12 @@ impl DeltaV1 {
         Ok(())
     }
 
-    pub fn content_checksum(&self) -> u64 {
+    /// Fixture-only checksum used by this compact contract vocabulary.
+    ///
+    /// Live Sashimono objects must use the production delta/checksum format,
+    /// not this additive helper. Keeping the method name explicit prevents the
+    /// fixture validator from being mistaken for a storage integrity primitive.
+    pub fn fixture_checksum(&self) -> u64 {
         let mut sum = 0u64;
         sum = add_str(sum, &self.tenant_scope);
         sum = add_str(sum, &self.database_id);
@@ -613,7 +645,7 @@ mod tests {
     #[test]
     fn golden_delta_fixture_validates() {
         let delta = delta_fixture();
-        assert_eq!(delta.checksum, delta.content_checksum());
+        assert_eq!(delta.checksum, delta.fixture_checksum());
         delta.validate().expect("delta fixture validates");
     }
 
@@ -705,7 +737,7 @@ mod tests {
         let checkpoint = checkpoint_fixture();
         let mut delta = delta_fixture();
         delta.base_database_page_count = checkpoint.database_page_count + 1;
-        delta.checksum = delta.content_checksum();
+        delta.checksum = delta.fixture_checksum();
 
         let err = select_recovery_plan(&root, &[checkpoint.clone()], &[delta], 128)
             .expect_err("delta must start from checkpoint page count");
@@ -715,6 +747,69 @@ mod tests {
             ContractError::DatabaseSizeMismatch {
                 expected: checkpoint.database_page_count,
                 actual: checkpoint.database_page_count + 1
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_plan_ignores_wrong_identity_delta_when_valid_candidate_exists() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let mut wrong_identity = delta_fixture();
+        wrong_identity.tenant_scope = "tenant-b/scope-a".to_string();
+        wrong_identity.checksum = wrong_identity.fixture_checksum();
+        let valid = delta_fixture();
+
+        let plan =
+            select_recovery_plan(&root, &[checkpoint], &[wrong_identity, valid.clone()], 128)
+                .expect("wrong-identity listing entry must not hide valid root-reachable delta");
+
+        assert_eq!(plan.deltas, vec![valid]);
+    }
+
+    #[test]
+    fn recovery_plan_rejects_duplicate_root_reachable_delta_sequence() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let delta_a = delta_fixture();
+        let mut delta_b = delta_fixture();
+        delta_b.replay_idempotency_key = "replay-different".to_string();
+        delta_b.checksum = delta_b.fixture_checksum();
+
+        let err = select_recovery_plan(&root, &[checkpoint], &[delta_a, delta_b], 128)
+            .expect_err("ambiguous same-sequence deltas must fail closed");
+
+        assert_eq!(err, ContractError::DuplicateDelta(1));
+    }
+
+    #[test]
+    fn recovery_plan_rejects_delta_page_size_mismatch() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let mut delta = delta_fixture();
+        delta.page_size = checkpoint.page_size * 2;
+        for page in &mut delta.changed_pages {
+            page.bytes.resize(delta.page_size as usize, 0xDD);
+        }
+        delta.checksum = delta.fixture_checksum();
+
+        let err = select_recovery_plan(&root, &[checkpoint.clone()], &[delta], 128)
+            .expect_err("delta page size must match checkpoint page size");
+
+        assert_eq!(
+            err,
+            ContractError::PageSizeMismatch {
+                expected: checkpoint.page_size,
+                actual: checkpoint.page_size * 2
             }
         );
     }
@@ -781,10 +876,22 @@ mod tests {
         let root = root_fixture();
         let mut delta = delta_fixture();
         delta.tenant_scope = "tenant-b/scope-a".to_string();
-        delta.checksum = delta.content_checksum();
+        delta.checksum = delta.fixture_checksum();
         let err = delta
             .validate_after_root(&root)
             .expect_err("wrong tenant must fail");
+        assert_eq!(err, ContractError::RootIdentityMismatch);
+    }
+
+    #[test]
+    fn delta_rejects_wrong_writer_before_replay() {
+        let root = root_fixture();
+        let mut delta = delta_fixture();
+        delta.writer_id = "writer-b".to_string();
+        delta.checksum = delta.fixture_checksum();
+        let err = delta
+            .validate_after_root(&root)
+            .expect_err("wrong writer must fail");
         assert_eq!(err, ContractError::RootIdentityMismatch);
     }
 
@@ -845,7 +952,7 @@ mod tests {
         let root = root_fixture();
         let mut delta = delta_fixture();
         delta.sequence += 1;
-        delta.checksum = delta.content_checksum();
+        delta.checksum = delta.fixture_checksum();
         let err = delta
             .validate_after_root(&root)
             .expect_err("sequence gap must fail");
@@ -862,7 +969,7 @@ mod tests {
     fn delta_rejects_wrong_end_database_size() {
         let mut delta = delta_fixture();
         delta.end_database_page_count = 1;
-        delta.checksum = delta.content_checksum();
+        delta.checksum = delta.fixture_checksum();
         let err = delta
             .validate()
             .expect_err("page beyond end page count must fail");
@@ -887,7 +994,7 @@ mod tests {
     fn delta_rejects_torn_page_bytes() {
         let mut delta = delta_fixture();
         delta.changed_pages[0].bytes.pop();
-        delta.checksum = delta.content_checksum();
+        delta.checksum = delta.fixture_checksum();
         let err = delta.validate().expect_err("short page must fail");
         assert!(matches!(err, ContractError::DeltaPageWrongSize { .. }));
     }

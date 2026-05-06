@@ -136,7 +136,7 @@ fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> Roll
     }
 }
 
-/// Extend a manifest for replay-driven growth.
+/// Move a manifest to replay's explicit target page count.
 ///
 /// Branches on strategy because the two encodings have incompatible
 /// invariants:
@@ -147,18 +147,25 @@ fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> Roll
 ///   `build_page_index` auto-detects "non-empty `group_pages`" and
 ///   flips strategy to `BTreeAware` (`manifest.rs:308-310`), which
 ///   would leave existing pages unindexed and break their resolution.
-/// - **BTreeAware**: `group_pages` is the source of truth. Append new
-///   page numbers `[old_page_count..new_page_count)` to the last
-///   existing group up to `pages_per_group`, then create new groups
-///   at the end. Rebuild `page_index`. `flush_dirty_groups` extends
-///   `page_group_keys` for new groups (`flush.rs:396-404`). Imported
-///   databases reach here because `import_sqlite_file` produces BTreeAware
-///   manifests.
-fn extend_for_growth(manifest: &mut Manifest, old_page_count: u64, new_page_count: u64) {
+/// - **BTreeAware**: `group_pages` is the source of truth. Shrink trims
+///   pages at or past `new_page_count`; growth appends page numbers
+///   `[old_page_count..new_page_count)` to the last existing group up to
+///   `pages_per_group`, then creates new groups at the end. Rebuild
+///   `page_index`. `flush_dirty_groups` extends `page_group_keys` for new
+///   groups (`flush.rs:396-404`). Imported databases reach here because
+///   `import_sqlite_file` produces BTreeAware manifests.
+fn set_replay_page_count(manifest: &mut Manifest, old_page_count: u64, new_page_count: u64) {
     use crate::tiered::config::GroupingStrategy;
 
     if new_page_count <= old_page_count {
         manifest.page_count = new_page_count;
+        if manifest.strategy == GroupingStrategy::BTreeAware {
+            for group in &mut manifest.group_pages {
+                group.retain(|page| *page < new_page_count);
+            }
+            manifest.group_pages.retain(|group| !group.is_empty());
+            manifest.build_page_index();
+        }
         return;
     }
 
@@ -263,6 +270,10 @@ pub struct ReplayHandle {
     ctx: ReplayContext,
     /// Turbolite zero-based page num -> page bytes.
     staged: BTreeMap<u64, Vec<u8>>,
+    /// Explicit end database page count from the delta stream, when known.
+    /// Required for shrink/truncation replay because changed pages alone
+    /// can only prove growth.
+    target_page_count: Option<u64>,
     /// Highest `sqlite_page_id` observed via `apply_page`. Used to
     /// detect database growth at finalize time.
     max_sqlite_page_id: u32,
@@ -291,6 +302,7 @@ impl ReplayHandle {
         Ok(Self {
             ctx,
             staged: BTreeMap::new(),
+            target_page_count: None,
             max_sqlite_page_id: 0,
             committed_seqs: Vec::new(),
             page_size,
@@ -334,6 +346,15 @@ impl ReplayHandle {
         // cycle; matches walrust's WAL-frame semantics where a later
         // frame supersedes an earlier one for the same page.
         self.staged.insert(page_num, data.to_vec());
+        Ok(())
+    }
+
+    /// Set the database page count after this replay batch. Drivers should
+    /// call this when their delta format carries an end page count, for
+    /// example SQLite's WAL commit db-size or page 1 database header.
+    pub fn set_target_page_count(&mut self, page_count: u64) -> io::Result<()> {
+        self.check_not_consumed("set_target_page_count")?;
+        self.target_page_count = Some(page_count);
         Ok(())
     }
 
@@ -420,7 +441,19 @@ impl ReplayHandle {
         // 1. Snapshot pre-state. Validate growth precondition.
         let pre_manifest = (**self.ctx.shared_manifest.load()).clone();
         let pre_page_count = pre_manifest.page_count;
-        let new_page_count = std::cmp::max(pre_page_count, self.max_sqlite_page_id as u64);
+        let max_replayed_page = self.max_sqlite_page_id as u64;
+        let new_page_count = self
+            .target_page_count
+            .unwrap_or_else(|| std::cmp::max(pre_page_count, max_replayed_page));
+        if new_page_count < max_replayed_page {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay finalize: target_page_count={} is smaller than replayed sqlite page id {}",
+                    new_page_count, max_replayed_page
+                ),
+            ));
+        }
 
         if self.staged.is_empty() {
             // Empty cycle. Caller may still publish a manifest with
@@ -439,7 +472,7 @@ impl ReplayHandle {
         //    publish it atomically in step 6.
         let mut post_manifest = pre_manifest.clone();
         if new_page_count != pre_page_count {
-            extend_for_growth(&mut post_manifest, pre_page_count, new_page_count);
+            set_replay_page_count(&mut post_manifest, pre_page_count, new_page_count);
         }
         if let Some(page0) = self.staged.get(&0) {
             // sqlite_page_id 1 -> turbolite page 0 carries the SQLite
@@ -1142,6 +1175,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn finalize_uses_explicit_target_page_count_for_shrink() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 8);
+        let pre_page_count = vfs.manifest().page_count;
+        assert!(pre_page_count >= 8);
+
+        let mut page0 = vec![0u8; page_size as usize];
+        page0[0..16].copy_from_slice(b"SQLite format 3\0");
+        page0[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        page0[28..32].copy_from_slice(&(4u32).to_be_bytes());
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &page0).unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let report = handle.finalize().unwrap();
+
+        let post = vfs.manifest();
+        assert_eq!(report.new_page_count, 4);
+        assert_eq!(post.page_count, 4);
+        assert!(post.page_location(3).is_some());
+        assert!(post.page_location(4).is_none());
+    }
+
+    #[test]
+    fn finalize_rejects_target_page_count_below_replayed_page() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(5, &payload).unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let err = handle.finalize().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("target_page_count=4"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// A finalize whose pre-flight (the staging-log write) fails
     /// must leave the live state untouched — no PendingFlush, no
     /// manifest growth, no bitmap flip, no page_count atomic bump.
@@ -1310,7 +1387,7 @@ mod tests {
     /// `page_location` because they were never inserted into
     /// `page_index`.
     #[test]
-    fn extend_for_growth_positional_does_not_flip_to_btreeaware() {
+    fn set_replay_page_count_positional_growth_does_not_flip_to_btreeaware() {
         use crate::tiered::config::GroupingStrategy;
         use crate::tiered::manifest::Manifest;
 
@@ -1322,7 +1399,7 @@ mod tests {
         // Critically: positional manifests have empty group_pages.
         assert!(manifest.group_pages.is_empty());
 
-        extend_for_growth(&mut manifest, 4, 10);
+        set_replay_page_count(&mut manifest, 4, 10);
 
         assert_eq!(manifest.page_count, 10);
         assert_eq!(
@@ -1341,6 +1418,27 @@ mod tests {
                 "positional page_location({p}) must resolve after growth"
             );
         }
+    }
+
+    #[test]
+    fn set_replay_page_count_btreeaware_shrink_trims_group_pages_and_index() {
+        use crate::tiered::config::GroupingStrategy;
+        use crate::tiered::manifest::Manifest;
+
+        let mut manifest = Manifest::empty();
+        manifest.strategy = GroupingStrategy::BTreeAware;
+        manifest.page_count = 8;
+        manifest.page_size = 4096;
+        manifest.pages_per_group = 4;
+        manifest.group_pages = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+        manifest.build_page_index();
+
+        set_replay_page_count(&mut manifest, 8, 5);
+
+        assert_eq!(manifest.page_count, 5);
+        assert_eq!(manifest.group_pages, vec![vec![0, 1, 2, 3], vec![4]]);
+        assert!(manifest.page_location(4).is_some());
+        assert!(manifest.page_location(5).is_none());
     }
 
     /// Atomicity contract for overwrites of already-present pages.
