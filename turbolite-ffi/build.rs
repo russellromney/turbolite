@@ -41,8 +41,14 @@ fn main() {
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
         } else {
-            // Linux: --export-dynamic exports all symbols.
-            println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic");
+            // Linux: the C shim is packaged as a static archive by cc.
+            // Since Rust code does not reference sqlite3_turbolite_init
+            // directly, force the linker to pull that archive member into
+            // the cdylib and export it for SQLite's dlsym lookup.
+            println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined=sqlite3_turbolite_init");
+            println!(
+                "cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=sqlite3_turbolite_init"
+            );
         }
 
         println!("cargo:rerun-if-changed=src/ext_entry.c");
