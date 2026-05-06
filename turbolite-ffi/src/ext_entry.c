@@ -487,7 +487,7 @@ static int turbolite_trace_callback(
 #ifdef _WIN32
 __declspec(dllexport)
 #endif
-int sqlite3_turbolite_init(
+int turbolite_sqlite3_turbolite_init_impl(
     sqlite3 *db,
     char **pzErrMsg,
     const sqlite3_api_routines *pApi
