@@ -248,9 +248,10 @@ pub extern "C" fn turbolite_state_dir_for_database_path(
 /// { "local_data_path": "/data/app.db" }
 /// ```
 ///
-/// turbolite owns `app.db` as the local page image; sidecar metadata lives
-/// next to it under `app.db-turbolite/`. The optional `cache_dir` field
-/// overrides the derived sidecar location.
+/// turbolite owns `app.db` as the local page image; the sidecar lives next
+/// to it under `app.db-turbolite/`. When `local_data_path` is set and
+/// `cache_dir` is *not* supplied, the sidecar path is derived from
+/// `local_data_path`. To pin the sidecar somewhere else, set both fields.
 ///
 /// # Lower-level local mode
 ///
@@ -288,13 +289,42 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
         Err(code) => return code,
     };
 
-    let config: turbolite::tiered::TurboliteConfig = match serde_json::from_str(config_json) {
+    // Parse to a Value first so we can detect whether `cache_dir` was
+    // explicitly supplied; if `local_data_path` is set without an explicit
+    // `cache_dir`, derive the file-first sidecar path from local_data_path.
+    let raw: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("invalid config JSON: {}", e));
+            return -1;
+        }
+    };
+    let cache_dir_present = raw
+        .get("cache_dir")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let local_data_path_present = raw
+        .get("local_data_path")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
+    let mut config: turbolite::tiered::TurboliteConfig = match serde_json::from_value(raw) {
         Ok(c) => c,
         Err(e) => {
             set_last_error(&format!("invalid config JSON: {}", e));
             return -1;
         }
     };
+
+    if local_data_path_present && !cache_dir_present {
+        if let Some(db_path) = config.local_data_path.clone() {
+            config.cache_dir =
+                turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+                    &db_path,
+                    "-turbolite",
+                );
+        }
+    }
 
     let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
         Ok(v) => v,

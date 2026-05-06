@@ -131,9 +131,10 @@ char *turbolite_state_dir_for_database_path(const char *database_path);
  * { "local_data_path": "/data/app.db" }
  * ```
  *
- * turbolite owns `app.db` as the local page image; sidecar metadata lives
- * next to it under `app.db-turbolite/`. The optional `cache_dir` field
- * overrides the derived sidecar location.
+ * turbolite owns `app.db` as the local page image; the sidecar lives next
+ * to it under `app.db-turbolite/`. When `local_data_path` is set and
+ * `cache_dir` is *not* supplied, the sidecar path is derived from
+ * `local_data_path`. To pin the sidecar somewhere else, set both fields.
  *
  * # Lower-level local mode
  *
@@ -271,6 +272,14 @@ void turbolite_free_string(char *s);
  * Close a database connection opened with `turbolite_open`.
  */
 void turbolite_close(struct TurboliteDb *db);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+extern int turbolite_sqlite3_turbolite_init_impl(void *db, char **pz_err_msg, const void *p_api);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+int sqlite3_turbolite_init(void *db, char **pz_err_msg, const void *p_api);
 #endif
 
 #if defined(TURBOLITE_LOADABLE_EXTENSION)
@@ -452,6 +461,10 @@ int turbolite_ext_register_named_vfs(const char *name_ptr, const char *cache_dir
  * stores its sidecar metadata at `<db_path>-turbolite/`. This is the
  * recommended user-facing entry point — bindings should expose this rather
  * than the bare `cache_dir`-driven [`turbolite_ext_register_named_vfs`].
+ *
+ * Other `TURBOLITE_*` env vars (compression, cache, prefetch, read-only)
+ * are honored via `TurboliteConfig::from_env()`; only the cache_dir is
+ * overridden to match the database path.
  *
  * Returns 0 on success, 1 on error.
  */

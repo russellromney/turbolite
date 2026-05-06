@@ -302,8 +302,11 @@ fn register_local() -> Result<(), std::io::Error> {
     // becomes the local page image and the sidecar lives at
     // `<path>-turbolite/`. Otherwise fall back to the historical "."
     // cache_dir behavior so existing test-extension callers keep working.
+    //
+    // Both branches start from `from_env()` so other TURBOLITE_* knobs
+    // (read-only, compression, prefetch, cache) are honored consistently.
     let config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
-        Ok(db_path) => TurboliteConfig::for_database_path(db_path),
+        Ok(db_path) => TurboliteConfig::from_env().with_database_path(db_path),
         Err(_) => TurboliteConfig {
             cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
                 .map(PathBuf::from)
@@ -352,8 +355,10 @@ fn register_tiered() -> Result<(), std::io::Error> {
         counters.base_put_bytes = 0;
     }
 
+    // Same shape as register_local: TURBOLITE_DATABASE_PATH selects file-first
+    // and overrides cache_dir; otherwise the explicit cache_dir wins.
     let config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
-        Ok(db_path) => TurboliteConfig::for_database_path(db_path),
+        Ok(db_path) => TurboliteConfig::from_env().with_database_path(db_path),
         Err(_) => TurboliteConfig {
             cache_dir,
             ..TurboliteConfig::from_env()
@@ -768,6 +773,10 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
 /// recommended user-facing entry point — bindings should expose this rather
 /// than the bare `cache_dir`-driven [`turbolite_ext_register_named_vfs`].
 ///
+/// Other `TURBOLITE_*` env vars (compression, cache, prefetch, read-only)
+/// are honored via `TurboliteConfig::from_env()`; only the cache_dir is
+/// overridden to match the database path.
+///
 /// Returns 0 on success, 1 on error.
 #[no_mangle]
 pub extern "C" fn turbolite_ext_register_file_first_vfs(
@@ -787,7 +796,8 @@ pub extern "C" fn turbolite_ext_register_file_first_vfs(
         }
     };
 
-    let config = turbolite::tiered::TurboliteConfig::for_database_path(db_path);
+    let config =
+        turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
     match turbolite::tiered::TurboliteVfs::new_local(config) {
         Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
             Ok(()) => 0,

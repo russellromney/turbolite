@@ -278,6 +278,65 @@ fn test_state_dir_for_database_path_null_returns_null() {
     assert!(ptr.is_null());
 }
 
+#[test]
+fn test_register_json_local_data_path_derives_sidecar() {
+    // When the JSON config sets `local_data_path` but not `cache_dir`,
+    // the sidecar must end up at `<local_data_path>-turbolite/`, not at
+    // the default `/tmp/turbolite-cache`.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("derived.db");
+    let name = CString::new("ffi-json-file-first-derive").unwrap();
+    let config = format!(
+        r#"{{ "local_data_path": "{}" }}"#,
+        db_path.to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0);
+
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path_c.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+    turbolite_close(db);
+
+    let sidecar = dir.path().join("derived.db-turbolite");
+    assert!(
+        sidecar.is_dir(),
+        "JSON local_data_path-only must derive sidecar next to db",
+    );
+    assert!(sidecar.join("local_state.msgpack").is_file());
+}
+
+#[test]
+fn test_register_json_local_data_path_with_explicit_cache_dir() {
+    // When BOTH fields are set, `cache_dir` wins (no auto-derivation).
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("explicit.db");
+    let custom_sidecar = dir.path().join("custom-sidecar");
+    std::fs::create_dir_all(&custom_sidecar).unwrap();
+    let name = CString::new("ffi-json-file-first-explicit").unwrap();
+    let config = format!(
+        r#"{{ "local_data_path": "{}", "cache_dir": "{}" }}"#,
+        db_path.to_str().unwrap(),
+        custom_sidecar.to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+    assert_eq!(turbolite_register(name.as_ptr(), config_json.as_ptr()), 0);
+
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path_c.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+    turbolite_close(db);
+
+    assert!(custom_sidecar.join("local_state.msgpack").is_file());
+    // No auto-derived sidecar at the default location.
+    assert!(!dir.path().join("explicit.db-turbolite").exists());
+}
+
 // --- turbolite_register_local ---
 
 #[test]

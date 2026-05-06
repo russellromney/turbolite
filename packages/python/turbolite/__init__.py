@@ -16,8 +16,10 @@ S3 cloud mode::
         endpoint="https://t3.storage.dev")
 
 Note: ``app.db`` is turbolite's compressed page image. It is not promised
-to be opened directly by stock ``sqlite3``. To get a stock SQLite file,
-use ``conn.iterdump()`` or ``VACUUM INTO`` while connected via turbolite.
+to be opened directly by stock ``sqlite3``. To produce a stock SQLite
+file, replay ``conn.iterdump()`` against a fresh ``sqlite3.connect``.
+``VACUUM INTO`` is not supported as an export path — the file-first VFS
+rejects the alias open of a different target file by design.
 """
 
 from __future__ import annotations
