@@ -1,4 +1,4 @@
-//! Direct hybrid page replay handle.
+//! Direct page replay handle.
 //!
 //! Lets a caller feed decoded physical pages (from an external WAL
 //! delta source) straight into Turbolite without staging through a
@@ -160,10 +160,30 @@ fn set_replay_page_count(manifest: &mut Manifest, old_page_count: u64, new_page_
     if new_page_count <= old_page_count {
         manifest.page_count = new_page_count;
         if manifest.strategy == GroupingStrategy::BTreeAware {
-            for group in &mut manifest.group_pages {
+            let old_group_pages = std::mem::take(&mut manifest.group_pages);
+            let old_keys = std::mem::take(&mut manifest.page_group_keys);
+            let old_frames = std::mem::take(&mut manifest.frame_tables);
+            let old_overrides = std::mem::take(&mut manifest.subframe_overrides);
+
+            let mut new_group_pages = Vec::new();
+            let mut new_keys = Vec::new();
+            let mut new_frames = Vec::new();
+            let mut new_overrides = Vec::new();
+
+            for (idx, mut group) in old_group_pages.into_iter().enumerate() {
                 group.retain(|page| *page < new_page_count);
+                if group.is_empty() {
+                    continue;
+                }
+                new_group_pages.push(group);
+                new_keys.push(old_keys.get(idx).cloned().unwrap_or_default());
+                new_frames.push(old_frames.get(idx).cloned().unwrap_or_default());
+                new_overrides.push(old_overrides.get(idx).cloned().unwrap_or_default());
             }
-            manifest.group_pages.retain(|group| !group.is_empty());
+            manifest.group_pages = new_group_pages;
+            manifest.page_group_keys = new_keys;
+            manifest.frame_tables = new_frames;
+            manifest.subframe_overrides = new_overrides;
             manifest.build_page_index();
         }
         return;
@@ -363,6 +383,23 @@ impl ReplayHandle {
     /// telemetry: no side effects on the cache.
     pub fn commit_changeset(&mut self, seq: u64) -> io::Result<()> {
         self.check_not_consumed("commit_changeset")?;
+        if self.committed_seqs.contains(&seq) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("commit_changeset: duplicate sequence {seq}"),
+            ));
+        }
+        if let Some(max) = self.committed_seqs.iter().copied().max() {
+            if seq != max + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "commit_changeset: non-contiguous sequence {seq}; expected {}",
+                        max + 1
+                    ),
+                ));
+            }
+        }
         self.committed_seqs.push(seq);
         Ok(())
     }
@@ -455,7 +492,7 @@ impl ReplayHandle {
             ));
         }
 
-        if self.staged.is_empty() {
+        if self.staged.is_empty() && new_page_count == pre_page_count {
             // Empty cycle. Caller may still publish a manifest with
             // an advanced cursor for the no-pending-state case.
             return Ok(FinalizeReport {
@@ -642,6 +679,11 @@ impl ReplayHandle {
         //    the new disk bytes.
         self.ctx.cache.clear_pages_from_mem_cache(&written);
         self.ctx.cache.mark_pages_present(&written);
+        if new_page_count < pre_page_count {
+            self.ctx
+                .cache
+                .truncate_to_page_count(new_page_count, self.page_size)?;
+        }
         self.ctx.cache.bump_generation();
 
         // 6. Publish the post-replay manifest atomically. ArcSwap is
@@ -1228,6 +1270,48 @@ mod tests {
         assert_eq!(post.page_count, 4);
         assert!(post.page_location(3).is_some());
         assert!(post.page_location(4).is_none());
+    }
+
+    #[test]
+    fn finalize_pure_shrink_publishes_and_truncates_cache_file() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 8);
+        let pre_page_count = vfs.manifest().page_count;
+        assert!(pre_page_count > 4);
+        vfs_cache(&vfs)
+            .write_page(pre_page_count - 1, &vec![0xAA; page_size as usize])
+            .unwrap();
+        let pre_len = std::fs::metadata(vfs.cache_file_path()).unwrap().len();
+        assert!(pre_len >= pre_page_count * page_size as u64);
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let report = handle.finalize().unwrap();
+
+        let post = vfs.manifest();
+        assert_eq!(report.new_page_count, 4);
+        assert_eq!(post.page_count, 4);
+        assert_eq!(
+            std::fs::metadata(vfs.cache_file_path()).unwrap().len(),
+            4 * page_size as u64
+        );
+        assert!(!vfs_cache(&vfs).is_present(4));
+    }
+
+    #[test]
+    fn finalize_rejects_non_contiguous_changeset_sequences() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &payload).unwrap();
+        handle.commit_changeset(3).unwrap();
+        let err = handle.commit_changeset(5).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("non-contiguous"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-06
 
-Turbolite's Bedrock user promise is:
+Turbolite's current user promise is:
 
 > A user can put a SQLite database in object storage, cold-open it through
 > Turbolite, query normal SQLite data, and export/download/validate the same
@@ -34,6 +34,20 @@ Negative control:
   canonical checksum. Removing the checkpoint would turn this into a local-cache
   test and the cold export would fail to prove object-store durability.
 
+## Compatibility Boundary
+
+Turbolite is still experimental and does not keep migration shims for old
+internal object formats or old split local metadata. Current proofs require:
+
+- raw manifest payloads, not the removed local wrapper format
+- pure page/object payloads, not the removed hybrid payload tag
+- unified `local_state.msgpack`, not legacy split sidecar files
+- a Turbolite-owned local database image, not stock SQLite compatibility
+
+The intended user-level compatibility path is export/import through normal
+SQLite bytes. Directly opening a Turbolite local image with stock `sqlite3` is
+not a supported contract.
+
 ## Latest Proof Pass
 
 ### Rust Library
@@ -46,10 +60,10 @@ cargo test -p turbolite --lib
 
 Result:
 
-- 526 passed
+- 530 passed
 - Backend: local/in-memory test backends
 - Proves: core VFS, manifest/page replay, local state, cache, compaction,
-  Sashimono contract validators, and regression invariants
+  checkpoint/delta contract validators, and regression invariants
 
 ### S3-Compatible Full Tiered Suite
 

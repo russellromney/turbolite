@@ -586,8 +586,7 @@ impl TurboliteVfs {
     }
 
     /// Garbage collect orphaned backend objects not referenced by the current
-    /// manifest or any snapshot manifests. Returns the number of objects
-    /// deleted.
+    /// manifest. Returns the number of objects deleted.
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
@@ -596,36 +595,6 @@ impl TurboliteVfs {
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());
         Self::add_manifest_keys_to_set(&manifest, &mut live_keys);
-
-        let snap_prefix = "manifest-snap-";
-        let snap_suffix = ".msgpack";
-        for key in &all_keys {
-            let filename = key.rsplit('/').next().unwrap_or(key);
-            if filename.starts_with(snap_prefix) && filename.ends_with(snap_suffix) {
-                live_keys.insert(key.clone());
-                match storage_helpers::get_manifest_at_key(
-                    self.storage.as_ref(),
-                    &self.runtime,
-                    key,
-                ) {
-                    Ok(Some(snap_manifest)) => {
-                        Self::add_manifest_keys_to_set(&snap_manifest, &mut live_keys);
-                    }
-                    Ok(None) => {
-                        turbolite_debug!(
-                            "[gc] snapshot manifest {} disappeared during gc, skipping",
-                            key,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[gc] WARNING: failed to load snapshot manifest {}: {}. Skipping.",
-                            key, e,
-                        );
-                    }
-                }
-            }
-        }
 
         let orphans: Vec<String> = all_keys
             .into_iter()
@@ -710,12 +679,6 @@ impl TurboliteVfs {
             }
         }
         live_keys.insert(keys::MANIFEST_KEY.to_string());
-
-        for key in &all_keys {
-            if key.contains("manifest-snap-") {
-                live_keys.insert(key.clone());
-            }
-        }
 
         let orphaned: Vec<String> = all_keys.difference(&live_keys).cloned().collect();
 
@@ -857,23 +820,7 @@ impl TurboliteVfs {
         })
     }
 
-    /// Copy the current manifest to a snapshot key.
-    pub fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
-        storage_helpers::copy_manifest_to_snapshot(self.storage.as_ref(), &self.runtime, snap_id)
-    }
-
-    /// Delete a snapshot manifest copy.
-    pub fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
-        storage_helpers::delete_snapshot_manifest(self.storage.as_ref(), &self.runtime, snap_id)
-    }
-
-    /// Load a manifest from a snapshot key.
-    pub fn get_snapshot_manifest(&self, snap_id: &str) -> io::Result<Option<Manifest>> {
-        let key = keys::snapshot_manifest_key(snap_id);
-        storage_helpers::get_manifest_at_key(self.storage.as_ref(), &self.runtime, &key)
-    }
-
-    /// Seed this VFS's backend with a manifest from another source (used by fork).
+    /// Seed this VFS's backend with a manifest from another source.
     pub fn seed_manifest(&self, manifest: &Manifest) -> io::Result<()> {
         storage_helpers::put_manifest(self.storage.as_ref(), &self.runtime, manifest)?;
         manifest::persist_manifest_local(&self.config.cache_dir, manifest)?;
@@ -887,7 +834,7 @@ impl TurboliteVfs {
 
     /// Import a local SQLite file into this VFS's backend as checkpointed base state.
     ///
-    /// This is the fresh-bootstrap path for hybrid Turbolite + walrust deployments:
+    /// This is the fresh-bootstrap path for Turbolite + WAL-delta deployments:
     /// the caller already has a committed SQLite file on disk, and turbolite must
     /// publish that file as page-group base state before walrust starts shipping
     /// deltas against it.
@@ -1082,7 +1029,14 @@ impl TurboliteVfs {
             let requested_matches = if requested_has_parent || requested.is_absolute() {
                 requested == data_path
             } else {
-                requested.file_name() == data_path.file_name()
+                // A bare "app.db" is only unambiguous when the configured
+                // data path is also bare. If the VFS is bound to
+                // /data/app.db, callers must open that same path; basename-only
+                // matching would alias unrelated cwd-local files onto it.
+                data_path
+                    .parent()
+                    .is_none_or(|parent| parent == Path::new(""))
+                    && requested.file_name() == data_path.file_name()
             };
             if !requested_matches {
                 return Err(io::Error::new(
@@ -1098,6 +1052,20 @@ impl TurboliteVfs {
         } else {
             Ok(self.config.cache_dir.join(db))
         }
+    }
+
+    fn is_file_first_main_db_name(&self, db: &str) -> bool {
+        self.config
+            .local_data_path
+            .as_ref()
+            .is_some_and(|_| self.local_main_db_path(db).is_ok())
+    }
+
+    fn is_file_first_main_db_basename(&self, db: &str) -> bool {
+        let Some(data_path) = self.config.local_data_path.as_ref() else {
+            return false;
+        };
+        Path::new(db).file_name() == data_path.file_name()
     }
 
     fn local_sqlite_companion_path(&self, db: &str) -> PathBuf {
@@ -1458,6 +1426,12 @@ impl Vfs for TurboliteVfs {
     }
 
     fn delete(&self, db: &str) -> Result<(), io::Error> {
+        if self.is_file_first_main_db_name(db) || self.is_file_first_main_db_basename(db) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to delete Turbolite main database image {db}"),
+            ));
+        }
         let path = self.local_sqlite_companion_path(db);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -1468,6 +1442,17 @@ impl Vfs for TurboliteVfs {
     }
 
     fn exists(&self, db: &str) -> Result<bool, io::Error> {
+        if self.config.local_data_path.is_some() {
+            if let Ok(path) = self.local_main_db_path(db) {
+                if path.exists() {
+                    return Ok(true);
+                }
+                return storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime);
+            }
+            if self.is_file_first_main_db_basename(db) {
+                return Ok(false);
+            }
+        }
         let path = self.local_sqlite_companion_path(db);
         if path.exists() {
             return Ok(true);

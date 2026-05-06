@@ -29,11 +29,6 @@ pub fn override_frame_key(group_id: u64, frame_idx: usize, version: u64) -> Stri
     format!("p/d/{group_id}_f{frame_idx}_v{version}")
 }
 
-/// Snapshot manifest key for a given snapshot id.
-pub fn snapshot_manifest_key(snap_id: &str) -> String {
-    format!("manifest-snap-{snap_id}.msgpack")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +40,5 @@ mod tests {
         assert_eq!(interior_chunk_key(3, 5), "p/it/3_v5");
         assert_eq!(index_chunk_key(1, 2), "p/ix/1_v2");
         assert_eq!(override_frame_key(5, 3, 10), "p/d/5_f3_v10");
-        assert_eq!(snapshot_manifest_key("abc"), "manifest-snap-abc.msgpack");
     }
 }

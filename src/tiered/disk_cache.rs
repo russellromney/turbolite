@@ -1658,6 +1658,51 @@ impl DiskCache {
         }
     }
 
+    /// Truncate the local page image to a logical page count and clear cache
+    /// metadata for pages at or beyond the new end.
+    pub(crate) fn truncate_to_page_count(&self, page_count: u64, page_size: u32) -> io::Result<()> {
+        let new_len = page_count * page_size as u64;
+        {
+            let _guard = self.cache_file_extend.lock();
+            self.cache_file.set_len(new_len)?;
+            self.cache_file_len.store(new_len, Ordering::Relaxed);
+        }
+
+        {
+            let bitmap = self.bitmap.read();
+            let old_capacity = (bitmap.bits.len() * 8) as u64;
+            if old_capacity > page_count {
+                bitmap.clear_range(page_count, old_capacity - page_count);
+            }
+        }
+
+        if self.cache_compression {
+            let mut index = self.cache_index.lock();
+            let stale_pages: Vec<u64> = index
+                .entries
+                .keys()
+                .copied()
+                .filter(|page| *page >= page_count)
+                .collect();
+            for page in stale_pages {
+                index.remove(page);
+            }
+        }
+
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let group_count = page_count.div_ceil(ppg);
+            let states = self.group_states.lock();
+            for (gid, state) in states.iter().enumerate() {
+                if gid as u64 >= group_count {
+                    state.store(GroupState::None as u8, Ordering::Release);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Evict a single page group from the local cache.
     pub(crate) fn evict_group(&self, gid: u64) {
         let page_nums = self.group_page_nums(gid);

@@ -140,9 +140,7 @@ pub(crate) fn list_all_keys_with_prefix(
     })
 }
 
-/// Fetch and deserialise the canonical turbolite manifest. Transparently
-/// handles pre-Anvil-g LocalManifest-wrapper bytes via
-/// [`manifest::decode_manifest_bytes`].
+/// Fetch and deserialise the canonical turbolite manifest.
 pub(crate) fn get_manifest(
     backend: &dyn StorageBackend,
     runtime: &TokioHandle,
@@ -151,28 +149,6 @@ pub(crate) fn get_manifest(
         None => Ok(None),
         Some(bytes) => {
             let mut m = manifest::decode_manifest_bytes(&bytes)?;
-            m.detect_and_normalize_strategy();
-            Ok(Some(m))
-        }
-    }
-}
-
-/// Fetch and deserialise a manifest stored at an arbitrary key. Used for
-/// snapshot manifests (`manifest-snap-{id}.msgpack`).
-pub(crate) fn get_manifest_at_key(
-    backend: &dyn StorageBackend,
-    runtime: &TokioHandle,
-    key: &str,
-) -> io::Result<Option<Manifest>> {
-    match get_page_group(backend, runtime, key)? {
-        None => Ok(None),
-        Some(bytes) => {
-            let mut m = manifest::decode_manifest_bytes(&bytes).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("decode manifest {key}: {e}"),
-                )
-            })?;
             m.detect_and_normalize_strategy();
             Ok(Some(m))
         }
@@ -189,32 +165,6 @@ pub(crate) fn put_manifest(
     let bytes = rmp_serde::to_vec(manifest)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode manifest: {e}")))?;
     put(backend, runtime, keys::MANIFEST_KEY, &bytes)
-}
-
-/// Copy the current manifest to a snapshot key. Reads the live manifest,
-/// rewrites the bytes under the snapshot key. Returns the destination key
-/// so callers can log / track it.
-pub(crate) fn copy_manifest_to_snapshot(
-    backend: &dyn StorageBackend,
-    runtime: &TokioHandle,
-    snap_id: &str,
-) -> io::Result<String> {
-    let bytes = get_page_group(backend, runtime, keys::MANIFEST_KEY)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no live manifest to snapshot"))?;
-    let dest = keys::snapshot_manifest_key(snap_id);
-    put(backend, runtime, &dest, &bytes)?;
-    Ok(dest)
-}
-
-/// Delete a snapshot manifest object.
-pub(crate) fn delete_snapshot_manifest(
-    backend: &dyn StorageBackend,
-    runtime: &TokioHandle,
-    snap_id: &str,
-) -> io::Result<()> {
-    let key = keys::snapshot_manifest_key(snap_id);
-    block_on(runtime, backend.delete(&key))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("delete {key}: {e}")))
 }
 
 /// Fetch multiple page groups by key, returning a `HashMap<key, bytes>`.

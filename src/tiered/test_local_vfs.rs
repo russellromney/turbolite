@@ -119,6 +119,41 @@ fn file_first_vfs_rejects_mismatched_main_db_name() {
     )
     .expect_err("same file-first VFS must not alias the same filename in another directory");
     assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+
+    let err = rusqlite::Connection::open_with_flags_and_vfs("app.db", flags, &vfs_name)
+        .expect_err("bare basename must not alias an absolute file-first path");
+    assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+}
+
+#[test]
+fn file_first_vfs_refuses_to_delete_main_db_image() {
+    use sqlite_vfs::Vfs;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("app.db");
+    let config = TurboliteConfig::for_database_path(&db_path);
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    std::fs::write(&db_path, b"turbolite-owned").unwrap();
+    assert!(
+        vfs.exists(db_path.to_str().unwrap()).unwrap(),
+        "main image should exist"
+    );
+    let err = vfs.delete(db_path.to_str().unwrap()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(db_path.exists(), "main image must survive delete refusal");
+
+    let err = vfs.delete("app.db").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        db_path.exists(),
+        "bare basename must not delete the bound main image"
+    );
+
+    assert!(
+        !vfs.exists("app.db").unwrap(),
+        "bare basename must not alias the bound absolute main image"
+    );
 }
 
 #[test]

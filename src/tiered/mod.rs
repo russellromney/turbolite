@@ -194,11 +194,13 @@ static LOCAL_CHECKPOINT_ONLY: AtomicBool = AtomicBool::new(false);
 ///
 /// Deprecated behavior shim: configure `CheckpointMode::LocalThenFlush` on
 /// `TurboliteConfig.cache.checkpoint_mode` before opening the VFS instead.
+#[deprecated(note = "use TurboliteConfig.cache.checkpoint_mode instead")]
 pub fn set_local_checkpoint_only(val: bool) {
     LOCAL_CHECKPOINT_ONLY.store(val, Ordering::Release);
 }
 
 /// Returns the current value of the legacy local-checkpoint-only flag.
+#[deprecated(note = "use TurboliteConfig.cache.checkpoint_mode instead")]
 pub fn is_local_checkpoint_only() -> bool {
     LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire)
 }

@@ -626,6 +626,22 @@ fn test_disk_cache_ignores_old_split_tracking_files() {
         bitmap.mark_present(5);
         bitmap.persist().unwrap();
     }
+    std::fs::write(dir.path().join("sub_chunk_tracker"), b"old tracker").unwrap();
+    std::fs::write(
+        dir.path().join("cache_index.json"),
+        br#"{"entries":{"5":{"offset":0,"compressed_len":64}},"next_offset":64}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("manifest.msgpack"),
+        rmp_serde::to_vec(&Manifest::empty()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dirty_groups.msgpack"),
+        rmp_serde::to_vec(&vec![0u64]).unwrap(),
+    )
+    .unwrap();
     std::fs::write(dir.path().join("data.cache"), vec![0u8; 64 * 8]).unwrap();
 
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();

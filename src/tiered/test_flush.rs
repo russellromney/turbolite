@@ -2,12 +2,14 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+#[allow(deprecated)]
 fn test_local_checkpoint_flag_default_false() {
     crate::tiered::set_local_checkpoint_only(false);
     assert!(!crate::tiered::is_local_checkpoint_only());
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_local_checkpoint_flag_set_and_clear() {
     crate::tiered::set_local_checkpoint_only(true);
     assert!(crate::tiered::is_local_checkpoint_only());

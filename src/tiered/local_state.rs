@@ -1,6 +1,8 @@
 use super::*;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const LOCAL_STATE_FILE: &str = "local_state.msgpack";
+static LOCAL_STATE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct LocalState {
@@ -76,15 +78,43 @@ pub(crate) fn persist(cache_dir: &Path, state: &LocalState) -> io::Result<()> {
             format!("serialize local_state.msgpack: {e}"),
         )
     })?;
-    fs::write(&tmp, data)?;
+    {
+        let mut file = FsOpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        use std::io::Write;
+        file.write_all(&data)?;
+        file.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    // Fsync the directory so the rename itself is durable after power loss.
+    // Some platforms/filesystems may not support directory fsync; surface the
+    // error so callers know the local recovery state was not durably published.
+    FsOpenOptions::new()
+        .read(true)
+        .open(cache_dir)?
+        .sync_all()?;
     Ok(())
+}
+
+fn update_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
+    let locks = LOCAL_STATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = cache_dir.to_path_buf();
+    let mut guard = locks.lock().expect("local_state lock table poisoned");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 pub(crate) fn update<F>(cache_dir: &Path, f: F) -> io::Result<()>
 where
     F: FnOnce(&mut LocalState),
 {
+    let lock = update_lock(cache_dir);
+    let _guard = lock.lock().expect("local_state update lock poisoned");
     let mut state = load_or_default(cache_dir)?;
     f(&mut state);
     persist(cache_dir, &state)
@@ -128,4 +158,45 @@ pub(crate) fn tracker_maps(
         }
     }
     (present, tiers, counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_preserves_concurrent_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let a_path = path.clone();
+        let a_barrier = barrier.clone();
+        let a = std::thread::spawn(move || {
+            a_barrier.wait();
+            update(&a_path, |state| {
+                let mut manifest = Manifest::empty();
+                manifest.version = 7;
+                state.manifest = Some(manifest);
+            })
+            .expect("manifest update");
+        });
+
+        let b_path = path.clone();
+        let b_barrier = barrier.clone();
+        let b = std::thread::spawn(move || {
+            b_barrier.wait();
+            update(&b_path, |state| {
+                state.page_bitmap = Some(vec![0b0010_0000]);
+            })
+            .expect("bitmap update");
+        });
+
+        a.join().expect("thread a");
+        b.join().expect("thread b");
+
+        let state = load(&path).expect("load").expect("state");
+        assert_eq!(state.manifest.expect("manifest").version, 7);
+        assert_eq!(state.page_bitmap.expect("bitmap"), vec![0b0010_0000]);
+    }
 }
