@@ -2251,8 +2251,16 @@ impl DatabaseHandle for TurboliteHandle {
             // Dual counter:
             // - version: monotonic +1, for S3 key uniqueness
             // - change_counter: SQLite file change counter, for walrust WAL replay
-            let next_version = self.manifest.load().version + 1;
-            let change_counter = read_change_counter_from_cache(&cache, page_size);
+            let manifest_snap_for_counter = self.manifest.load();
+            let next_version = manifest_snap_for_counter.version + 1;
+            let cache_change_counter = try_read_change_counter_from_cache(&cache, page_size)?;
+            let change_counter = cache_change_counter.max(manifest_snap_for_counter.change_counter);
+            if change_counter == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file change counter must be > 0 at checkpoint time",
+                ));
+            }
             let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
             let mut new_keys = self.manifest.load().page_group_keys.clone();
             // Track old keys being replaced (for post-checkpoint GC)

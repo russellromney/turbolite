@@ -20,7 +20,7 @@ use super::storage as storage_helpers;
 use super::{
     bundle_chunk_range, compact, decode_page_group, decode_page_group_seekable_full,
     encode_interior_bundle, encode_override_frame, encode_page_group, encode_page_group_seekable,
-    keys, manifest, read_change_counter_from_cache, staging, DiskCache, FrameEntry, Manifest,
+    keys, manifest, staging, try_read_change_counter_from_cache, DiskCache, FrameEntry, Manifest,
     SubChunkId, SubChunkTier,
 };
 
@@ -174,7 +174,14 @@ fn flush_inner(
     turbolite_debug!("[flush] uploading {} dirty groups...", dirty_groups.len(),);
 
     let next_version = manifest_snap.version + 1;
-    let change_counter = read_change_counter_from_cache(cache, manifest_snap.page_size);
+    let cache_change_counter = try_read_change_counter_from_cache(cache, manifest_snap.page_size)?;
+    let change_counter = cache_change_counter.max(manifest_snap.change_counter);
+    if change_counter == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file change counter must be > 0 at checkpoint/flush time",
+        ));
+    }
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();

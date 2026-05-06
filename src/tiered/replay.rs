@@ -491,6 +491,9 @@ impl ReplayHandle {
         // group_pages, page_index, and db_header changes are
         // adopted along with the page bytes.
         post_manifest.version = pre_manifest.version + 1;
+        if let Some(seq) = self.committed_seqs.iter().copied().max() {
+            post_manifest.change_counter = post_manifest.change_counter.max(seq);
+        }
 
         // 3. Pre-flight the staging log to disk. This is the most
         //    fallible part of the operation; doing it before any live
@@ -962,6 +965,33 @@ mod tests {
             pre_pending + 1,
             "finalize must enqueue exactly one PendingFlush"
         );
+    }
+
+    /// Replay commit sequence is the durable substrate cursor for
+    /// direct page replay. It must be promoted into the base manifest
+    /// even when the replayed changeset does not include SQLite page
+    /// 1, otherwise a later opener would replay already-absorbed
+    /// deltas.
+    #[test]
+    fn finalize_promotes_committed_seq_to_manifest_change_counter() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let pre_change_counter = vfs.manifest().change_counter;
+        let seq = pre_change_counter + 100;
+        let payload = vec![0x88u8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(2, &payload).unwrap();
+        handle.commit_changeset(seq).unwrap();
+        handle.finalize().unwrap();
+
+        assert_eq!(vfs.manifest().change_counter, seq);
+
+        let bytes = vfs
+            .publish_replayed_base()
+            .expect("publish replayed base after cursor promotion");
+        let published = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
+        assert_eq!(published.change_counter, seq);
     }
 
     /// Two replay cycles back-to-back without an intervening publish

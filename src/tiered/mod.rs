@@ -238,16 +238,22 @@ pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
 /// number would corrupt data on recovery (walrust would replay WAL
 /// segments over the wrong page state).
 pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32) -> u64 {
-    let mut page0 = vec![0u8; page_size as usize];
-    cache
-        .read_page(0, &mut page0)
+    let counter = try_read_change_counter_from_cache(cache, page_size)
         .expect("page 0 must be in cache at checkpoint time");
-    let counter = read_file_change_counter(&page0);
     assert!(
         counter > 0,
         "file change counter must be > 0 at checkpoint time"
     );
     counter
+}
+
+pub(crate) fn try_read_change_counter_from_cache(
+    cache: &DiskCache,
+    page_size: u32,
+) -> std::io::Result<u64> {
+    let mut page0 = vec![0u8; page_size as usize];
+    cache.read_page(0, &mut page0)?;
+    Ok(read_file_change_counter(&page0))
 }
 
 // ===== Page group coordinate math =====
