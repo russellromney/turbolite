@@ -2961,30 +2961,35 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(true);
         }
 
-        // Detect transaction rollback.
-        // If lock downgrades from EXCLUSIVE/RESERVED and we have unsynced dirty
-        // pages, the transaction was rolled back. Clear dirty pages and evict
-        // them from the disk cache so subsequent reads re-fetch from the source
-        // of truth (S3 or local pg/).
+        // Persist on lock downgrade. SQLite drops the EXCLUSIVE/RESERVED
+        // lock once a transaction is finished, whether by commit or by
+        // rollback. In both cases the dirty pages in our local cache
+        // already reflect the post-operation page state:
+        //
+        // - WAL commit: checkpoint writes new pages to the main DB (us);
+        //   xSync would normally fire next.
+        // - Rollback-journal commit: same — pages get written, then xSync.
+        // - Rollback: SQLite replays the journal back into the main DB
+        //   (via xWrite) before releasing the lock, so our dirty set
+        //   ends up holding the original (rolled-back) page bytes.
+        //
+        // Earlier code treated "lock downgrade without intervening xSync"
+        // as a signal to discard dirty pages (assumed rollback). That
+        // heuristic silently drops every write under
+        // PRAGMA synchronous=OFF, where SQLite skips xSync on every
+        // commit — so each commit looked like a rollback. Replacing the
+        // heuristic with an unconditional sync() keeps both the commit
+        // and rollback cases correct: turbolite's manifest+bitmap end
+        // up matching whatever SQLite finished writing.
         if (current == LockKind::Exclusive || current == LockKind::Reserved)
             && (lock == LockKind::Shared || lock == LockKind::None)
             && self.dirty_since_sync
         {
-            let mut dirty = self.dirty_page_nums.write();
-            if !dirty.is_empty() {
-                let stale_pages: Vec<u64> = dirty.iter().copied().collect();
-                turbolite_debug!(
-                    "[turbolite] lock downgrade without sync: clearing {} dirty pages (transaction rollback)",
-                    stale_pages.len(),
+            if let Err(e) = self.sync(false) {
+                eprintln!(
+                    "[turbolite] flush-on-lock-downgrade failed: {e}"
                 );
-                dirty.clear();
-                drop(dirty);
-                // Evict stale pages from disk cache so reads go back to source.
-                if let Some(cache) = &self.cache {
-                    cache.clear_pages_from_disk(&stale_pages);
-                }
             }
-            self.dirty_since_sync = false;
         }
 
         let lock_file = self.ensure_lock_file()?;

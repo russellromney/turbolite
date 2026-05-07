@@ -34,12 +34,19 @@ int main(void) {
     printf("turbolite %s — sensor logger\n", turbolite_version());
     printf("Data dir: %s\n\n", data_dir);
 
-    /* Register VFS and open database */
-    if (turbolite_register_local("sensor", data_dir, 3) != 0)
-        die("register VFS");
-
+    /*
+     * File-first registration: the caller's database path is the local
+     * page image. Sidecar metadata lives at `<db_path>-turbolite/`.
+     *
+     * To export a stock SQLite file from this database, run:
+     *   turbolite_exec(db, "VACUUM INTO '/tmp/exported.sqlite'");
+     * The exported file opens with the standard sqlite3 CLI.
+     */
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/sensors.db", data_dir);
+
+    if (turbolite_register_local_file_first("sensor", db_path, 3) != 0)
+        die("register VFS");
 
     void *db = turbolite_open(db_path, "sensor");
     if (!db) die("open database");

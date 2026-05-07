@@ -11,16 +11,12 @@ pip install turbolite
 ## Usage
 
 ```python
-import sqlite3
 import turbolite
 
-# Load the extension (registers the "turbolite" VFS process-wide)
-conn = sqlite3.connect(":memory:")
-turbolite.load(conn)
-conn.close()
-
-# Open a compressed database
-conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)
+# File-first: /data/app.db is the local page image (turbolite-owned).
+# /data/app.db-turbolite/ holds hidden implementation state
+# (manifest, cache, staging logs).
+conn = turbolite.connect("/data/app.db")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
 conn.execute("INSERT INTO users VALUES (1, 'alice')")
 conn.commit()
@@ -30,16 +26,27 @@ print(rows)  # [(1, 'alice')]
 conn.close()
 ```
 
-### Convenience wrapper
+`app.db` is turbolite's compressed page image. It is not promised to be
+opened directly by stock `sqlite3`. To produce a normal SQLite file the
+standard `sqlite3` CLI can read, use `iterdump`:
 
 ```python
-import turbolite
-
-conn = turbolite.connect("my.db")
-conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
-conn.commit()
-conn.close()
+src = turbolite.connect("/data/app.db")
+dst = sqlite3.connect("/data/exported.sqlite")
+dst.executescript("\n".join(src.iterdump()))
+dst.close()
+src.close()
 ```
+
+### Lower-level entry point
+
+If you need direct access to the SQLite extension (e.g. to register
+multiple per-tenant VFSes from a single connection), call
+`turbolite.load(conn)` and use the `turbolite_register_file_first_vfs(name,
+db_path)` SQL function yourself. The bare `cache_dir`-based
+`turbolite_register_vfs(name, cache_dir)` is still available for embedders
+who want to manage the cache layout directly, but new code should use
+`turbolite.connect()` or the file-first SQL function.
 
 ### SQL functions
 

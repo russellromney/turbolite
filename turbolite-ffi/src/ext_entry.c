@@ -29,6 +29,11 @@ extern int turbolite_ext_register_vfs(void);
  * Defined in src/ext.rs. */
 extern int turbolite_ext_register_named_vfs(const char *name, const char *cache_dir);
 
+/* Rust function -- registers a file-first local VFS keyed to a database
+ * path. The caller's path is the local page image; sidecar metadata lives
+ * at `<db_path>-turbolite/`. Defined in src/ext.rs. */
+extern int turbolite_ext_register_file_first_vfs(const char *name, const char *db_path);
+
 /* Rust function -- runs EQP on SQL and pushes plan to global queue.
  * Defined in src/tiered/query_plan.rs. */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
@@ -77,10 +82,11 @@ extern int turbolite_evict_query(sqlite3 *db, const char *sql);
 /*
  * turbolite_register_vfs(name TEXT, cache_dir TEXT)
  *
- * Register a named local VFS with isolated state.
- * Each call creates a new VFS instance with its own manifest, cache,
- * and page group state. This enables multiple independent databases
- * in the same process via the loadable extension.
+ * Lower-level: register a named local VFS with isolated state under a
+ * caller-owned cache directory. Each call creates a new VFS instance with
+ * its own manifest, cache, and page group state. The local database image
+ * is stored at `<cache_dir>/data.cache`. Bindings that expose a user-facing
+ * `app.db` should call `turbolite_register_file_first_vfs` instead.
  *
  * Example: SELECT turbolite_register_vfs('turbolite-0', '/path/to/dbdir');
  * Then:    sqlite3_open_v2("file:db?vfs=turbolite-0", ...)
@@ -100,6 +106,37 @@ static void turbolite_register_vfs_func(
         return;
     }
     int rc = turbolite_ext_register_named_vfs(name, cache_dir);
+    sqlite3_result_int(ctx, rc);
+}
+
+/*
+ * turbolite_register_file_first_vfs(name TEXT, db_path TEXT)
+ *
+ * Register a file-first local VFS keyed to a database path. The caller's
+ * `db_path` is the local page image; sidecar metadata lives under
+ * `<db_path>-turbolite/`. This is the recommended user-facing entry point.
+ *
+ * Example: SELECT turbolite_register_file_first_vfs('app', '/data/app.db');
+ * Then:    sqlite3_open_v2("/data/app.db", ..., "app");
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static void turbolite_register_file_first_vfs_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *name = (const char *)sqlite3_value_text(argv[0]);
+    const char *db_path = (const char *)sqlite3_value_text(argv[1]);
+    if (!name || !db_path) {
+        sqlite3_result_error(
+            ctx,
+            "turbolite_register_file_first_vfs: name and db_path required",
+            -1);
+        return;
+    }
+    int rc = turbolite_ext_register_file_first_vfs(name, db_path);
     sqlite3_result_int(ctx, rc);
 }
 
@@ -477,6 +514,19 @@ int turbolite_c_sqlite3_turbolite_init(
     );
     if (rc != SQLITE_OK) {
         *pzErrMsg = sqlite3_mprintf("turbolite: failed to register turbolite_register_vfs()");
+        return rc;
+    }
+
+    /* register turbolite_register_file_first_vfs(name, db_path) SQL function.
+     * File-first registration: the caller's db_path is the local page image
+     * and sidecar metadata lives at <db_path>-turbolite/. */
+    rc = sqlite3_create_function_v2(
+        db, "turbolite_register_file_first_vfs", 2,
+        SQLITE_UTF8, 0, turbolite_register_file_first_vfs_func, 0, 0, 0
+    );
+    if (rc != SQLITE_OK) {
+        *pzErrMsg = sqlite3_mprintf(
+            "turbolite: failed to register turbolite_register_file_first_vfs()");
         return rc;
     }
 

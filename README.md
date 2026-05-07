@@ -416,14 +416,18 @@ make lib-bundled  # build libturbolite.{so,dylib}
 ```go
 // #cgo LDFLAGS: -L/path/to/target/release -lturbolite
 // #include <stdlib.h>
-// extern int turbolite_register_local(const char* name, const char* cache_dir, int level);
+// extern int turbolite_register_local_file_first(const char* name, const char* db_path, int level);
 // extern void* turbolite_open(const char* path, const char* vfs_name);
 // extern int turbolite_exec(void* db, const char* sql);
 // extern char* turbolite_query_json(void* db, const char* sql);
 // extern void turbolite_close(void* db);
 import "C"
 ```
-See [examples/go/](examples/go/) for a full HTTP server example.
+The recommended `turbolite_register_local_file_first(name, db_path, level)` is keyed
+on the user-facing database path. The lower-level
+`turbolite_register_local(name, cache_dir, level)` is still exported for
+embedders that want to manage the cache directory themselves. See
+[examples/go/](examples/go/) for a full HTTP server example.
 
 ### Loadable extension (any language)
 
@@ -439,7 +443,21 @@ sqlite3_enable_load_extension(db, 1);
 sqlite3_load_extension(db, "path/to/turbolite", NULL, NULL);
 // "turbolite" VFS (local) is always registered
 // "turbolite-s3" VFS is also registered if TURBOLITE_BUCKET is set
-``` 
+```
+
+For the file-first user story, register a per-database VFS that owns the
+caller's `app.db`:
+
+```sql
+SELECT turbolite_register_file_first_vfs('app', '/data/app.db');
+-- now open /data/app.db via vfs=app; turbolite stores its sidecar
+-- metadata at /data/app.db-turbolite/.
+```
+
+To configure the default `"turbolite"` VFS for file-first mode at extension
+load time, set `TURBOLITE_DATABASE_PATH=/data/app.db` in the environment
+before loading the extension. The sidecar is then `/data/app.db-turbolite/`
+and the lower-level `TURBOLITE_CACHE_DIR` knob is ignored.
 
 ### Node.js
 
@@ -448,37 +466,54 @@ npm install turbolite
 ```
 
 ```js
-const { Database } = require("turbolite");
+const { connect } = require("turbolite");
 
-const db = new Database("my.db");
+// File-first: /data/app.db is the local page image.
+// /data/app.db-turbolite/ holds hidden implementation state.
+const db = connect("/data/app.db");
 db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-db.exec("INSERT INTO users VALUES (1, 'alice')");
+db.prepare("INSERT INTO users VALUES (?, ?)").run(1, 'alice');
 
-const rows = db.query("SELECT * FROM users");
+const rows = db.prepare("SELECT id, name FROM users").all();
 // [{ id: 1, name: 'alice' }]
 db.close();
 ```
 
-Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/) for full docs.
+`db` is a standard better-sqlite3 Database. `connect()` registers a
+per-database file-first VFS for you. To export a stock SQLite file (for
+example to inspect with the `sqlite3` CLI), use the better-sqlite3 backup
+API: `await db.backup('export.sqlite')`. See
+[turbolite-ffi/packages/node/](turbolite-ffi/packages/node/) for full docs.
 
-### Rust (local)
+### Rust (local, file-first)
 
 ```rust
 use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 
-let config = TurboliteConfig {
-    cache_dir: "/path/to/data".into(),
-    ..Default::default()
-};
-let vfs = TurboliteVfs::new(config)?;
+// `app.db` is the user-visible local page image.
+// `app.db-turbolite/` holds hidden implementation state.
+let config = TurboliteConfig::for_database_path("/data/app.db");
+let vfs = TurboliteVfs::new_local(config)?;
 turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(
-    "mydb.db",
+    "/data/app.db",
     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
     "turbolite",
 )?;
 ```
+
+The lower-level form lets you pick the cache directory directly:
+
+```rust
+let config = TurboliteConfig {
+    cache_dir: "/path/to/data".into(),  // turbolite owns this dir
+    ..Default::default()
+};
+```
+
+In that case the local image is `/path/to/data/data.cache` rather than a
+caller-named `app.db`. New embedders should prefer the file-first form.
 
 ### Rust (S3 cloud)
 
@@ -486,20 +521,22 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 use hadb_storage::StorageBackend;
 
-let config = TurboliteConfig {
-    cache_dir: "/tmp/cache".into(),
-    ..Default::default()
-};
+let config = TurboliteConfig::for_database_path("/data/app.db");
 let storage: Arc<dyn StorageBackend> = /* your S3 backend */;
 let vfs = TurboliteVfs::with_backend(config, storage, tokio::runtime::Handle::current())?;
 turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(
-    "mydb.db",
+    "/data/app.db",
     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
     "turbolite",
 )?;
 ```
+
+`app.db` is turbolite's compressed page image. It is not promised to be
+opened directly by stock `sqlite3`. For a normal SQLite file (e.g. for the
+`sqlite3` CLI), use the SQLite online backup API or the binding-specific
+export helper (`conn.iterdump()` in Python, `db.backup()` in Node).
 
 ## CLI
 

@@ -1,20 +1,29 @@
 /**
  * turbolite -- SQLite with compressed page groups and optional S3 cloud storage for Node.js.
  *
- * Local mode (default):
+ * Local mode (default), file-first:
  *
  *   import { connect } from 'turbolite';
- *   const db = connect('my.db');
- *   // db is a better-sqlite3 Database with full API:
+ *   const db = connect('/data/app.db');
+ *   // /data/app.db is the local page image (turbolite-owned).
+ *   // /data/app.db-turbolite/ holds hidden implementation state
+ *   // (manifest, cache, staging logs).
+ *   // db is a better-sqlite3 Database with the full API:
  *   // prepared statements, param binding, transactions, etc.
  *
  * S3 cloud mode:
  *
- *   const db = connect('my.db', {
+ *   const db = connect('/data/app.db', {
  *     mode: 's3',
  *     bucket: 'my-bucket',
  *     endpoint: 'https://t3.storage.dev',
  *   });
+ *
+ * Note: app.db is turbolite's compressed page image. It is not promised
+ * to be opened directly by stock sqlite3. To get a stock SQLite file
+ * that the standard sqlite3 CLI can open, run
+ *   db.exec("VACUUM INTO 'export.sqlite'")
+ * while connected via turbolite.
  */
 
 import path from 'path';
@@ -162,6 +171,16 @@ export function load(db: Database.Database): void {
 }
 
 /**
+ * Return the hidden sidecar directory path for a file-first database path.
+ *
+ * For `/data/app.db` this is `/data/app.db-turbolite`. Useful for tests or
+ * tooling that asserts on layout without hardcoding the suffix rule.
+ */
+export function stateDirForDatabasePath(dbPath: string): string {
+  return `${dbPath}-turbolite`;
+}
+
+/**
  * Open a turbolite database. Returns a standard better-sqlite3 Database
  * with full API: prepared statements, param binding, transactions,
  * user-defined functions, aggregates, etc.
@@ -222,10 +241,10 @@ export function connect(
   let vfsName: string;
 
   if (mode === 'local') {
-    // Each local database gets its own VFS with isolated manifest, cache,
-    // and page group state. This matches the napi-rs behavior where each
-    // Database() call created a separate VFS instance.
-    vfsName = `turbolite-${_vfsCounter++}`;
+    // File-first: each local database gets its own VFS keyed to the
+    // user-supplied path. The path itself is the local page image; sidecar
+    // metadata lives at `${absPath}-turbolite/`.
+    vfsName = `turbolite-node-${_vfsCounter++}`;
     const dbDir = path.dirname(absPath);
     if (!fs.existsSync(dbDir)) {
       throw new Error(
@@ -233,11 +252,13 @@ export function connect(
       );
     }
     const rc = bootstrap
-      .prepare('SELECT turbolite_register_vfs(?, ?)')
+      .prepare('SELECT turbolite_register_file_first_vfs(?, ?)')
       .pluck()
-      .get(vfsName, dbDir) as number;
+      .get(vfsName, absPath) as number;
     if (rc !== 0) {
-      throw new Error(`Failed to register VFS '${vfsName}' for ${dbDir}`);
+      throw new Error(
+        `Failed to register file-first VFS '${vfsName}' for ${absPath}`
+      );
     }
   } else {
     // S3 mode uses the global "turbolite-s3" VFS registered at init time.

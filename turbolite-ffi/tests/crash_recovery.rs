@@ -694,3 +694,162 @@ fn test_delete_mode_crash_recovery() {
     assert!(json.contains("ok"), "integrity must pass: {}", json);
     turbolite_close(db);
 }
+
+
+/// Regression test for the lock-downgrade-without-sync rollback bug.
+///
+/// Earlier code in TurboliteHandle::lock() treated "lock downgrades from
+/// EXCLUSIVE/RESERVED with dirty pages but no intervening xSync" as a
+/// signal that the transaction had been rolled back, and discarded the
+/// dirty pages. SQLite skips xSync entirely under PRAGMA synchronous=OFF,
+/// so every commit looked like a rollback and writes were silently
+/// dropped on close+reopen.
+///
+/// This locks the matrix down: every (journal_mode, synchronous) pair
+/// must preserve writes across a clean close + reopen.
+#[test]
+fn test_persistence_across_synchronous_modes() {
+    let cases: &[(&str, &str)] = &[
+        ("WAL", "OFF"),
+        ("WAL", "NORMAL"),
+        ("WAL", "FULL"),
+        ("WAL", "EXTRA"),
+        ("DELETE", "OFF"),
+        ("DELETE", "NORMAL"),
+        ("DELETE", "FULL"),
+        ("TRUNCATE", "OFF"),
+        ("TRUNCATE", "NORMAL"),
+        ("PERSIST", "OFF"),
+        ("PERSIST", "NORMAL"),
+    ];
+
+    for (journal, sync) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("persist_{journal}_{sync}.db"));
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        let vfs_name = setup_vfs(dir.path());
+
+        let db = open_db(&db_path_str, &vfs_name);
+        exec_sql(db, &format!("PRAGMA journal_mode={journal}"));
+        exec_sql(db, &format!("PRAGMA synchronous={sync}"));
+        exec_sql(
+            db,
+            "CREATE TABLE rows (id INTEGER PRIMARY KEY, val TEXT)",
+        );
+        for i in 0..20 {
+            exec_sql(db, &format!("INSERT INTO rows VALUES ({i}, 'v{i}')"));
+        }
+        // Some configurations checkpoint, others don't; the contract is
+        // that clean-close + reopen preserves data either way.
+        if *journal == "WAL" {
+            exec_sql(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+        }
+        turbolite_close(db);
+
+        let db = open_db(&db_path_str, &vfs_name);
+        let json = query_json(db, "SELECT COUNT(*) as cnt FROM rows");
+        assert!(
+            json.contains("20"),
+            "journal={journal} sync={sync}: lost rows after clean close+reopen: {json}",
+        );
+        let json = query_json(db, "PRAGMA integrity_check");
+        assert!(
+            json.contains("ok"),
+            "journal={journal} sync={sync}: integrity check failed: {json}",
+        );
+        turbolite_close(db);
+    }
+}
+
+/// Regression test for the same bug at a finer granularity: prove that
+/// committing many transactions under sync=OFF preserves every commit,
+/// not just the last. Earlier behavior would discard every commit's
+/// dirty pages at lock-downgrade.
+#[test]
+fn test_synchronous_off_multiple_commits_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("multi_commit.db");
+    let db_path_str = db_path.to_str().unwrap().to_string();
+
+    let vfs_name = setup_vfs(dir.path());
+
+    let db = open_db(&db_path_str, &vfs_name);
+    exec_sql(db, "PRAGMA journal_mode=WAL");
+    exec_sql(db, "PRAGMA synchronous=OFF");
+    exec_sql(db, "CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT)");
+
+    // 10 separate commit boundaries — each should survive.
+    for i in 0..10 {
+        exec_sql(db, "BEGIN");
+        for j in 0..5 {
+            exec_sql(
+                db,
+                &format!("INSERT INTO log VALUES ({}, 'tx{i}_{j}')", i * 5 + j),
+            );
+        }
+        exec_sql(db, "COMMIT");
+    }
+    exec_sql(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    turbolite_close(db);
+
+    let db = open_db(&db_path_str, &vfs_name);
+    let json = query_json(db, "SELECT COUNT(*) as cnt FROM log");
+    assert!(
+        json.contains("50"),
+        "sync=OFF must preserve every commit, expected 50 rows: {json}",
+    );
+    let json = query_json(db, "PRAGMA integrity_check");
+    assert!(json.contains("ok"), "integrity must pass: {}", json);
+    turbolite_close(db);
+}
+
+
+/// Rollback regression: the lock-downgrade-without-sync code path used
+/// to discard dirty pages on the assumption they were rolled-back
+/// in-progress writes. The new behavior unconditionally persists at
+/// lock downgrade. Make sure that's still correct for actual rollbacks
+/// — i.e., the rollback's restored-original page bytes are what end up
+/// persisted, not the in-progress writes.
+#[test]
+fn test_rollback_under_sync_off_keeps_pre_txn_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollback.db");
+    let db_path_str = db_path.to_str().unwrap().to_string();
+
+    let vfs_name = setup_vfs(dir.path());
+
+    let db = open_db(&db_path_str, &vfs_name);
+    exec_sql(db, "PRAGMA journal_mode=WAL");
+    exec_sql(db, "PRAGMA synchronous=OFF");
+    exec_sql(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+    for i in 0..10 {
+        exec_sql(db, &format!("INSERT INTO t VALUES ({i}, 'committed')"));
+    }
+    exec_sql(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+
+    // Now run a transaction that we explicitly rollback.
+    exec_sql(db, "BEGIN");
+    for i in 10..20 {
+        exec_sql(db, &format!("INSERT INTO t VALUES ({i}, 'aborted')"));
+    }
+    exec_sql(db, "ROLLBACK");
+    exec_sql(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    turbolite_close(db);
+
+    // Reopen: must see only the 10 committed rows; no 'aborted' rows.
+    let db = open_db(&db_path_str, &vfs_name);
+    let json = query_json(db, "SELECT COUNT(*) FROM t");
+    assert!(
+        json.contains("10"),
+        "rollback must not persist aborted rows: {json}",
+    );
+    let json = query_json(db, "SELECT COUNT(*) FROM t WHERE val = 'aborted'");
+    assert!(
+        json.contains(":0") || json.contains(": 0"),
+        "no aborted rows must persist: {json}",
+    );
+    let json = query_json(db, "PRAGMA integrity_check");
+    assert!(json.contains("ok"), "integrity must pass after rollback: {json}");
+    turbolite_close(db);
+}

@@ -6,7 +6,7 @@
  * user-defined functions, aggregates, concurrent reads, persistence,
  * failure modes, and S3 cloud storage.
  */
-import { connect, load } from './dist/index.js';
+import { connect, load, stateDirForDatabasePath } from './dist/index.js';
 import Database from 'better-sqlite3';
 import { strict as assert } from 'node:assert';
 import fs from 'node:fs';
@@ -59,6 +59,54 @@ test('basic CRUD', () => {
   assert.equal(rows[1].val, 'world');
   db.close();
 });
+
+test('file-first layout: app.db + app.db-turbolite/local_state.msgpack', () => {
+  const dir = testDir();
+  const dbPath = path.join(dir, 'app.db');
+
+  const db = connect(dbPath);
+  db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+  db.exec("INSERT INTO t VALUES (1, 'one')");
+  db.exec("INSERT INTO t VALUES (2, 'two')");
+  db.close();
+
+  assert.ok(fs.existsSync(dbPath), `${dbPath} must exist after close`);
+
+  const sidecar = stateDirForDatabasePath(dbPath);
+  assert.equal(sidecar, dbPath + '-turbolite');
+  assert.ok(fs.statSync(sidecar).isDirectory(), `${sidecar} must be a dir`);
+
+  const localState = path.join(sidecar, 'local_state.msgpack');
+  assert.ok(fs.existsSync(localState),
+    `file-first: ${localState} must exist (consolidated local state)`);
+
+  // The pre-PR-#27 split DiskCache tracking files must not be produced.
+  // In pure-local mode the local backend still owns its own
+  // `manifest.msgpack` under the sidecar, which is fine.
+  for (const legacy of [
+    'page_bitmap', 'sub_chunk_tracker', 'cache_index.json',
+    'dirty_groups.msgpack',
+  ]) {
+    assert.ok(!fs.existsSync(path.join(sidecar, legacy)),
+      `file-first: legacy split file ${legacy} should not be produced`);
+  }
+
+  // Reopen and verify data.
+  const db2 = connect(dbPath);
+  const rows = db2.prepare('SELECT * FROM t ORDER BY id').all();
+  assert.deepEqual(rows, [
+    { id: 1, val: 'one' },
+    { id: 2, val: 'two' },
+  ]);
+  db2.close();
+});
+
+// Note: better-sqlite3's `db.backup(path)` is the supported export path
+// for producing a stock SQLite file (it opens the destination through
+// SQLite's default VFS rather than the turbolite VFS). It is async and
+// the synchronous test runner here doesn't drive it; the equivalent
+// behavior is exercised by the Python `iterdump` test in
+// test_turbolite.py.
 
 test('prepared statements with param binding', () => {
   const db = connect(path.join(testDir(), 'params.db'));

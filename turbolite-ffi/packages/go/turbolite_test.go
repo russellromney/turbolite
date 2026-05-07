@@ -277,6 +277,77 @@ func TestWALMode(t *testing.T) {
 	db.Exec("INSERT INTO t VALUES (1)")
 }
 
+// ===== File-first layout =====
+
+func TestFileFirstLayout(t *testing.T) {
+	dir := tmpDir(t)
+	dbPath := filepath.Join(dir, "app.db")
+
+	db, err := Open(dbPath, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO t VALUES (1, 'one')"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	db.Close()
+
+	// app.db is the user-visible artifact.
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("app.db must exist after close: %v", err)
+	}
+
+	sidecar := StateDirForDatabasePath(dbPath)
+	if sidecar != dbPath+"-turbolite" {
+		t.Fatalf("sidecar path: got %q want %q", sidecar, dbPath+"-turbolite")
+	}
+	info, err := os.Stat(sidecar)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("sidecar dir must exist: %v", err)
+	}
+
+	// Consolidated local-state file is the promised name.
+	localState := filepath.Join(sidecar, "local_state.msgpack")
+	if _, err := os.Stat(localState); err != nil {
+		t.Fatalf("file-first: local_state.msgpack must exist: %v", err)
+	}
+
+	// Pre-PR-#27 split DiskCache tracking files must not be produced.
+	// In pure-local mode the local backend still owns its own
+	// `manifest.msgpack` under the sidecar, which is expected.
+	for _, legacy := range []string{
+		"page_bitmap", "sub_chunk_tracker", "cache_index.json",
+		"dirty_groups.msgpack",
+	} {
+		if _, err := os.Stat(filepath.Join(sidecar, legacy)); err == nil {
+			t.Fatalf("file-first: legacy split file %s must not be produced", legacy)
+		}
+	}
+
+	// Reopen and verify data.
+	db2, err := Open(dbPath, nil)
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer db2.Close()
+	var val string
+	if err := db2.QueryRow("SELECT val FROM t WHERE id = 1").Scan(&val); err != nil {
+		t.Fatalf("SELECT after reopen: %v", err)
+	}
+	if val != "one" {
+		t.Fatalf("expected 'one', got %q", val)
+	}
+}
+
+// Note: producing a stock SQLite export requires the SQLite online backup
+// API, which the turbolite Go binding does not currently expose. (The
+// turbolite VFS rejects mismatched alias opens by design, so `VACUUM INTO`
+// is not the right path — see file-first contract.) The Python binding's
+// `iterdump`-based export is the documented user-facing example.
+
 // ===== Persistence =====
 
 func TestPersistenceAcrossReopen(t *testing.T) {

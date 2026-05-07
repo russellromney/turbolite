@@ -188,6 +188,237 @@ fn test_persistence_across_connections() {
     turbolite_close(db);
 }
 
+// --- turbolite_register_local_file_first ---
+
+#[test]
+fn test_register_local_file_first_layout() {
+    // File-first: db_path is the local page image; sidecar metadata lives at
+    // `<db_path>-turbolite/` and the consolidated state file is
+    // local_state.msgpack. Old split tracking files should not appear.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("app.db");
+    let vfs_name = CString::new("ffi-file-first").unwrap();
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+
+    let rc = turbolite_register_local_file_first(vfs_name.as_ptr(), db_path_c.as_ptr(), 3);
+    assert_eq!(rc, 0, "register_local_file_first should succeed");
+
+    let db = turbolite_open(db_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null(), "open should return non-null handle");
+
+    let sql = CString::new(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT); \
+         INSERT INTO t VALUES (1, 'one'); \
+         INSERT INTO t VALUES (2, 'two');",
+    )
+    .unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+    turbolite_close(db);
+
+    assert!(db_path.is_file(), "file-first: app.db must exist");
+    let sidecar = dir.path().join("app.db-turbolite");
+    assert!(sidecar.is_dir(), "file-first: sidecar dir must exist");
+
+    let local_state = sidecar.join("local_state.msgpack");
+    assert!(
+        local_state.is_file(),
+        "file-first: local_state.msgpack must exist"
+    );
+
+    // In pure-local mode the local backend still owns its own
+    // `manifest.msgpack` under the sidecar (via the storage client); only the
+    // DiskCache split tracking files are gone. The file-first contract is
+    // about consolidating local cache tracking into local_state.msgpack.
+    for legacy in [
+        "page_bitmap",
+        "sub_chunk_tracker",
+        "cache_index.json",
+        "dirty_groups.msgpack",
+    ] {
+        assert!(
+            !sidecar.join(legacy).is_file(),
+            "file-first: legacy split file {legacy} should not be produced"
+        );
+    }
+
+    // Reopen and read.
+    let db = turbolite_open(db_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null());
+    let query = CString::new("SELECT * FROM t ORDER BY id").unwrap();
+    let json_ptr = turbolite_query_json(db, query.as_ptr());
+    assert!(!json_ptr.is_null());
+    let json_str = unsafe { std::ffi::CStr::from_ptr(json_ptr) }
+        .to_str()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+    let rows = parsed.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["val"], "one");
+    assert_eq!(rows[1]["val"], "two");
+    turbolite_free_string(json_ptr);
+    turbolite_close(db);
+}
+
+#[test]
+fn test_register_local_file_first_null_name_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = CString::new(dir.path().join("app.db").to_str().unwrap()).unwrap();
+    let rc = turbolite_register_local_file_first(std::ptr::null(), db_path.as_ptr(), 3);
+    assert_eq!(rc, -1);
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(msg.contains("name"), "expected 'name' in error: {msg}");
+}
+
+#[test]
+fn test_register_local_file_first_null_database_path_fails() {
+    let name = CString::new("ffi-file-first-null-path").unwrap();
+    let rc = turbolite_register_local_file_first(name.as_ptr(), std::ptr::null(), 3);
+    assert_eq!(rc, -1);
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+    let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_str().unwrap();
+    assert!(
+        msg.contains("database_path"),
+        "expected 'database_path' in error: {msg}"
+    );
+}
+
+#[test]
+fn test_register_local_file_first_honors_compression_level() {
+    // Regression test: the file-first FFI helper must apply the
+    // compression_level argument the same way the lower-level helper does.
+    // Build with two different levels and confirm both succeed end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    for (suffix, level) in [("a", 1), ("b", 22)] {
+        let db_path = dir.path().join(format!("app-{suffix}.db"));
+        let vfs = CString::new(format!("ffi-file-first-comp-{suffix}")).unwrap();
+        let dbp = CString::new(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            turbolite_register_local_file_first(vfs.as_ptr(), dbp.as_ptr(), level),
+            0,
+            "level={level} must succeed"
+        );
+        let db = turbolite_open(dbp.as_ptr(), vfs.as_ptr());
+        assert!(!db.is_null());
+        let sql = CString::new("CREATE TABLE t (i INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+        turbolite_close(db);
+        assert!(db_path.is_file());
+    }
+}
+
+#[test]
+fn test_register_local_file_first_rejects_alias_open() {
+    // File-first VFS identity contract: opening a different filename
+    // through the same VFS must be rejected. This proves the binding
+    // layer can rely on per-VFS path identity for isolation.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("app.db");
+    let other_path = dir.path().join("other.db");
+    let vfs_name = CString::new("ffi-file-first-alias").unwrap();
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let other_path_c = CString::new(other_path.to_str().unwrap()).unwrap();
+
+    assert_eq!(
+        turbolite_register_local_file_first(vfs_name.as_ptr(), db_path_c.as_ptr(), 3),
+        0
+    );
+
+    // Opening the registered path is fine.
+    let db = turbolite_open(db_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null(), "registered path must open");
+    turbolite_close(db);
+
+    // Opening a different path through the same VFS must fail.
+    let aliased = turbolite_open(other_path_c.as_ptr(), vfs_name.as_ptr());
+    assert!(
+        aliased.is_null(),
+        "file-first VFS must reject mismatched alias open"
+    );
+    let err = turbolite_last_error();
+    assert!(!err.is_null());
+}
+
+#[test]
+fn test_state_dir_for_database_path_helper() {
+    let path = CString::new("/tmp/app.db").unwrap();
+    let ptr = turbolite_state_dir_for_database_path(path.as_ptr());
+    assert!(!ptr.is_null());
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(s, "/tmp/app.db-turbolite");
+    turbolite_free_string(ptr);
+}
+
+#[test]
+fn test_state_dir_for_database_path_null_returns_null() {
+    let ptr = turbolite_state_dir_for_database_path(std::ptr::null());
+    assert!(ptr.is_null());
+}
+
+#[test]
+fn test_register_json_local_data_path_derives_sidecar() {
+    // When the JSON config sets `local_data_path` but not `cache_dir`,
+    // the sidecar must end up at `<local_data_path>-turbolite/`, not at
+    // the default `/tmp/turbolite-cache`.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("derived.db");
+    let name = CString::new("ffi-json-file-first-derive").unwrap();
+    let config = format!(
+        r#"{{ "local_data_path": "{}" }}"#,
+        db_path.to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+    let rc = turbolite_register(name.as_ptr(), config_json.as_ptr());
+    assert_eq!(rc, 0);
+
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path_c.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+    turbolite_close(db);
+
+    let sidecar = dir.path().join("derived.db-turbolite");
+    assert!(
+        sidecar.is_dir(),
+        "JSON local_data_path-only must derive sidecar next to db",
+    );
+    assert!(sidecar.join("local_state.msgpack").is_file());
+}
+
+#[test]
+fn test_register_json_local_data_path_with_explicit_cache_dir() {
+    // When BOTH fields are set, `cache_dir` wins (no auto-derivation).
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("explicit.db");
+    let custom_sidecar = dir.path().join("custom-sidecar");
+    std::fs::create_dir_all(&custom_sidecar).unwrap();
+    let name = CString::new("ffi-json-file-first-explicit").unwrap();
+    let config = format!(
+        r#"{{ "local_data_path": "{}", "cache_dir": "{}" }}"#,
+        db_path.to_str().unwrap(),
+        custom_sidecar.to_str().unwrap()
+    );
+    let config_json = CString::new(config).unwrap();
+    assert_eq!(turbolite_register(name.as_ptr(), config_json.as_ptr()), 0);
+
+    let db_path_c = CString::new(db_path.to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path_c.as_ptr(), name.as_ptr());
+    assert!(!db.is_null());
+    let sql = CString::new("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+    turbolite_close(db);
+
+    assert!(custom_sidecar.join("local_state.msgpack").is_file());
+    // No auto-derived sidecar at the default location.
+    assert!(!dir.path().join("explicit.db-turbolite").exists());
+}
+
 // --- turbolite_register_local ---
 
 #[test]

@@ -54,14 +54,46 @@ const char *turbolite_version(void);
 
 #if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
- * Register a local TurboliteVfs (page groups on disk, no S3).
+ * Register a local TurboliteVfs keyed to a database file path (file-first).
  *
- * This is the recommended way to create a high-performance local SQLite VFS
- * with compressed page groups and manifest-based storage.
+ * This is the recommended local registration. The caller's `database_path`
+ * is the primary local database image; turbolite stores its hidden
+ * implementation state under `<database_path>-turbolite/` (manifest, cache,
+ * staging logs, etc.). Bindings should prefer this over
+ * [`turbolite_register_local`].
+ *
+ * `database_path` may be relative or absolute. Relative paths are kept
+ * verbatim and resolved against the process working directory at open time.
+ * The string is copied immediately into a `PathBuf`; the caller may free
+ * the buffer after this call returns.
  *
  * # Parameters
- * - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
- * - `cache_dir`: Directory where page groups and manifest are stored.
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+ * - `database_path`: User-facing database path (e.g. `/data/app.db`).
+ * - `compression_level`: zstd level 1-22 (3 is a good default).
+ *
+ * # Returns
+ * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+ */
+int turbolite_register_local_file_first(const char *name,
+                                        const char *database_path,
+                                        int compression_level);
+#endif
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Register a local TurboliteVfs (lower-level: caller picks cache_dir).
+ *
+ * Lower-level than [`turbolite_register_local_file_first`]: turbolite owns
+ * the entire `cache_dir` directory and stores the local database image at
+ * `<cache_dir>/data.cache` instead of a caller-supplied file path. Use this
+ * only when you need to control the cache layout directly. New embedders
+ * should prefer the file-first registration so the user-facing artifact is
+ * `app.db`, not `cache_dir/data.cache`.
+ *
+ * # Parameters
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+ * - `cache_dir`: Directory turbolite owns for its page-group storage.
  * - `compression_level`: zstd level 1-22 (3 is a good default).
  *
  * # Returns
@@ -72,23 +104,53 @@ int turbolite_register_local(const char *name, const char *cache_dir, int compre
 
 #if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
+ * Compute the hidden sidecar directory path for a database file.
+ *
+ * Convenience for bindings that want to assert or eagerly create the
+ * sidecar location without re-implementing the suffix rule. For
+ * `database_path = "/data/app.db"` the result is `/data/app.db-turbolite`.
+ *
+ * The returned string is heap-allocated; callers must free it with
+ * [`turbolite_free_string`].
+ *
+ * Returns NULL if `database_path` is NULL or not valid UTF-8.
+ */
+char *turbolite_state_dir_for_database_path(const char *database_path);
+#endif
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
  * Register a TurboliteVfs from a JSON configuration string.
  *
  * Unified entry point that supports both local and cloud modes. The JSON
  * object is deserialized into a `TurboliteConfig`. Unknown fields are ignored.
  *
- * # Minimal JSON (local mode)
+ * # File-first local mode (recommended)
+ *
+ * ```json
+ * { "local_data_path": "/data/app.db" }
+ * ```
+ *
+ * turbolite owns `app.db` as the local page image; the sidecar lives next
+ * to it under `app.db-turbolite/`. When `local_data_path` is set and
+ * `cache_dir` is *not* supplied, the sidecar path is derived from
+ * `local_data_path`. To pin the sidecar somewhere else, set both fields.
+ *
+ * # Lower-level local mode
  *
  * ```json
  * { "cache_dir": "/data/mydb" }
  * ```
+ *
+ * turbolite owns the directory and stores the page image at
+ * `/data/mydb/data.cache`. Prefer the file-first form for new embedders.
  *
  * # Cloud mode
  *
  * ```json
  * {
  *   "storage_backend": { "S3": { "bucket": "my-bucket", "prefix": "db/" } },
- *   "cache_dir": "/tmp/cache"
+ *   "local_data_path": "/data/app.db"
  * }
  * ```
  *
@@ -210,6 +272,14 @@ void turbolite_free_string(char *s);
  * Close a database connection opened with `turbolite_open`.
  */
 void turbolite_close(struct TurboliteDb *db);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+extern int turbolite_sqlite3_turbolite_init_impl(void *db, char **pz_err_msg, const void *p_api);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+int sqlite3_turbolite_init(void *db, char **pz_err_msg, const void *p_api);
 #endif
 
 #if defined(TURBOLITE_LOADABLE_EXTENSION)
@@ -365,9 +435,40 @@ int32_t turbolite_gc(void);
  * Called from SQL: SELECT turbolite_register_vfs('name', '/path/to/cache_dir').
  * Each registered VFS gets its own manifest, cache, and page group state,
  * enabling multiple independent databases in the same process.
+ *
+ * This is the lower-level form: turbolite owns the entire `cache_dir` and
+ * stores the local database image at `<cache_dir>/data.cache`. Bindings that
+ * expose a user-facing `app.db` should prefer
+ * [`turbolite_ext_register_file_first_vfs`] so the user's database path is
+ * the local image.
+ *
  * Returns 0 on success, 1 on error.
  */
 int turbolite_ext_register_named_vfs(const char *name_ptr, const char *cache_dir_ptr);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Register a file-first local VFS keyed to a database path.
+ *
+ * Called from SQL via:
+ *
+ * ```sql
+ * SELECT turbolite_register_file_first_vfs('app', '/data/app.db');
+ * ```
+ *
+ * The caller's `db_path` becomes the local database image and turbolite
+ * stores its sidecar metadata at `<db_path>-turbolite/`. This is the
+ * recommended user-facing entry point — bindings should expose this rather
+ * than the bare `cache_dir`-driven [`turbolite_ext_register_named_vfs`].
+ *
+ * Other `TURBOLITE_*` env vars (compression, cache, prefetch, read-only)
+ * are honored via `TurboliteConfig::from_env()`; only the cache_dir is
+ * overridden to match the database path.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int turbolite_ext_register_file_first_vfs(const char *name_ptr, const char *db_path_ptr);
 #endif
 
 /**

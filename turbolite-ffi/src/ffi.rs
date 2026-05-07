@@ -19,18 +19,25 @@
 //! #include "turbolite.h"
 //! #include <sqlite3.h>
 //!
-//! // Register the VFS (local mode)
-//! int rc = turbolite_register_local("turbolite", "/data/mydb", 3);
+//! // Recommended file-first registration: the caller's database path is
+//! // the local page image. Sidecar metadata lives in `/data/app.db-turbolite/`.
+//! int rc = turbolite_register_local_file_first("turbolite", "/data/app.db", 3);
 //! if (rc != 0) {
 //!     fprintf(stderr, "error: %s\n", turbolite_last_error());
 //! }
 //!
-//! // Or use JSON config for full control:
-//! // int rc = turbolite_register("turbolite", "{\"cache_dir\": \"/data/mydb\"}");
-//!
-//! // Open a database using the registered VFS
 //! sqlite3 *db;
-//! sqlite3_open_v2("mydb.sqlite", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "turbolite");
+//! sqlite3_open_v2("/data/app.db", &db,
+//!                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "turbolite");
+//!
+//! // Lower-level: pass a cache directory and let turbolite store the
+//! // page image under `<cache_dir>/data.cache`. Useful when the caller
+//! // wants to manage the cache layout themselves.
+//! // int rc = turbolite_register_local("turbolite-low", "/data/mydb", 3);
+//!
+//! // JSON config for full control (file-first):
+//! // turbolite_register("turbolite",
+//! //     "{\"local_data_path\": \"/data/app.db\"}");
 //! ```
 
 use std::cell::RefCell;
@@ -85,14 +92,74 @@ pub extern "C" fn turbolite_version() -> *const c_char {
 
 // --- VFS registration ---
 
-/// Register a local TurboliteVfs (page groups on disk, no S3).
+/// Register a local TurboliteVfs keyed to a database file path (file-first).
 ///
-/// This is the recommended way to create a high-performance local SQLite VFS
-/// with compressed page groups and manifest-based storage.
+/// This is the recommended local registration. The caller's `database_path`
+/// is the primary local database image; turbolite stores its hidden
+/// implementation state under `<database_path>-turbolite/` (manifest, cache,
+/// staging logs, etc.). Bindings should prefer this over
+/// [`turbolite_register_local`].
+///
+/// `database_path` may be relative or absolute. Relative paths are kept
+/// verbatim and resolved against the process working directory at open time.
+/// The string is copied immediately into a `PathBuf`; the caller may free
+/// the buffer after this call returns.
 ///
 /// # Parameters
-/// - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
-/// - `cache_dir`: Directory where page groups and manifest are stored.
+/// - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+/// - `database_path`: User-facing database path (e.g. `/data/app.db`).
+/// - `compression_level`: zstd level 1-22 (3 is a good default).
+///
+/// # Returns
+/// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+#[no_mangle]
+pub extern "C" fn turbolite_register_local_file_first(
+    name: *const c_char,
+    database_path: *const c_char,
+    compression_level: c_int,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let database_path = match cstr_to_str(database_path, "database_path") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let mut config = turbolite::tiered::TurboliteConfig::for_database_path(database_path);
+    config.compression.level = compression_level;
+    config.compression_level = compression_level;
+
+    let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("local vfs creation failed: {}", e));
+            return -1;
+        }
+    };
+    match turbolite::tiered::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register a local TurboliteVfs (lower-level: caller picks cache_dir).
+///
+/// Lower-level than [`turbolite_register_local_file_first`]: turbolite owns
+/// the entire `cache_dir` directory and stores the local database image at
+/// `<cache_dir>/data.cache` instead of a caller-supplied file path. Use this
+/// only when you need to control the cache layout directly. New embedders
+/// should prefer the file-first registration so the user-facing artifact is
+/// `app.db`, not `cache_dir/data.cache`.
+///
+/// # Parameters
+/// - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+/// - `cache_dir`: Directory turbolite owns for its page-group storage.
 /// - `compression_level`: zstd level 1-22 (3 is a good default).
 ///
 /// # Returns
@@ -138,23 +205,69 @@ pub extern "C" fn turbolite_register_local(
     }
 }
 
+/// Compute the hidden sidecar directory path for a database file.
+///
+/// Convenience for bindings that want to assert or eagerly create the
+/// sidecar location without re-implementing the suffix rule. For
+/// `database_path = "/data/app.db"` the result is `/data/app.db-turbolite`.
+///
+/// The returned string is heap-allocated; callers must free it with
+/// [`turbolite_free_string`].
+///
+/// Returns NULL if `database_path` is NULL or not valid UTF-8.
+#[no_mangle]
+pub extern "C" fn turbolite_state_dir_for_database_path(
+    database_path: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+    let database_path = match cstr_to_str(database_path, "database_path") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+        database_path,
+        "-turbolite",
+    );
+    match CString::new(dir.to_string_lossy().into_owned()) {
+        Ok(cs) => cs.into_raw(),
+        Err(e) => {
+            set_last_error(&format!("path contains null byte: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Register a TurboliteVfs from a JSON configuration string.
 ///
 /// Unified entry point that supports both local and cloud modes. The JSON
 /// object is deserialized into a `TurboliteConfig`. Unknown fields are ignored.
 ///
-/// # Minimal JSON (local mode)
+/// # File-first local mode (recommended)
+///
+/// ```json
+/// { "local_data_path": "/data/app.db" }
+/// ```
+///
+/// turbolite owns `app.db` as the local page image; the sidecar lives next
+/// to it under `app.db-turbolite/`. When `local_data_path` is set and
+/// `cache_dir` is *not* supplied, the sidecar path is derived from
+/// `local_data_path`. To pin the sidecar somewhere else, set both fields.
+///
+/// # Lower-level local mode
 ///
 /// ```json
 /// { "cache_dir": "/data/mydb" }
 /// ```
+///
+/// turbolite owns the directory and stores the page image at
+/// `/data/mydb/data.cache`. Prefer the file-first form for new embedders.
 ///
 /// # Cloud mode
 ///
 /// ```json
 /// {
 ///   "storage_backend": { "S3": { "bucket": "my-bucket", "prefix": "db/" } },
-///   "cache_dir": "/tmp/cache"
+///   "local_data_path": "/data/app.db"
 /// }
 /// ```
 ///
@@ -176,13 +289,42 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
         Err(code) => return code,
     };
 
-    let config: turbolite::tiered::TurboliteConfig = match serde_json::from_str(config_json) {
+    // Parse to a Value first so we can detect whether `cache_dir` was
+    // explicitly supplied; if `local_data_path` is set without an explicit
+    // `cache_dir`, derive the file-first sidecar path from local_data_path.
+    let raw: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("invalid config JSON: {}", e));
+            return -1;
+        }
+    };
+    let cache_dir_present = raw
+        .get("cache_dir")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let local_data_path_present = raw
+        .get("local_data_path")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+
+    let mut config: turbolite::tiered::TurboliteConfig = match serde_json::from_value(raw) {
         Ok(c) => c,
         Err(e) => {
             set_last_error(&format!("invalid config JSON: {}", e));
             return -1;
         }
     };
+
+    if local_data_path_present && !cache_dir_present {
+        if let Some(db_path) = config.local_data_path.clone() {
+            config.cache_dir =
+                turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+                    &db_path,
+                    "-turbolite",
+                );
+        }
+    }
 
     let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
         Ok(v) => v,

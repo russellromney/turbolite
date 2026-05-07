@@ -13,66 +13,144 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/**
- * Minimum confidence to fire a prediction.
- */
-#define CONFIDENCE_THRESHOLD 0.5
+typedef struct Option_CreateFnDestroy Option_CreateFnDestroy;
 
+typedef struct Option_CreateFnFinal Option_CreateFnFinal;
+
+typedef struct Option_CreateFnStep Option_CreateFnStep;
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Opaque database connection handle.
  */
 typedef struct TurboliteDb TurboliteDb;
+#endif
+
+typedef void sqlite3;
+
+typedef void sqlite3_context;
+
+typedef void sqlite3_value;
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Get the last error message, or NULL if no error occurred.
  *
  * The returned pointer is valid until the next turbolite_* call on this thread.
  */
 const char *turbolite_last_error(void);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Get the turbolite version string. Always returns a valid pointer.
  */
 const char *turbolite_version(void);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
- * Register a local TurboliteVfs (page groups on disk, no S3).
+ * Register a local TurboliteVfs keyed to a database file path (file-first).
  *
- * This is the recommended way to create a high-performance local SQLite VFS
- * with compressed page groups and manifest-based storage.
+ * This is the recommended local registration. The caller's `database_path`
+ * is the primary local database image; turbolite stores its hidden
+ * implementation state under `<database_path>-turbolite/` (manifest, cache,
+ * staging logs, etc.). Bindings should prefer this over
+ * [`turbolite_register_local`].
+ *
+ * `database_path` may be relative or absolute. Relative paths are kept
+ * verbatim and resolved against the process working directory at open time.
+ * The string is copied immediately into a `PathBuf`; the caller may free
+ * the buffer after this call returns.
  *
  * # Parameters
- * - `name`: VFS name (e.g. `"turbolite"`). Must be unique.
- * - `cache_dir`: Directory where page groups and manifest are stored.
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+ * - `database_path`: User-facing database path (e.g. `/data/app.db`).
+ * - `compression_level`: zstd level 1-22 (3 is a good default).
+ *
+ * # Returns
+ * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+ */
+int turbolite_register_local_file_first(const char *name,
+                                        const char *database_path,
+                                        int compression_level);
+#endif
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Register a local TurboliteVfs (lower-level: caller picks cache_dir).
+ *
+ * Lower-level than [`turbolite_register_local_file_first`]: turbolite owns
+ * the entire `cache_dir` directory and stores the local database image at
+ * `<cache_dir>/data.cache` instead of a caller-supplied file path. Use this
+ * only when you need to control the cache layout directly. New embedders
+ * should prefer the file-first registration so the user-facing artifact is
+ * `app.db`, not `cache_dir/data.cache`.
+ *
+ * # Parameters
+ * - `name`: VFS name (e.g. `"turbolite"`). Must be unique per process.
+ * - `cache_dir`: Directory turbolite owns for its page-group storage.
  * - `compression_level`: zstd level 1-22 (3 is a good default).
  *
  * # Returns
  * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
  */
 int turbolite_register_local(const char *name, const char *cache_dir, int compression_level);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Compute the hidden sidecar directory path for a database file.
+ *
+ * Convenience for bindings that want to assert or eagerly create the
+ * sidecar location without re-implementing the suffix rule. For
+ * `database_path = "/data/app.db"` the result is `/data/app.db-turbolite`.
+ *
+ * The returned string is heap-allocated; callers must free it with
+ * [`turbolite_free_string`].
+ *
+ * Returns NULL if `database_path` is NULL or not valid UTF-8.
+ */
+char *turbolite_state_dir_for_database_path(const char *database_path);
+#endif
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Register a TurboliteVfs from a JSON configuration string.
  *
  * Unified entry point that supports both local and cloud modes. The JSON
  * object is deserialized into a `TurboliteConfig`. Unknown fields are ignored.
  *
- * # Minimal JSON (local mode)
+ * # File-first local mode (recommended)
+ *
+ * ```json
+ * { "local_data_path": "/data/app.db" }
+ * ```
+ *
+ * turbolite owns `app.db` as the local page image; the sidecar lives next
+ * to it under `app.db-turbolite/`. When `local_data_path` is set and
+ * `cache_dir` is *not* supplied, the sidecar path is derived from
+ * `local_data_path`. To pin the sidecar somewhere else, set both fields.
+ *
+ * # Lower-level local mode
  *
  * ```json
  * { "cache_dir": "/data/mydb" }
  * ```
+ *
+ * turbolite owns the directory and stores the page image at
+ * `/data/mydb/data.cache`. Prefer the file-first form for new embedders.
  *
  * # Cloud mode
  *
  * ```json
  * {
  *   "storage_backend": { "S3": { "bucket": "my-bucket", "prefix": "db/" } },
- *   "cache_dir": "/tmp/cache"
+ *   "local_data_path": "/data/app.db"
  * }
  * ```
  *
@@ -84,8 +162,9 @@ int turbolite_register_local(const char *name, const char *cache_dir, int compre
  * 0 on success, -1 on error. Call `turbolite_last_error()` for details.
  */
 int turbolite_register(const char *name, const char *config_json);
+#endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (!defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Register an S3-backed cloud VFS.
  *
@@ -111,7 +190,7 @@ int turbolite_register_cloud(const char *name,
                              const char *region);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (!defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Backward-compatible alias for `turbolite_register_cloud`.
  */
@@ -123,13 +202,16 @@ int turbolite_register_tiered(const char *name,
                               const char *region);
 #endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Clear all VFS caches (shared file state, in-process locks).
  *
  * Call this when running fresh benchmarks or tests to ensure no stale state.
  */
 void turbolite_clear_caches(void);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Invalidate cached state for a specific database file.
  *
@@ -139,7 +221,9 @@ void turbolite_clear_caches(void);
  * 0 on success, -1 on error.
  */
 int turbolite_invalidate_cache(const char *path);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Open a database using a previously registered VFS.
  *
@@ -151,7 +235,9 @@ int turbolite_invalidate_cache(const char *path);
  * Opaque handle on success, NULL on error. Must be closed with `turbolite_close`.
  */
 struct TurboliteDb *turbolite_open(const char *path, const char *vfs_name);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Execute a SQL statement (DDL/DML) that returns no rows.
  *
@@ -159,7 +245,9 @@ struct TurboliteDb *turbolite_open(const char *path, const char *vfs_name);
  * 0 on success, -1 on error.
  */
 int turbolite_exec(struct TurboliteDb *db, const char *sql);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Execute a SQL query and return results as a JSON array of objects.
  *
@@ -170,17 +258,31 @@ int turbolite_exec(struct TurboliteDb *db, const char *sql);
  * or NULL on error.
  */
 char *turbolite_query_json(struct TurboliteDb *db, const char *sql);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Free a string returned by `turbolite_query_json`.
  */
 void turbolite_free_string(char *s);
+#endif
 
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Close a database connection opened with `turbolite_open`.
  */
 void turbolite_close(struct TurboliteDb *db);
+#endif
 
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+extern int turbolite_sqlite3_turbolite_init_impl(void *db, char **pz_err_msg, const void *p_api);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+int sqlite3_turbolite_init(void *db, char **pz_err_msg, const void *p_api);
+#endif
+
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
  * Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -190,8 +292,9 @@ void turbolite_close(struct TurboliteDb *db);
  * Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
  */
 int turbolite_ext_register_vfs(void);
+#endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
  * Returns 0 on success, 1 if no tiered VFS.
@@ -199,28 +302,47 @@ int turbolite_ext_register_vfs(void);
 int32_t turbolite_bench_clear_cache(int32_t mode);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int32_t turbolite_bench_flush_to_storage(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
- * Reset S3 counters. Returns 0 on success.
+ * Reset S3 counters. Always returns 0; counters are now backend-impl
+ * specific and not exposed through the generic trait.
  */
 int32_t turbolite_bench_reset_s3(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
- * Get S3 GET count since last reset.
+ * Get S3 GET count. Returns 0: not surfaced through the generic
+ * `StorageBackend` trait. Embedders that need per-backend metrics
+ * hold a concrete `hadb_storage_s3::S3Storage` directly.
  */
 int64_t turbolite_bench_s3_gets(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
- * Get S3 GET bytes since last reset.
+ * Get S3 GET bytes. Always 0; see above.
  */
 int64_t turbolite_bench_s3_bytes(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int64_t turbolite_bench_s3_puts(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int64_t turbolite_bench_s3_put_bytes(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
+int32_t turbolite_bench_flush_to_storage(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Evict cached data for named trees. tree_names is a comma-separated C string.
  * Returns number of groups evicted, or -1 if no tiered VFS.
@@ -228,11 +350,11 @@ int64_t turbolite_bench_s3_bytes(void);
 int32_t turbolite_evict_tree(const char *tree_names);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 int32_t turbolite_evict_tree(const char *_tree_names);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Return cache info as a JSON C string. Caller must treat as SQLITE_TRANSIENT.
  * Returns null if no tiered VFS.
@@ -242,7 +364,7 @@ int32_t turbolite_evict_tree(const char *_tree_names);
 const char *turbolite_cache_info(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
  * Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
@@ -251,11 +373,11 @@ const char *turbolite_cache_info(void);
 const char *turbolite_warm(void *db, const char *sql);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 const char *turbolite_warm(void *_db, const char *_sql);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
  * tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
@@ -263,11 +385,11 @@ const char *turbolite_warm(void *_db, const char *_sql);
 int32_t turbolite_evict_query(void *db, const char *sql);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 int32_t turbolite_evict_query(void *_db, const char *_sql);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
  * Returns number of sub-chunks evicted, or -1 if no tiered VFS.
@@ -275,15 +397,15 @@ int32_t turbolite_evict_query(void *_db, const char *_sql);
 int32_t turbolite_evict(const char *tier);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 int32_t turbolite_evict(const char *_tier);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 const char *turbolite_cache_info(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Full GC: list all S3 objects under prefix, delete orphans not in manifest.
  * Returns number of objects deleted, or -1 if no tiered VFS.
@@ -291,7 +413,7 @@ const char *turbolite_cache_info(void);
 int32_t turbolite_gc(void);
 #endif
 
-#if defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
  * Returns JSON report string (caller must free), or null on error.
@@ -299,31 +421,59 @@ int32_t turbolite_gc(void);
 const char *turbolite_compact(void);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 const char *turbolite_compact(void);
 #endif
 
-#if !defined(TURBOLITE_CLOUD)
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
 int32_t turbolite_gc(void);
 #endif
 
-extern int32_t sqlite3_prepare_v2(void *db,
-                                  const char *sql,
-                                  int32_t nbyte,
-                                  void **stmt,
-                                  const char **tail);
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Create and register a new local VFS with a custom name and cache directory.
+ * Called from SQL: SELECT turbolite_register_vfs('name', '/path/to/cache_dir').
+ * Each registered VFS gets its own manifest, cache, and page group state,
+ * enabling multiple independent databases in the same process.
+ *
+ * This is the lower-level form: turbolite owns the entire `cache_dir` and
+ * stores the local database image at `<cache_dir>/data.cache`. Bindings that
+ * expose a user-facing `app.db` should prefer
+ * [`turbolite_ext_register_file_first_vfs`] so the user's database path is
+ * the local image.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int turbolite_ext_register_named_vfs(const char *name_ptr, const char *cache_dir_ptr);
+#endif
 
-extern int32_t sqlite3_step(void *stmt);
-
-extern const char *sqlite3_column_text(void *stmt, int32_t col);
-
-extern int32_t sqlite3_finalize(void *stmt);
-
-extern int64_t sqlite3_column_int64(void *stmt, int32_t col);
+#if defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
+ * Register a file-first local VFS keyed to a database path.
+ *
+ * Called from SQL via:
+ *
+ * ```sql
+ * SELECT turbolite_register_file_first_vfs('app', '/data/app.db');
+ * ```
+ *
+ * The caller's `db_path` becomes the local database image and turbolite
+ * stores its sidecar metadata at `<db_path>-turbolite/`. This is the
+ * recommended user-facing entry point — bindings should expose this rather
+ * than the bare `cache_dir`-driven [`turbolite_ext_register_named_vfs`].
+ *
+ * Other `TURBOLITE_*` env vars (compression, cache, prefetch, read-only)
+ * are honored via `TurboliteConfig::from_env()`; only the cache_dir is
+ * overridden to match the database path.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int turbolite_ext_register_file_first_vfs(const char *name_ptr, const char *db_path_ptr);
+#endif
 
 /**
- * FFI entry point called from C trace callback.
- * Runs EQP, parses, and pushes to global queue.
+ * Run EQP on `sql` against `db` and push the planned accesses onto the
+ * global plan queue. Invoked from `SQLITE_TRACE_STMT`.
  *
  * # Safety
  * `db` must be a valid sqlite3 handle. `sql` must be a valid C string.
@@ -331,18 +481,123 @@ extern int64_t sqlite3_column_int64(void *stmt, int32_t col);
 void turbolite_trace_push_plan(void *db, const char *sql);
 
 /**
- * FFI entry point called from C trace profile callback.
- * Signals query completion for between-query eviction.
+ * Signal query completion so the VFS runs between-query eviction on the
+ * next read. Invoked from `SQLITE_TRACE_PROFILE`.
  */
 void turbolite_trace_end_query(void);
 
 /**
- * FFI entry point: `turbolite_config_set(key, value)` SQL function.
+ * FFI entry point: `turbolite_config_set(key, value)`.
+ *
+ * Returns:
+ *   0 — pushed successfully
+ *   1 — validation failed (unknown key or bad value)
+ *   2 — no active turbolite handle on this thread
  *
  * # Safety
  * `key` and `value` must be valid C strings.
  */
-int32_t turbolite_config_set(const char *key, const char *value);
+int turbolite_config_set(const char *key, const char *value);
+
+/**
+ * Clone an Arc to the current thread's top-of-stack handle queue, or
+ * return NULL if no turbolite connection is active on this thread.
+ *
+ * The returned pointer owns one refcount; the caller must eventually
+ * release it via [`turbolite_settings_queue_free`] — typically by
+ * handing it to `sqlite3_create_function_v2` as `pApp` with
+ * [`turbolite_settings_queue_free_cb`] as `xDestroy`.
+ *
+ * Used by `turbolite_install_config_functions` to snapshot the calling
+ * connection's queue at install time.
+ */
+const void *turbolite_current_queue_clone(void);
+
+/**
+ * Drop one refcount on a queue pointer previously returned by
+ * [`turbolite_current_queue_clone`]. NULL is a no-op.
+ *
+ * # Safety
+ * `ptr` must be NULL or a pointer returned by
+ * `turbolite_current_queue_clone` (not yet freed).
+ */
+void turbolite_settings_queue_free(const void *ptr);
+
+/**
+ * `xDestroy` callback signature wrapper for
+ * `sqlite3_create_function_v2`. `void *` instead of `const void *` to
+ * match SQLite's callback ABI.
+ *
+ * # Safety
+ * `ptr` must be NULL or a pointer returned by
+ * `turbolite_current_queue_clone` (not yet freed).
+ */
+void turbolite_settings_queue_free_cb(void *ptr);
+
+/**
+ * Push a `(key, value)` update into a specific queue pointer. Used by
+ * the C shim's `turbolite_config_set_func` after pApp-capture.
+ *
+ * Returns:
+ *   0 — pushed successfully
+ *   1 — validation failed (unknown key / bad value) or null pointer
+ *
+ * # Safety
+ * `queue_ptr` must be a live pointer returned by
+ * `turbolite_current_queue_clone`. `key` / `value` must be valid C
+ * strings.
+ */
+int turbolite_settings_queue_push(const void *queue_ptr, const char *key, const char *value);
+
+extern int sqlite3_exec(sqlite3 *db,
+                        const char *sql,
+                        const void *callback,
+                        const void *arg,
+                        char **errmsg);
+
+extern void sqlite3_free(void *ptr);
+
+extern int sqlite3_create_function_v2(sqlite3 *db,
+                                      const char *zFunctionName,
+                                      int nArg,
+                                      int eTextRep,
+                                      void *pApp,
+                                      struct Option_CreateFnStep xFunc,
+                                      struct Option_CreateFnStep xStep,
+                                      struct Option_CreateFnFinal xFinal,
+                                      struct Option_CreateFnDestroy xDestroy);
+
+extern void *sqlite3_user_data(sqlite3_context *ctx);
+
+extern const char *sqlite3_value_text(sqlite3_value *value);
+
+extern void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int len);
+
+extern void sqlite3_result_int(sqlite3_context *ctx, int val);
+
+extern int sqlite3_file_control(sqlite3 *db, const char *zDbName, int op, void *arg);
+
+/**
+ * Register the `turbolite_config_set(key, value)` SQL function on this
+ * connection, capturing the calling connection's handle queue via
+ * `sqlite3_create_function_v2`'s `pApp`.
+ *
+ * Returns:
+ * - `SQLITE_OK` (0) on success
+ * - `SQLITE_MISUSE` if the connection's VFS isn't one of turbolite's
+ *   registered names (protects against cross-connection queue leaks
+ *   when this function is called on a non-turbolite connection while
+ *   a turbolite handle is alive on the same thread — the queue would
+ *   otherwise route pushes to the wrong connection)
+ * - A SQLite error code if the `PRAGMA schema_version` probe fails
+ *   (connection isn't turbolite-backed)
+ * - `SQLITE_MISUSE` if no turbolite handle is active on this thread
+ *   after the probe
+ *
+ * # Safety
+ * `db` must be a live `sqlite3*` handle.
+ */
+int turbolite_install_config_functions(sqlite3 *db);
 
 #ifdef __cplusplus
 }  // extern "C"

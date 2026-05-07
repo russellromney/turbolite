@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int passed = 0;
@@ -210,6 +211,77 @@ static void test_persistence(void) {
 cleanup:;
 }
 
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int dir_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void test_register_local_file_first(void) {
+    TEST("file-first: register, CRUD, layout, reopen");
+    const char *dir = make_tmpdir();
+    ASSERT(dir != NULL);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/app.db", dir);
+
+    /* File-first registration: db_path is the local page image. */
+    int rc = turbolite_register_local_file_first("c-file-first", db_path, 3);
+    ASSERT(rc == 0);
+
+    void *db = turbolite_open(db_path, "c-file-first");
+    ASSERT(db != NULL);
+
+    turbolite_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);"
+                       "INSERT INTO t VALUES (1, 'one');"
+                       "INSERT INTO t VALUES (2, 'two');");
+    turbolite_close(db);
+
+    /* app.db is the user-visible artifact. */
+    ASSERT(file_exists(db_path));
+
+    /* Sidecar dir + consolidated local-state file. */
+    char sidecar[512];
+    snprintf(sidecar, sizeof(sidecar), "%s/app.db-turbolite", dir);
+    ASSERT(dir_exists(sidecar));
+
+    char *expected_sidecar = turbolite_state_dir_for_database_path(db_path);
+    ASSERT(expected_sidecar != NULL);
+    ASSERT(strcmp(expected_sidecar, sidecar) == 0);
+    turbolite_free_string(expected_sidecar);
+
+    char local_state[512];
+    snprintf(local_state, sizeof(local_state), "%s/local_state.msgpack", sidecar);
+    ASSERT(file_exists(local_state));
+
+    /* Pre-PR-#27 split tracking files must not be required. */
+    const char *legacy[] = {
+        "page_bitmap", "sub_chunk_tracker", "cache_index.json",
+        "dirty_groups.msgpack",
+    };
+    for (size_t i = 0; i < sizeof(legacy) / sizeof(legacy[0]); i++) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/%s", sidecar, legacy[i]);
+        ASSERT(!file_exists(p));
+    }
+
+    /* Reopen and verify data. */
+    db = turbolite_open(db_path, "c-file-first");
+    ASSERT(db != NULL);
+    char *json = turbolite_query_json(db, "SELECT id, val FROM t ORDER BY id");
+    ASSERT(json != NULL);
+    ASSERT(strstr(json, "\"one\"") != NULL);
+    ASSERT(strstr(json, "\"two\"") != NULL);
+    turbolite_free_string(json);
+    turbolite_close(db);
+    PASS();
+cleanup:;
+}
+
 static void test_null_safety(void) {
     TEST("NULL handles don't crash");
     turbolite_close(NULL);
@@ -310,6 +382,7 @@ int main(void) {
     test_version();
     test_null_args();
     test_register_compressed();
+    test_register_local_file_first();
     test_open_close();
     test_exec();
     test_bad_sql();

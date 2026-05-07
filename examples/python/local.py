@@ -33,7 +33,13 @@ from pydantic import BaseModel
 data_dir = tempfile.mkdtemp(prefix="turbolite-example-")
 db_path = os.path.join(data_dir, "books.db")
 
-# Local compressed database (mode="local" is the default)
+# File-first local mode (the default): the user-visible database file is
+# `books.db`. turbolite stores its hidden implementation state next to it,
+# at `books.db-turbolite/` (manifest, cache, staging logs).
+#
+# `books.db` is turbolite's compressed page image. To get a stock SQLite
+# file that the standard sqlite3 CLI can open, run
+# `conn.execute("VACUUM INTO 'books-export.sqlite'")` while connected.
 conn = turbolite.connect(db_path)
 
 conn.execute("""

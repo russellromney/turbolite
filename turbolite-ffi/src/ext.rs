@@ -10,13 +10,20 @@
 //! If `TURBOLITE_BUCKET` is set, also registers **"turbolite-s3"** — tiered
 //! S3 VFS. Fails hard if bucket is set but configuration is invalid.
 //!
-//! ### Environment variables (tiered mode)
+//! Bindings can also call `SELECT turbolite_register_file_first_vfs(name,
+//! db_path)` per database to register a VFS keyed to a specific file path.
+//! That is the recommended user-facing entry point: turbolite owns
+//! `db_path` as the local page image and stores its sidecar metadata under
+//! `<db_path>-turbolite/`.
+//!
+//! ### Environment variables
 //!
 //! | Variable | Required | Default | Description |
 //! |---|---|---|---|
-//! | `TURBOLITE_BUCKET` | yes | — | S3 bucket name (triggers S3 VFS registration) |
+//! | `TURBOLITE_DATABASE_PATH` | no | — | File-first local database image path. When set, the default `"turbolite"` VFS registers as file-first and stores sidecar state under `<path>-turbolite/`. |
+//! | `TURBOLITE_BUCKET` | (s3) | — | S3 bucket name (triggers S3 VFS registration) |
 //! | `TURBOLITE_PREFIX` | no | `"turbolite"` | S3 key prefix |
-//! | `TURBOLITE_CACHE_DIR` | no | `"/tmp/turbolite"` | Local cache directory |
+//! | `TURBOLITE_CACHE_DIR` | no | `"."` (local) / `"/tmp/turbolite"` (s3) | Lower-level cache directory; ignored when `TURBOLITE_DATABASE_PATH` is set. |
 //! | `TURBOLITE_ENDPOINT_URL` | no | — | Custom S3 endpoint (Tigris, MinIO) |
 //! | `TURBOLITE_REGION` | no | — | AWS region |
 //! | `TURBOLITE_PREFETCH_THREADS` | no | `num_cpus + 1` | Prefetch worker threads |
@@ -291,14 +298,21 @@ fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
     use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-    // Loadable extensions preserve the historical "." cache_dir fallback when
-    // TURBOLITE_CACHE_DIR is unset. Everything else comes from the env-driven
-    // constructor.
-    let config = TurboliteConfig {
-        cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(".")),
-        ..TurboliteConfig::from_env()
+    // File-first when TURBOLITE_DATABASE_PATH is set: the env-supplied path
+    // becomes the local page image and the sidecar lives at
+    // `<path>-turbolite/`. Otherwise fall back to the historical "."
+    // cache_dir behavior so existing test-extension callers keep working.
+    //
+    // Both branches start from `from_env()` so other TURBOLITE_* knobs
+    // (read-only, compression, prefetch, cache) are honored consistently.
+    let config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
+        Ok(db_path) => TurboliteConfig::from_env().with_database_path(db_path),
+        Err(_) => TurboliteConfig {
+            cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(".")),
+            ..TurboliteConfig::from_env()
+        },
     };
     let vfs = TurboliteVfs::new_local(config)?;
     turbolite::tiered::register("turbolite", vfs)
@@ -341,9 +355,14 @@ fn register_tiered() -> Result<(), std::io::Error> {
         counters.base_put_bytes = 0;
     }
 
-    let config = TurboliteConfig {
-        cache_dir,
-        ..TurboliteConfig::from_env()
+    // Same shape as register_local: TURBOLITE_DATABASE_PATH selects file-first
+    // and overrides cache_dir; otherwise the explicit cache_dir wins.
+    let config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
+        Ok(db_path) => TurboliteConfig::from_env().with_database_path(db_path),
+        Err(_) => TurboliteConfig {
+            cache_dir,
+            ..TurboliteConfig::from_env()
+        },
     };
     turbolite::tiered::set_local_checkpoint_only(
         std::env::var("TURBOLITE_LOCAL_THEN_FLUSH")
@@ -696,6 +715,13 @@ pub extern "C" fn turbolite_gc() -> i32 {
 /// Called from SQL: SELECT turbolite_register_vfs('name', '/path/to/cache_dir').
 /// Each registered VFS gets its own manifest, cache, and page group state,
 /// enabling multiple independent databases in the same process.
+///
+/// This is the lower-level form: turbolite owns the entire `cache_dir` and
+/// stores the local database image at `<cache_dir>/data.cache`. Bindings that
+/// expose a user-facing `app.db` should prefer
+/// [`turbolite_ext_register_file_first_vfs`] so the user's database path is
+/// the local image.
+///
 /// Returns 0 on success, 1 on error.
 #[no_mangle]
 pub extern "C" fn turbolite_ext_register_named_vfs(
@@ -729,6 +755,65 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
         },
         Err(e) => {
             eprintln!("turbolite: failed to create VFS '{}': {}", name, e);
+            1
+        }
+    }
+}
+
+/// Register a file-first local VFS keyed to a database path.
+///
+/// Called from SQL via:
+///
+/// ```sql
+/// SELECT turbolite_register_file_first_vfs('app', '/data/app.db');
+/// ```
+///
+/// The caller's `db_path` becomes the local database image and turbolite
+/// stores its sidecar metadata at `<db_path>-turbolite/`. This is the
+/// recommended user-facing entry point — bindings should expose this rather
+/// than the bare `cache_dir`-driven [`turbolite_ext_register_named_vfs`].
+///
+/// Other `TURBOLITE_*` env vars (compression, cache, prefetch, read-only)
+/// are honored via `TurboliteConfig::from_env()`; only the cache_dir is
+/// overridden to match the database path.
+///
+/// Returns 0 on success, 1 on error.
+#[no_mangle]
+pub extern "C" fn turbolite_ext_register_file_first_vfs(
+    name_ptr: *const std::os::raw::c_char,
+    db_path_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let name = unsafe {
+        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return 1,
+        }
+    };
+    let db_path = unsafe {
+        match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => return 1,
+        }
+    };
+
+    let config =
+        turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
+    match turbolite::tiered::TurboliteVfs::new_local(config) {
+        Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!(
+                    "turbolite: failed to register file-first VFS '{}': {}",
+                    name, e
+                );
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "turbolite: failed to create file-first VFS '{}': {}",
+                name, e
+            );
             1
         }
     }

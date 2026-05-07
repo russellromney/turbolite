@@ -5,19 +5,27 @@
 // database/sql interface: prepared statements, param binding, transactions,
 // connection pooling, etc.
 //
-// Local mode (default):
+// Local mode (default), file-first:
 //
-//	db, err := turbolite.Open("my.db", nil)
+//	db, err := turbolite.Open("/data/app.db", nil)
 //	defer db.Close()
 //	db.Exec("INSERT INTO t VALUES (?)", 42)
 //
+// `/data/app.db` is the local page image (turbolite-owned).
+// `/data/app.db-turbolite/` holds hidden implementation state
+// (manifest, cache, staging logs).
+//
 // S3 cloud mode:
 //
-//	db, err := turbolite.Open("my.db", &turbolite.Options{
+//	db, err := turbolite.Open("/data/app.db", &turbolite.Options{
 //	    Mode:     "s3",
 //	    Bucket:   "my-bucket",
 //	    Endpoint: "https://t3.storage.dev",
 //	})
+//
+// Note: app.db is turbolite's compressed page image. It is not promised
+// to be opened directly by stock sqlite3. To get a stock SQLite file,
+// run `db.Exec("VACUUM INTO 'export.sqlite'")` while connected.
 package turbolite
 
 import (
@@ -130,6 +138,14 @@ func ensureBootstrap(ext string) error {
 	return bootstrapErr
 }
 
+// StateDirForDatabasePath returns the hidden sidecar directory path for a
+// file-first database path. For "/data/app.db" this is
+// "/data/app.db-turbolite". Useful for tests or tooling that asserts on
+// layout without hardcoding the suffix rule.
+func StateDirForDatabasePath(dbPath string) string {
+	return dbPath + "-turbolite"
+}
+
 // Open opens a turbolite database and returns a standard *sql.DB.
 //
 // Each call creates an isolated VFS instance so multiple databases in the
@@ -207,11 +223,14 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 		if _, err := os.Stat(dbDir); os.IsNotExist(err) {
 			return nil, fmt.Errorf("turbolite: directory does not exist: %s", dbDir)
 		}
-		// Register a per-database VFS with isolated manifest/cache.
+		// File-first: register a per-database VFS keyed to the user-supplied
+		// file path. The path is the local page image; sidecar metadata
+		// lives at <absPath>-turbolite/.
 		vfsName = fmt.Sprintf("turbolite-go-%d", atomic.AddUint64(&vfsCounter, 1))
-		_, err := bootstrapDB.Exec("SELECT turbolite_register_vfs(?, ?)", vfsName, dbDir)
+		_, err := bootstrapDB.Exec(
+			"SELECT turbolite_register_file_first_vfs(?, ?)", vfsName, absPath)
 		if err != nil {
-			return nil, fmt.Errorf("turbolite: register VFS %q: %w", vfsName, err)
+			return nil, fmt.Errorf("turbolite: register file-first VFS %q: %w", vfsName, err)
 		}
 	} else {
 		vfsName = "turbolite-s3"
