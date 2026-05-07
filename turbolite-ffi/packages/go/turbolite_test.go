@@ -740,6 +740,107 @@ func TestS3WriteRead(t *testing.T) {
 	}
 }
 
+func TestS3TwoPrefixesSameProcessDoNotCross(t *testing.T) {
+	bucket := os.Getenv("TIERED_TEST_BUCKET")
+	if bucket == "" {
+		bucket = os.Getenv("TURBOLITE_BUCKET")
+	}
+	if bucket == "" {
+		t.Skip("no TIERED_TEST_BUCKET or TURBOLITE_BUCKET set")
+	}
+
+	dir := tmpDir(t)
+	prefixBase := fmt.Sprintf("test/go-isolation-%d", os.Getpid())
+	dbA, err := Open(filepath.Join(dir, "a.db"), &Options{
+		Mode:     "s3",
+		Bucket:   bucket,
+		Prefix:   prefixBase + "/a",
+		Endpoint: os.Getenv("AWS_ENDPOINT_URL"),
+		Region:   "auto",
+		CacheDir: filepath.Join(dir, "a-cache"),
+	})
+	if err != nil {
+		t.Fatalf("Open S3 A: %v", err)
+	}
+	defer dbA.Close()
+	dbB, err := Open(filepath.Join(dir, "b.db"), &Options{
+		Mode:     "s3",
+		Bucket:   bucket,
+		Prefix:   prefixBase + "/b",
+		Endpoint: os.Getenv("AWS_ENDPOINT_URL"),
+		Region:   "auto",
+		CacheDir: filepath.Join(dir, "b-cache"),
+	})
+	if err != nil {
+		t.Fatalf("Open S3 B: %v", err)
+	}
+	defer dbB.Close()
+
+	dbA.Exec("CREATE TABLE marker (value TEXT)")
+	dbA.Exec("INSERT INTO marker VALUES ('from-a')")
+	dbB.Exec("CREATE TABLE marker (value TEXT)")
+	dbB.Exec("INSERT INTO marker VALUES ('from-b')")
+
+	var a, b string
+	dbA.QueryRow("SELECT value FROM marker").Scan(&a)
+	dbB.QueryRow("SELECT value FROM marker").Scan(&b)
+	if a != "from-a" {
+		t.Fatalf("expected DB A marker from-a, got %q", a)
+	}
+	if b != "from-b" {
+		t.Fatalf("expected DB B marker from-b, got %q", b)
+	}
+}
+
+func TestS3DefaultPrefixesSameProcessDoNotCross(t *testing.T) {
+	bucket := os.Getenv("TIERED_TEST_BUCKET")
+	if bucket == "" {
+		bucket = os.Getenv("TURBOLITE_BUCKET")
+	}
+	if bucket == "" {
+		t.Skip("no TIERED_TEST_BUCKET or TURBOLITE_BUCKET set")
+	}
+
+	dir := tmpDir(t)
+	dbA, err := Open(filepath.Join(dir, "default-a.db"), &Options{
+		Mode:     "s3",
+		Bucket:   bucket,
+		Endpoint: os.Getenv("AWS_ENDPOINT_URL"),
+		Region:   "auto",
+		CacheDir: filepath.Join(dir, "default-a-cache"),
+	})
+	if err != nil {
+		t.Fatalf("Open S3 default A: %v", err)
+	}
+	defer dbA.Close()
+	dbB, err := Open(filepath.Join(dir, "default-b.db"), &Options{
+		Mode:     "s3",
+		Bucket:   bucket,
+		Endpoint: os.Getenv("AWS_ENDPOINT_URL"),
+		Region:   "auto",
+		CacheDir: filepath.Join(dir, "default-b-cache"),
+	})
+	if err != nil {
+		t.Fatalf("Open S3 default B: %v", err)
+	}
+	defer dbB.Close()
+
+	dbA.Exec("CREATE TABLE marker (value TEXT)")
+	dbA.Exec("INSERT INTO marker VALUES ('default-a')")
+	dbB.Exec("CREATE TABLE marker (value TEXT)")
+	dbB.Exec("INSERT INTO marker VALUES ('default-b')")
+
+	var a, b string
+	dbA.QueryRow("SELECT value FROM marker").Scan(&a)
+	dbB.QueryRow("SELECT value FROM marker").Scan(&b)
+	if a != "default-a" {
+		t.Fatalf("expected DB A marker default-a, got %q", a)
+	}
+	if b != "default-b" {
+		t.Fatalf("expected DB B marker default-b, got %q", b)
+	}
+}
+
 func TestS3CacheSizeZero(t *testing.T) {
 	bucket := os.Getenv("TIERED_TEST_BUCKET")
 	if bucket == "" {

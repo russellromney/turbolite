@@ -70,6 +70,17 @@ static BENCH_HANDLE: std::sync::OnceLock<turbolite::tiered::TurboliteSharedState
     std::sync::OnceLock::new();
 
 #[cfg(feature = "cli-s3")]
+static S3_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cli-s3")]
+fn s3_runtime() -> &'static tokio::runtime::Runtime {
+    S3_RUNTIME.get_or_init(|| {
+        tokio::runtime::Runtime::new()
+            .expect("turbolite: failed to build shared S3 registration runtime")
+    })
+}
+
+#[cfg(feature = "cli-s3")]
 #[derive(Default)]
 struct StorageCounters {
     gets: std::sync::atomic::AtomicU64,
@@ -796,8 +807,7 @@ pub extern "C" fn turbolite_ext_register_file_first_vfs(
         }
     };
 
-    let config =
-        turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
+    let config = turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
     match turbolite::tiered::TurboliteVfs::new_local(config) {
         Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
             Ok(()) => 0,
@@ -817,6 +827,126 @@ pub extern "C" fn turbolite_ext_register_file_first_vfs(
             1
         }
     }
+}
+
+#[cfg(feature = "cli-s3")]
+fn optional_cstr(ptr: *const std::os::raw::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr).to_str().ok() }
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Register a file-first S3 VFS keyed to one logical volume.
+///
+/// Unlike the process-global `turbolite-s3` convenience VFS, this creates a
+/// VFS with caller-supplied name and caller-supplied bucket/prefix. Bindings
+/// that open many volumes in one process should use this path so each volume
+/// has a distinct VFS identity.
+#[cfg(feature = "cli-s3")]
+#[no_mangle]
+pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
+    name_ptr: *const std::os::raw::c_char,
+    db_path_ptr: *const std::os::raw::c_char,
+    bucket_ptr: *const std::os::raw::c_char,
+    prefix_ptr: *const std::os::raw::c_char,
+    endpoint_ptr: *const std::os::raw::c_char,
+    region_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    use std::sync::Arc;
+    use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+
+    let name = unsafe {
+        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => return 1,
+        }
+    };
+    let db_path = unsafe {
+        match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
+            Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+            _ => return 1,
+        }
+    };
+    let bucket = unsafe {
+        match std::ffi::CStr::from_ptr(bucket_ptr).to_str() {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => return 1,
+        }
+    };
+    let prefix = optional_cstr(prefix_ptr).unwrap_or_else(|| "turbolite".to_string());
+    let endpoint_url = optional_cstr(endpoint_ptr);
+    let region = optional_cstr(region_ptr);
+
+    let handle = s3_runtime().handle().clone();
+    let backend = match handle.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket.clone(), endpoint_url.as_deref())
+            .await
+            .map(|storage| storage.with_prefix(prefix.clone()))
+    }) {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!(
+                "turbolite: failed to create S3 backend for VFS '{}': {}",
+                name, e
+            );
+            return 1;
+        }
+    };
+    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(backend);
+    let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
+    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
+    {
+        let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+        counters.counters = Some(counters_handle);
+        counters.base_gets = 0;
+        counters.base_get_bytes = 0;
+        counters.base_puts = 0;
+        counters.base_put_bytes = 0;
+    }
+
+    let mut config = TurboliteConfig::from_env().with_database_path(db_path);
+    config.bucket = bucket;
+    config.prefix = prefix;
+    config.endpoint_url = endpoint_url;
+    config.region = region;
+
+    let vfs = match TurboliteVfs::with_backend(config, backend, handle) {
+        Ok(vfs) => vfs,
+        Err(e) => {
+            eprintln!(
+                "turbolite: failed to create file-first S3 VFS '{}': {}",
+                name, e
+            );
+            return 1;
+        }
+    };
+    match turbolite::tiered::register(&name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!(
+                "turbolite: failed to register file-first S3 VFS '{}': {}",
+                name, e
+            );
+            1
+        }
+    }
+}
+
+#[cfg(not(feature = "cli-s3"))]
+#[no_mangle]
+pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
+    _name_ptr: *const std::os::raw::c_char,
+    _db_path_ptr: *const std::os::raw::c_char,
+    _bucket_ptr: *const std::os::raw::c_char,
+    _prefix_ptr: *const std::os::raw::c_char,
+    _endpoint_ptr: *const std::os::raw::c_char,
+    _region_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    eprintln!("turbolite: file-first S3 VFS registration requires the 'cli-s3' feature");
+    1
 }
 
 #[cfg(not(feature = "cli-s3"))]

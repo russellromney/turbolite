@@ -25,6 +25,7 @@ rejects the alias open of a different target file by design.
 from __future__ import annotations
 
 import itertools
+import hashlib
 import os
 import platform
 import sqlite3
@@ -37,6 +38,7 @@ __version__ = "0.4.1"
 # Each connect() call gets its own VFS so manifest/cache/sidecar state stays
 # pinned to one database file.
 _vfs_counter = itertools.count()
+_s3_vfs_by_fingerprint: dict[tuple[object, ...], str] = {}
 
 
 def _find_ext() -> str:
@@ -70,8 +72,8 @@ def load(conn: sqlite3.Connection) -> None:
     Load the turbolite extension into a sqlite3 connection.
 
     After loading, the "turbolite" VFS (local mode) is always registered.
-    If TURBOLITE_BUCKET is set in the environment, "turbolite-s3"
-    (S3 cloud mode) is also registered.
+    S3 connections register a per-volume VFS from explicit connect()
+    arguments; they do not rely on the process-global "turbolite-s3" VFS.
 
     Args:
         conn: Any open sqlite3.Connection (can be :memory:).
@@ -109,6 +111,45 @@ def state_dir_for_database_path(path: str) -> str:
     return f"{os.fspath(path)}-turbolite"
 
 
+def _s3_fingerprint(
+    *,
+    abs_path: str,
+    bucket: str,
+    prefix: str,
+    endpoint: str | None,
+    region: str | None,
+    cache_dir: str | None,
+    compression_level: int | None,
+    prefetch_threads: int | None,
+    read_only: bool,
+    page_cache: str,
+) -> tuple[object, ...]:
+    return (
+        abs_path,
+        bucket,
+        prefix,
+        endpoint or "",
+        region or "",
+        cache_dir or "",
+        compression_level or "",
+        prefetch_threads or "",
+        read_only,
+        page_cache,
+    )
+
+
+def _default_s3_vfs_name(fingerprint: tuple[object, ...]) -> str:
+    material = "\0".join(str(part) for part in fingerprint)
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return f"turbolite-s3-{digest}"
+
+
+def _default_s3_prefix(abs_path: str) -> str:
+    stem = os.path.basename(abs_path).replace("/", "_") or "database"
+    digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:16]
+    return f"turbolite/{stem}-{digest}"
+
+
 def connect(
     path: str,
     *,
@@ -134,7 +175,8 @@ def connect(
         path: Path to the database file. May be relative or absolute.
         mode: "local" for local VFS, "s3" for S3 cloud VFS.
         bucket: S3 bucket (required for mode="s3", or set TURBOLITE_BUCKET).
-        prefix: S3 key prefix (default "turbolite").
+        prefix: S3 key prefix. Defaults to a stable prefix derived from the
+            database path, so distinct paths do not overlap in one bucket.
         endpoint: S3 endpoint URL (Tigris, MinIO). Falls back to AWS_ENDPOINT_URL.
         region: AWS region. Falls back to AWS_REGION.
         cache_dir: Lower-level override for the sidecar directory. When unset
@@ -163,21 +205,11 @@ def connect(
         )
 
     if mode == "s3":
-        # Set env vars BEFORE loading the extension. The C init function
-        # checks TURBOLITE_BUCKET to decide whether to register turbolite-s3.
-        # Once loaded, the VFS is registered for the process lifetime.
         effective_bucket = bucket or os.environ.get("TURBOLITE_BUCKET")
         if not effective_bucket:
             raise ValueError(
                 "mode='s3' requires a bucket. Pass bucket= or set TURBOLITE_BUCKET."
             )
-        os.environ["TURBOLITE_BUCKET"] = effective_bucket
-        if prefix is not None:
-            os.environ["TURBOLITE_PREFIX"] = prefix
-        if endpoint is not None:
-            os.environ["TURBOLITE_ENDPOINT_URL"] = endpoint
-        if region is not None:
-            os.environ["TURBOLITE_REGION"] = region
         if cache_dir is not None:
             os.environ["TURBOLITE_CACHE_DIR"] = cache_dir
         if read_only:
@@ -189,15 +221,9 @@ def connect(
         os.environ["TURBOLITE_PREFETCH_THREADS"] = str(prefetch_threads)
     os.environ["TURBOLITE_MEM_CACHE_BUDGET"] = page_cache
 
-    # Load the extension once. S3 env vars must be set BEFORE first load
-    # because the C init function only runs once per process.
-    if mode == "s3" and _loaded_local and not _loaded_s3:
-        raise RuntimeError(
-            "Cannot switch to S3 mode after local mode was already loaded. "
-            "The SQLite extension init only runs once per process. "
-            "Use mode='s3' on the first turbolite.connect() call, or set "
-            "TURBOLITE_BUCKET in the environment before importing turbolite."
-        )
+    # Load the extension once. S3 mode no longer depends on a fixed
+    # process-global VFS registered at extension load time; each S3 connect
+    # registers a per-volume VFS below.
     boot = _ensure_bootstrap()
 
     if mode == "local":
@@ -214,13 +240,48 @@ def connect(
                 f"turbolite: failed to register file-first VFS '{vfs}' for {abs_path}"
             )
     else:
-        if not _loaded_s3:
+        effective_bucket = bucket or os.environ.get("TURBOLITE_BUCKET")
+        if not effective_bucket:
             raise RuntimeError(
-                "Cannot use S3 mode: TURBOLITE_BUCKET was not set when the extension "
-                "was first loaded. Set TURBOLITE_BUCKET in the environment before "
-                "the first turbolite.connect() call."
+                "Cannot use S3 mode: pass bucket= or set TURBOLITE_BUCKET."
             )
-        vfs = "turbolite-s3"
+        effective_prefix = (
+            prefix or os.environ.get("TURBOLITE_PREFIX") or _default_s3_prefix(abs_path)
+        )
+        effective_endpoint = endpoint or os.environ.get("TURBOLITE_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
+        effective_region = region or os.environ.get("TURBOLITE_REGION") or os.environ.get("AWS_REGION")
+        fingerprint = _s3_fingerprint(
+            abs_path=abs_path,
+            bucket=effective_bucket,
+            prefix=effective_prefix,
+            endpoint=effective_endpoint,
+            region=effective_region,
+            cache_dir=cache_dir,
+            compression_level=compression_level,
+            prefetch_threads=prefetch_threads,
+            read_only=read_only,
+            page_cache=page_cache,
+        )
+        vfs = _s3_vfs_by_fingerprint.get(fingerprint)
+        if vfs is None:
+            vfs = _default_s3_vfs_name(fingerprint)
+            rc = boot.execute(
+                "SELECT turbolite_register_s3_file_first_vfs(?, ?, ?, ?, ?, ?)",
+                (
+                    vfs,
+                    abs_path,
+                    effective_bucket,
+                    effective_prefix,
+                    effective_endpoint,
+                    effective_region,
+                ),
+            ).fetchone()[0]
+            if rc != 0:
+                raise RuntimeError(
+                    f"turbolite: failed to register file-first S3 VFS '{vfs}' "
+                    f"for {abs_path} at {effective_bucket}/{effective_prefix}"
+                )
+            _s3_vfs_by_fingerprint[fingerprint] = vfs
 
     conn = sqlite3.connect(f"file:{abs_path}?vfs={vfs}", uri=True)
 

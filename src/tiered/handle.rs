@@ -2986,9 +2986,7 @@ impl DatabaseHandle for TurboliteHandle {
             && self.dirty_since_sync
         {
             if let Err(e) = self.sync(false) {
-                eprintln!(
-                    "[turbolite] flush-on-lock-downgrade failed: {e}"
-                );
+                eprintln!("[turbolite] flush-on-lock-downgrade failed: {e}");
             }
         }
 

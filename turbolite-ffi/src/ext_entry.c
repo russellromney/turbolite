@@ -34,6 +34,18 @@ extern int turbolite_ext_register_named_vfs(const char *name, const char *cache_
  * at `<db_path>-turbolite/`. Defined in src/ext.rs. */
 extern int turbolite_ext_register_file_first_vfs(const char *name, const char *db_path);
 
+/* Rust function -- registers a file-first S3 VFS keyed to one logical
+ * volume. Unlike the process-global "turbolite-s3" convenience VFS, this
+ * lets bindings create one VFS identity per bucket/prefix/db_path. */
+extern int turbolite_ext_register_s3_file_first_vfs(
+    const char *name,
+    const char *db_path,
+    const char *bucket,
+    const char *prefix,
+    const char *endpoint,
+    const char *region
+);
+
 /* Rust function -- runs EQP on SQL and pushes plan to global queue.
  * Defined in src/tiered/query_plan.rs. */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
@@ -137,6 +149,42 @@ static void turbolite_register_file_first_vfs_func(
         return;
     }
     int rc = turbolite_ext_register_file_first_vfs(name, db_path);
+    sqlite3_result_int(ctx, rc);
+}
+
+/*
+ * turbolite_register_s3_file_first_vfs(
+ *   name TEXT, db_path TEXT, bucket TEXT, prefix TEXT, endpoint TEXT, region TEXT
+ * )
+ *
+ * Register a file-first S3 VFS keyed to one logical volume. The caller's
+ * `db_path` is the local page image; sidecar metadata lives under
+ * `<db_path>-turbolite/`; remote objects live under the supplied
+ * bucket/prefix. This is the multi-volume-safe S3 entry point.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static void turbolite_register_s3_file_first_vfs_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *name = (const char *)sqlite3_value_text(argv[0]);
+    const char *db_path = (const char *)sqlite3_value_text(argv[1]);
+    const char *bucket = (const char *)sqlite3_value_text(argv[2]);
+    const char *prefix = (const char *)sqlite3_value_text(argv[3]);
+    const char *endpoint = (const char *)sqlite3_value_text(argv[4]);
+    const char *region = (const char *)sqlite3_value_text(argv[5]);
+    if (!name || !db_path || !bucket) {
+        sqlite3_result_error(
+            ctx,
+            "turbolite_register_s3_file_first_vfs: name, db_path, and bucket required",
+            -1);
+        return;
+    }
+    int rc = turbolite_ext_register_s3_file_first_vfs(
+        name, db_path, bucket, prefix, endpoint, region);
     sqlite3_result_int(ctx, rc);
 }
 
@@ -527,6 +575,18 @@ int turbolite_c_sqlite3_turbolite_init(
     if (rc != SQLITE_OK) {
         *pzErrMsg = sqlite3_mprintf(
             "turbolite: failed to register turbolite_register_file_first_vfs()");
+        return rc;
+    }
+
+    /* register turbolite_register_s3_file_first_vfs(...) SQL function.
+     * S3 file-first registration: one VFS per logical volume. */
+    rc = sqlite3_create_function_v2(
+        db, "turbolite_register_s3_file_first_vfs", 6,
+        SQLITE_UTF8, 0, turbolite_register_s3_file_first_vfs_func, 0, 0, 0
+    );
+    if (rc != SQLITE_OK) {
+        *pzErrMsg = sqlite3_mprintf(
+            "turbolite: failed to register turbolite_register_s3_file_first_vfs()");
         return rc;
     }
 
