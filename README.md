@@ -345,7 +345,7 @@ With the `wal` feature flag enabled, turbolite ships WAL frames to S3 via [walru
 
 ```toml
 # Cargo.toml
-turbolite = { version = "0.4", features = ["cloud", "zstd", "wal"] }
+turbolite = { version = "0.5", features = ["cloud", "zstd", "wal"] }
 ```
 
 ```rust
@@ -405,9 +405,9 @@ conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
 **Rust**:
 ```toml
 [dependencies]
-turbolite = "0.4"                                              # local VFS
-turbolite = { version = "0.4", features = ["cloud"] }          # + S3 storage
-turbolite = { version = "0.4", features = ["encryption"] }     # + encryption
+turbolite = "0.5"                                              # local VFS
+turbolite = { version = "0.5", features = ["cloud"] }          # + S3 storage
+turbolite = { version = "0.5", features = ["encryption"] }     # + encryption
 ```
 
 **Go** (cgo, links the shared library):

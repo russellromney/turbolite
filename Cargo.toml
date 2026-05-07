@@ -7,7 +7,7 @@ members = [".", "turbolite-ffi"]
 
 [package]
 name = "turbolite"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "turbolite - SQLite VFS with sub-50ms cold queries from S3 + page-level compression and encryption"
 license = "Apache-2.0"
@@ -39,7 +39,7 @@ wal = ["dep:walrust-core", "cli-s3"]
 lambda = ["dep:lambda_runtime", "bench-s3", "zstd"]
 
 [dependencies]
-sqlite-vfs = { git = "https://github.com/russellromney/sqlite-vfs.git", branch = "fix/shm-barrier-wal-push" }
+sqlite-vfs = { git = "https://github.com/russellromney/sqlite-vfs.git", version = "0.2.0", branch = "fix/shm-barrier-wal-push" }
 zstd = { version = "0.13", optional = true }
 lz4_flex = { version = "0.11", optional = true }
 snap = { version = "1.1", optional = true }
