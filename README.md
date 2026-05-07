@@ -396,7 +396,8 @@ conn = sqlite3.connect(":memory:")
 turbolite.load(conn)
 conn.close()
 conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
-conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
+# For S3, prefer turbolite.connect(..., mode="s3", bucket=..., prefix=...).
+# It registers a per-database VFS so multiple S3 volumes can share one process.
 ```
 
 **Node.js**: `npm install turbolite` — see [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/)
@@ -442,7 +443,7 @@ make ext  # produces target/release/turbolite.{so,dylib}
 sqlite3_enable_load_extension(db, 1);
 sqlite3_load_extension(db, "path/to/turbolite", NULL, NULL);
 // "turbolite" VFS (local) is always registered
-// "turbolite-s3" VFS is also registered if TURBOLITE_BUCKET is set
+// "turbolite-s3" is a single-volume convenience VFS when TURBOLITE_BUCKET is set
 ```
 
 For the file-first user story, register a per-database VFS that owns the

@@ -229,6 +229,97 @@ def test_s3_write_read():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_s3_two_prefixes_same_process_do_not_cross():
+    """S3 mode: two prefixes in one process must get distinct VFS identities."""
+    bucket = os.environ.get("TIERED_TEST_BUCKET") or os.environ.get("TURBOLITE_BUCKET")
+    if not bucket:
+        print("SKIP: S3 tests (no TIERED_TEST_BUCKET set)")
+        return
+
+    print("test: S3 two-prefix isolation in one process...")
+    d = tempfile.mkdtemp()
+    try:
+        prefix_base = f"test/python-isolation-{os.getpid()}"
+        conn_a = turbolite.connect(
+            os.path.join(d, "a.db"),
+            mode="s3",
+            bucket=bucket,
+            prefix=f"{prefix_base}/a",
+            endpoint=os.environ.get("AWS_ENDPOINT_URL"),
+            region="auto",
+            cache_dir=os.path.join(d, "a-cache"),
+        )
+        conn_b = turbolite.connect(
+            os.path.join(d, "b.db"),
+            mode="s3",
+            bucket=bucket,
+            prefix=f"{prefix_base}/b",
+            endpoint=os.environ.get("AWS_ENDPOINT_URL"),
+            region="auto",
+            cache_dir=os.path.join(d, "b-cache"),
+        )
+
+        conn_a.execute("CREATE TABLE marker (value TEXT)")
+        conn_a.execute("INSERT INTO marker VALUES ('from-a')")
+        conn_a.commit()
+        conn_b.execute("CREATE TABLE marker (value TEXT)")
+        conn_b.execute("INSERT INTO marker VALUES ('from-b')")
+        conn_b.commit()
+
+        assert conn_a.execute("SELECT value FROM marker").fetchone()[0] == "from-a"
+        assert conn_b.execute("SELECT value FROM marker").fetchone()[0] == "from-b"
+
+        conn_a.close()
+        conn_b.close()
+        print("  PASS")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_s3_default_prefixes_do_not_cross():
+    """S3 mode: two paths with default prefixes must not share remote state."""
+    bucket = os.environ.get("TIERED_TEST_BUCKET") or os.environ.get("TURBOLITE_BUCKET")
+    if not bucket:
+        print("SKIP: S3 tests (no TIERED_TEST_BUCKET set)")
+        return
+
+    print("test: S3 default-prefix isolation in one process...")
+    d = tempfile.mkdtemp()
+    try:
+        conn_a = turbolite.connect(
+            os.path.join(d, "default-a.db"),
+            mode="s3",
+            bucket=bucket,
+            endpoint=os.environ.get("AWS_ENDPOINT_URL"),
+            region="auto",
+            cache_dir=os.path.join(d, "default-a-cache"),
+        )
+        conn_b = turbolite.connect(
+            os.path.join(d, "default-b.db"),
+            mode="s3",
+            bucket=bucket,
+            endpoint=os.environ.get("AWS_ENDPOINT_URL"),
+            region="auto",
+            cache_dir=os.path.join(d, "default-b-cache"),
+        )
+
+        conn_a.execute("CREATE TABLE marker (value TEXT)")
+        conn_a.execute("INSERT INTO marker VALUES ('default-a')")
+        conn_a.commit()
+        conn_b.execute("CREATE TABLE marker (value TEXT)")
+        conn_b.execute("INSERT INTO marker VALUES ('default-b')")
+        conn_b.commit()
+
+        assert conn_a.execute("SELECT value FROM marker").fetchone()[0] == "default-a"
+        assert conn_b.execute("SELECT value FROM marker").fetchone()[0] == "default-b"
+
+        conn_a.close()
+        conn_b.close()
+        print("  PASS")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_s3_requires_bucket():
     """S3 mode without bucket should raise ValueError."""
     print("test: S3 mode requires bucket...")
@@ -246,10 +337,11 @@ def test_s3_requires_bucket():
 
 
 if __name__ == "__main__":
-    # S3 write test must run FIRST: the extension init only runs once per
-    # process, and TURBOLITE_BUCKET must be set before loading to register
-    # turbolite-s3. Local mode works regardless of load order.
+    # S3 tests can run before or after local tests: S3 mode now registers
+    # a per-volume VFS instead of relying on process-global turbolite-s3.
     test_s3_write_read()
+    test_s3_two_prefixes_same_process_do_not_cross()
+    test_s3_default_prefixes_do_not_cross()
     test_local_basic_crud()
     test_local_file_first_layout()
     test_local_relative_path()

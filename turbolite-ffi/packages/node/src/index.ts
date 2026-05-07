@@ -29,6 +29,7 @@
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 import Database from 'better-sqlite3';
 
 export interface ConnectOptions {
@@ -36,7 +37,7 @@ export interface ConnectOptions {
   mode?: 'local' | 's3';
   /** S3 bucket name (required when mode = "s3"). */
   bucket?: string;
-  /** S3 key prefix (mode = "s3", default "turbolite"). */
+  /** S3 key prefix. Defaults to a stable prefix derived from the database path. */
   prefix?: string;
   /** S3 endpoint URL, e.g. for Tigris or MinIO (mode = "s3"). */
   endpoint?: string;
@@ -58,6 +59,7 @@ export interface ConnectOptions {
 }
 
 let _vfsCounter = 0;
+const _s3VfsByFingerprint = new Map<string, string>();
 
 /**
  * Find the bundled loadable extension binary.
@@ -110,6 +112,29 @@ function addPlatformExt(basePath: string): string {
   return `${basePath}.${ext}`;
 }
 
+function s3Fingerprint(parts: Array<string | number | boolean | undefined | null>): string {
+  return parts
+    .map((part) => {
+      if (part == null) return '';
+      return String(part);
+    })
+    .join('\0');
+}
+
+function defaultS3VfsName(fingerprint: string): string {
+  return `turbolite-s3-${crypto
+    .createHash('sha256')
+    .update(fingerprint)
+    .digest('hex')
+    .slice(0, 16)}`;
+}
+
+function defaultS3Prefix(absPath: string): string {
+  const stem = path.basename(absPath) || 'database';
+  const digest = crypto.createHash('sha256').update(absPath).digest('hex').slice(0, 16);
+  return `turbolite/${stem}-${digest}`;
+}
+
 /**
  * Open a better-sqlite3 Database with a URI filename.
  *
@@ -149,22 +174,17 @@ function openUri(
 // Lazily created and kept alive for the process lifetime so that
 // turbolite_register_vfs() calls can be made at any time.
 let _bootstrap: Database.Database | null = null;
-let _loadedS3 = false;
 
 function ensureBootstrap(): Database.Database {
   if (_bootstrap) return _bootstrap;
   _bootstrap = new Database(':memory:');
   _bootstrap.loadExtension(findExt());
-  if (process.env.TURBOLITE_BUCKET) {
-    _loadedS3 = true;
-  }
   return _bootstrap;
 }
 
 /**
  * Load the turbolite extension into an existing better-sqlite3 Database.
- * Registers the "turbolite" VFS (local mode) globally. If TURBOLITE_BUCKET
- * is set, also registers "turbolite-s3".
+ * Registers the extension SQL helpers and default VFS entries.
  */
 export function load(db: Database.Database): void {
   db.loadExtension(findExt());
@@ -209,19 +229,22 @@ export function connect(
     throw new Error(`mode must be 'local' or 's3', got '${mode}'`);
   }
 
-  // Set env vars BEFORE loading the extension. The C init function checks
-  // TURBOLITE_BUCKET to decide whether to register turbolite-s3.
+  const effectiveBucket = bucket ?? process.env.TURBOLITE_BUCKET;
+  const absPath = path.resolve(dbPath);
+  const effectivePrefix =
+    prefix ?? process.env.TURBOLITE_PREFIX ?? defaultS3Prefix(absPath);
+  const effectiveEndpoint =
+    endpoint ??
+    process.env.TURBOLITE_ENDPOINT_URL ??
+    process.env.AWS_ENDPOINT_URL;
+  const effectiveRegion = region ?? process.env.TURBOLITE_REGION ?? process.env.AWS_REGION;
+
   if (mode === 's3') {
-    const effectiveBucket = bucket ?? process.env.TURBOLITE_BUCKET;
     if (!effectiveBucket) {
       throw new Error(
         "mode='s3' requires a bucket. Pass bucket or set TURBOLITE_BUCKET."
       );
     }
-    process.env.TURBOLITE_BUCKET = effectiveBucket;
-    if (prefix != null) process.env.TURBOLITE_PREFIX = prefix;
-    if (endpoint != null) process.env.TURBOLITE_ENDPOINT_URL = endpoint;
-    if (region != null) process.env.TURBOLITE_REGION = region;
     if (cacheDir != null) process.env.TURBOLITE_CACHE_DIR = cacheDir;
     if (readOnly) process.env.TURBOLITE_READ_ONLY = 'true';
   }
@@ -237,7 +260,6 @@ export function connect(
   // Ensure the extension is loaded (registers SQL functions + global VFS).
   const bootstrap = ensureBootstrap();
 
-  const absPath = path.resolve(dbPath);
   let vfsName: string;
 
   if (mode === 'local') {
@@ -261,15 +283,45 @@ export function connect(
       );
     }
   } else {
-    // S3 mode uses the global "turbolite-s3" VFS registered at init time.
-    if (!_loadedS3) {
+    const fingerprint = s3Fingerprint([
+      absPath,
+      effectiveBucket,
+      effectivePrefix,
+      effectiveEndpoint,
+      effectiveRegion,
+      cacheDir,
+      compressionLevel,
+      prefetchThreads,
+      readOnly,
+      pageCache,
+    ]);
+    let registered = _s3VfsByFingerprint.get(fingerprint);
+    if (!registered) {
+      registered = defaultS3VfsName(fingerprint);
+      const rc = bootstrap
+        .prepare('SELECT turbolite_register_s3_file_first_vfs(?, ?, ?, ?, ?, ?)')
+        .pluck()
+        .get(
+          registered,
+          absPath,
+          effectiveBucket,
+          effectivePrefix,
+          effectiveEndpoint ?? null,
+          effectiveRegion ?? null,
+        ) as number;
+      if (rc !== 0) {
+        throw new Error(
+          `Failed to register S3 file-first VFS '${registered}' for ${absPath}`
+        );
+      }
+      _s3VfsByFingerprint.set(fingerprint, registered);
+    }
+    if (!registered) {
       throw new Error(
-        'Cannot use S3 mode: TURBOLITE_BUCKET was not set when the extension ' +
-        'was first loaded. Set TURBOLITE_BUCKET in the environment before ' +
-        'the first turbolite.connect() call.'
+        `Failed to resolve S3 file-first VFS for ${absPath}`
       );
     }
-    vfsName = 'turbolite-s3';
+    vfsName = registered;
   }
 
   const db = openUri(`file:${absPath}?vfs=${vfsName}`, absPath, {

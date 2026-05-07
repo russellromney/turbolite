@@ -695,7 +695,6 @@ fn test_delete_mode_crash_recovery() {
     turbolite_close(db);
 }
 
-
 /// Regression test for the lock-downgrade-without-sync rollback bug.
 ///
 /// Earlier code in TurboliteHandle::lock() treated "lock downgrades from
@@ -733,10 +732,7 @@ fn test_persistence_across_synchronous_modes() {
         let db = open_db(&db_path_str, &vfs_name);
         exec_sql(db, &format!("PRAGMA journal_mode={journal}"));
         exec_sql(db, &format!("PRAGMA synchronous={sync}"));
-        exec_sql(
-            db,
-            "CREATE TABLE rows (id INTEGER PRIMARY KEY, val TEXT)",
-        );
+        exec_sql(db, "CREATE TABLE rows (id INTEGER PRIMARY KEY, val TEXT)");
         for i in 0..20 {
             exec_sql(db, &format!("INSERT INTO rows VALUES ({i}, 'v{i}')"));
         }
@@ -804,7 +800,6 @@ fn test_synchronous_off_multiple_commits_persist() {
     turbolite_close(db);
 }
 
-
 /// Rollback regression: the lock-downgrade-without-sync code path used
 /// to discard dirty pages on the assumption they were rolled-back
 /// in-progress writes. The new behavior unconditionally persists at
@@ -850,6 +845,9 @@ fn test_rollback_under_sync_off_keeps_pre_txn_state() {
         "no aborted rows must persist: {json}",
     );
     let json = query_json(db, "PRAGMA integrity_check");
-    assert!(json.contains("ok"), "integrity must pass after rollback: {json}");
+    assert!(
+        json.contains("ok"),
+        "integrity must pass after rollback: {json}"
+    );
     turbolite_close(db);
 }

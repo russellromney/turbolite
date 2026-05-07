@@ -299,10 +299,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
             return -1;
         }
     };
-    let cache_dir_present = raw
-        .get("cache_dir")
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    let cache_dir_present = raw.get("cache_dir").map(|v| !v.is_null()).unwrap_or(false);
     let local_data_path_present = raw
         .get("local_data_path")
         .map(|v| !v.is_null())
@@ -318,11 +315,10 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
 
     if local_data_path_present && !cache_dir_present {
         if let Some(db_path) = config.local_data_path.clone() {
-            config.cache_dir =
-                turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
-                    &db_path,
-                    "-turbolite",
-                );
+            config.cache_dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+                &db_path,
+                "-turbolite",
+            );
         }
     }
 

@@ -29,10 +29,12 @@
 package turbolite
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -47,7 +49,7 @@ type Options struct {
 	Bucket string
 	// S3 endpoint URL (for Tigris, MinIO).
 	Endpoint string
-	// S3 key prefix (default "turbolite").
+	// S3 key prefix. Defaults to a stable prefix derived from the database path.
 	Prefix string
 	// AWS region.
 	Region string
@@ -72,10 +74,42 @@ var (
 	bootstrapErr  error
 	bootstrapDB   *sql.DB
 
+	s3RegistryMu sync.Mutex
+	s3VFSByKey   = map[string]string{}
+
 	extPathOnce sync.Once
 	extPath     string
 	extPathErr  error
 )
+
+func defaultS3VFSName(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("turbolite-s3-%x", sum[:8])
+}
+
+func defaultS3Prefix(absPath string) string {
+	sum := sha256.Sum256([]byte(absPath))
+	stem := filepath.Base(absPath)
+	if stem == "." || stem == string(filepath.Separator) || stem == "" {
+		stem = "database"
+	}
+	return fmt.Sprintf("turbolite/%s-%x", stem, sum[:8])
+}
+
+func s3Fingerprint(absPath, bucket, prefix, endpoint, region, cacheDir, pageCache string, compressionLevel, prefetchThreads int, readOnly bool) string {
+	return strings.Join([]string{
+		absPath,
+		bucket,
+		prefix,
+		endpoint,
+		region,
+		cacheDir,
+		pageCache,
+		fmt.Sprintf("%d", compressionLevel),
+		fmt.Sprintf("%d", prefetchThreads),
+		fmt.Sprintf("%t", readOnly),
+	}, "\x00")
+}
 
 // findExt locates the turbolite loadable extension binary.
 func findExt() (string, error) {
@@ -177,7 +211,9 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 	}
 	dbDir := filepath.Dir(absPath)
 
-	// Set env vars before the extension loads.
+	// Set behavior env vars before VFS registration. S3 bucket/prefix are
+	// passed explicitly to the per-volume registration below; they must not
+	// rely on the process-global "turbolite-s3" shortcut.
 	if opts.Mode == "s3" {
 		bucket := opts.Bucket
 		if bucket == "" {
@@ -185,16 +221,6 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 		}
 		if bucket == "" {
 			return nil, fmt.Errorf("turbolite: mode='s3' requires Bucket or TURBOLITE_BUCKET")
-		}
-		os.Setenv("TURBOLITE_BUCKET", bucket)
-		if opts.Prefix != "" {
-			os.Setenv("TURBOLITE_PREFIX", opts.Prefix)
-		}
-		if opts.Endpoint != "" {
-			os.Setenv("TURBOLITE_ENDPOINT_URL", opts.Endpoint)
-		}
-		if opts.Region != "" {
-			os.Setenv("TURBOLITE_REGION", opts.Region)
 		}
 		if opts.CacheDir != "" {
 			os.Setenv("TURBOLITE_CACHE_DIR", opts.CacheDir)
@@ -233,7 +259,57 @@ func Open(path string, opts *Options) (*sql.DB, error) {
 			return nil, fmt.Errorf("turbolite: register file-first VFS %q: %w", vfsName, err)
 		}
 	} else {
-		vfsName = "turbolite-s3"
+		bucket := opts.Bucket
+		if bucket == "" {
+			bucket = os.Getenv("TURBOLITE_BUCKET")
+		}
+		prefix := opts.Prefix
+		if prefix == "" {
+			prefix = os.Getenv("TURBOLITE_PREFIX")
+		}
+		if prefix == "" {
+			prefix = defaultS3Prefix(absPath)
+		}
+		endpoint := opts.Endpoint
+		if endpoint == "" {
+			endpoint = os.Getenv("TURBOLITE_ENDPOINT_URL")
+			if endpoint == "" {
+				endpoint = os.Getenv("AWS_ENDPOINT_URL")
+			}
+		}
+		region := opts.Region
+		if region == "" {
+			region = os.Getenv("TURBOLITE_REGION")
+			if region == "" {
+				region = os.Getenv("AWS_REGION")
+			}
+		}
+		key := s3Fingerprint(
+			absPath,
+			bucket,
+			prefix,
+			endpoint,
+			region,
+			opts.CacheDir,
+			opts.PageCache,
+			opts.CompressionLevel,
+			opts.PrefetchThreads,
+			opts.ReadOnly,
+		)
+		s3RegistryMu.Lock()
+		vfsName = s3VFSByKey[key]
+		if vfsName == "" {
+			vfsName = defaultS3VFSName(key)
+			_, err := bootstrapDB.Exec(
+				"SELECT turbolite_register_s3_file_first_vfs(?, ?, ?, ?, ?, ?)",
+				vfsName, absPath, bucket, prefix, endpoint, region)
+			if err != nil {
+				s3RegistryMu.Unlock()
+				return nil, fmt.Errorf("turbolite: register file-first S3 VFS %q: %w", vfsName, err)
+			}
+			s3VFSByKey[key] = vfsName
+		}
+		s3RegistryMu.Unlock()
 	}
 
 	// Register a driver that sets per-connection pragmas.

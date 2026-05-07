@@ -14,8 +14,8 @@ import path from 'node:path';
 import os from 'node:os';
 
 // If TIERED_TEST_BUCKET is set but TURBOLITE_BUCKET is not, propagate it.
-// The turbolite extension checks TURBOLITE_BUCKET during init to decide
-// whether to register the S3 VFS. This must happen before any connect() call.
+// The wrapper resolves the effective bucket from TURBOLITE_BUCKET unless an
+// explicit bucket option is passed.
 if (process.env.TIERED_TEST_BUCKET && !process.env.TURBOLITE_BUCKET) {
   process.env.TURBOLITE_BUCKET = process.env.TIERED_TEST_BUCKET;
 }
@@ -605,6 +605,81 @@ if (bucket) {
     const row = db.prepare('SELECT val FROM counter WHERE id = 1').get();
     assert.equal(row.val, 50);
     db.close();
+  });
+
+  test('S3 two prefixes in one process do not cross', () => {
+    const root = testDir();
+    const basePrefix = `test/node-two-prefix-${Date.now()}`;
+    const dbA = connect(path.join(root, 'a.db'), {
+      mode: 's3',
+      bucket,
+      prefix: `${basePrefix}/a`,
+      endpoint: s3Endpoint || undefined,
+      region: 'auto',
+    });
+    const dbB = connect(path.join(root, 'b.db'), {
+      mode: 's3',
+      bucket,
+      prefix: `${basePrefix}/b`,
+      endpoint: s3Endpoint || undefined,
+      region: 'auto',
+    });
+
+    dbA.exec('CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)');
+    dbA.prepare('INSERT INTO marker VALUES (?, ?)').run(1, 'alpha');
+    dbA.pragma('wal_checkpoint(TRUNCATE)');
+
+    dbB.exec('CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)');
+    dbB.prepare('INSERT INTO marker VALUES (?, ?)').run(1, 'bravo');
+    dbB.pragma('wal_checkpoint(TRUNCATE)');
+
+    assert.equal(
+      dbA.prepare('SELECT value FROM marker WHERE id = 1').get().value,
+      'alpha'
+    );
+    assert.equal(
+      dbB.prepare('SELECT value FROM marker WHERE id = 1').get().value,
+      'bravo'
+    );
+
+    dbA.close();
+    dbB.close();
+  });
+
+  test('S3 default prefixes in one process do not cross', () => {
+    const root = testDir();
+    const dbA = connect(path.join(root, 'default-a.db'), {
+      mode: 's3',
+      bucket,
+      endpoint: s3Endpoint || undefined,
+      region: 'auto',
+    });
+    const dbB = connect(path.join(root, 'default-b.db'), {
+      mode: 's3',
+      bucket,
+      endpoint: s3Endpoint || undefined,
+      region: 'auto',
+    });
+
+    dbA.exec('CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)');
+    dbA.prepare('INSERT INTO marker VALUES (?, ?)').run(1, 'default-alpha');
+    dbA.pragma('wal_checkpoint(TRUNCATE)');
+
+    dbB.exec('CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)');
+    dbB.prepare('INSERT INTO marker VALUES (?, ?)').run(1, 'default-bravo');
+    dbB.pragma('wal_checkpoint(TRUNCATE)');
+
+    assert.equal(
+      dbA.prepare('SELECT value FROM marker WHERE id = 1').get().value,
+      'default-alpha'
+    );
+    assert.equal(
+      dbB.prepare('SELECT value FROM marker WHERE id = 1').get().value,
+      'default-bravo'
+    );
+
+    dbA.close();
+    dbB.close();
   });
 
   test('S3 requires bucket', () => {
