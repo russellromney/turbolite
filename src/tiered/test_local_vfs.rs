@@ -254,6 +254,34 @@ fn set_manifest_adopts_same_version_higher_replay_cursor() {
     );
 }
 
+#[test]
+fn exact_replay_cursor_can_replace_sqlite_header_counter() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 7;
+    base.change_counter = 99;
+    base.page_count = 4;
+    vfs.set_manifest(base);
+
+    let bytes = vfs
+        .manifest_bytes_with_exact_replay_cursor(3)
+        .expect("exact cursor manifest bytes");
+    let decoded = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode exact cursor bytes");
+
+    assert_eq!(decoded.change_counter, 3);
+    assert_eq!(
+        vfs.manifest().change_counter,
+        3,
+        "promotion publishes the external WAL replay cursor exactly, not max(sqlite header, replay seq)"
+    );
+}
+
 /// Local VFS with compression enabled: write + checkpoint + reopen.
 #[test]
 #[cfg(feature = "zstd")]

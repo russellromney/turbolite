@@ -905,6 +905,25 @@ impl TurboliteVfs {
         super::wire::encode_pure(&m)
     }
 
+    /// Serialize and install the current manifest with an exact external
+    /// replay cursor.
+    ///
+    /// This is intentionally stricter than
+    /// `manifest_bytes_with_replay_cursor_at_least`: promotion paths use it
+    /// after flushing follower-replayed pages into a new base, so the next WAL
+    /// writer's base cursor must describe exactly the bytes now present in
+    /// that base, independent of SQLite's file-header change counter.
+    pub fn manifest_bytes_with_exact_replay_cursor(
+        &self,
+        change_counter: u64,
+    ) -> io::Result<Vec<u8>> {
+        let mut m = self.manifest();
+        m.change_counter = change_counter;
+        manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
+        self.shared_manifest.store(Arc::new(m.clone()));
+        super::wire::encode_pure(&m)
+    }
+
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
     /// page/base manifest via `set_manifest()`.
     pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
