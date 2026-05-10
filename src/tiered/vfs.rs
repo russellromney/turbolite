@@ -887,6 +887,24 @@ impl TurboliteVfs {
         super::wire::encode_pure(&m)
     }
 
+    /// Serialize the current manifest while ensuring its replay cursor is at
+    /// least `change_counter`.
+    ///
+    /// Integration layers use this after they publish external WAL deltas and
+    /// then publish a page/base manifest that covers those same bytes. The
+    /// cursor tells the next opener that deltas up to this seq are already in
+    /// the base and must not be replayed again.
+    pub fn manifest_bytes_with_replay_cursor_at_least(
+        &self,
+        change_counter: u64,
+    ) -> io::Result<Vec<u8>> {
+        let mut m = self.manifest();
+        m.change_counter = m.change_counter.max(change_counter);
+        manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
+        self.shared_manifest.store(Arc::new(m.clone()));
+        super::wire::encode_pure(&m)
+    }
+
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
     /// page/base manifest via `set_manifest()`.
     pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
@@ -929,18 +947,35 @@ impl TurboliteVfs {
     pub fn set_manifest(&self, mut manifest: Manifest) {
         manifest.detect_and_normalize_strategy();
 
-        // Refuse to downgrade. The manifest version is monotonically increasing.
+        // Refuse to downgrade. The manifest version is monotonically
+        // increasing, but physical-replay users may publish a
+        // same-version manifest whose replay cursor moved forward.
+        // That cursor is also a durable floor, so allow the
+        // same-version/higher-cursor adoption while rejecting exact
+        // replays and stale cursors.
         {
             let current = self.shared_manifest.load();
             if manifest.version > 0 && current.version > 0 && manifest.version <= current.version {
-                if manifest.version < current.version {
+                let advances_replay_cursor = manifest.version == current.version
+                    && manifest.change_counter > current.change_counter;
+                if !advances_replay_cursor {
+                    if manifest.version < current.version {
+                        turbolite_debug!(
+                            "[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
+                            manifest.version,
+                            current.version,
+                        );
+                    }
+                    return;
+                }
+                if manifest.version == current.version {
                     turbolite_debug!(
-                        "[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
+                        "[set_manifest] adopting same-version v{} replay cursor {} -> {}",
                         manifest.version,
-                        current.version,
+                        current.change_counter,
+                        manifest.change_counter,
                     );
                 }
-                return;
             }
         }
 
@@ -1216,19 +1251,7 @@ impl TurboliteVfs {
         // works for both Positional and BTreeAware manifests because
         // ReplayHandle::finalize already extended page_count and
         // group_pages before emitting the staging log.
-        let has_pending = self
-            .pending_flushes
-            .lock()
-            .map(|g| !g.is_empty())
-            .unwrap_or(false)
-            || self
-                .shared_dirty_groups
-                .lock()
-                .map(|g| !g.is_empty())
-                .unwrap_or(false);
-        if has_pending {
-            self.flush_to_storage()?;
-        }
+        self.flush_to_storage()?;
         // Whether we flushed or not, the in-memory manifest is the
         // source of truth for the published payload. Delta replay is
         // discoverable from the integration layer's configured delta

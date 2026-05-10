@@ -219,6 +219,41 @@ fn file_first_with_backend_keeps_sidecar_to_local_state() {
     assert!(remote_dir.join("p").exists(), "backend owns page objects");
 }
 
+#[test]
+fn set_manifest_adopts_same_version_higher_replay_cursor() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 7;
+    base.change_counter = 2;
+    base.page_count = 4;
+    vfs.set_manifest(base);
+    assert_eq!(vfs.manifest().change_counter, 2);
+
+    let mut advanced = vfs.manifest();
+    advanced.change_counter = 9;
+    vfs.set_manifest(advanced);
+    assert_eq!(
+        vfs.manifest().change_counter,
+        9,
+        "same-version manifest must be able to advance the replay floor"
+    );
+
+    let mut stale = vfs.manifest();
+    stale.change_counter = 3;
+    vfs.set_manifest(stale);
+    assert_eq!(
+        vfs.manifest().change_counter,
+        9,
+        "same-version stale cursor must still be rejected"
+    );
+}
+
 /// Local VFS with compression enabled: write + checkpoint + reopen.
 #[test]
 #[cfg(feature = "zstd")]
