@@ -259,7 +259,7 @@ pub(crate) struct ReplayContext {
     pub vfs_page_count: Arc<AtomicU64>,
     pub pending_flushes: Arc<Mutex<Vec<PendingFlush>>>,
     pub staging_seq: Arc<AtomicU64>,
-    pub flush_lock: Arc<Mutex<()>>,
+    pub flush_lock: Arc<parking_lot::Mutex<()>>,
     /// VFS-level read/write gate. `finalize` takes the write half
     /// for the entire commit phase so an in-flight SQLite read
     /// transaction (which holds the read half between `xLock(SHARED)`
@@ -610,9 +610,7 @@ impl ReplayHandle {
             pause.wait();
         }
 
-        let _flush_guard = self.ctx.flush_lock.lock().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("flush_lock poisoned: {e}"))
-        })?;
+        let _flush_guard = self.ctx.flush_lock.lock();
 
         // 4. Write pages to data.cache via the no-visibility helper,
         //    capturing the pre-image of any **already-present** page

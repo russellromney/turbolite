@@ -33,7 +33,7 @@ pub struct TurboliteSharedState {
     pub(crate) shared_manifest: Arc<ArcSwap<Manifest>>,
     pub(crate) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     pub(crate) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
-    pub(crate) flush_lock: Arc<Mutex<()>>,
+    pub(crate) flush_lock: Arc<parking_lot::Mutex<()>>,
     pub(crate) compression_level: i32,
     #[cfg(feature = "zstd")]
     pub(crate) dictionary: Option<Vec<u8>>,
@@ -235,7 +235,7 @@ impl TurboliteSharedState {
 
     /// Upload locally-checkpointed dirty pages without holding any SQLite lock.
     pub fn flush_to_storage(&self) -> io::Result<()> {
-        let _guard = self.flush_lock.lock().unwrap();
+        let _guard = self.flush_lock.lock();
         flush::flush_dirty_groups(
             self.storage.as_ref(),
             &self.runtime,

@@ -54,7 +54,7 @@ pub struct TurboliteVfs {
     /// Serialises flush_to_storage() calls. Prevents two concurrent flushes
     /// from racing on version numbers and storage keys. Also prevents a
     /// durable-mode checkpoint from interleaving with a flush in progress.
-    flush_lock: Arc<Mutex<()>>,
+    flush_lock: Arc<parking_lot::Mutex<()>>,
     /// Read/write gate for direct hybrid page replay.
     ///
     /// SQLite read transactions hold an Arc-owned read guard between
@@ -333,7 +333,7 @@ impl TurboliteVfs {
         } else {
             Arc::new(Mutex::new(recovered_staging))
         };
-        let flush_lock = Arc::new(Mutex::new(()));
+        let flush_lock = Arc::new(parking_lot::Mutex::new(()));
         let replay_gate: Arc<parking_lot::RwLock<()>> = Arc::new(parking_lot::RwLock::new(()));
         let replay_epoch = Arc::new(AtomicU64::new(0));
 
@@ -537,7 +537,7 @@ impl TurboliteVfs {
     /// Upload locally-checkpointed dirty pages to the backend without holding
     /// any SQLite lock.
     pub fn flush_to_storage(&self) -> io::Result<()> {
-        let _guard = self.flush_lock.lock().unwrap();
+        let _guard = self.flush_lock.lock();
         flush::flush_dirty_groups(
             self.storage.as_ref(),
             &self.runtime,
