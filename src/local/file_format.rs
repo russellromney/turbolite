@@ -35,6 +35,12 @@ pub const HEADER_LEN: usize = 64;
 pub const DIR_ENTRY_LEN: usize = 12;
 /// Default logical page size when the caller does not specify one.
 pub const DEFAULT_PAGE_SIZE: u32 = 4096;
+/// Smallest accepted page size (SQLite's minimum). Guards against a corrupt
+/// header driving absurd allocations / divisions.
+pub const MIN_PAGE_SIZE: u32 = 512;
+/// Largest accepted page size. A decompressed page can never exceed this,
+/// so it doubles as the per-page decompression cap (anti zip-bomb).
+pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// Header flag: page payloads are encrypted.
 pub const FLAG_ENCRYPTED: u16 = 1 << 0;
@@ -88,12 +94,26 @@ impl Header {
                 format!("unsupported TLLOCAL1 version {format_version}"),
             ));
         }
+        let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("TLLOCAL1 page_size {page_size} out of range"),
+            ));
+        }
+        let directory_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        if directory_offset < HEADER_LEN as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLLOCAL1 directory_offset inside header",
+            ));
+        }
         Ok(Header {
             format_version,
             flags: u16::from_le_bytes([buf[10], buf[11]]),
-            page_size: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            page_size,
             page_count: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-            directory_offset: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            directory_offset,
         })
     }
 }
@@ -121,19 +141,21 @@ impl PageCodec {
 
 /// Encode one logical page into its stored blob.
 ///
-/// `nonce` must be unique per page for the lifetime of the key; the VFS
-/// passes the page's logical byte offset, which is stable per page index.
-pub fn encode_page(page: &[u8], codec: &PageCodec, nonce: u64) -> io::Result<Vec<u8>> {
+/// When a key is configured the payload is encrypted with AES-256-GCM using
+/// a fresh random nonce stored in the blob, so rewriting the same page never
+/// reuses a keystream (CTR-style many-time-pad) and tampering is detected.
+pub fn encode_page(page: &[u8], codec: &PageCodec) -> io::Result<Vec<u8>> {
     let (tag, payload) = compress_page(page, codec)?;
-    let payload = maybe_encrypt(payload, nonce, codec)?;
+    let payload = maybe_encrypt(payload, codec)?;
     let mut blob = Vec::with_capacity(payload.len() + 1);
     blob.push(tag);
     blob.extend_from_slice(&payload);
     Ok(blob)
 }
 
-/// Decode a stored blob back into a logical page.
-pub fn decode_page(blob: &[u8], codec: &PageCodec, nonce: u64) -> io::Result<Vec<u8>> {
+/// Decode a stored blob back into a logical page. `max_page` caps the
+/// decompressed output (anti decompression-bomb); pass the header page size.
+pub fn decode_page(blob: &[u8], codec: &PageCodec, max_page: usize) -> io::Result<Vec<u8>> {
     if blob.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -141,10 +163,18 @@ pub fn decode_page(blob: &[u8], codec: &PageCodec, nonce: u64) -> io::Result<Vec
         ));
     }
     let tag = blob[0];
-    let payload = maybe_decrypt(&blob[1..], nonce, codec)?;
+    let payload = maybe_decrypt(&blob[1..], codec)?;
     match tag {
-        CODEC_RAW => Ok(payload),
-        CODEC_ZSTD => decompress_zstd(&payload),
+        CODEC_RAW => {
+            if payload.len() > max_page {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raw page exceeds page size",
+                ));
+            }
+            Ok(payload)
+        }
+        CODEC_ZSTD => decompress_zstd(&payload, max_page),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown page codec tag {other}"),
@@ -180,12 +210,19 @@ fn compress_zstd(data: &[u8], _level: i32) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(feature = "zstd")]
-fn decompress_zstd(data: &[u8]) -> io::Result<Vec<u8>> {
-    crate::compress::decompress(data, None)
+fn decompress_zstd(data: &[u8], max_page: usize) -> io::Result<Vec<u8>> {
+    let out = crate::compress::decompress(data, None)?;
+    if out.len() > max_page {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed page exceeds page size (possible bomb)",
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(not(feature = "zstd"))]
-fn decompress_zstd(_data: &[u8]) -> io::Result<Vec<u8>> {
+fn decompress_zstd(_data: &[u8], _max_page: usize) -> io::Result<Vec<u8>> {
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         "page is zstd-compressed but zstd feature is not compiled in",
@@ -193,15 +230,15 @@ fn decompress_zstd(_data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(feature = "encryption")]
-fn maybe_encrypt(payload: Vec<u8>, nonce: u64, codec: &PageCodec) -> io::Result<Vec<u8>> {
+fn maybe_encrypt(payload: Vec<u8>, codec: &PageCodec) -> io::Result<Vec<u8>> {
     match codec.key {
-        Some(key) => crate::compress::encrypt_ctr(&payload, nonce, &key),
+        Some(key) => crate::compress::encrypt_gcm_random_nonce(&payload, &key),
         None => Ok(payload),
     }
 }
 
 #[cfg(not(feature = "encryption"))]
-fn maybe_encrypt(payload: Vec<u8>, _nonce: u64, codec: &PageCodec) -> io::Result<Vec<u8>> {
+fn maybe_encrypt(payload: Vec<u8>, codec: &PageCodec) -> io::Result<Vec<u8>> {
     if codec.key.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -212,15 +249,15 @@ fn maybe_encrypt(payload: Vec<u8>, _nonce: u64, codec: &PageCodec) -> io::Result
 }
 
 #[cfg(feature = "encryption")]
-fn maybe_decrypt(payload: &[u8], nonce: u64, codec: &PageCodec) -> io::Result<Vec<u8>> {
+fn maybe_decrypt(payload: &[u8], codec: &PageCodec) -> io::Result<Vec<u8>> {
     match codec.key {
-        Some(key) => crate::compress::decrypt_ctr(payload, nonce, &key),
+        Some(key) => crate::compress::decrypt_gcm_random_nonce(payload, &key),
         None => Ok(payload.to_vec()),
     }
 }
 
 #[cfg(not(feature = "encryption"))]
-fn maybe_decrypt(payload: &[u8], _nonce: u64, codec: &PageCodec) -> io::Result<Vec<u8>> {
+fn maybe_decrypt(payload: &[u8], codec: &PageCodec) -> io::Result<Vec<u8>> {
     if codec.key.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -300,7 +337,7 @@ mod tests {
         // Highly compressible page (zeros) -> should pick zstd and shrink.
         let page = vec![0u8; 4096];
         let codec = plain_codec();
-        let blob = encode_page(&page, &codec, 4096).unwrap();
+        let blob = encode_page(&page, &codec).unwrap();
         assert!(blob.len() < page.len(), "compressible page should shrink");
         let back = decode_page(&blob, &codec, 4096).unwrap();
         assert_eq!(back, page);
@@ -317,9 +354,9 @@ mod tests {
             *b = (x >> 24) as u8;
         }
         let codec = plain_codec();
-        let blob = encode_page(&page, &codec, 0).unwrap();
+        let blob = encode_page(&page, &codec).unwrap();
         assert_eq!(blob.len(), page.len() + 1, "raw fallback = payload + tag");
-        let back = decode_page(&blob, &codec, 0).unwrap();
+        let back = decode_page(&blob, &codec, 4096).unwrap();
         assert_eq!(back, page);
     }
 
@@ -331,9 +368,36 @@ mod tests {
             level: 0,
             key: None,
         };
-        let blob = encode_page(&page, &codec, 0).unwrap();
+        let blob = encode_page(&page, &codec).unwrap();
         assert_eq!(blob.len(), page.len() + 1);
-        assert_eq!(decode_page(&blob, &codec, 0).unwrap(), page);
+        assert_eq!(decode_page(&blob, &codec, 4096).unwrap(), page);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_raw_page() {
+        let page = vec![1u8; 4096];
+        let codec = PageCodec {
+            compress: false,
+            level: 0,
+            key: None,
+        };
+        let blob = encode_page(&page, &codec).unwrap();
+        // A max_page smaller than the stored raw page must be rejected.
+        assert!(decode_page(&blob, &codec, 1024).is_err());
+    }
+
+    #[test]
+    fn header_rejects_out_of_range_page_size() {
+        let mut h = Header {
+            format_version: FORMAT_VERSION,
+            flags: 0,
+            page_size: 100, // below MIN_PAGE_SIZE
+            page_count: 1,
+            directory_offset: HEADER_LEN as u64,
+        };
+        assert!(Header::decode(&h.encode()).is_err());
+        h.page_size = 1 << 20; // above MAX_PAGE_SIZE
+        assert!(Header::decode(&h.encode()).is_err());
     }
 
     #[test]
@@ -361,30 +425,47 @@ mod tests {
             level: 3,
             key: Some([42u8; 32]),
         };
-        let nonce = 8192;
-        let blob = encode_page(&page, &codec, nonce).unwrap();
+        let blob = encode_page(&page, &codec).unwrap();
         // Encrypted payload must not equal the plaintext page tail.
         assert_ne!(&blob[1..], &page[..blob.len() - 1]);
-        let back = decode_page(&blob, &codec, nonce).unwrap();
+        let back = decode_page(&blob, &codec, 4096).unwrap();
         assert_eq!(back, page);
     }
 
     #[cfg(feature = "encryption")]
     #[test]
-    fn encrypted_blob_wrong_nonce_corrupts() {
-        // CTR with the wrong nonce yields garbage after decompress; we
-        // only assert it does not reproduce the original plaintext.
+    fn encrypted_blob_rewrite_uses_fresh_nonce() {
+        // GCM random-nonce: encoding the same page twice must produce
+        // different ciphertext (no keystream reuse), yet both decode back.
         let page = vec![3u8; 4096];
         let codec = PageCodec {
             compress: false,
             level: 0,
             key: Some([9u8; 32]),
         };
-        let blob = encode_page(&page, &codec, 100).unwrap();
-        let wrong = decode_page(&blob, &codec, 200);
-        match wrong {
-            Ok(bytes) => assert_ne!(bytes, page),
-            Err(_) => {}
-        }
+        let a = encode_page(&page, &codec).unwrap();
+        let b = encode_page(&page, &codec).unwrap();
+        assert_ne!(a, b, "fresh nonce per encode");
+        assert_eq!(decode_page(&a, &codec, 4096).unwrap(), page);
+        assert_eq!(decode_page(&b, &codec, 4096).unwrap(), page);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_blob_wrong_key_errors() {
+        // GCM is authenticated: the wrong key must fail to decrypt, never
+        // return garbage.
+        let page = vec![3u8; 4096];
+        let codec = PageCodec {
+            compress: false,
+            level: 0,
+            key: Some([9u8; 32]),
+        };
+        let blob = encode_page(&page, &codec).unwrap();
+        let wrong_codec = PageCodec {
+            key: Some([1u8; 32]),
+            ..codec
+        };
+        assert!(decode_page(&blob, &wrong_codec, 4096).is_err());
     }
 }

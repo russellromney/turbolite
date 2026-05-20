@@ -393,12 +393,13 @@ impl Manifest {
                 let end = std::cmp::min(start + ppg, self.page_count);
                 Cow::Owned((start..end).collect())
             }
-            GroupingStrategy::BTreeAware => Cow::Borrowed(
-                self.group_pages
-                    .get(gid as usize)
-                    .expect("BTreeAware group must exist in group_pages")
-                    .as_slice(),
-            ),
+            // A group id with no entry can only come from a corrupt or
+            // hand-crafted manifest; return empty rather than panicking the
+            // process on untrusted wire input.
+            GroupingStrategy::BTreeAware => match self.group_pages.get(gid as usize) {
+                Some(pages) => Cow::Borrowed(pages.as_slice()),
+                None => Cow::Owned(Vec::new()),
+            },
         }
     }
 

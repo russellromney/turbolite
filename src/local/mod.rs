@@ -27,18 +27,22 @@
 pub mod file_format;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
+use fs2::FileExt;
 use sqlite_vfs::{
     DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs, WalDisabled,
 };
 
 use file_format::{
     decode_directory, decode_page, encode_directory, encode_page, Header, PageCodec,
-    DEFAULT_PAGE_SIZE, FORMAT_VERSION, HEADER_LEN,
+    DIR_ENTRY_LEN, DEFAULT_PAGE_SIZE, FORMAT_VERSION, HEADER_LEN,
 };
 
 /// The tiered (cloud/replicated) mode keeps its metadata in this sidecar
@@ -136,18 +140,19 @@ pub fn open_local_with<P: AsRef<Path>>(
     path: P,
     options: LocalOptions,
 ) -> Result<rusqlite::Connection, LocalError> {
-    let path = path.as_ref().to_path_buf();
+    let path = absolutize(path.as_ref());
     refuse_if_tiered(&path)?;
+    if !(file_format::MIN_PAGE_SIZE..=file_format::MAX_PAGE_SIZE).contains(&options.page_size) {
+        return Err(LocalError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "page_size out of range",
+        )));
+    }
 
-    let vfs = LocalCompressedVfs {
-        path: path.clone(),
-        codec: options.codec(),
-        page_size: options.page_size,
-    };
-
-    let vfs_name = unique_vfs_name();
-    sqlite_vfs::register(&vfs_name, vfs, false)
-        .map_err(|e| LocalError::Io(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))))?;
+    // Reuse one registered VFS per (path, options). VFS registrations are
+    // process-global and cannot be unregistered, so registering a fresh one
+    // on every open would leak unboundedly.
+    let vfs_name = register_or_reuse_vfs(&path, &options)?;
 
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
         | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
@@ -156,6 +161,60 @@ pub fn open_local_with<P: AsRef<Path>>(
         .ok_or_else(|| LocalError::Io(io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 path")))?;
     let conn = rusqlite::Connection::open_with_flags_and_vfs(path_str, flags, &vfs_name)?;
     Ok(conn)
+}
+
+/// Make a path absolute and lexically clean without requiring it to exist
+/// (the file may be about to be created), so that `./db`, `db`, and an
+/// absolute form of the same file all map to one VFS / lock identity.
+fn absolutize(path: &Path) -> PathBuf {
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in base.components() {
+        use std::path::Component::*;
+        match comp {
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Registry of VFS names keyed by an identity string (path + options), so a
+/// reopen of the same database reuses its registration.
+fn register_or_reuse_vfs(path: &Path, options: &LocalOptions) -> Result<String, LocalError> {
+    static REGISTRY: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let key = format!(
+        "{}|{}|{}|{}|{}",
+        path.display(),
+        options.page_size,
+        options.compress,
+        options.level,
+        options.encryption_key.is_some(),
+    );
+    let mut guard = REGISTRY.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(name) = map.get(&key) {
+        return Ok(name.clone());
+    }
+    let vfs_name = unique_vfs_name();
+    let vfs = LocalCompressedVfs {
+        path: path.to_path_buf(),
+        codec: options.codec(),
+        page_size: options.page_size,
+    };
+    sqlite_vfs::register(&vfs_name, vfs, false)
+        .map_err(|e| LocalError::Io(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))))?;
+    map.insert(key, vfs_name.clone());
+    Ok(vfs_name)
 }
 
 /// Refuse to open a path that belongs to a tiered database: either the
@@ -191,7 +250,7 @@ struct LocalCompressedVfs {
 
 impl LocalCompressedVfs {
     fn is_main(&self, db: &str) -> bool {
-        Path::new(db) == self.path
+        absolutize(Path::new(db)) == self.path
     }
 }
 
@@ -271,6 +330,8 @@ pub enum LocalHandle {
 /// The compressed main database, held as a flat byte image while open.
 pub struct MainHandle {
     path: PathBuf,
+    lock_path: PathBuf,
+    lock_file: File,
     codec: PageCodec,
     page_size: u32,
     image: Vec<u8>,
@@ -280,6 +341,26 @@ pub struct MainHandle {
 
 impl MainHandle {
     fn open(path: PathBuf, codec: PageCodec, page_size: u32) -> Result<Self, io::Error> {
+        // Single-writer guard: hold an exclusive advisory lock on a sibling
+        // lock file for the connection's lifetime. A second opener — in this
+        // process or another — fails fast instead of loading an independent
+        // image and clobbering the other's commits on persist().
+        let lock_path = lock_path_for(&path);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "database {} is locked by another connection",
+                    path.display()
+                ),
+            )
+        })?;
+
         let (image, page_size) = match std::fs::read(&path) {
             Ok(bytes) if bytes.is_empty() => (Vec::new(), page_size),
             Ok(bytes) => decode_file(&bytes, &codec)?,
@@ -288,6 +369,8 @@ impl MainHandle {
         };
         Ok(MainHandle {
             path,
+            lock_path,
+            lock_file,
             codec,
             page_size,
             image,
@@ -306,17 +389,14 @@ impl MainHandle {
         let page_size = self.page_size as usize;
         let mut data: Vec<u8> = Vec::new();
         let mut directory: Vec<(u64, u32)> = Vec::new();
-        let mut page_index: u64 = 0;
         for chunk in self.image.chunks(page_size) {
-            let nonce = page_index * self.page_size as u64;
-            let blob = encode_page(chunk, &self.codec, nonce)?;
+            let blob = encode_page(chunk, &self.codec)?;
             let offset = (HEADER_LEN + data.len()) as u64;
             let len = u32::try_from(blob.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "page blob too large")
             })?;
             data.extend_from_slice(&blob);
             directory.push((offset, len));
-            page_index += 1;
         }
         let directory_offset = (HEADER_LEN + data.len()) as u64;
         let header = Header {
@@ -338,10 +418,52 @@ impl MainHandle {
     }
 }
 
+impl Drop for MainHandle {
+    fn drop(&mut self) {
+        // Flush committed-but-unsynced state. Under PRAGMA synchronous=OFF
+        // SQLite never calls xSync, so without this a "committed"
+        // transaction would be lost on close.
+        if self.dirty {
+            if let Err(e) = self.persist() {
+                crate::turbolite_debug!("local db: flush on close failed: {e}");
+            }
+        }
+        let _ = FileExt::unlock(&self.lock_file);
+        // Best-effort: keep the database a single file at rest.
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Sibling lock-file path for a database path: `<name>.tl-lock`.
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tl-lock");
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
 /// Decode a complete TLLOCAL1 file into its flat image. Returns the image
 /// and the page size recorded in the header.
 fn decode_file(bytes: &[u8], codec: &PageCodec) -> Result<(Vec<u8>, u32), io::Error> {
     let header = Header::decode(bytes)?;
+
+    // Encryption is self-describing: refuse a key/flag mismatch instead of
+    // returning silent garbage (RAW-tagged ciphertext, or a key applied to
+    // plaintext).
+    let file_encrypted = header.flags & file_format::FLAG_ENCRYPTED != 0;
+    if file_encrypted != codec.key.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            if file_encrypted {
+                "database is encrypted but no key was supplied"
+            } else {
+                "key supplied but database is not encrypted"
+            },
+        ));
+    }
+
     let dir_off = header.directory_offset as usize;
     if dir_off > bytes.len() {
         return Err(io::Error::new(
@@ -349,21 +471,46 @@ fn decode_file(bytes: &[u8], codec: &PageCodec) -> Result<(Vec<u8>, u32), io::Er
             "directory offset past end of file",
         ));
     }
-    let directory = decode_directory(&bytes[dir_off..], header.page_count as usize)?;
-    let mut image = Vec::with_capacity(header.page_count as usize * header.page_size as usize);
-    for (i, (offset, len)) in directory.iter().enumerate() {
+    // Bound page_count from the (attacker-controlled) header before
+    // allocating: each page needs >=1 data byte plus a directory entry, so
+    // it can never exceed the file length. Prevents an OOM/abort DoS.
+    let page_count = header.page_count as usize;
+    let max_pages = bytes.len() / (1 + DIR_ENTRY_LEN);
+    if page_count > max_pages {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "page_count exceeds file capacity",
+        ));
+    }
+    // Exact-tail invariant: the directory occupies the remainder of the file.
+    if dir_off
+        .checked_add(page_count * DIR_ENTRY_LEN)
+        .map_or(true, |end| end != bytes.len())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory length inconsistent with file size",
+        ));
+    }
+
+    let directory = decode_directory(&bytes[dir_off..], page_count)?;
+    let max_page = header.page_size as usize;
+    let mut image = Vec::with_capacity(bytes.len());
+    for (offset, len) in directory.iter() {
         let start = *offset as usize;
         let end = start
             .checked_add(*len as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "page extent overflow"))?;
-        if end > bytes.len() {
+        // A page blob must lie entirely within the data region
+        // [HEADER_LEN, dir_off); pointers into the header or directory are
+        // corrupt.
+        if start < HEADER_LEN || end > dir_off {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "page blob extends past end of file",
+                io::ErrorKind::InvalidData,
+                "page blob outside data region",
             ));
         }
-        let nonce = i as u64 * header.page_size as u64;
-        let page = decode_page(&bytes[start..end], codec, nonce)?;
+        let page = decode_page(&bytes[start..end], codec, max_page)?;
         image.extend_from_slice(&page);
     }
     Ok((image, header.page_size))
@@ -379,20 +526,32 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        // Best-effort directory fsync so the rename is durable. Failure
-        // here is non-fatal (some platforms reject opening a dir).
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // Best-effort directory fsync so the rename is durable. Opening a
+        // directory is rejected on some platforms (benign); a real sync
+        // failure is a durability risk, so surface it via debug logging
+        // rather than swallowing it silently.
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    crate::turbolite_debug!("local db: parent dir fsync failed: {e}");
+                }
+            }
+            Err(e) => {
+                crate::turbolite_debug!("local db: could not open parent dir to fsync: {e}");
+            }
         }
     }
     Ok(())
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(format!(".tmp-local-{}", std::process::id()));
-    match path.parent() {
+    // Unique per-write suffix so concurrent persists never share a temp file.
+    name.push(format!(".tmp-local-{}-{}", std::process::id(), seq));
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(parent) => parent.join(name),
         None => PathBuf::from(name),
     }
@@ -543,10 +702,11 @@ mod tests {
             .expect("write");
         }
 
-        // At rest: exactly one file, no journal, no sidecar.
+        // At rest: exactly one file, no journal, no sidecar, no lock file.
         assert!(db.exists(), "db file present");
         assert!(!dir.join("data.db-journal").exists(), "no journal at rest");
         assert!(!dir.join(TIERED_SIDECAR).exists(), "no tiered sidecar");
+        assert!(!dir.join("data.db.tl-lock").exists(), "lock file removed at rest");
 
         let conn = open_local(&db).expect("reopen");
         let count: i64 = conn
@@ -590,6 +750,52 @@ mod tests {
             "compressed file {file_size} should be <=70% of logical {logical}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn l1_second_open_rejected_while_open() {
+        let dir = temp_dir();
+        let db = dir.join("locked.db");
+        let conn = open_local(&db).expect("first open");
+        conn.execute_batch("CREATE TABLE t(x);").unwrap();
+        // A second concurrent open of the same path must fail rather than
+        // load an independent image and clobber on persist.
+        assert!(open_local(&db).is_err(), "second concurrent open must fail");
+        drop(conn);
+        // After the first connection closes, reopen succeeds.
+        let reopened = open_local(&db).expect("reopen after close");
+        let n: i64 = reopened
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name='t'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn l1_wrong_key_is_rejected() {
+        // Opening an encrypted DB without a key (or vice versa) must error,
+        // not return garbage.
+        #[cfg(feature = "encryption")]
+        {
+            let dir = temp_dir();
+            let db = dir.join("ek.db");
+            {
+                let opts = LocalOptions {
+                    encryption_key: Some([5u8; 32]),
+                    ..Default::default()
+                };
+                let conn = open_local_with(&db, opts).unwrap();
+                conn.execute_batch("CREATE TABLE t(x);").unwrap();
+            }
+            // No key supplied for an encrypted file -> error on first page read.
+            let plain = open_local(&db);
+            let read_failed = match plain {
+                Err(_) => true,
+                Ok(c) => c.execute_batch("SELECT * FROM t").is_err(),
+            };
+            assert!(read_failed, "encrypted db opened without key must fail");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
