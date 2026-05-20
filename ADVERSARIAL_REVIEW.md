@@ -104,28 +104,29 @@ verified — not bundled in unverified.
   bound (`actual_pages * page_size`); the rest use the absolute ceiling
   `MAX_TIERED_DECOMPRESSED_BYTES` (1 GiB), well above any legitimate group.
 
-### F6 — [High] Read-after-truncate returns stale bytes (fast path skips the page-count bound) — **Documented**
-- `src/tiered/handle.rs:944-952` fast-path read checks `cache.is_present` with
-  no `page_num < manifest.page_count` bound (that bound is only at ~966, after
-  the fast path returns), and `set_len` (xTruncate, ~2927-2957) neither clears
-  the cache bitmap nor bumps generation. After truncate+regrow a read returns
-  old page contents instead of zeros → corruption.
-- **Fix:** in `set_len` call `cache.truncate_to_page_count` + `bump_generation`;
-  add `page_num < manifest.page_count` to the fast path (fall through to
-  zero-fill).
+### F6 — [High] Read-after-truncate returns stale bytes (fast path skips the page-count bound) — **Fixed**
+- `src/tiered/handle.rs` fast-path read checked `cache.is_present` with no
+  `page_num < manifest.page_count` bound, and `set_len` (xTruncate) neither
+  cleared the cache bitmap nor bumped generation. After truncate+regrow a read
+  returned old page contents instead of zeros → corruption.
+- **Fix:** `set_len` now calls `cache.truncate_to_page_count(new_count, ps)` +
+  `bump_generation()` when the page count shrinks; the fast path now requires
+  `page_num < page_count` and otherwise falls through to the slow path's
+  zero-fill.
 
-### F7 — [High] Durable VACUUM sync truncates the cache file but leaves the bitmap set — **Documented**
-- `src/tiered/handle.rs:2825-2849` truncates via `set_len` without clearing the
-  bitmap for pages ≥ page_count → fast path hits `is_present` then reads past
-  EOF → IO error.
-- **Fix:** use `cache.truncate_to_page_count(...)` + `bump_generation()`.
+### F7 — [High] Durable VACUUM sync truncates the cache file but leaves the bitmap set — **Fixed**
+- `src/tiered/handle.rs` durable sync truncated via a raw `set_len` (also
+  page_size-wrong under the new encryption stride) without clearing the bitmap
+  for pages ≥ page_count → fast path hit `is_present` then read past EOF.
+- **Fix:** use `cache.truncate_to_page_count(page_count, ps)` (slot-stride aware,
+  clears bitmap/tracker/index/group-state for pages ≥ count) + `bump_generation()`.
 
-### F8 — [High] `set_manifest` mutates the cache outside the replay gate — **Documented**
-- `src/tiered/vfs.rs:1024-1128` (HA follower) calls `evict_group` + `write_page(0)`
-  + `bump_generation` without holding `replay_gate.write()` → torn snapshot
-  mid read-transaction.
-- **Fix:** take `replay_gate.write()` around that block (mirror
-  `ReplayHandle::finalize`).
+### F8 — [High] `set_manifest` mutates the cache outside the replay gate — **Fixed**
+- `src/tiered/vfs.rs` (HA follower) called `evict_group` + `write_page(0)` +
+  `bump_generation` without holding `replay_gate.write()` → torn snapshot mid
+  read-transaction.
+- **Fix:** take `replay_gate.write()` for the whole cache-mutation + manifest-swap
+  block (mirrors `ReplayHandle::finalize`).
 
 ### F9 — [High/Med] Lock-downgrade flush keyed on `dirty_since_sync` can publish uncommitted bytes — **Documented**
 - `src/tiered/handle.rs:2986-2993`; can publish rolled-back bytes under
@@ -133,14 +134,17 @@ verified — not bundled in unverified.
 - **Fix:** gate the flush on an explicit "xSync since last write" flag, not
   `dirty_since_sync`; include `Pending` in the source-lock set.
 
-### F12 — [High] Compressed cache file grows unbounded; single-page compressed writes are eviction-blind — **Documented**
-- `src/tiered/disk_cache.rs:1641-1658` (compressed mode skips hole-punch and
-  `next_offset` is monotonic) and `:947-984` (`write_page_compressed` never
-  updates the SubChunkTracker).
-- **Fix:** mark the tracker in `write_page_compressed` (like the bulk path); add
-  a compaction pass that rewrites live entries and resets `next_offset` from
-  `evict_to_budget` when physical size exceeds a high-water multiple of live
-  bytes.
+### F12 — [High] Compressed cache file grows unbounded; single-page compressed writes are eviction-blind — **Fixed**
+- `src/tiered/disk_cache.rs` (compressed mode skips hole-punch and `next_offset`
+  is monotonic) and `write_page_compressed` never updated the SubChunkTracker.
+- **Fix:** `write_page_compressed` now marks the sub-chunk present in the tracker
+  (like the bulk path), so single-page writes are eviction-visible. Added
+  `compact_compressed_cache` (in-place front-pack of live blobs, file shrink,
+  index swap, `next_offset` reset) fenced by a new `compaction_lock` that
+  compressed reads/writes take as readers; `evict_to_budget` triggers it after
+  an eviction pass when physical size exceeds 2× live bytes (and > 1 MiB).
+  Tests: `test_compressed_compaction_reclaims_dead_space_and_preserves_live_pages`,
+  `test_compressed_single_write_marks_tracker`.
 
 ### F10 — [Med] `assemble()` recovery never shrinks page_count; fragile page-size special-case — **Documented**
 - `src/tiered/vfs.rs:282-306` (and `sync_after_external_restore`/

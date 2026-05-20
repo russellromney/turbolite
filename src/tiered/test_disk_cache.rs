@@ -1495,6 +1495,67 @@ fn compressed_cache(dir: &Path, page_size: u32, page_count: u64) -> DiskCache {
 }
 
 #[test]
+fn test_compressed_compaction_reclaims_dead_space_and_preserves_live_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 64);
+
+    // Write 16 distinct pages.
+    for p in 0..16u64 {
+        let data: Vec<u8> = (0..64)
+            .map(|i| (p as u8).wrapping_mul(7).wrapping_add(i))
+            .collect();
+        cache.write_page(p, &data).unwrap();
+    }
+    let before = cache.cache_index.lock().next_offset;
+    assert!(before > 0);
+
+    // Evict the even pages from the index (leaves dead space; compressed mode
+    // does not hole-punch).
+    let evicted: Vec<u64> = (0..16u64).filter(|p| p % 2 == 0).collect();
+    cache.clear_pages_from_disk(&evicted);
+
+    let live = cache.cache_index.lock().live_bytes();
+    let physical = cache.cache_index.lock().next_offset;
+    assert_eq!(
+        physical, before,
+        "next_offset is monotonic before compaction"
+    );
+    assert!(live < physical, "evicted pages must leave dead space");
+
+    // Compact: file shrinks to live bytes, next_offset resets, odd pages survive.
+    cache.compact_compressed_cache().unwrap();
+    let after = cache.cache_index.lock().next_offset;
+    assert_eq!(
+        after, live,
+        "next_offset resets to live bytes after compaction"
+    );
+    assert!(after < before, "physical size must shrink");
+
+    for p in (1..16u64).step_by(2) {
+        let expected: Vec<u8> = (0..64)
+            .map(|i| (p as u8).wrapping_mul(7).wrapping_add(i))
+            .collect();
+        let mut buf = vec![0u8; 64];
+        cache.read_page(p, &mut buf).unwrap();
+        assert_eq!(buf, expected, "live page {} corrupted by compaction", p);
+    }
+}
+
+#[test]
+fn test_compressed_single_write_marks_tracker() {
+    // Single-page compressed writes must update the tracker (eviction accounting),
+    // not just the bitmap — otherwise the compressed cache grows unbounded.
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+    let before = cache.cache_bytes();
+    cache.write_page(0, &vec![0xABu8; 64]).unwrap();
+    assert!(
+        cache.cache_bytes() > before,
+        "single compressed write must register bytes in the tracker"
+    );
+}
+
+#[test]
 fn test_compressed_write_read_roundtrip() {
     let dir = TempDir::new().unwrap();
     let cache = compressed_cache(dir.path(), 64, 16);

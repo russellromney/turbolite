@@ -1061,6 +1061,14 @@ impl TurboliteVfs {
             old.page_group_keys.clone()
         };
 
+        // Hold the replay gate across the whole cache mutation + manifest swap.
+        // Without it, an in-flight SQLite read transaction could observe a torn
+        // snapshot: groups already evicted / page 0 already rewritten while the
+        // shared manifest still points at the old version (or vice versa). This
+        // mirrors ReplayHandle::finalize, which fences finalize against readers
+        // the same way.
+        let _replay_guard = self.replay_gate.write();
+
         if !manifest.group_pages.is_empty() {
             self.cache.set_group_pages(manifest.group_pages.clone());
             self.cache.ensure_group_capacity(manifest.group_pages.len());

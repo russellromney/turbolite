@@ -98,6 +98,13 @@ impl CacheIndex {
         self.entries.contains_key(&page_num)
     }
 
+    /// Sum of live (still-indexed) compressed bytes. `next_offset` is the
+    /// physical file high-water mark; the gap between the two is dead space left
+    /// by evicted pages (compressed mode never hole-punches).
+    pub(crate) fn live_bytes(&self) -> u64 {
+        self.entries.values().map(|e| e.compressed_len as u64).sum()
+    }
+
     /// Remove a page from the index.
     pub(crate) fn remove(&mut self, page_num: u64) {
         self.entries.remove(&page_num);
@@ -236,6 +243,11 @@ pub(crate) struct DiskCache {
     /// Index mapping page_num -> (offset, compressed_len) in the compressed cache file.
     /// Only populated when cache_compression is true.
     pub(crate) cache_index: parking_lot::Mutex<CacheIndex>,
+    /// Guards the compressed cache file against concurrent compaction. Reads and
+    /// writes of compressed pages take a read guard; `compact_compressed_cache`
+    /// takes the write guard so it can rewrite blobs + swap offsets exclusively.
+    /// Uncompressed mode never takes this (zero overhead there).
+    pub(crate) compaction_lock: parking_lot::RwLock<()>,
     /// Raw zstd dictionary bytes for cache compression/decompression.
     /// Shared via Arc so DiskCache (which is Arc<DiskCache>) can be used from multiple threads.
     /// EncoderDictionary/DecoderDictionary are created on each use (cheap, same pattern as PrefetchPool).
@@ -543,6 +555,7 @@ impl DiskCache {
             cache_compression,
             cache_compression_level,
             cache_index: parking_lot::Mutex::new(cache_index),
+            compaction_lock: parking_lot::RwLock::new(()),
             #[cfg(feature = "zstd")]
             dictionary: dictionary.map(|d| Arc::new(d)),
             stat_hits: AtomicU64::new(0),
@@ -800,6 +813,10 @@ impl DiskCache {
     fn read_page_compressed(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
+        // Fence against in-place compaction: hold the read guard so the index
+        // lookup and the pread that follows see a consistent layout.
+        let _compact = self.compaction_lock.read();
+
         let entry = {
             let index = self.cache_index.lock();
             match index.get(page_num) {
@@ -998,6 +1015,10 @@ impl DiskCache {
     fn write_page_compressed(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
+        // Fence against in-place compaction (offset allocation + pwrite must see
+        // a stable layout).
+        let _compact = self.compaction_lock.read();
+
         // Compress (with dictionary if available)
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
@@ -1031,6 +1052,15 @@ impl DiskCache {
         self.cache_file.write_all_at(&blob, offset)?;
 
         self.bitmap_mark(page_num);
+        // Mark the sub-chunk present in the tracker (like the bulk path). Without
+        // this, single-page compressed writes were eviction-blind: the tracker's
+        // byte accounting never saw them, so evict_to_budget could not reclaim
+        // them and the compressed cache file grew unbounded.
+        {
+            let mut tracker = self.tracker.lock();
+            let id = tracker.sub_chunk_for_page(page_num);
+            tracker.mark_present(id, SubChunkTier::Data);
+        }
         Ok(())
     }
 
@@ -1123,6 +1153,9 @@ impl DiskCache {
     ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
+
+        // Fence against in-place compaction.
+        let _compact = self.compaction_lock.read();
 
         // Create encoder dictionary once for all pages in this batch
         #[cfg(feature = "zstd")]
@@ -1302,6 +1335,9 @@ impl DiskCache {
         start_index_in_group: u32,
     ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        // Fence against in-place compaction.
+        let _compact = self.compaction_lock.read();
 
         // Create encoder dictionary once for all pages in this batch
         #[cfg(feature = "zstd")]
@@ -1902,7 +1938,85 @@ impl DiskCache {
                 );
             }
         }
+
+        // Compressed mode never hole-punches (variable-length blobs at packed
+        // offsets), so evicted pages leave dead space and the physical file
+        // (next_offset) grows monotonically. When dead space dominates, compact:
+        // rewrite the live blobs contiguously and reset next_offset. Trigger
+        // only when the file is past a 2x high-water multiple of live bytes (and
+        // non-trivial) so steady-state churn doesn't compact on every pass.
+        if self.cache_compression && evicted > 0 {
+            let (physical, live) = {
+                let index = self.cache_index.lock();
+                (index.next_offset, index.live_bytes())
+            };
+            if live > 0 && physical > live.saturating_mul(2) && physical > (1 << 20) {
+                if let Err(e) = self.compact_compressed_cache() {
+                    eprintln!("[cache] WARN: compressed-cache compaction failed: {}", e);
+                }
+            }
+        }
+
         evicted
+    }
+
+    /// Compact the compressed cache file in place: front-pack the live blobs,
+    /// rebuild the index with packed offsets, reset `next_offset`, and shrink
+    /// the file. Reclaims dead space left by evicted pages. No-op unless
+    /// compression is enabled.
+    ///
+    /// Takes `compaction_lock.write()` so no compressed read/write observes a
+    /// half-moved layout. Blobs only move to **lower** offsets (packed from 0),
+    /// and the index is swapped atomically under the same exclusive guard.
+    pub(crate) fn compact_compressed_cache(&self) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if !self.cache_compression {
+            return Ok(());
+        }
+
+        let _compact = self.compaction_lock.write();
+        let _extend = self.cache_file_extend.lock();
+
+        // Snapshot the current entries sorted by offset so front-packing only
+        // ever writes to a position at or below the blob's current location
+        // (never clobbering a not-yet-copied later blob).
+        let mut entries: Vec<(u64, CacheIndexEntry)> = {
+            let index = self.cache_index.lock();
+            index.entries.iter().map(|(&p, &e)| (p, e)).collect()
+        };
+        entries.sort_by_key(|(_, e)| e.offset);
+
+        let mut new_entries: HashMap<u64, CacheIndexEntry> = HashMap::with_capacity(entries.len());
+        let mut cursor = 0u64;
+        for (page_num, e) in &entries {
+            let mut blob = vec![0u8; e.compressed_len as usize];
+            // A read failure on one entry must not corrupt the whole cache;
+            // skip it (the page re-fetches on miss) rather than abort.
+            if self.cache_file.read_exact_at(&mut blob, e.offset).is_err() {
+                continue;
+            }
+            if cursor != e.offset {
+                self.cache_file.write_all_at(&blob, cursor)?;
+            }
+            new_entries.insert(
+                *page_num,
+                CacheIndexEntry {
+                    offset: cursor,
+                    compressed_len: e.compressed_len,
+                },
+            );
+            cursor += e.compressed_len as u64;
+        }
+
+        // Shrink the file to the packed size and swap the index.
+        self.cache_file.set_len(cursor)?;
+        self.cache_file_len.store(cursor, Ordering::Relaxed);
+        {
+            let mut index = self.cache_index.lock();
+            index.entries = new_entries;
+            index.next_offset = cursor;
+        }
+        Ok(())
     }
 
     /// Prune the compressed cache index: remove all entries NOT in `keep_pages`.

@@ -1065,10 +1065,20 @@ impl DatabaseHandle for TurboliteHandle {
         // FAST PATH: if page is cached, this handle has no dirty pages, AND no other
         // handle has written since we last synced (generation matches), read directly
         // from cache. Skips manifest lookup, prefetch heuristics.
+        //
+        // The `page_num < page_count` bound is load-bearing: after a
+        // truncate-then-regrow the bitmap bit can lag behind the logical size,
+        // and a cached-but-now-out-of-bounds page must NOT short-circuit here —
+        // it has to fall through to the slow path's zero-fill. Without the bound
+        // a read returned stale pre-truncate bytes.
         if !self.dirty_since_sync {
             if let Some(cache) = &self.cache {
                 let current_gen = cache.generation.load(Ordering::Acquire);
-                if current_gen == self.cached_generation && cache.is_present(page_num) {
+                let page_count = self.manifest.load().page_count;
+                if current_gen == self.cached_generation
+                    && page_num < page_count
+                    && cache.is_present(page_num)
+                {
                     cache.read_page(page_num, buf)?;
                     cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -2957,27 +2967,22 @@ impl DatabaseHandle for TurboliteHandle {
             let _ = cache.persist_bitmap();
 
             // Truncate cache file if it's larger than current page_count.
-            // After VACUUM, page_count decreases but the sparse cache file retains its old size.
+            // After VACUUM, page_count decreases but the sparse cache file
+            // retains its old size. Use truncate_to_page_count, which (a) sizes
+            // the file by the correct slot stride (widened under encryption) and
+            // (b) clears the bitmap / tracker / index / group-state for pages at
+            // or beyond the new count — a raw set_len left those bits set, so a
+            // fast-path read of a now-out-of-bounds page hit `is_present` and
+            // then read past EOF (IO error). Bump generation so other handles'
+            // fast paths re-validate.
             {
                 let current_page_count = self.manifest.load().page_count;
-                let ps = self.page_size.load(Ordering::Relaxed) as u64;
+                let ps = self.page_size.load(Ordering::Relaxed);
                 if current_page_count > 0 && ps > 0 {
-                    let target_size = current_page_count * ps;
-                    let _guard = cache.cache_file_extend.lock();
-                    if let Ok(meta) = cache.cache_file.metadata() {
-                        if meta.len() > target_size {
-                            if let Err(e) = cache.cache_file.set_len(target_size) {
-                                eprintln!("[sync] WARN: cache truncation failed: {}", e);
-                            } else {
-                                cache.cache_file_len.store(target_size, Ordering::Relaxed);
-                                turbolite_debug!(
-                                    "[sync] cache truncated: {}B -> {}B ({} pages)",
-                                    meta.len(),
-                                    target_size,
-                                    current_page_count
-                                );
-                            }
-                        }
+                    if let Err(e) = cache.truncate_to_page_count(current_page_count, ps) {
+                        eprintln!("[sync] WARN: cache truncation failed: {}", e);
+                    } else {
+                        cache.bump_generation();
                     }
                 }
             }
@@ -3079,13 +3084,32 @@ impl DatabaseHandle for TurboliteHandle {
             (size + page_size as u64 - 1) / page_size as u64
         };
 
+        let old_page_count = self.manifest.load().page_count;
+
         let mut manifest = (**self.manifest.load()).clone();
         manifest.page_count = new_page_count;
         self.manifest.store(Arc::new(manifest));
 
         // Remove dirty pages beyond new size
-        let mut dirty = self.dirty_page_nums.write();
-        dirty.retain(|&pn| pn < new_page_count);
+        {
+            let mut dirty = self.dirty_page_nums.write();
+            dirty.retain(|&pn| pn < new_page_count);
+        }
+
+        // Shrink the cache to match: clear the bitmap / tracker / index for
+        // pages at or beyond the new count and bump generation. Without this a
+        // truncate-then-regrow leaves stale `is_present` bits, so a read of a
+        // regrown page returned the OLD contents from the cache file instead of
+        // zero-fill — silent corruption. truncate_to_page_count handles the
+        // file resize (slot-stride aware under encryption) and bit clearing.
+        if let Some(cache) = &self.cache {
+            if new_page_count < old_page_count {
+                if let Err(e) = cache.truncate_to_page_count(new_page_count, page_size) {
+                    return Err(e);
+                }
+                self.cached_generation = cache.bump_generation();
+            }
+        }
 
         Ok(())
     }
