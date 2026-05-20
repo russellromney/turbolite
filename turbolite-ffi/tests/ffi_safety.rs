@@ -755,3 +755,85 @@ fn test_free_string_after_close() {
     });
     assert!(result.is_ok());
 }
+
+// F20 regression: the close-guard is process-global, not thread-local, so a
+// handle closed on one thread is seen as closed on every other thread. Before
+// the fix the guard was thread-local: a second close from another thread
+// missed the marker and `Box::from_raw`'d an already-freed pointer
+// (double-free / use-after-free). These tests open + close on the main thread
+// and then drive a second close / an exec from a *different* thread; both must
+// be rejected, never crash.
+//
+// The raw `*mut TurboliteDb` is not `Send`, so we ferry the address as a
+// `usize` and rebuild the pointer inside the spawned thread.
+#[test]
+fn test_close_then_close_from_other_thread_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let vfs_name = CString::new(next_vfs_name()).unwrap();
+    let json = CString::new(format!(
+        r#"{{"cache_dir":"{}"}}"#,
+        dir.path().to_str().unwrap()
+    ))
+    .unwrap();
+    assert_eq!(turbolite_register(vfs_name.as_ptr(), json.as_ptr()), 0);
+
+    let db_path = CString::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null());
+
+    let sql = CString::new("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    assert_eq!(turbolite_exec(db, sql.as_ptr()), 0);
+
+    // Close on the main thread (this thread owns the free).
+    turbolite_close(db);
+
+    // A second close from another thread must be a no-op, not a double-free.
+    let addr = db as usize;
+    let handle = std::thread::spawn(move || {
+        let dangling = addr as *mut turbolite_ffi::ffi::TurboliteDb;
+        ffi_no_panic("close(other_thread, after_close)", move || {
+            turbolite_close(dangling);
+        })
+    });
+    let result = handle.join().expect("worker thread should not panic");
+    assert!(result.is_ok(), "cross-thread double close must not crash");
+}
+
+#[test]
+fn test_exec_from_other_thread_after_close_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let vfs_name = CString::new(next_vfs_name()).unwrap();
+    let json = CString::new(format!(
+        r#"{{"cache_dir":"{}"}}"#,
+        dir.path().to_str().unwrap()
+    ))
+    .unwrap();
+    assert_eq!(turbolite_register(vfs_name.as_ptr(), json.as_ptr()), 0);
+
+    let db_path = CString::new(dir.path().join("test.db").to_str().unwrap()).unwrap();
+    let db = turbolite_open(db_path.as_ptr(), vfs_name.as_ptr());
+    assert!(!db.is_null());
+
+    let create = CString::new("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    assert_eq!(turbolite_exec(db, create.as_ptr()), 0);
+
+    // Close on the main thread.
+    turbolite_close(db);
+
+    // An exec from a different thread must observe the global close-guard and
+    // return -1 (handle closed), not touch freed memory.
+    let addr = db as usize;
+    let handle = std::thread::spawn(move || {
+        let dangling = addr as *mut turbolite_ffi::ffi::TurboliteDb;
+        let sql = CString::new("INSERT INTO t VALUES (1)").unwrap();
+        ffi_no_panic("exec(other_thread, after_close)", move || {
+            turbolite_exec(dangling, sql.as_ptr())
+        })
+    });
+    let result = handle.join().expect("worker thread should not panic");
+    assert_eq!(
+        result.expect("exec must not panic"),
+        -1,
+        "cross-thread exec after close must be rejected"
+    );
+}
