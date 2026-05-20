@@ -171,6 +171,15 @@ required-features = ["bench-s3"]
 [build-dependencies]
 cc = "1"
 
+# Belt-and-suspenders for the C-FFI boundary: abort on panic in release
+# builds (the shipping cdylib). Every extern "C" body already wraps itself in
+# catch_unwind and maps a panic to an error sentinel, so a panic should never
+# reach this; if one ever escapes the guard, aborting is defined behavior
+# whereas unwinding across C is UB. Test/dev builds keep unwinding so the
+# harness can catch panics.
+[profile.release]
+panic = "abort"
+
 [[example]]
 name = "quick-bench"
 path = "benchmark/quick-bench.rs"

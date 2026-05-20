@@ -31,6 +31,21 @@ use crate::settings::{
     turbolite_current_queue_clone, turbolite_settings_queue_free_cb, turbolite_settings_queue_push,
 };
 
+/// Run an FFI body under `catch_unwind`, returning `fallback` on panic.
+///
+/// Unwinding across the `extern "C"` boundary (including a SQLite-invoked
+/// scalar callback) is undefined behavior; wrap the body so a caught panic
+/// becomes the documented error sentinel instead.
+fn install_guard<F, R>(fallback: R, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => fallback,
+    }
+}
+
 // SQLite constants we need. Mirrors <sqlite3.h>.
 const SQLITE_OK: c_int = 0;
 const SQLITE_MISUSE: c_int = 21;
@@ -109,28 +124,38 @@ unsafe extern "C" fn config_set_scalar(
     _argc: c_int,
     argv: *mut *mut sqlite3_value,
 ) {
-    let queue = sqlite3_user_data(ctx);
-    if queue.is_null() {
-        let msg = b"turbolite_config_set: missing queue pointer (bug)\0";
-        sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
-        return;
-    }
+    // SQLite invokes this across the C boundary; a panic must not unwind into
+    // it. On a caught panic, report a SQLite error rather than leaving the
+    // result unset.
+    let panicked = install_guard(true, || {
+        let queue = sqlite3_user_data(ctx);
+        if queue.is_null() {
+            let msg = b"turbolite_config_set: missing queue pointer (bug)\0";
+            sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
+            return false;
+        }
 
-    let key = sqlite3_value_text(*argv.offset(0));
-    let value = sqlite3_value_text(*argv.offset(1));
-    if key.is_null() || value.is_null() {
-        let msg = b"turbolite_config_set: key and value required\0";
-        sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
-        return;
-    }
+        let key = sqlite3_value_text(*argv.offset(0));
+        let value = sqlite3_value_text(*argv.offset(1));
+        if key.is_null() || value.is_null() {
+            let msg = b"turbolite_config_set: key and value required\0";
+            sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
+            return false;
+        }
 
-    let rc = turbolite_settings_queue_push(queue, key, value);
-    if rc != 0 {
-        let msg = b"turbolite_config_set: invalid key or value\0";
+        let rc = turbolite_settings_queue_push(queue, key, value);
+        if rc != 0 {
+            let msg = b"turbolite_config_set: invalid key or value\0";
+            sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
+            return false;
+        }
+        sqlite3_result_int(ctx, 0);
+        false
+    });
+    if panicked {
+        let msg = b"turbolite_config_set: internal panic caught\0";
         sqlite3_result_error(ctx, msg.as_ptr() as *const c_char, -1);
-        return;
     }
-    sqlite3_result_int(ctx, 0);
 }
 
 /// Register the `turbolite_config_set(key, value)` SQL function on this
@@ -153,50 +178,52 @@ unsafe extern "C" fn config_set_scalar(
 /// `db` must be a live `sqlite3*` handle.
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) -> c_int {
-    // VFS-name guard. See the `install_hook.rs` equivalent comment:
-    // without this, a non-turbolite connection opened on a thread with
-    // an active turbolite handle would receive a scalar pointing at
-    // the turbolite handle's queue.
-    if !connection_uses_turbolite_vfs(db) {
-        return SQLITE_MISUSE;
-    }
+    install_guard(SQLITE_MISUSE, || {
+        // VFS-name guard. See the `install_hook.rs` equivalent comment:
+        // without this, a non-turbolite connection opened on a thread with
+        // an active turbolite handle would receive a scalar pointing at
+        // the turbolite handle's queue.
+        if !connection_uses_turbolite_vfs(db) {
+            return SQLITE_MISUSE;
+        }
 
-    // Force xOpen on the main-db file so THIS connection's handle
-    // queue is top-of-stack on the thread-local. `PRAGMA schema_version`
-    // reads page 1 which is enough to trigger the VFS open.
-    let pragma = CStr::from_bytes_with_nul(b"PRAGMA schema_version\0").expect("static cstring");
-    let mut err_msg: *mut c_char = std::ptr::null_mut();
-    let rc = sqlite3_exec(
-        db,
-        pragma.as_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        &mut err_msg,
-    );
-    if !err_msg.is_null() {
-        sqlite3_free(err_msg as *mut c_void);
-    }
-    if rc != SQLITE_OK {
-        return rc;
-    }
+        // Force xOpen on the main-db file so THIS connection's handle
+        // queue is top-of-stack on the thread-local. `PRAGMA schema_version`
+        // reads page 1 which is enough to trigger the VFS open.
+        let pragma = CStr::from_bytes_with_nul(b"PRAGMA schema_version\0").expect("static cstring");
+        let mut err_msg: *mut c_char = std::ptr::null_mut();
+        let rc = sqlite3_exec(
+            db,
+            pragma.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut err_msg,
+        );
+        if !err_msg.is_null() {
+            sqlite3_free(err_msg as *mut c_void);
+        }
+        if rc != SQLITE_OK {
+            return rc;
+        }
 
-    let queue = turbolite_current_queue_clone();
-    if queue.is_null() {
-        return SQLITE_MISUSE;
-    }
+        let queue = turbolite_current_queue_clone();
+        if queue.is_null() {
+            return SQLITE_MISUSE;
+        }
 
-    let fn_name = CStr::from_bytes_with_nul(b"turbolite_config_set\0").expect("static cstring");
-    sqlite3_create_function_v2(
-        db,
-        fn_name.as_ptr(),
-        2,
-        SQLITE_UTF8 | SQLITE_DIRECTONLY,
-        queue as *mut c_void,
-        Some(config_set_scalar),
-        None,
-        None,
-        Some(turbolite_settings_queue_free_cb),
-    )
+        let fn_name = CStr::from_bytes_with_nul(b"turbolite_config_set\0").expect("static cstring");
+        sqlite3_create_function_v2(
+            db,
+            fn_name.as_ptr(),
+            2,
+            SQLITE_UTF8 | SQLITE_DIRECTONLY,
+            queue as *mut c_void,
+            Some(config_set_scalar),
+            None,
+            None,
+            Some(turbolite_settings_queue_free_cb),
+        )
+    })
 }
 
 /// Ask SQLite for the sqlite3_vfs pointer backing the "main" database
@@ -214,6 +241,18 @@ unsafe fn connection_uses_turbolite_vfs(db: *mut sqlite3) -> bool {
         &mut vfs_ptr as *mut _ as *mut c_void,
     );
     if rc != SQLITE_OK || vfs_ptr.is_null() {
+        return false;
+    }
+    // Version-gate before trusting the hand-rolled prefix layout. SQLite has
+    // only ever grown sqlite3_vfs by appending fields, so iVersion >= 1 and a
+    // positive szOsFile guarantee the iVersion/szOsFile/mxPathname/pNext/zName
+    // prefix we mirror is present and that `vfs_ptr` points at a real
+    // sqlite3_vfs (not a stale/garbage pointer). Without this, a host with an
+    // unexpected struct shape would have us dereference zName at the wrong
+    // offset. iVersion is the first field, so reading it is always in bounds.
+    let i_version = (*vfs_ptr).i_version;
+    let sz_os_file = (*vfs_ptr).sz_os_file;
+    if i_version < 1 || sz_os_file <= 0 {
         return false;
     }
     let name_ptr = (*vfs_ptr).z_name;

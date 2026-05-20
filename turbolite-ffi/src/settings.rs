@@ -17,6 +17,21 @@ use std::sync::{Arc, Mutex};
 
 use turbolite::tiered::settings::{self, push_to_current, validate, SettingUpdate, SettingsQueue};
 
+/// Run an FFI body under `catch_unwind`, returning `fallback` on panic.
+///
+/// Unwinding across the `extern "C"` boundary is undefined behavior; each
+/// exported function below routes its body through this guard so a caught
+/// panic becomes the function's documented error sentinel instead.
+fn settings_guard<F, R>(fallback: R, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => fallback,
+    }
+}
+
 /// FFI entry point: `turbolite_config_set(key, value)`.
 ///
 /// Returns:
@@ -28,28 +43,30 @@ use turbolite::tiered::settings::{self, push_to_current, validate, SettingUpdate
 /// `key` and `value` must be valid C strings.
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_config_set(key: *const c_char, value: *const c_char) -> c_int {
-    if key.is_null() || value.is_null() {
-        return 1;
-    }
-    let key_str = match CStr::from_ptr(key).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
-    let value_str = match CStr::from_ptr(value).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
+    settings_guard(1, || {
+        if key.is_null() || value.is_null() {
+            return 1;
+        }
+        let key_str = match CStr::from_ptr(key).to_str() {
+            Ok(s) => s,
+            Err(_) => return 1,
+        };
+        let value_str = match CStr::from_ptr(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return 1,
+        };
 
-    if validate(key_str, value_str).is_err() {
-        return 1;
-    }
-    if !push_to_current(SettingUpdate {
-        key: key_str.to_string(),
-        value: value_str.to_string(),
-    }) {
-        return 2;
-    }
-    0
+        if validate(key_str, value_str).is_err() {
+            return 1;
+        }
+        if !push_to_current(SettingUpdate {
+            key: key_str.to_string(),
+            value: value_str.to_string(),
+        }) {
+            return 2;
+        }
+        0
+    })
 }
 
 /// Clone an Arc to the current thread's top-of-stack handle queue, or
@@ -64,10 +81,10 @@ pub unsafe extern "C" fn turbolite_config_set(key: *const c_char, value: *const 
 /// connection's queue at install time.
 #[no_mangle]
 pub extern "C" fn turbolite_current_queue_clone() -> *const c_void {
-    match settings::top_queue() {
+    settings_guard(std::ptr::null(), || match settings::top_queue() {
         Some(q) => Arc::into_raw(q) as *const c_void,
         None => std::ptr::null(),
-    }
+    })
 }
 
 /// Drop one refcount on a queue pointer previously returned by
@@ -78,10 +95,12 @@ pub extern "C" fn turbolite_current_queue_clone() -> *const c_void {
 /// `turbolite_current_queue_clone` (not yet freed).
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_settings_queue_free(ptr: *const c_void) {
-    if !ptr.is_null() {
-        // Round-trip back to Arc; drop releases one refcount.
-        drop(Arc::from_raw(ptr as *const Mutex<Vec<SettingUpdate>>));
-    }
+    settings_guard((), || {
+        if !ptr.is_null() {
+            // Round-trip back to Arc; drop releases one refcount.
+            drop(Arc::from_raw(ptr as *const Mutex<Vec<SettingUpdate>>));
+        }
+    });
 }
 
 /// `xDestroy` callback signature wrapper for
@@ -113,34 +132,39 @@ pub unsafe extern "C" fn turbolite_settings_queue_push(
     key: *const c_char,
     value: *const c_char,
 ) -> c_int {
-    if queue_ptr.is_null() || key.is_null() || value.is_null() {
-        return 1;
-    }
-    let key_str = match CStr::from_ptr(key).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
-    let value_str = match CStr::from_ptr(value).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
-    if validate(key_str, value_str).is_err() {
-        return 1;
-    }
+    settings_guard(1, || {
+        if queue_ptr.is_null() || key.is_null() || value.is_null() {
+            return 1;
+        }
+        let key_str = match CStr::from_ptr(key).to_str() {
+            Ok(s) => s,
+            Err(_) => return 1,
+        };
+        let value_str = match CStr::from_ptr(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return 1,
+        };
+        if validate(key_str, value_str).is_err() {
+            return 1;
+        }
 
-    // Borrow the Arc via ManuallyDrop so we don't consume the refcount;
-    // xDestroy still owns one refcount for the function's lifetime.
-    let queue_arc: &Mutex<Vec<SettingUpdate>> = &*(queue_ptr as *const Mutex<Vec<SettingUpdate>>);
-    queue_arc
-        .lock()
-        .expect("settings queue poisoned")
-        .push(SettingUpdate {
-            key: key_str.to_string(),
-            value: value_str.to_string(),
-        });
+        // Borrow the Arc via ManuallyDrop so we don't consume the refcount;
+        // xDestroy still owns one refcount for the function's lifetime.
+        let queue_arc: &Mutex<Vec<SettingUpdate>> =
+            &*(queue_ptr as *const Mutex<Vec<SettingUpdate>>);
+        // Recover from a poisoned lock rather than panicking across the C
+        // boundary; the queue is a plain Vec of updates and stays usable.
+        queue_arc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(SettingUpdate {
+                key: key_str.to_string(),
+                value: value_str.to_string(),
+            });
 
-    // Silence the "unused type" warning for the public alias so the docs
-    // cross-link cleanly.
-    let _: Option<SettingsQueue> = None;
-    0
+        // Silence the "unused type" warning for the public alias so the docs
+        // cross-link cleanly.
+        let _: Option<SettingsQueue> = None;
+        0
+    })
 }

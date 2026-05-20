@@ -36,6 +36,24 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Run an FFI body under `catch_unwind`, returning `fallback` on panic.
+///
+/// Unwinding across the `extern "C"` boundary is undefined behavior, so every
+/// exported function below routes its body through this guard and converts a
+/// caught panic into the function's documented error sentinel. The closure is
+/// wrapped in `AssertUnwindSafe` because these bodies legitimately touch raw
+/// pointers and process-global state across the boundary; on the panic path
+/// only a fixed sentinel is returned.
+fn ext_guard<F, R>(fallback: R, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => fallback,
+    }
+}
+
 extern "C" {
     fn turbolite_c_sqlite3_turbolite_init(
         db: *mut c_void,
@@ -55,7 +73,11 @@ pub unsafe extern "C" fn sqlite3_turbolite_init(
     pz_err_msg: *mut *mut c_char,
     api: *const c_void,
 ) -> c_int {
-    turbolite_c_sqlite3_turbolite_init(db, pz_err_msg, api)
+    // SQLITE_ERROR == 1: a panic unwinding from the C init (which may call
+    // back into Rust registration) across this boundary is UB.
+    ext_guard(1, || {
+        turbolite_c_sqlite3_turbolite_init(db, pz_err_msg, api)
+    })
 }
 
 static LOCAL_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -72,12 +94,26 @@ static BENCH_HANDLE: std::sync::OnceLock<turbolite::tiered::TurboliteSharedState
 #[cfg(feature = "cli-s3")]
 static S3_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
+/// Returns the shared S3 registration runtime, or `None` if it could not be
+/// built. Built lazily once. Returning `None` (instead of `.expect`-panicking)
+/// keeps the failure on the FFI error path rather than unwinding across C.
 #[cfg(feature = "cli-s3")]
-fn s3_runtime() -> &'static tokio::runtime::Runtime {
-    S3_RUNTIME.get_or_init(|| {
-        tokio::runtime::Runtime::new()
-            .expect("turbolite: failed to build shared S3 registration runtime")
-    })
+fn s3_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    // OnceLock has no fallible get_or_init on stable, so build first and only
+    // store on success; a transient failure can be retried on the next call.
+    if let Some(rt) = S3_RUNTIME.get() {
+        return Some(rt);
+    }
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => {
+            let _ = S3_RUNTIME.set(rt);
+            S3_RUNTIME.get()
+        }
+        Err(e) => {
+            eprintln!("turbolite: failed to build shared S3 registration runtime: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(feature = "cli-s3")]
@@ -279,30 +315,32 @@ fn start_background_flush(interval_ms: u64) {
 ///
 /// Always registers "turbolite" (local TurboliteVfs).
 /// If TURBOLITE_BUCKET is set, also registers "turbolite-s3" (tiered VFS).
-/// Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
+/// Returns 1 if TURBOLITE_BUCKET is set but tiered VFS creation fails.
 #[no_mangle]
 pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
-    // Register local VFS (always)
-    if !LOCAL_VFS_REGISTERED.swap(true, Ordering::SeqCst) {
-        if let Err(e) = register_local() {
-            LOCAL_VFS_REGISTERED.store(false, Ordering::SeqCst);
-            eprintln!("turbolite: failed to register local VFS: {e}");
-            return 1;
+    ext_guard(1, || {
+        // Register local VFS (always)
+        if !LOCAL_VFS_REGISTERED.swap(true, Ordering::SeqCst) {
+            if let Err(e) = register_local() {
+                LOCAL_VFS_REGISTERED.store(false, Ordering::SeqCst);
+                eprintln!("turbolite: failed to register local VFS: {e}");
+                return 1;
+            }
         }
-    }
 
-    // Register tiered VFS if TURBOLITE_BUCKET is set
-    if std::env::var("TURBOLITE_BUCKET").is_ok()
-        && !TIERED_VFS_REGISTERED.swap(true, Ordering::SeqCst)
-    {
-        if let Err(e) = register_tiered() {
-            TIERED_VFS_REGISTERED.store(false, Ordering::SeqCst);
-            eprintln!("turbolite: TURBOLITE_BUCKET is set but tiered VFS failed: {e}");
-            return 1;
+        // Register tiered VFS if TURBOLITE_BUCKET is set
+        if std::env::var("TURBOLITE_BUCKET").is_ok()
+            && !TIERED_VFS_REGISTERED.swap(true, Ordering::SeqCst)
+        {
+            if let Err(e) = register_tiered() {
+                TIERED_VFS_REGISTERED.store(false, Ordering::SeqCst);
+                eprintln!("turbolite: TURBOLITE_BUCKET is set but tiered VFS failed: {e}");
+                return 1;
+            }
         }
-    }
 
-    0
+        0
+    })
 }
 
 fn register_local() -> Result<(), std::io::Error> {
@@ -335,8 +373,12 @@ fn register_tiered() -> Result<(), std::io::Error> {
     use std::sync::Arc;
     use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-    let bucket =
-        std::env::var("TURBOLITE_BUCKET").expect("TURBOLITE_BUCKET must be set for tiered mode");
+    let bucket = std::env::var("TURBOLITE_BUCKET").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TURBOLITE_BUCKET must be set for tiered mode",
+        )
+    })?;
     let prefix = std::env::var("TURBOLITE_PREFIX").unwrap_or_else(|_| "turbolite".into());
     let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
         .map(PathBuf::from)
@@ -358,7 +400,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
     let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
     {
-        let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
+        let mut counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
         counters.counters = Some(counters_handle);
         counters.base_gets = 0;
         counters.base_get_bytes = 0;
@@ -400,7 +442,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
-    match BENCH_HANDLE.get() {
+    ext_guard(1, || match BENCH_HANDLE.get() {
         Some(h) => {
             match mode {
                 0 => h.clear_cache_all(),
@@ -411,13 +453,13 @@ pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
             0
         }
         None => 1,
-    }
+    })
 }
 
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
-    match BENCH_HANDLE.get() {
+    ext_guard(1, || match BENCH_HANDLE.get() {
         Some(h) => match h.flush_to_storage() {
             Ok(()) => 0,
             Err(e) => {
@@ -426,7 +468,7 @@ pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
             }
         },
         None => 1,
-    }
+    })
 }
 
 /// Reset S3 counters. Always returns 0; counters are now backend-impl
@@ -434,25 +476,27 @@ pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
-    let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-    match counters.counters.clone() {
-        Some(storage_counters) => {
-            counters.base_gets = storage_counters
-                .gets
-                .load(std::sync::atomic::Ordering::Relaxed);
-            counters.base_get_bytes = storage_counters
-                .get_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            counters.base_puts = storage_counters
-                .puts
-                .load(std::sync::atomic::Ordering::Relaxed);
-            counters.base_put_bytes = storage_counters
-                .put_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            0
+    ext_guard(1, || {
+        let mut counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+        match counters.counters.clone() {
+            Some(storage_counters) => {
+                counters.base_gets = storage_counters
+                    .gets
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                counters.base_get_bytes = storage_counters
+                    .get_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                counters.base_puts = storage_counters
+                    .puts
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                counters.base_put_bytes = storage_counters
+                    .put_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                0
+            }
+            None => 1,
         }
-        None => 1,
-    }
+    })
 }
 
 /// Get S3 GET count. Returns 0: not surfaced through the generic
@@ -461,12 +505,14 @@ pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
-    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-    counters.counters.as_ref().map_or(0, |storage_counters| {
-        storage_counters
-            .gets
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(counters.base_gets) as i64
+    ext_guard(0, || {
+        let counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+        counters.counters.as_ref().map_or(0, |storage_counters| {
+            storage_counters
+                .gets
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(counters.base_gets) as i64
+        })
     })
 }
 
@@ -474,36 +520,42 @@ pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
-    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-    counters.counters.as_ref().map_or(0, |storage_counters| {
-        storage_counters
-            .get_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(counters.base_get_bytes) as i64
+    ext_guard(0, || {
+        let counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+        counters.counters.as_ref().map_or(0, |storage_counters| {
+            storage_counters
+                .get_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(counters.base_get_bytes) as i64
+        })
     })
 }
 
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_puts() -> i64 {
-    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-    counters.counters.as_ref().map_or(0, |storage_counters| {
-        storage_counters
-            .puts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(counters.base_puts) as i64
+    ext_guard(0, || {
+        let counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+        counters.counters.as_ref().map_or(0, |storage_counters| {
+            storage_counters
+                .puts
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(counters.base_puts) as i64
+        })
     })
 }
 
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_put_bytes() -> i64 {
-    let counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-    counters.counters.as_ref().map_or(0, |storage_counters| {
-        storage_counters
-            .put_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(counters.base_put_bytes) as i64
+    ext_guard(0, || {
+        let counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+        counters.counters.as_ref().map_or(0, |storage_counters| {
+            storage_counters
+                .put_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(counters.base_put_bytes) as i64
+        })
     })
 }
 
@@ -520,17 +572,19 @@ pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
-    if tree_names.is_null() {
-        return -1;
-    }
-    let names = match std::ffi::CStr::from_ptr(tree_names).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    match BENCH_HANDLE.get() {
-        Some(h) => h.evict_tree(names) as i32,
-        None => -1,
-    }
+    ext_guard(-1, || {
+        if tree_names.is_null() {
+            return -1;
+        }
+        let names = match std::ffi::CStr::from_ptr(tree_names).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        match BENCH_HANDLE.get() {
+            Some(h) => h.evict_tree(names) as i32,
+            None => -1,
+        }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
@@ -546,23 +600,25 @@ pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
-    thread_local! {
-        static CACHE_INFO_BUF: std::cell::RefCell<std::ffi::CString> =
-            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
-    }
-    match BENCH_HANDLE.get() {
-        Some(h) => {
-            let json = h.cache_info();
-            match std::ffi::CString::new(json) {
-                Ok(c) => CACHE_INFO_BUF.with(|buf| {
-                    *buf.borrow_mut() = c;
-                    buf.borrow().as_ptr()
-                }),
-                Err(_) => std::ptr::null(),
-            }
+    ext_guard(std::ptr::null(), || {
+        thread_local! {
+            static CACHE_INFO_BUF: std::cell::RefCell<std::ffi::CString> =
+                std::cell::RefCell::new(std::ffi::CString::default());
         }
-        None => std::ptr::null(),
-    }
+        match BENCH_HANDLE.get() {
+            Some(h) => {
+                let json = h.cache_info();
+                match std::ffi::CString::new(json) {
+                    Ok(c) => CACHE_INFO_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    }),
+                    Err(_) => std::ptr::null(),
+                }
+            }
+            None => std::ptr::null(),
+        }
+    })
 }
 
 /// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
@@ -574,31 +630,33 @@ pub unsafe extern "C" fn turbolite_warm(
     db: *mut std::ffi::c_void,
     sql: *const std::os::raw::c_char,
 ) -> *const std::os::raw::c_char {
-    thread_local! {
-        static WARM_BUF: std::cell::RefCell<std::ffi::CString> =
-            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
-    }
-    if sql.is_null() {
-        return std::ptr::null();
-    }
-    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null(),
-    };
-    match BENCH_HANDLE.get() {
-        Some(h) => {
-            let accesses = turbolite::tiered::run_eqp_and_parse(db, sql_str);
-            let json = h.warm_from_plan(&accesses);
-            match std::ffi::CString::new(json) {
-                Ok(c) => WARM_BUF.with(|buf| {
-                    *buf.borrow_mut() = c;
-                    buf.borrow().as_ptr()
-                }),
-                Err(_) => std::ptr::null(),
-            }
+    ext_guard(std::ptr::null(), || {
+        thread_local! {
+            static WARM_BUF: std::cell::RefCell<std::ffi::CString> =
+                std::cell::RefCell::new(std::ffi::CString::default());
         }
-        None => std::ptr::null(),
-    }
+        if sql.is_null() {
+            return std::ptr::null();
+        }
+        let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null(),
+        };
+        match BENCH_HANDLE.get() {
+            Some(h) => {
+                let accesses = turbolite::tiered::run_eqp_and_parse(db, sql_str);
+                let json = h.warm_from_plan(&accesses);
+                match std::ffi::CString::new(json) {
+                    Ok(c) => WARM_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    }),
+                    Err(_) => std::ptr::null(),
+                }
+            }
+            None => std::ptr::null(),
+        }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
@@ -618,20 +676,22 @@ pub unsafe extern "C" fn turbolite_evict_query(
     db: *mut std::ffi::c_void,
     sql: *const std::os::raw::c_char,
 ) -> i32 {
-    if sql.is_null() {
-        return -1;
-    }
-    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    match BENCH_HANDLE.get() {
-        Some(h) => {
-            let accesses = turbolite::tiered::run_eqp_and_parse(db, sql_str);
-            h.evict_query(&accesses) as i32
+    ext_guard(-1, || {
+        if sql.is_null() {
+            return -1;
         }
-        None => -1,
-    }
+        let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        match BENCH_HANDLE.get() {
+            Some(h) => {
+                let accesses = turbolite::tiered::run_eqp_and_parse(db, sql_str);
+                h.evict_query(&accesses) as i32
+            }
+            None => -1,
+        }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
@@ -648,17 +708,19 @@ pub unsafe extern "C" fn turbolite_evict_query(
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {
-    if tier.is_null() {
-        return -1;
-    }
-    let tier_str = match std::ffi::CStr::from_ptr(tier).to_str() {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    match BENCH_HANDLE.get() {
-        Some(h) => h.evict_tier(tier_str) as i32,
-        None => -1,
-    }
+    ext_guard(-1, || {
+        if tier.is_null() {
+            return -1;
+        }
+        let tier_str = match std::ffi::CStr::from_ptr(tier).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        match BENCH_HANDLE.get() {
+            Some(h) => h.evict_tier(tier_str) as i32,
+            None => -1,
+        }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
@@ -678,7 +740,7 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
-    match BENCH_HANDLE.get() {
+    ext_guard(-1, || match BENCH_HANDLE.get() {
         Some(h) => match h.gc() {
             Ok(count) => count as i32,
             Err(e) => {
@@ -687,27 +749,43 @@ pub extern "C" fn turbolite_gc() -> i32 {
             }
         },
         None => -1,
-    }
+    })
 }
 
 /// Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
-/// Returns JSON report string (caller must free), or null on error.
+/// Returns a JSON report C string, or null on error.
+///
+/// The returned pointer is owned by a thread-local buffer and stays valid
+/// until the next `turbolite_compact` call on the same thread (treat as
+/// SQLITE_TRANSIENT). The caller must NOT free it. The previous version
+/// returned `CString::into_raw`, which the C side never freed (a leak per
+/// call), and `unwrap`'d on a JSON string containing a NUL byte (a panic
+/// across the C boundary).
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
-    match BENCH_HANDLE.get() {
-        Some(h) => match h.compact(0.3) {
-            Ok(json) => {
-                let c_str = std::ffi::CString::new(json).unwrap();
-                c_str.into_raw()
-            }
-            Err(e) => {
-                eprintln!("[compact] ERROR: {}", e);
-                std::ptr::null()
-            }
-        },
-        None => std::ptr::null(),
-    }
+    ext_guard(std::ptr::null(), || {
+        thread_local! {
+            static COMPACT_BUF: std::cell::RefCell<std::ffi::CString> =
+                std::cell::RefCell::new(std::ffi::CString::default());
+        }
+        match BENCH_HANDLE.get() {
+            Some(h) => match h.compact(0.3) {
+                Ok(json) => match std::ffi::CString::new(json) {
+                    Ok(c) => COMPACT_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    }),
+                    Err(_) => std::ptr::null(),
+                },
+                Err(e) => {
+                    eprintln!("[compact] ERROR: {}", e);
+                    std::ptr::null()
+                }
+            },
+            None => std::ptr::null(),
+        }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
@@ -739,36 +817,38 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
     name_ptr: *const std::os::raw::c_char,
     cache_dir_ptr: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
-    let name = unsafe {
-        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return 1,
-        }
-    };
-    let cache_dir = unsafe {
-        match std::ffi::CStr::from_ptr(cache_dir_ptr).to_str() {
-            Ok(s) => std::path::PathBuf::from(s),
-            Err(_) => return 1,
-        }
-    };
+    ext_guard(1, || {
+        let name = unsafe {
+            match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return 1,
+            }
+        };
+        let cache_dir = unsafe {
+            match std::ffi::CStr::from_ptr(cache_dir_ptr).to_str() {
+                Ok(s) => std::path::PathBuf::from(s),
+                Err(_) => return 1,
+            }
+        };
 
-    let config = turbolite::tiered::TurboliteConfig {
-        cache_dir,
-        ..turbolite::tiered::TurboliteConfig::from_env()
-    };
-    match turbolite::tiered::TurboliteVfs::new_local(config) {
-        Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
-            Ok(()) => 0,
+        let config = turbolite::tiered::TurboliteConfig {
+            cache_dir,
+            ..turbolite::tiered::TurboliteConfig::from_env()
+        };
+        match turbolite::tiered::TurboliteVfs::new_local(config) {
+            Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("turbolite: failed to register VFS '{}': {}", name, e);
+                    1
+                }
+            },
             Err(e) => {
-                eprintln!("turbolite: failed to register VFS '{}': {}", name, e);
+                eprintln!("turbolite: failed to create VFS '{}': {}", name, e);
                 1
             }
-        },
-        Err(e) => {
-            eprintln!("turbolite: failed to create VFS '{}': {}", name, e);
-            1
         }
-    }
+    })
 }
 
 /// Register a file-first local VFS keyed to a database path.
@@ -794,39 +874,41 @@ pub extern "C" fn turbolite_ext_register_file_first_vfs(
     name_ptr: *const std::os::raw::c_char,
     db_path_ptr: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
-    let name = unsafe {
-        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return 1,
-        }
-    };
-    let db_path = unsafe {
-        match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
-            Ok(s) => std::path::PathBuf::from(s),
-            Err(_) => return 1,
-        }
-    };
+    ext_guard(1, || {
+        let name = unsafe {
+            match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => return 1,
+            }
+        };
+        let db_path = unsafe {
+            match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
+                Ok(s) => std::path::PathBuf::from(s),
+                Err(_) => return 1,
+            }
+        };
 
-    let config = turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
-    match turbolite::tiered::TurboliteVfs::new_local(config) {
-        Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
-            Ok(()) => 0,
+        let config = turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
+        match turbolite::tiered::TurboliteVfs::new_local(config) {
+            Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!(
+                        "turbolite: failed to register file-first VFS '{}': {}",
+                        name, e
+                    );
+                    1
+                }
+            },
             Err(e) => {
                 eprintln!(
-                    "turbolite: failed to register file-first VFS '{}': {}",
+                    "turbolite: failed to create file-first VFS '{}': {}",
                     name, e
                 );
                 1
             }
-        },
-        Err(e) => {
-            eprintln!(
-                "turbolite: failed to create file-first VFS '{}': {}",
-                name, e
-            );
-            1
         }
-    }
+    })
 }
 
 #[cfg(feature = "cli-s3")]
@@ -858,81 +940,89 @@ pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
     use std::sync::Arc;
     use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-    let name = unsafe {
-        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
-            Ok(s) if !s.is_empty() => s.to_string(),
-            _ => return 1,
-        }
-    };
-    let db_path = unsafe {
-        match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
-            Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
-            _ => return 1,
-        }
-    };
-    let bucket = unsafe {
-        match std::ffi::CStr::from_ptr(bucket_ptr).to_str() {
-            Ok(s) if !s.is_empty() => s.to_string(),
-            _ => return 1,
-        }
-    };
-    let prefix = optional_cstr(prefix_ptr).unwrap_or_else(|| "turbolite".to_string());
-    let endpoint_url = optional_cstr(endpoint_ptr);
-    let region = optional_cstr(region_ptr);
+    ext_guard(1, || {
+        let name = unsafe {
+            match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+                Ok(s) if !s.is_empty() => s.to_string(),
+                _ => return 1,
+            }
+        };
+        let db_path = unsafe {
+            match std::ffi::CStr::from_ptr(db_path_ptr).to_str() {
+                Ok(s) if !s.is_empty() => std::path::PathBuf::from(s),
+                _ => return 1,
+            }
+        };
+        let bucket = unsafe {
+            match std::ffi::CStr::from_ptr(bucket_ptr).to_str() {
+                Ok(s) if !s.is_empty() => s.to_string(),
+                _ => return 1,
+            }
+        };
+        let prefix = optional_cstr(prefix_ptr).unwrap_or_else(|| "turbolite".to_string());
+        let endpoint_url = optional_cstr(endpoint_ptr);
+        let region = optional_cstr(region_ptr);
 
-    let handle = s3_runtime().handle().clone();
-    let backend = match handle.block_on(async {
-        hadb_storage_s3::S3Storage::from_env(bucket.clone(), endpoint_url.as_deref())
-            .await
-            .map(|storage| storage.with_prefix(prefix.clone()))
-    }) {
-        Ok(backend) => backend,
-        Err(e) => {
-            eprintln!(
-                "turbolite: failed to create S3 backend for VFS '{}': {}",
-                name, e
-            );
-            return 1;
+        let handle = match s3_runtime() {
+            Some(rt) => rt.handle().clone(),
+            None => {
+                eprintln!("turbolite: S3 registration runtime unavailable for VFS '{name}'");
+                return 1;
+            }
+        };
+        let backend = match handle.block_on(async {
+            hadb_storage_s3::S3Storage::from_env(bucket.clone(), endpoint_url.as_deref())
+                .await
+                .map(|storage| storage.with_prefix(prefix.clone()))
+        }) {
+            Ok(backend) => backend,
+            Err(e) => {
+                eprintln!(
+                    "turbolite: failed to create S3 backend for VFS '{}': {}",
+                    name, e
+                );
+                return 1;
+            }
+        };
+        let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(backend);
+        let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
+        let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
+        {
+            let mut counters = s3_counters().lock().unwrap_or_else(|e| e.into_inner());
+            counters.counters = Some(counters_handle);
+            counters.base_gets = 0;
+            counters.base_get_bytes = 0;
+            counters.base_puts = 0;
+            counters.base_put_bytes = 0;
         }
-    };
-    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(backend);
-    let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
-    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
-    {
-        let mut counters = s3_counters().lock().expect("s3 counter mutex poisoned");
-        counters.counters = Some(counters_handle);
-        counters.base_gets = 0;
-        counters.base_get_bytes = 0;
-        counters.base_puts = 0;
-        counters.base_put_bytes = 0;
-    }
 
-    let mut config = TurboliteConfig::from_env().with_database_path(db_path);
-    config.bucket = bucket;
-    config.prefix = prefix;
-    config.endpoint_url = endpoint_url;
-    config.region = region;
+        let mut config = TurboliteConfig::from_env().with_database_path(db_path);
+        config.bucket = bucket;
+        config.prefix = prefix;
+        config.endpoint_url = endpoint_url;
+        config.region = region;
 
-    let vfs = match TurboliteVfs::with_backend(config, backend, handle) {
-        Ok(vfs) => vfs,
-        Err(e) => {
-            eprintln!(
-                "turbolite: failed to create file-first S3 VFS '{}': {}",
-                name, e
-            );
-            return 1;
+        let vfs = match TurboliteVfs::with_backend(config, backend, handle) {
+            Ok(vfs) => vfs,
+            Err(e) => {
+                eprintln!(
+                    "turbolite: failed to create file-first S3 VFS '{}': {}",
+                    name, e
+                );
+                return 1;
+            }
+        };
+        match turbolite::tiered::register(&name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!(
+                    "turbolite: failed to register file-first S3 VFS '{}': {}",
+                    name, e
+                );
+                1
+            }
         }
-    };
-    match turbolite::tiered::register(&name, vfs) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!(
-                "turbolite: failed to register file-first S3 VFS '{}': {}",
-                name, e
-            );
-            1
-        }
-    }
+    })
 }
 
 #[cfg(not(feature = "cli-s3"))]
