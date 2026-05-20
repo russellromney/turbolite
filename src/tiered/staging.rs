@@ -143,7 +143,14 @@ pub(crate) fn read_staging_log(path: &Path, _page_size: u32) -> io::Result<HashM
             break;
         }
 
-        reader.read_exact(&mut page_buf)?;
+        // A torn trailing page body (crash mid-write) is a clean EOF, not a
+        // hard error: stop and keep the complete records before it. Treating
+        // it as an error would abort the flush forever (poison pill).
+        match reader.read_exact(&mut page_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
         pages.insert(page_num, page_buf.clone());
     }
 
@@ -410,6 +417,43 @@ mod tests {
         let result = read_staging_log(&path, 64);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn staging_torn_trailing_page_body_recovers_complete_records() {
+        // A crash mid-page-write leaves a complete page_num followed by a
+        // truncated body. read_staging_log must treat that as EOF and keep
+        // the complete records, not hard-error (poison pill aborting flush).
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let page_size = 64u32;
+
+        // Two complete records via the writer, then append a torn third.
+        let mut writer = StagingWriter::open(&staging_dir, 1, page_size).unwrap();
+        let p0 = vec![0xA1u8; page_size as usize];
+        let p3 = vec![0xB2u8; page_size as usize];
+        writer.append(0, &p0).unwrap();
+        writer.append(3, &p3).unwrap();
+        let (path, count) = writer.finalize().unwrap();
+        assert_eq!(count, 2);
+
+        // Append a torn record: full page_num (8 bytes) + a short body.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&7u64.to_le_bytes()).unwrap();
+            f.write_all(&[0xCCu8; 10]).unwrap(); // body short of page_size
+            f.sync_all().unwrap();
+        }
+
+        let pages = read_staging_log(&path, page_size).unwrap();
+        assert_eq!(pages.len(), 2, "torn trailing body dropped, others kept");
+        assert_eq!(pages[&0], p0);
+        assert_eq!(pages[&3], p3);
+        assert!(!pages.contains_key(&7), "torn record not recovered");
     }
 
     #[test]

@@ -158,10 +158,14 @@ environment.
   `mark_all_pages_present` shrink clears bits above count;
   `clear_pages_at_or_above` clears stray pages.
 
-### F11 — [Med] Torn staging-log page body is a poison pill — **Documented**
-- `src/tiered/staging.rs:134-148` returns a hard error on a torn trailing page
-  body (aborting flush forever), while a torn page-number is treated as EOF.
-- **Fix:** treat a short page-body read as EOF (stop, keep complete records).
+### F11 — [Med] Torn staging-log page body is a poison pill — **Fixed**
+- `src/tiered/staging.rs` `read_staging_log` returned a hard error on a torn
+  trailing page body (aborting flush forever), while a torn page-number was
+  already treated as EOF.
+- **Fix:** a short page-body read is now treated as clean EOF (`break`, keep the
+  complete records before it), matching the page-number case. Test
+  `staging_torn_trailing_page_body_recovers_complete_records`: a log with two
+  complete records plus a truncated trailing body recovers exactly the two.
 
 ### F13 — [Med] Cache trimmed only at end-of-query → unbounded mid-query — **Documented**
 - `src/tiered/handle.rs:1041-1069`; the 64-fetch lazy hook only does TTL
