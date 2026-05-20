@@ -35,6 +35,8 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
+pub mod local;
+pub use local::{open_local, open_local_with, LocalError, LocalOptions};
 pub mod tiered;
 pub use tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteHandle, TurboliteVfs};
 pub mod btree_walker;
