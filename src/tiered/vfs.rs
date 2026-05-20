@@ -924,6 +924,28 @@ impl TurboliteVfs {
         super::wire::encode(&m).map_err(io::Error::from)
     }
 
+    /// Phase 004: persist the follower's advancing **working** replay
+    /// cursor.
+    ///
+    /// After a follower applies a verified prefix of delta envelopes, it
+    /// records its new replay position here: `last_applied_seq` and the
+    /// `base_object_checksum` anchor advance to the last applied delta's
+    /// envelope checksum (see `phase4_chain::FollowerCursor`). This is
+    /// stored in the local manifest's `cursor` field so the next poll —
+    /// and a process restart — resume from the right anchor instead of
+    /// re-applying from the base.
+    ///
+    /// Only the `cursor` field is touched; the page-group description
+    /// (which still names the base's groups; applied delta pages live in
+    /// the local cache, not new groups) is left intact.
+    pub fn update_replay_cursor(&self, cursor: super::manifest::ReplayCursor) -> io::Result<()> {
+        let mut m = self.manifest();
+        m.cursor = cursor;
+        manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
+        self.shared_manifest.store(Arc::new(m));
+        Ok(())
+    }
+
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
     /// page/base manifest via `set_manifest()`.
     pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
