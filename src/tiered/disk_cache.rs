@@ -377,10 +377,20 @@ impl DiskCache {
             .open(cache_file_path)?;
         let cache_file_was_empty = cache_file.metadata()?.len() == 0;
 
-        // For uncompressed mode: extend to full size (sparse file).
+        // For uncompressed mode: extend to full size (sparse file). When
+        // encryption is on, each page slot is widened to hold its inline
+        // random-nonce GCM frame, so pre-size with the encrypted stride.
         // For compressed mode: the file grows via append, no pre-allocation needed.
         if !cache_compression && page_count > 0 && page_size > 0 {
-            let target_size = page_count * page_size as u64;
+            #[cfg(feature = "encryption")]
+            let slot = if encryption_key.is_some() {
+                page_size as u64 + compress::GCM_RANDOM_NONCE_OVERHEAD as u64
+            } else {
+                page_size as u64
+            };
+            #[cfg(not(feature = "encryption"))]
+            let slot = page_size as u64;
+            let target_size = page_count * slot;
             let meta = cache_file.metadata()?;
             if meta.len() < target_size {
                 cache_file.set_len(target_size)?;
@@ -676,6 +686,29 @@ impl DiskCache {
         }
     }
 
+    /// Per-page byte stride in the **uncompressed** cache file.
+    ///
+    /// Without encryption a page occupies exactly `page_size` bytes at
+    /// `page_num * page_size`. With encryption each page is stored as a
+    /// random-nonce GCM frame (`[12-byte nonce][page_size ciphertext][16-byte
+    /// tag]`), so the slot is widened by `GCM_RANDOM_NONCE_OVERHEAD`. A fresh
+    /// nonce per write makes page rewrites safe (no keystream/nonce reuse).
+    #[inline]
+    fn slot_stride(&self) -> u64 {
+        let ps = self.page_size.load(Ordering::Acquire) as u64;
+        #[cfg(feature = "encryption")]
+        if self.encryption_key.is_some() {
+            return ps + compress::GCM_RANDOM_NONCE_OVERHEAD as u64;
+        }
+        ps
+    }
+
+    /// Byte offset of `page_num`'s slot in the uncompressed cache file.
+    #[inline]
+    fn slot_offset(&self, page_num: u64) -> u64 {
+        page_num * self.slot_stride()
+    }
+
     /// Ensure the cache file is at least `needed` bytes. Lock-free fast path
     /// when file is already large enough; mutex only for the rare set_len.
     fn ensure_file_len(&self, needed: u64) -> io::Result<()> {
@@ -742,13 +775,24 @@ impl DiskCache {
             // Miss: fall through to pread (page not decoded yet or evicted)
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-        self.cache_file.read_exact_at(buf, offset)?;
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
-            let decrypted = compress::decrypt_ctr(buf, page_num, key)?;
-            buf.copy_from_slice(&decrypted);
+            // Encrypted slot: read the full GCM frame, decrypt to a full page,
+            // then copy the requested prefix (SQLite may request a partial read
+            // such as the 16/100-byte file header).
+            let ps = self.page_size.load(Ordering::Acquire) as usize;
+            let stride = ps + compress::GCM_RANDOM_NONCE_OVERHEAD;
+            let mut frame = vec![0u8; stride];
+            self.cache_file
+                .read_exact_at(&mut frame, page_num * stride as u64)?;
+            let plain = compress::decrypt_gcm_random_nonce(&frame, key)?;
+            let copy_len = buf.len().min(plain.len());
+            buf[..copy_len].copy_from_slice(&plain[..copy_len]);
+            return Ok(());
         }
+
+        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+        self.cache_file.read_exact_at(buf, offset)?;
         Ok(())
     }
 
@@ -774,10 +818,10 @@ impl DiskCache {
         self.cache_file
             .read_exact_at(&mut compressed, entry.offset)?;
 
-        // Decrypt if encrypted (CTR, same size)
+        // Decrypt if encrypted (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
-            let decrypted = compress::decrypt_ctr(&compressed, page_num, key)?;
+            let decrypted = compress::decrypt_gcm_random_nonce(&compressed, key)?;
             compressed = decrypted;
         }
 
@@ -881,19 +925,19 @@ impl DiskCache {
             ));
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
-
-        // CTR encryption: same size, no overhead. Encrypt before
-        // pwrite. The bitmap and mem_cache are NOT touched.
+        // Random-nonce GCM frame (fresh nonce per write, stored inline) so a
+        // page rewrite never reuses a nonce/keystream. The slot stride widens
+        // by GCM_RANDOM_NONCE_OVERHEAD. The bitmap and mem_cache are NOT touched.
         let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _enc_buf = compress::encrypt_ctr(data, page_num, key)?;
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, key)?;
             _enc_buf.as_slice()
         } else {
             data
         };
 
+        let offset = self.slot_offset(page_num);
         let needed = offset + data.len() as u64;
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
@@ -907,35 +951,42 @@ impl DiskCache {
             return self.write_page_compressed(page_num, data);
         }
 
-        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+        // Plaintext page data, kept for the mem_cache update below (which must
+        // store decrypted bytes). `write_data` is what actually hits disk.
+        let plain = data;
 
-        // CTR encryption: same size, no overhead
-        let _write_data: Vec<u8>;
+        // Random-nonce GCM frame (fresh nonce per write, stored inline). The
+        // slot stride widens by GCM_RANDOM_NONCE_OVERHEAD so a rewrite of the
+        // same page never reuses a nonce/keystream.
+        let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _write_data = compress::encrypt_ctr(data, page_num, key)?;
-            _write_data.as_slice()
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, key)?;
+            _enc_buf.as_slice()
         } else {
             data
         };
 
+        let offset = self.slot_offset(page_num);
         let needed = offset + data.len() as u64;
 
         // Extend file if needed (serialized via mutex), then pwrite (lock-free)
         self.ensure_file_len(needed)?;
         self.cache_file.write_all_at(data, offset)?;
         self.bitmap_mark(page_num);
-        // Update in-memory cache if page is already cached (keep dirty data consistent).
-        // Don't promote on write -- read path handles promotion.
+        // Update in-memory cache if page is already cached (keep dirty data
+        // consistent). The mem_cache holds PLAINTEXT pages, so copy from `plain`
+        // (not the encrypted on-disk frame). Don't promote on write -- read path
+        // handles promotion.
         if let Some(ref mc) = self.mem_cache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 if !ptr.is_null() {
-                    let copy_len = data
+                    let copy_len = plain
                         .len()
                         .min(self.page_size.load(Ordering::Relaxed) as usize);
                     unsafe {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
+                        std::ptr::copy_nonoverlapping(plain.as_ptr(), ptr, copy_len);
                     }
                 }
             }
@@ -959,10 +1010,10 @@ impl DiskCache {
             None,
         )?;
 
-        // Encrypt compressed blob
+        // Encrypt compressed blob (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         let blob = if let Some(ref key) = self.encryption_key {
-            compress::encrypt_ctr(&blob, page_num, key)?
+            compress::encrypt_gcm_random_nonce(&blob, key)?
         } else {
             blob
         };
@@ -1002,27 +1053,32 @@ impl DiskCache {
         // Promote decoded pages to mem_cache BEFORE encryption (we want raw data).
         self.promote_bulk_to_mem_cache(start_page, data, num_pages);
 
-        // CTR encryption: encrypt each page in-place (same size, no overhead)
+        // Encryption: wrap each page in its own random-nonce GCM frame. Each
+        // frame is `page_sz + GCM_RANDOM_NONCE_OVERHEAD` bytes, so the slot
+        // stride widens and the contiguous blob is written at `start_page *
+        // stride`. A fresh nonce per page makes rewrites safe.
         #[cfg(feature = "encryption")]
-        let data = if let Some(ref key) = self.encryption_key {
-            let mut encrypted = Vec::with_capacity(data.len());
+        let (data, stride) = if let Some(ref key) = self.encryption_key {
+            let stride = page_sz + compress::GCM_RANDOM_NONCE_OVERHEAD;
+            let mut encrypted = Vec::with_capacity(num_pages as usize * stride);
             for i in 0..num_pages {
                 let start = i as usize * page_sz;
                 let end = (start + page_sz).min(data.len());
-                encrypted.extend_from_slice(&compress::encrypt_ctr(
+                encrypted.extend_from_slice(&compress::encrypt_gcm_random_nonce(
                     &data[start..end],
-                    start_page + i,
                     key,
                 )?);
             }
-            encrypted
+            (encrypted, stride)
         } else {
-            data.to_vec()
+            (data.to_vec(), page_sz)
         };
         #[cfg(feature = "encryption")]
         let data = data.as_slice();
+        #[cfg(not(feature = "encryption"))]
+        let stride = page_sz;
 
-        let offset = start_page * page_sz as u64;
+        let offset = start_page * stride as u64;
         let needed = offset + data.len() as u64;
 
         self.ensure_file_len(needed)?;
@@ -1092,7 +1148,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_ctr(&compressed, start_page + i, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, key)?
             } else {
                 compressed
             };
@@ -1186,23 +1242,26 @@ impl DiskCache {
         // Promote decoded pages to mem_cache before encryption
         self.promote_scattered_to_mem_cache(written_pages, data);
 
-        // Find max page to size the cache file
+        // Find max page to size the cache file (in slot-stride units, which
+        // widen when encryption is on).
+        let stride = self.slot_stride() as usize;
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
-        let needed = (max_page + 1) * page_sz as u64;
+        let needed = (max_page + 1) * stride as u64;
 
         self.ensure_file_len(needed)?;
         for (i, &pnum) in written_pages.iter().enumerate() {
             let src_start = i * page_sz;
             let page_data = &data[src_start..src_start + page_sz];
+            // Fresh random-nonce GCM frame per page (nonce stored inline).
             #[cfg(feature = "encryption")]
             let page_data = if let Some(ref key) = self.encryption_key {
-                &compress::encrypt_ctr(page_data, pnum, key)?
+                &compress::encrypt_gcm_random_nonce(page_data, key)?
             } else {
                 page_data
             };
             #[cfg(not(feature = "encryption"))]
             let page_data = page_data;
-            let offset = pnum * page_sz as u64;
+            let offset = pnum * stride as u64;
             self.cache_file.write_all_at(page_data, offset)?;
         }
 
@@ -1266,7 +1325,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_ctr(&compressed, pnum, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, key)?
             } else {
                 compressed
             };
@@ -1642,10 +1701,12 @@ impl DiskCache {
         #[cfg(target_os = "linux")]
         if !self.cache_compression {
             use std::os::unix::io::AsRawFd;
-            let ps = self.page_size.load(Ordering::Acquire) as u64;
+            // Hole-punch the whole slot, which includes the inline nonce/tag
+            // when encryption widens the stride.
+            let stride = self.slot_stride();
             for &pnum in page_nums {
-                let offset = (pnum * ps) as libc::off_t;
-                let len = ps as libc::off_t;
+                let offset = (pnum * stride) as libc::off_t;
+                let len = stride as libc::off_t;
                 unsafe {
                     libc::fallocate(
                         self.cache_file.as_raw_fd(),
@@ -1661,7 +1722,16 @@ impl DiskCache {
     /// Truncate the local page image to a logical page count and clear cache
     /// metadata for pages at or beyond the new end.
     pub(crate) fn truncate_to_page_count(&self, page_count: u64, page_size: u32) -> io::Result<()> {
-        let new_len = page_count * page_size as u64;
+        // Size in slot-stride units (widened when encryption is on).
+        #[cfg(feature = "encryption")]
+        let slot = if self.encryption_key.is_some() {
+            page_size as u64 + compress::GCM_RANDOM_NONCE_OVERHEAD as u64
+        } else {
+            page_size as u64
+        };
+        #[cfg(not(feature = "encryption"))]
+        let slot = page_size as u64;
+        let new_len = page_count * slot;
         {
             let _guard = self.cache_file_extend.lock();
             self.cache_file.set_len(new_len)?;

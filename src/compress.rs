@@ -140,39 +140,18 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     Ok(data.to_vec())
 }
 
-// ===== AES-GCM Encryption (for main DB pages — adds 16-byte auth tag) =====
-
-#[cfg(feature = "encryption")]
-pub fn encrypt_gcm(data: &[u8], page_num: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
-    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
-
-    let cipher = Aes256Gcm::new(key.into());
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[0..8].copy_from_slice(&page_num.to_le_bytes());
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    cipher
-        .encrypt(nonce, data)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))
-}
-
-#[cfg(feature = "encryption")]
-pub fn decrypt_gcm(data: &[u8], page_num: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
-    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
-
-    let cipher = Aes256Gcm::new(key.into());
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[0..8].copy_from_slice(&page_num.to_le_bytes());
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    cipher
-        .decrypt(nonce, data)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
-}
-
-// ===== AES-GCM Encryption with random nonce (for S3 — nonce-reuse safe) =====
+// ===== AES-GCM Encryption with random nonce (nonce-reuse safe) =====
 // Output: [12-byte random nonce][ciphertext + 16-byte GCM tag]
-// Total overhead: 28 bytes per frame (negligible on ~256KB frames)
+// Total overhead: GCM_RANDOM_NONCE_OVERHEAD (28) bytes per frame.
+//
+// A deterministic page-number-derived GCM nonce was removed: rewriting a page
+// reused the nonce, which under GCM both XORs the two plaintexts and (worse)
+// leaks the GHASH authentication subkey, enabling tag forgery. Every rewritable
+// path must use a fresh random nonce stored inline.
+
+/// Byte overhead of the random-nonce GCM frame: 12-byte nonce + 16-byte tag.
+#[cfg(feature = "encryption")]
+pub const GCM_RANDOM_NONCE_OVERHEAD: usize = 12 + 16;
 
 #[cfg(feature = "encryption")]
 pub fn encrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
@@ -214,16 +193,23 @@ pub fn decrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
 }
 
-// ===== AES-CTR Encryption (for WAL passthrough — no size overhead) =====
+// ===== AES-CTR Encryption (no size overhead) =====
+//
+// CONTRACT: `nonce` MUST be unique per (key, plaintext-write). CTR reuses the
+// keystream whenever the same nonce is reused under the same key, so two writes
+// with the same nonce leak `P1 ^ P2`. Callers that rewrite the same logical
+// slot MUST pass a fresh random nonce each time (e.g. SubChunkTracker::persist
+// generates a random 64-bit nonce and stores it inline). Do NOT pass a purely
+// positional value (page number / file offset) for any rewritable target.
 
 #[cfg(feature = "encryption")]
-pub fn encrypt_ctr(data: &[u8], offset: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
+pub fn encrypt_ctr(data: &[u8], nonce: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
     use aes::Aes256;
     use ctr::cipher::{KeyIvInit, StreamCipher};
     type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
     let mut iv = [0u8; 16];
-    iv[0..8].copy_from_slice(&offset.to_le_bytes());
+    iv[0..8].copy_from_slice(&nonce.to_le_bytes());
 
     let mut cipher = Aes256Ctr::new(key.into(), &iv.into());
     let mut result = data.to_vec();
@@ -232,7 +218,28 @@ pub fn encrypt_ctr(data: &[u8], offset: u64, key: &[u8; 32]) -> io::Result<Vec<u
 }
 
 #[cfg(feature = "encryption")]
-pub fn decrypt_ctr(data: &[u8], offset: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
+pub fn decrypt_ctr(data: &[u8], nonce: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
     // CTR mode: encryption and decryption are the same operation
-    encrypt_ctr(data, offset, key)
+    encrypt_ctr(data, nonce, key)
+}
+
+/// CTR with an explicit keystream byte offset (`skip`). Used by the encrypted
+/// passthrough sidecar: a frame is encrypted under `nonce` starting at the
+/// write's first byte; a later read of a sub-range seeks the keystream by the
+/// in-extent byte offset so partial reads decrypt correctly. Encryption and
+/// decryption are the same operation.
+#[cfg(feature = "encryption")]
+pub fn ctr_xor_at(data: &[u8], nonce: u64, skip: u64, key: &[u8; 32]) -> io::Result<Vec<u8>> {
+    use aes::Aes256;
+    use ctr::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+    type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+
+    let mut iv = [0u8; 16];
+    iv[0..8].copy_from_slice(&nonce.to_le_bytes());
+
+    let mut cipher = Aes256Ctr::new(key.into(), &iv.into());
+    cipher.seek(skip);
+    let mut result = data.to_vec();
+    cipher.apply_keystream(&mut result);
+    Ok(result)
 }

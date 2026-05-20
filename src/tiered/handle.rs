@@ -115,6 +115,13 @@ pub struct TurboliteHandle {
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
+    /// Per-write random-nonce sidecar for encrypted passthrough (WAL/journal).
+    /// `Some` only when the handle is passthrough AND an encryption key is set.
+    /// Eliminates AES-CTR keystream reuse on in-place WAL frame rewrites: each
+    /// write picks a fresh random nonce stored in a sidecar file keyed by the
+    /// write's start offset, and reads recover the nonce for their range.
+    #[cfg(feature = "encryption")]
+    passthrough_nonces: Option<RwLock<PassthroughNonceMap>>,
 
     // --- Shared ---
     lock: RwLock<LockKind>,
@@ -166,6 +173,105 @@ const PENDING_BYTE: u64 = 0x40000000;
 const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
+
+/// Per-write random-nonce sidecar for encrypted passthrough (WAL/journal).
+///
+/// AES-CTR is size-preserving, which the WAL/journal layout requires (SQLite
+/// owns the offsets and expects on-disk bytes to map 1:1 to logical offsets).
+/// A purely positional IV (`iv = offset`) reuses the keystream every time the
+/// same WAL slot is rewritten across transactions/checkpoints — a two-time pad.
+///
+/// Fix: each write picks a fresh random 64-bit nonce and records `(start, len,
+/// nonce)` in this map (persisted to a `.tlnonce` sidecar). Reads find the
+/// write extent covering their range, seek the CTR keystream by the in-extent
+/// byte offset, and decrypt. The data file stays byte-for-byte the same size.
+#[cfg(feature = "encryption")]
+pub(crate) struct PassthroughNonceMap {
+    /// Sidecar file path (`<wal_path>.tlnonce`).
+    path: PathBuf,
+    /// start_offset -> (len, nonce). Sorted for range lookup.
+    entries: std::collections::BTreeMap<u64, (u64, u64)>,
+}
+
+#[cfg(feature = "encryption")]
+impl PassthroughNonceMap {
+    /// Sidecar path for a passthrough file.
+    fn sidecar_path(wal_path: &std::path::Path) -> PathBuf {
+        let mut s = wal_path.as_os_str().to_owned();
+        s.push(".tlnonce");
+        PathBuf::from(s)
+    }
+
+    /// Load the sidecar if present; otherwise start empty.
+    fn load(wal_path: &std::path::Path) -> Self {
+        let path = Self::sidecar_path(wal_path);
+        let mut entries = std::collections::BTreeMap::new();
+        if let Ok(bytes) = std::fs::read(&path) {
+            // Layout: repeated [start u64 LE][len u64 LE][nonce u64 LE].
+            let mut i = 0usize;
+            while i + 24 <= bytes.len() {
+                let start = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+                let len = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
+                let nonce = u64::from_le_bytes(bytes[i + 16..i + 24].try_into().unwrap());
+                entries.insert(start, (len, nonce));
+                i += 24;
+            }
+        }
+        Self { path, entries }
+    }
+
+    /// Persist the map atomically (tmp + rename).
+    fn persist(&self) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(self.entries.len() * 24);
+        for (start, (len, nonce)) in &self.entries {
+            buf.extend_from_slice(&start.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&nonce.to_le_bytes());
+        }
+        let tmp = self.path.with_extension("tlnonce.tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Record a fresh random nonce for a write at `[start, start+len)`.
+    /// Drops any prior entries fully contained in the new extent so stale
+    /// sub-writes can't shadow this one. Returns the chosen nonce.
+    fn record_write(&mut self, start: u64, len: u64) -> u64 {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut b);
+        let nonce = u64::from_le_bytes(b);
+        let end = start + len;
+        // Remove entries fully covered by the new write.
+        let covered: Vec<u64> = self
+            .entries
+            .range(start..end)
+            .filter(|(&s, &(l, _))| s >= start && s + l <= end)
+            .map(|(&s, _)| s)
+            .collect();
+        for s in covered {
+            self.entries.remove(&s);
+        }
+        self.entries.insert(start, (len, nonce));
+        nonce
+    }
+
+    /// Find the nonce + extent start covering `[offset, offset+len)`.
+    /// Returns `(extent_start, nonce)` for the newest write whose extent
+    /// fully contains the requested range.
+    fn lookup(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
+        let read_end = offset + len;
+        // The covering extent has start <= offset; scan candidates with
+        // start <= offset, prefer the one with the largest start (most recent
+        // write to that region) that still contains the whole read.
+        self.entries
+            .range(..=offset)
+            .rev()
+            .find(|(&s, &(l, _))| s <= offset && s + l >= read_end)
+            .map(|(&s, &(_, nonce))| (s, nonce))
+    }
+}
 
 impl TurboliteHandle {
     /// Create a tiered handle backed by a pluggable `StorageBackend` +
@@ -404,6 +510,8 @@ impl TurboliteHandle {
             staging_seq,
             staging_dir,
             passthrough_file: None,
+            #[cfg(feature = "encryption")]
+            passthrough_nonces: None,
             lock: RwLock::new(LockKind::None),
             db_path,
             lock_file: None,
@@ -420,6 +528,10 @@ impl TurboliteHandle {
         db_path: PathBuf,
         encryption_key: Option<[u8; 32]>,
     ) -> Self {
+        #[cfg(feature = "encryption")]
+        let passthrough_nonces = encryption_key
+            .is_some()
+            .then(|| RwLock::new(PassthroughNonceMap::load(&db_path)));
         Self {
             storage: None,
             runtime: None,
@@ -460,6 +572,8 @@ impl TurboliteHandle {
             staging_seq: Arc::new(AtomicU64::new(0)),
             staging_dir: PathBuf::new(),
             passthrough_file: Some(RwLock::new(file)),
+            #[cfg(feature = "encryption")]
+            passthrough_nonces,
             lock: RwLock::new(LockKind::None),
             db_path,
             lock_file: None,
@@ -921,7 +1035,17 @@ impl DatabaseHandle for TurboliteHandle {
             file.read_exact_at(buf, offset)?;
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                let decrypted = compress::decrypt_ctr(buf, offset, key)?;
+                // Recover the per-write random nonce covering this range from
+                // the sidecar, then seek the CTR keystream by the in-extent
+                // offset. A read with no recorded extent (e.g. reading a hole
+                // SQLite never wrote, or a sidecar lost on crash) decrypts to
+                // garbage rather than leaking a fixed-keystream plaintext xor.
+                let nonces = self.passthrough_nonces.as_ref().unwrap().read();
+                let (skip, nonce) = match nonces.lookup(offset, buf.len() as u64) {
+                    Some((start, nonce)) => (offset - start, nonce),
+                    None => (0, offset),
+                };
+                let decrypted = compress::ctr_xor_at(buf, nonce, skip, key)?;
                 buf[..decrypted.len()].copy_from_slice(&decrypted);
             }
             return Ok(());
@@ -1722,7 +1846,17 @@ impl DatabaseHandle for TurboliteHandle {
             let file = self.passthrough_file.as_ref().unwrap().read();
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                let encrypted = compress::encrypt_ctr(buf, offset, key)?;
+                // Fresh random nonce per write, recorded in the sidecar keyed by
+                // this write's start offset. This is what makes in-place WAL
+                // frame rewrites safe (no keystream reuse). The data file stays
+                // the same size — only the sidecar carries the nonce.
+                let nonce = {
+                    let mut nonces = self.passthrough_nonces.as_ref().unwrap().write();
+                    let nonce = nonces.record_write(offset, buf.len() as u64);
+                    nonces.persist()?;
+                    nonce
+                };
+                let encrypted = compress::ctr_xor_at(buf, nonce, 0, key)?;
                 return file.write_all_at(&encrypted, offset);
             }
             return file.write_all_at(buf, offset);

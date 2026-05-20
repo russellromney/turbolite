@@ -227,7 +227,8 @@ fn test_passthrough_no_encryption_is_plaintext() {
 #[test]
 #[cfg(feature = "encryption")]
 fn test_passthrough_different_offsets_different_ciphertext() {
-    // Same data written at different offsets must produce different ciphertext (nonce = offset)
+    // Same data written at different offsets must produce different ciphertext
+    // (each write picks a fresh random nonce stored in the sidecar).
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test.wal");
     let file = FsOpenOptions::new()

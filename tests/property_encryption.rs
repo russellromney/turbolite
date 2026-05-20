@@ -7,101 +7,18 @@
 
 use proptest::prelude::*;
 use turbolite::compress::{
-    decrypt_ctr, decrypt_gcm, decrypt_gcm_random_nonce, encrypt_ctr, encrypt_gcm,
-    encrypt_gcm_random_nonce,
+    decrypt_ctr, decrypt_gcm_random_nonce, encrypt_ctr, encrypt_gcm_random_nonce,
 };
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
-    // --- AES-GCM (page-num-derived nonce) ---
+    // The deterministic page-number-nonce GCM (encrypt_gcm/decrypt_gcm) was
+    // removed: a rewrite reused the nonce, which under GCM XORs plaintexts and
+    // leaks the GHASH auth subkey (tag forgery). All rewritable paths now use a
+    // fresh random nonce stored inline (encrypt_gcm_random_nonce).
 
-    #[test]
-    fn gcm_roundtrip(
-        data in proptest::collection::vec(any::<u8>(), 0..65536),
-        page_num in 0u64..1_000_000,
-        key in proptest::collection::vec(any::<u8>(), 32..=32),
-    ) {
-        let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm(&data, page_num, &key).expect("encrypt");
-        let decrypted = decrypt_gcm(&encrypted, page_num, &key).expect("decrypt");
-        prop_assert_eq!(&data, &decrypted);
-    }
-
-    #[test]
-    fn gcm_ciphertext_differs_from_plaintext(
-        data in proptest::collection::vec(any::<u8>(), 64..65536),
-        page_num in 0u64..1_000_000,
-        key in proptest::collection::vec(any::<u8>(), 32..=32),
-    ) {
-        let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm(&data, page_num, &key).expect("encrypt");
-        // Ciphertext should differ from plaintext (except astronomically unlikely)
-        prop_assert_ne!(&data[..], &encrypted[..data.len()]);
-    }
-
-    #[test]
-    fn gcm_different_page_nums_produce_different_ciphertext(
-        data in proptest::collection::vec(any::<u8>(), 64..1024),
-        page_a in 0u64..1_000_000,
-        page_b in 0u64..1_000_000,
-        key in proptest::collection::vec(any::<u8>(), 32..=32),
-    ) {
-        prop_assume!(page_a != page_b);
-        let key: [u8; 32] = key.try_into().expect("key len");
-        let enc_a = encrypt_gcm(&data, page_a, &key).expect("encrypt a");
-        let enc_b = encrypt_gcm(&data, page_b, &key).expect("encrypt b");
-        prop_assert_ne!(enc_a, enc_b);
-    }
-
-    #[test]
-    fn gcm_wrong_page_num_fails_decrypt(
-        data in proptest::collection::vec(any::<u8>(), 64..1024),
-        page_num in 0u64..1_000_000,
-        wrong_page in 0u64..1_000_000,
-        key in proptest::collection::vec(any::<u8>(), 32..=32),
-    ) {
-        prop_assume!(page_num != wrong_page);
-        let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm(&data, page_num, &key).expect("encrypt");
-        let result = decrypt_gcm(&encrypted, wrong_page, &key);
-        prop_assert!(result.is_err(), "decryption with wrong page_num should fail");
-    }
-
-    #[test]
-    fn gcm_wrong_key_fails_decrypt(
-        data in proptest::collection::vec(any::<u8>(), 64..1024),
-        page_num in 0u64..1_000_000,
-        key_a in proptest::collection::vec(any::<u8>(), 32..=32),
-        key_b in proptest::collection::vec(any::<u8>(), 32..=32),
-    ) {
-        prop_assume!(key_a != key_b);
-        let key_a: [u8; 32] = key_a.try_into().expect("key len");
-        let key_b: [u8; 32] = key_b.try_into().expect("key len");
-        let encrypted = encrypt_gcm(&data, page_num, &key_a).expect("encrypt");
-        let result = decrypt_gcm(&encrypted, page_num, &key_b);
-        prop_assert!(result.is_err(), "decryption with wrong key should fail");
-    }
-
-    #[test]
-    fn gcm_tampered_ciphertext_fails(
-        data in proptest::collection::vec(any::<u8>(), 64..1024),
-        page_num in 0u64..1_000_000,
-        key in proptest::collection::vec(any::<u8>(), 32..=32),
-        tamper_pos in 0..1040usize,
-        tamper_byte in any::<u8>(),
-    ) {
-        let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm(&data, page_num, &key).expect("encrypt");
-        if tamper_pos < encrypted.len() {
-            let mut tampered = encrypted.clone();
-            tampered[tamper_pos] ^= tamper_byte | 1; // ensure at least 1 bit flips
-            let result = decrypt_gcm(&tampered, page_num, &key);
-            prop_assert!(result.is_err(), "tampered ciphertext should fail GCM auth");
-        }
-    }
-
-    // --- AES-GCM with random nonce (S3 mode) ---
+    // --- AES-GCM with random nonce ---
 
     #[test]
     fn gcm_random_nonce_roundtrip(
@@ -198,16 +115,21 @@ proptest! {
         prop_assert_eq!(enc, dec, "encrypt and decrypt should be identical in CTR mode");
     }
 
+    // --- Page rewrite must NOT reuse a nonce/keystream (F1/F2 regression) ---
+
     #[test]
-    fn gcm_deterministic_for_same_page(
-        data in proptest::collection::vec(any::<u8>(), 64..1024),
-        page_num in 0u64..1_000_000,
+    fn gcm_page_rewrite_differs_and_both_decrypt(
+        data in proptest::collection::vec(any::<u8>(), 64..4096),
         key in proptest::collection::vec(any::<u8>(), 32..=32),
     ) {
-        // Page-num-derived nonce is deterministic: same inputs = same output
+        // Encrypting the SAME page twice (a rewrite of the same logical slot)
+        // must produce DIFFERENT ciphertext (fresh random nonce), and BOTH
+        // ciphertexts must decrypt back to the original plaintext.
         let key: [u8; 32] = key.try_into().expect("key len");
-        let enc_a = encrypt_gcm(&data, page_num, &key).expect("encrypt a");
-        let enc_b = encrypt_gcm(&data, page_num, &key).expect("encrypt b");
-        prop_assert_eq!(enc_a, enc_b);
+        let enc1 = encrypt_gcm_random_nonce(&data, &key).expect("encrypt 1");
+        let enc2 = encrypt_gcm_random_nonce(&data, &key).expect("encrypt 2");
+        prop_assert_ne!(&enc1, &enc2, "page rewrite must not reuse nonce/keystream");
+        prop_assert_eq!(decrypt_gcm_random_nonce(&enc1, &key).expect("dec 1"), data.clone());
+        prop_assert_eq!(decrypt_gcm_random_nonce(&enc2, &key).expect("dec 2"), data);
     }
 }

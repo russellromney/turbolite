@@ -18,6 +18,42 @@ verified — not bundled in unverified.
 
 ## Fixed in this PR
 
+### F1 — [Catastrophic] AES-CTR keystream reuse on every page rewrite — **Fixed**
+- `src/compress.rs` `encrypt_ctr` used a purely positional IV (`iv = offset`).
+  Used by the disk cache and WAL passthrough. Rewriting a page reused the
+  identical keystream, so `C1 ⊕ C2 = P1 ⊕ P2` leaked plaintext relationships
+  (two-time pad); persisted across restarts.
+- **Fix (format-breaking):** the rewritable encrypted paths now use a fresh
+  random nonce per write, stored inline.
+  - Uncompressed disk-cache pages route through
+    `encrypt_gcm_random_nonce`/`decrypt_gcm_random_nonce`; each page slot is
+    widened to `page_size + GCM_RANDOM_NONCE_OVERHEAD` (28 bytes: 12-byte nonce
+    + 16-byte tag). All read/write/no-visibility/bulk/scattered/hole-punch/
+    truncate/`set_len`/file-presize offset math in `disk_cache.rs` now uses the
+    widened slot stride (`slot_stride`/`slot_offset`).
+  - Compressed disk-cache pages already track a variable per-page length in the
+    cache index, so they switched from CTR to `encrypt_gcm_random_nonce`.
+  - WAL/journal passthrough (`handle.rs`) keeps size-preserving CTR (SQLite owns
+    the offsets) but draws a fresh random nonce per write, stored in a
+    `.tlnonce` sidecar keyed by write start offset; reads recover the nonce for
+    their range and seek the keystream (`compress::ctr_xor_at`). The
+    `SubChunkTracker::persist` CTR path already used a random nonce and is
+    unchanged.
+- `encrypt_ctr` now documents the unique-nonce contract; a rewrite of the same
+  page produces different ciphertext that still decrypts (regression test
+  `gcm_page_rewrite_differs_and_both_decrypt`).
+
+### F2 — [Catastrophic] `encrypt_gcm`/`decrypt_gcm` use a deterministic page-number nonce — **Fixed**
+- `src/compress.rs` derived `nonce = page_num`; GCM nonce reuse on rewrite leaks
+  the GHASH auth subkey (tag forgery) and XORs plaintexts. A test asserted the
+  broken determinism.
+- **Fix:** deleted both functions; all callers use `encrypt_gcm_random_nonce`.
+  Removed the determinism test. Encryption + lib suites green
+  (`cargo test --features encryption --lib`: 607 passed; `property_encryption`:
+  8 passed). Live-S3 `tests/tiered/encryption.rs` is gated and not run here, but
+  exercises only the compressed/encoded paths, which transparently handle the
+  larger random-nonce frames.
+
 ### F16 — [High] Unbounded recursion in `collect_leaf_pages` (stack-overflow DoS) — **Fixed**
 - `src/btree_walker.rs:379-411`
 - `collect_leaf_pages` (sqlite_master parsing) recursed into interior-page
@@ -40,27 +76,6 @@ verified — not bundled in unverified.
 ---
 
 ## Documented (verified real; fix specified)
-
-### F1 — [Catastrophic] AES-CTR keystream reuse on every page rewrite — **Documented (top priority)**
-- `src/compress.rs:220-232` `encrypt_ctr` sets `iv[0..8] = offset` and zero
-  elsewhere — a deterministic, purely positional IV. Used by the disk cache and
-  WAL passthrough. Rewriting a page reuses the identical keystream, so
-  `C1 ⊕ C2 = P1 ⊕ P2` leaks plaintext relationships (two-time pad); persists
-  across restarts.
-- **Fix (format-breaking, chosen):** generate a fresh random nonce per write,
-  stored inline with the ciphertext, and decrypt with the stored nonce. Prefer
-  routing these paths through the existing `encrypt_gcm_random_nonce` /
-  `decrypt_gcm_random_nonce` (used correctly by `src/local/file_format.rs`),
-  widening the encrypted cache-slot stride and updating all read/write/bulk/
-  scattered/hole-punch/truncate/`set_len` offset math in `disk_cache.rs`. Update
-  the encryption test suite to the new format.
-
-### F2 — [Catastrophic] `encrypt_gcm`/`decrypt_gcm` use a deterministic page-number nonce — **Documented (top priority)**
-- `src/compress.rs:146-171` derive `nonce = page_num`; GCM nonce reuse on
-  rewrite leaks the GHASH auth subkey (tag forgery) and XORs plaintexts. These
-  are `pub` and a test asserts the (broken) determinism.
-- **Fix:** delete them or require a caller-supplied unique nonce; route callers
-  through `encrypt_gcm_random_nonce`. Remove the determinism test.
 
 ### F3 — [Med] Tiered GCM frames carry no AAD → swappable/replayable across slots — **Documented**
 - `src/tiered/encoding.rs:84-89,149-161,379-385`

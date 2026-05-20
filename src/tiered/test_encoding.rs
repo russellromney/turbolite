@@ -904,10 +904,13 @@ fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
     let page_data = vec![0xABu8; 64];
     cache.write_page(3, &page_data).unwrap();
 
-    // Read raw bytes from cache file — should NOT be plaintext
+    // Read raw bytes from cache file — should NOT be plaintext. Encrypted slots
+    // are widened to hold the inline random-nonce GCM frame (12-byte nonce +
+    // page + 16-byte tag), so page 3 lives at 3 * (64 + 28).
+    let stride = 64 + 28u64;
     let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
     let mut raw = vec![0u8; 64];
-    file.read_exact_at(&mut raw, 3 * 64).unwrap();
+    file.read_exact_at(&mut raw, 3 * stride + 12).unwrap(); // skip the 12-byte nonce
     assert_ne!(
         &raw[..],
         &page_data[..],
@@ -917,7 +920,7 @@ fn test_encrypted_cache_data_on_disk_is_not_plaintext() {
 
 #[test]
 #[cfg(feature = "encryption")]
-fn test_encrypted_cache_wrong_key_returns_garbage() {
+fn test_encrypted_cache_wrong_key_fails() {
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, Some(key), Vec::new()).unwrap();
@@ -926,7 +929,8 @@ fn test_encrypted_cache_wrong_key_returns_garbage() {
     cache.write_page(5, &page_data).unwrap();
     drop(cache);
 
-    // Reopen with wrong key — CTR decrypts to garbage (no auth tag to reject)
+    // Reopen with wrong key — random-nonce GCM authenticates, so a wrong key
+    // is REJECTED (auth failure) rather than silently returning garbage.
     let bad_cache = DiskCache::new(
         dir.path(),
         3600,
@@ -939,10 +943,10 @@ fn test_encrypted_cache_wrong_key_returns_garbage() {
     )
     .unwrap();
     let mut buf = vec![0u8; 64];
-    bad_cache.read_page(5, &mut buf).unwrap();
-    assert_ne!(
-        buf, page_data,
-        "wrong key must not produce correct plaintext"
+    let result = bad_cache.read_page(5, &mut buf);
+    assert!(
+        result.is_err(),
+        "wrong key must fail GCM authentication, not return data"
     );
 }
 
@@ -982,11 +986,12 @@ fn test_encrypted_cache_different_pages_different_ciphertext() {
     cache.write_page(1, &page_data).unwrap();
 
     let file = std::fs::File::open(dir.path().join("data.cache")).unwrap();
-    let page_sz = 64usize;
-    let mut raw0 = vec![0u8; page_sz];
-    let mut raw1 = vec![0u8; page_sz];
+    // Encrypted slots are widened to page_size + 28 (nonce + tag).
+    let stride = 64 + 28u64;
+    let mut raw0 = vec![0u8; stride as usize];
+    let mut raw1 = vec![0u8; stride as usize];
     file.read_exact_at(&mut raw0, 0).unwrap();
-    file.read_exact_at(&mut raw1, page_sz as u64).unwrap();
+    file.read_exact_at(&mut raw1, stride).unwrap();
     assert_ne!(
         raw0, raw1,
         "same plaintext at different pages must produce different ciphertext"
@@ -995,14 +1000,16 @@ fn test_encrypted_cache_different_pages_different_ciphertext() {
 
 #[test]
 #[cfg(feature = "encryption")]
-fn test_encrypted_cache_file_size_matches_page_size() {
-    // Cache file size = page_count * page_size (no overhead from encryption)
+fn test_encrypted_cache_file_size_matches_widened_stride() {
+    // Encrypted slots are widened to page_size + GCM_RANDOM_NONCE_OVERHEAD so
+    // each page holds its inline random-nonce GCM frame. File is pre-sized to
+    // page_count * (page_size + 28).
     let dir = TempDir::new().unwrap();
     let key = test_key();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, Some(key), Vec::new()).unwrap();
     let _ = cache;
     let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
-    assert_eq!(meta.len(), 8 * 64); // page_count * page_size, no overhead
+    assert_eq!(meta.len(), 8 * (64 + 28)); // page_count * widened stride
 }
 
 #[test]
