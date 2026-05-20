@@ -239,6 +239,26 @@ struct TurboliteDb *turbolite_open(const char *path, const char *vfs_name);
 
 #if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
+ * Open (or create) a single-file compressed local database.
+ *
+ * Unlike `turbolite_open`, this needs no separately registered VFS — it
+ * self-registers a compressed single-file VFS for `path`. There is no
+ * manifest, page-group sidecar, staging directory, or remote storage; the
+ * database is exactly one file at rest (zstd-compressed pages). Opening the
+ * same path twice concurrently fails (single writer).
+ *
+ * # Parameters
+ * - `path`: Database file path (UTF-8).
+ *
+ * # Returns
+ * Opaque handle on success, NULL on error (see `turbolite_last_error`).
+ * Must be closed with `turbolite_close`.
+ */
+struct TurboliteDb *turbolite_open_local(const char *path);
+#endif
+
+#if !defined(TURBOLITE_LOADABLE_EXTENSION)
+/**
  * Execute a SQL statement (DDL/DML) that returns no rows.
  *
  * # Returns

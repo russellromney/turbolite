@@ -36,6 +36,7 @@ const turbolite_register_local = lib.func(
   ["str", "str", "int"]
 );
 const turbolite_open = lib.func("turbolite_open", "void*", ["str", "str"]);
+const turbolite_open_local = lib.func("turbolite_open_local", "void*", ["str"]);
 const turbolite_exec = lib.func("turbolite_exec", "int", ["void*", "str"]);
 const turbolite_query_json = lib.func("turbolite_query_json", "str", [
   "void*",
@@ -189,6 +190,33 @@ test("full round-trip: create, insert, query, verify", () => {
     assertEqual(rows[2].age, 35);
 
     turbolite_close(db);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("open_local: single-file compressed db round-trip + reopen", () => {
+  const dir = makeTmpDir();
+  try {
+    const path = join(dir, "local.db");
+    // No register step: open_local self-registers a single-file VFS.
+    const db = turbolite_open_local(path);
+    assert(db, `open_local failed: ${turbolite_last_error()}`);
+    turbolite_exec(
+      db,
+      `CREATE TABLE t (id INTEGER, v TEXT);
+       INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');`
+    );
+    turbolite_close(db);
+
+    // Reopen the same file and verify persistence.
+    const db2 = turbolite_open_local(path);
+    assert(db2, `reopen failed: ${turbolite_last_error()}`);
+    const rows = queryJSON(db2, "SELECT v FROM t ORDER BY id");
+    assertEqual(rows.length, 2);
+    assertEqual(rows[0].v, "alpha");
+    assertEqual(rows[1].v, "beta");
+    turbolite_close(db2);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
