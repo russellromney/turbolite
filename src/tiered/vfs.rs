@@ -946,6 +946,42 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// Phase 004 base publish: stamp the manifest with a populated
+    /// replay cursor and writer identity, then encode it.
+    ///
+    /// Sets `cursor.last_applied_seq`, `cursor.epoch`, and `writer_id`,
+    /// computes the chain anchor via [`super::wire::base_anchor_checksum`]
+    /// (BLAKE3 of the manifest with the anchor field cleared), writes
+    /// that anchor into `cursor.base_object_checksum`, persists locally,
+    /// installs the shared manifest, and returns `(payload, anchor)`.
+    ///
+    /// The caller publishes `payload` through the ManifestStore and uses
+    /// `anchor` as the `prev_checksum` of the first delta after this
+    /// base. A follower decoding the payload reads the same anchor from
+    /// `cursor.base_object_checksum` and verifies the first delta
+    /// chains to it. This is the writer half of the phase-004 contract;
+    /// `update_replay_cursor` is the follower half.
+    pub fn manifest_bytes_with_phase4_cursor(
+        &self,
+        last_applied_seq: u64,
+        epoch: u64,
+        writer_id: &str,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut m = self.manifest();
+        m.cursor.last_applied_seq = last_applied_seq;
+        m.cursor.epoch = epoch;
+        m.writer_id = writer_id.to_string();
+        // Anchor is hashed with the field cleared (base_anchor_checksum
+        // does the clearing); then we store it back so the follower
+        // reads it directly.
+        let anchor = super::wire::base_anchor_checksum(&m).map_err(io::Error::from)?;
+        m.cursor.base_object_checksum = anchor.to_vec();
+        manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
+        self.shared_manifest.store(Arc::new(m.clone()));
+        let payload = super::wire::encode(&m).map_err(io::Error::from)?;
+        Ok((payload, anchor.to_vec()))
+    }
+
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
     /// page/base manifest via `set_manifest()`.
     pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
