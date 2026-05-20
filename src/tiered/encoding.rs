@@ -235,6 +235,25 @@ pub(crate) fn decode_page_group_seekable_full(
     Ok((actual_pages, page_size, output))
 }
 
+/// Compute `8 + page_count * page_size` with overflow checking.
+///
+/// `page_count`/`page_size` come from an untrusted (corrupt or hostile)
+/// decompressed header. Computed naively, the product can wrap `usize` so
+/// `expected_len` becomes small, the truncation guard passes, and a huge
+/// `page_count` then reaches `Vec::with_capacity` — an OOM/abort. Checking
+/// here makes the truncation guard a real bound on `page_count`.
+fn checked_group_expected_len(page_count: u32, page_size: u32) -> io::Result<usize> {
+    (page_count as usize)
+        .checked_mul(page_size as usize)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "page group header page_count * page_size overflows usize (corrupt/malformed)",
+            )
+        })
+}
+
 /// Decode a page group: decompress single zstd frame, split into pages.
 /// Returns Vec of raw page buffers (each exactly page_size bytes).
 pub(crate) fn decode_page_group(
@@ -261,7 +280,7 @@ pub(crate) fn decode_page_group(
     let page_count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let page_size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
-    let expected_len = 8 + page_count as usize * page_size as usize;
+    let expected_len = checked_group_expected_len(page_count, page_size)?;
     if raw.len() < expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -309,7 +328,7 @@ pub(crate) fn decode_page_group_bulk(
     let page_count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let page_size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
-    let expected_len = 8 + page_count as usize * page_size as usize;
+    let expected_len = checked_group_expected_len(page_count, page_size)?;
     if raw.len() < expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -409,8 +428,27 @@ pub(crate) fn decode_interior_bundle(
     let page_count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
     let page_size = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
 
-    let pnums_end = 8 + page_count * 8;
-    let expected_len = pnums_end + page_count * page_size;
+    // Overflow-check the offset arithmetic before trusting it: an untrusted
+    // header could wrap these to small values, pass the truncation guard,
+    // and drive `Vec::with_capacity(page_count)` into an OOM/abort.
+    let pnums_end = page_count
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "interior bundle page_count overflows usize (corrupt/malformed)",
+            )
+        })?;
+    let expected_len = page_count
+        .checked_mul(page_size)
+        .and_then(|n| n.checked_add(pnums_end))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "interior bundle page_count * page_size overflows usize (corrupt/malformed)",
+            )
+        })?;
     if raw.len() < expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

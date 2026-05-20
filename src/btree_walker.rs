@@ -382,6 +382,26 @@ fn collect_leaf_pages(
     read_page: &dyn Fn(u64) -> Option<Vec<u8>>,
     leaves: &mut Vec<u64>,
 ) {
+    // Guard against a cyclic/self-referential interior page (corrupt or
+    // hostile DB image): without a visited set this recursion would loop
+    // forever and overflow the stack. Mirrors the cycle guard `walk_btree`
+    // already has.
+    let mut visited = std::collections::HashSet::new();
+    collect_leaf_pages_inner(root_page, page_size, read_page, leaves, &mut visited);
+}
+
+fn collect_leaf_pages_inner(
+    root_page: u64,
+    page_size: u32,
+    read_page: &dyn Fn(u64) -> Option<Vec<u8>>,
+    leaves: &mut Vec<u64>,
+    visited: &mut std::collections::HashSet<u64>,
+) {
+    if !visited.insert(root_page) {
+        // Already walked this page — a child pointer cycled back.
+        return;
+    }
+
     let buf = match read_page(root_page) {
         Some(b) => b,
         None => return,
@@ -398,7 +418,13 @@ fn collect_leaf_pages(
             let children = extract_interior_children(&buf, hdr_off, page_size);
             for child_1based in children {
                 if child_1based > 0 {
-                    collect_leaf_pages(child_1based as u64 - 1, page_size, read_page, leaves);
+                    collect_leaf_pages_inner(
+                        child_1based as u64 - 1,
+                        page_size,
+                        read_page,
+                        leaves,
+                        visited,
+                    );
                 }
             }
         }
