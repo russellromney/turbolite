@@ -44,6 +44,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
+use std::sync::{Mutex, OnceLock};
 
 // --- Error handling ---
 
@@ -51,10 +52,43 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-// Track closed handle addresses to prevent use-after-close and double-close
-// We add BEFORE dropping so the second call sees the address still valid
-thread_local! {
-    static CLOSED_HANDLES: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+// Track closed handle addresses to prevent use-after-close and double-close.
+//
+// This MUST be a process-global set, not thread-local: language bindings
+// (Python, Go, Node) routinely open a handle on one thread and close it on
+// another. A thread-local guard never sees a handle closed on a different
+// thread, so a second close from that thread would `Box::from_raw` an
+// already-freed pointer (double-free / use-after-free). A process-global
+// Mutex<HashSet<usize>> makes the closed-set visible across all threads.
+// Concurrent operations on the *same* handle remain the caller's
+// responsibility (a single TurboliteDb is not internally synchronized).
+fn closed_handles() -> &'static Mutex<HashSet<usize>> {
+    static CLOSED_HANDLES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    CLOSED_HANDLES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn handle_is_closed(addr: usize) -> bool {
+    closed_handles()
+        .lock()
+        .map(|h| h.contains(&addr))
+        .unwrap_or(false)
+}
+
+fn mark_handle_open(addr: usize) {
+    if let Ok(mut h) = closed_handles().lock() {
+        h.remove(&addr);
+    }
+}
+
+/// Returns true if this call transitioned the handle from open to closed
+/// (i.e. the caller now owns the free). A concurrent/duplicate close returns
+/// false.
+fn mark_handle_closed(addr: usize) -> bool {
+    match closed_handles().lock() {
+        Ok(mut h) => h.insert(addr),
+        // Poisoned lock: treat as "already closed" to avoid a double-free.
+        Err(_) => false,
+    }
 }
 
 fn set_last_error(msg: &str) {
@@ -69,14 +103,54 @@ fn clear_last_error() {
     });
 }
 
+/// Run an FFI body under `catch_unwind`, returning `fallback` if it panics.
+///
+/// A panic that unwinds across the `extern "C"` boundary is undefined
+/// behavior. Every `extern "C"` function below routes its body through this
+/// guard so a caught panic is turned into the function's documented error
+/// sentinel (`-1`, a NULL pointer, etc.) instead of unwinding into C. The
+/// closure is wrapped in `AssertUnwindSafe` because FFI bodies legitimately
+/// touch raw pointers and the thread-local error cell across the boundary;
+/// on the panic path we only return a fixed sentinel and set `last_error`,
+/// so no logically-inconsistent state escapes.
+fn ffi_guard<F, R>(fallback: R, body: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => {
+            set_last_error("internal panic caught at FFI boundary");
+            fallback
+        }
+    }
+}
+
+/// Valid zstd compression levels are 1..=22. A `c_int` from C is untrusted;
+/// an out-of-range value forwarded into the compression config can panic or
+/// produce undefined zstd behavior, so reject it at the boundary.
+fn validate_compression_level(level: c_int) -> Result<c_int, c_int> {
+    if (1..=22).contains(&level) {
+        Ok(level)
+    } else {
+        set_last_error(&format!(
+            "compression_level {} out of range (expected 1..=22)",
+            level
+        ));
+        Err(-1)
+    }
+}
+
 /// Get the last error message, or NULL if no error occurred.
 ///
 /// The returned pointer is valid until the next turbolite_* call on this thread.
 #[no_mangle]
 pub extern "C" fn turbolite_last_error() -> *const c_char {
-    LAST_ERROR.with(|e| match &*e.borrow() {
-        Some(s) => s.as_ptr(),
-        None => std::ptr::null(),
+    ffi_guard(std::ptr::null(), || {
+        LAST_ERROR.with(|e| match &*e.borrow() {
+            Some(s) => s.as_ptr(),
+            None => std::ptr::null(),
+        })
     })
 }
 
@@ -85,9 +159,11 @@ pub extern "C" fn turbolite_last_error() -> *const c_char {
 /// Get the turbolite version string. Always returns a valid pointer.
 #[no_mangle]
 pub extern "C" fn turbolite_version() -> *const c_char {
-    // Null-terminated static byte string — no allocation, lives forever.
-    static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
-    VERSION.as_ptr() as *const c_char
+    ffi_guard(std::ptr::null(), || {
+        // Null-terminated static byte string — no allocation, lives forever.
+        static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+        VERSION.as_ptr() as *const c_char
+    })
 }
 
 // --- VFS registration ---
@@ -118,34 +194,40 @@ pub extern "C" fn turbolite_register_local_file_first(
     database_path: *const c_char,
     compression_level: c_int,
 ) -> c_int {
-    clear_last_error();
-    let name = match cstr_to_str(name, "name") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let database_path = match cstr_to_str(database_path, "database_path") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    ffi_guard(-1, || {
+        clear_last_error();
+        let name = match unsafe { cstr_to_str(&name, "name") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let database_path = match unsafe { cstr_to_str(&database_path, "database_path") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let compression_level = match validate_compression_level(compression_level) {
+            Ok(l) => l,
+            Err(code) => return code,
+        };
 
-    let mut config = turbolite::tiered::TurboliteConfig::for_database_path(database_path);
-    config.compression.level = compression_level;
-    config.compression_level = compression_level;
+        let mut config = turbolite::tiered::TurboliteConfig::for_database_path(database_path);
+        config.compression.level = compression_level;
+        config.compression_level = compression_level;
 
-    let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(&format!("local vfs creation failed: {}", e));
-            return -1;
+        let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(&format!("local vfs creation failed: {}", e));
+                return -1;
+            }
+        };
+        match turbolite::tiered::register(name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&format!("register failed: {}", e));
+                -1
+            }
         }
-    };
-    match turbolite::tiered::register(name, vfs) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_last_error(&format!("register failed: {}", e));
-            -1
-        }
-    }
+    })
 }
 
 /// Register a local TurboliteVfs (lower-level: caller picks cache_dir).
@@ -170,39 +252,45 @@ pub extern "C" fn turbolite_register_local(
     cache_dir: *const c_char,
     compression_level: c_int,
 ) -> c_int {
-    clear_last_error();
-    let name = match cstr_to_str(name, "name") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let cache_dir = match cstr_to_str(cache_dir, "cache_dir") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    ffi_guard(-1, || {
+        clear_last_error();
+        let name = match unsafe { cstr_to_str(&name, "name") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let cache_dir = match unsafe { cstr_to_str(&cache_dir, "cache_dir") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let compression_level = match validate_compression_level(compression_level) {
+            Ok(l) => l,
+            Err(code) => return code,
+        };
 
-    let config = turbolite::tiered::TurboliteConfig {
-        cache_dir: std::path::PathBuf::from(cache_dir),
-        compression: turbolite::tiered::CompressionConfig {
-            level: compression_level,
+        let config = turbolite::tiered::TurboliteConfig {
+            cache_dir: std::path::PathBuf::from(cache_dir),
+            compression: turbolite::tiered::CompressionConfig {
+                level: compression_level,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
+        };
 
-    let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(&format!("local vfs creation failed: {}", e));
-            return -1;
+        let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(&format!("local vfs creation failed: {}", e));
+                return -1;
+            }
+        };
+        match turbolite::tiered::register(name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&format!("register failed: {}", e));
+                -1
+            }
         }
-    };
-    match turbolite::tiered::register(name, vfs) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_last_error(&format!("register failed: {}", e));
-            -1
-        }
-    }
+    })
 }
 
 /// Compute the hidden sidecar directory path for a database file.
@@ -219,22 +307,24 @@ pub extern "C" fn turbolite_register_local(
 pub extern "C" fn turbolite_state_dir_for_database_path(
     database_path: *const c_char,
 ) -> *mut c_char {
-    clear_last_error();
-    let database_path = match cstr_to_str(database_path, "database_path") {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
-        database_path,
-        "-turbolite",
-    );
-    match CString::new(dir.to_string_lossy().into_owned()) {
-        Ok(cs) => cs.into_raw(),
-        Err(e) => {
-            set_last_error(&format!("path contains null byte: {}", e));
-            std::ptr::null_mut()
+    ffi_guard(std::ptr::null_mut(), || {
+        clear_last_error();
+        let database_path = match unsafe { cstr_to_str(&database_path, "database_path") } {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+            database_path,
+            "-turbolite",
+        );
+        match CString::new(dir.to_string_lossy().into_owned()) {
+            Ok(cs) => cs.into_raw(),
+            Err(e) => {
+                set_last_error(&format!("path contains null byte: {}", e));
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Register a TurboliteVfs from a JSON configuration string.
@@ -279,63 +369,66 @@ pub extern "C" fn turbolite_state_dir_for_database_path(
 /// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
 #[no_mangle]
 pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_char) -> c_int {
-    clear_last_error();
-    let name = match cstr_to_str(name, "name") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let config_json = match cstr_to_str(config_json, "config_json") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    ffi_guard(-1, || {
+        clear_last_error();
+        let name = match unsafe { cstr_to_str(&name, "name") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let config_json = match unsafe { cstr_to_str(&config_json, "config_json") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
 
-    // Parse to a Value first so we can detect whether `cache_dir` was
-    // explicitly supplied; if `local_data_path` is set without an explicit
-    // `cache_dir`, derive the file-first sidecar path from local_data_path.
-    let raw: serde_json::Value = match serde_json::from_str(config_json) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(&format!("invalid config JSON: {}", e));
-            return -1;
-        }
-    };
-    let cache_dir_present = raw.get("cache_dir").map(|v| !v.is_null()).unwrap_or(false);
-    let local_data_path_present = raw
-        .get("local_data_path")
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+        // Parse to a Value first so we can detect whether `cache_dir` was
+        // explicitly supplied; if `local_data_path` is set without an explicit
+        // `cache_dir`, derive the file-first sidecar path from local_data_path.
+        let raw: serde_json::Value = match serde_json::from_str(config_json) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(&format!("invalid config JSON: {}", e));
+                return -1;
+            }
+        };
+        let cache_dir_present = raw.get("cache_dir").map(|v| !v.is_null()).unwrap_or(false);
+        let local_data_path_present = raw
+            .get("local_data_path")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
 
-    let mut config: turbolite::tiered::TurboliteConfig = match serde_json::from_value(raw) {
-        Ok(c) => c,
-        Err(e) => {
-            set_last_error(&format!("invalid config JSON: {}", e));
-            return -1;
-        }
-    };
+        let mut config: turbolite::tiered::TurboliteConfig = match serde_json::from_value(raw) {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(&format!("invalid config JSON: {}", e));
+                return -1;
+            }
+        };
 
-    if local_data_path_present && !cache_dir_present {
-        if let Some(db_path) = config.local_data_path.clone() {
-            config.cache_dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
-                &db_path,
-                "-turbolite",
-            );
+        if local_data_path_present && !cache_dir_present {
+            if let Some(db_path) = config.local_data_path.clone() {
+                config.cache_dir =
+                    turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+                        &db_path,
+                        "-turbolite",
+                    );
+            }
         }
-    }
 
-    let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(&format!("vfs creation failed: {}", e));
-            return -1;
+        let vfs = match turbolite::tiered::TurboliteVfs::new_local(config) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(&format!("vfs creation failed: {}", e));
+                return -1;
+            }
+        };
+        match turbolite::tiered::register(name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&format!("register failed: {}", e));
+                -1
+            }
         }
-    };
-    match turbolite::tiered::register(name, vfs) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_last_error(&format!("register failed: {}", e));
-            -1
-        }
-    }
+    })
 }
 
 /// Register an S3-backed cloud VFS.
@@ -363,69 +456,71 @@ pub extern "C" fn turbolite_register_cloud(
     endpoint_url: *const c_char,
     region: *const c_char,
 ) -> c_int {
-    clear_last_error();
-    let name = match cstr_to_str(name, "name") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let bucket = match cstr_to_str(bucket, "bucket") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let prefix = match cstr_to_str(prefix, "prefix") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let cache_dir = match cstr_to_str(cache_dir, "cache_dir") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let endpoint_url = nullable_cstr_to_option(endpoint_url);
-    let region = nullable_cstr_to_option(region);
+    ffi_guard(-1, || {
+        clear_last_error();
+        let name = match unsafe { cstr_to_str(&name, "name") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let bucket = match unsafe { cstr_to_str(&bucket, "bucket") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let prefix = match unsafe { cstr_to_str(&prefix, "prefix") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let cache_dir = match unsafe { cstr_to_str(&cache_dir, "cache_dir") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let endpoint_url = unsafe { nullable_cstr_to_option(&endpoint_url) };
+        let region = unsafe { nullable_cstr_to_option(&region) };
 
-    let config = turbolite::tiered::TurboliteConfig {
-        cache_dir: std::path::PathBuf::from(cache_dir),
-        ..Default::default()
-    };
+        let config = turbolite::tiered::TurboliteConfig {
+            cache_dir: std::path::PathBuf::from(cache_dir),
+            ..Default::default()
+        };
 
-    // Wire hadb-storage-s3 via env vars + an owned tokio runtime (the
-    // FFI boundary can't inherit one from the caller).
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            set_last_error(&format!("tokio runtime: {}", e));
-            return -1;
-        }
-    };
-    let handle = runtime.handle().clone();
-    let _ = (prefix, region); // reserved for Phase Turbogenesis CLI wiring
-    let backend = match handle.block_on(async {
-        hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint_url).await
-    }) {
-        Ok(b) => std::sync::Arc::new(b) as std::sync::Arc<dyn hadb_storage::StorageBackend>,
-        Err(e) => {
-            set_last_error(&format!("S3Storage::from_env: {}", e));
-            return -1;
-        }
-    };
+        // Wire hadb-storage-s3 via env vars + an owned tokio runtime (the
+        // FFI boundary can't inherit one from the caller).
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                set_last_error(&format!("tokio runtime: {}", e));
+                return -1;
+            }
+        };
+        let handle = runtime.handle().clone();
+        let _ = (prefix, region); // reserved for Phase Turbogenesis CLI wiring
+        let backend = match handle.block_on(async {
+            hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint_url).await
+        }) {
+            Ok(b) => std::sync::Arc::new(b) as std::sync::Arc<dyn hadb_storage::StorageBackend>,
+            Err(e) => {
+                set_last_error(&format!("S3Storage::from_env: {}", e));
+                return -1;
+            }
+        };
 
-    let vfs = match turbolite::tiered::TurboliteVfs::with_backend(config, backend, handle) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(&format!("cloud vfs creation failed: {}", e));
-            return -1;
+        let vfs = match turbolite::tiered::TurboliteVfs::with_backend(config, backend, handle) {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(&format!("cloud vfs creation failed: {}", e));
+                return -1;
+            }
+        };
+        // Leak the runtime for the process lifetime; the VFS captures a handle
+        // into it. The FFI boundary owns no cleanup hook.
+        std::mem::forget(runtime);
+        match turbolite::tiered::register(name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&format!("cloud register failed: {}", e));
+                -1
+            }
         }
-    };
-    // Leak the runtime for the process lifetime; the VFS captures a handle
-    // into it. The FFI boundary owns no cleanup hook.
-    std::mem::forget(runtime);
-    match turbolite::tiered::register(name, vfs) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_last_error(&format!("cloud register failed: {}", e));
-            -1
-        }
-    }
+    })
 }
 
 /// Backward-compatible alias for `turbolite_register_cloud`.
@@ -449,7 +544,9 @@ pub extern "C" fn turbolite_register_tiered(
 /// Call this when running fresh benchmarks or tests to ensure no stale state.
 #[no_mangle]
 pub extern "C" fn turbolite_clear_caches() {
-    turbolite::clear_all_caches();
+    ffi_guard((), || {
+        turbolite::clear_all_caches();
+    });
 }
 
 /// Invalidate cached state for a specific database file.
@@ -460,13 +557,15 @@ pub extern "C" fn turbolite_clear_caches() {
 /// 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn turbolite_invalidate_cache(path: *const c_char) -> c_int {
-    clear_last_error();
-    let path = match cstr_to_str(path, "path") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    turbolite::invalidate_cache(path);
-    0
+    ffi_guard(-1, || {
+        clear_last_error();
+        let path = match unsafe { cstr_to_str(&path, "path") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        turbolite::invalidate_cache(path);
+        0
+    })
 }
 
 // --- Database operations ---
@@ -489,36 +588,35 @@ pub struct TurboliteDb {
 /// Opaque handle on success, NULL on error. Must be closed with `turbolite_close`.
 #[no_mangle]
 pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -> *mut TurboliteDb {
-    clear_last_error();
-    let path = match cstr_to_str(path, "path") {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    let vfs_name = match cstr_to_str(vfs_name, "vfs_name") {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
+    ffi_guard(std::ptr::null_mut(), || {
+        clear_last_error();
+        let path = match unsafe { cstr_to_str(&path, "path") } {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        let vfs_name = match unsafe { cstr_to_str(&vfs_name, "vfs_name") } {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-    let flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
 
-    match rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs_name) {
-        Ok(conn) => {
-            // turbolite manages its own manifest-aware page cache. Disable SQLite's.
-            let _ = conn.execute_batch("PRAGMA cache_size=0;");
-            let db = Box::into_raw(Box::new(TurboliteDb { conn }));
-            // Clear any stale "closed" marker if this address was reused
-            let addr = db as u64;
-            CLOSED_HANDLES.with(|handles| {
-                handles.borrow_mut().remove(&addr);
-            });
-            db
+        match rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs_name) {
+            Ok(conn) => {
+                // turbolite manages its own manifest-aware page cache. Disable SQLite's.
+                let _ = conn.execute_batch("PRAGMA cache_size=0;");
+                let db = Box::into_raw(Box::new(TurboliteDb { conn }));
+                // Clear any stale "closed" marker if this address was reused.
+                mark_handle_open(db as usize);
+                db
+            }
+            Err(e) => {
+                set_last_error(&format!("open failed: {}", e));
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("open failed: {}", e));
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Open (or create) a single-file compressed local database.
@@ -537,26 +635,25 @@ pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -
 /// Must be closed with `turbolite_close`.
 #[no_mangle]
 pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb {
-    clear_last_error();
-    let path = match cstr_to_str(path, "path") {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
+    ffi_guard(std::ptr::null_mut(), || {
+        clear_last_error();
+        let path = match unsafe { cstr_to_str(&path, "path") } {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-    match turbolite::open_local(path) {
-        Ok(conn) => {
-            let db = Box::into_raw(Box::new(TurboliteDb { conn }));
-            let addr = db as u64;
-            CLOSED_HANDLES.with(|handles| {
-                handles.borrow_mut().remove(&addr);
-            });
-            db
+        match turbolite::open_local(path) {
+            Ok(conn) => {
+                let db = Box::into_raw(Box::new(TurboliteDb { conn }));
+                mark_handle_open(db as usize);
+                db
+            }
+            Err(e) => {
+                set_last_error(&format!("open_local failed: {}", e));
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            set_last_error(&format!("open_local failed: {}", e));
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Execute a SQL statement (DDL/DML) that returns no rows.
@@ -565,30 +662,30 @@ pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb 
 /// 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
-    clear_last_error();
-    if db.is_null() {
-        set_last_error("db handle must not be NULL");
-        return -1;
-    }
-    let addr = db as u64;
-    let is_closed = CLOSED_HANDLES.with(|h| h.borrow().contains(&addr));
-    if is_closed {
-        set_last_error("db handle is already closed");
-        return -1;
-    }
-    let sql = match cstr_to_str(sql, "sql") {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    let db = unsafe { &*db };
-    match db.conn.execute_batch(sql) {
-        Ok(()) => 0,
-        Err(e) => {
-            set_last_error(&format!("exec failed: {}", e));
-            -1
+    ffi_guard(-1, || {
+        clear_last_error();
+        if db.is_null() {
+            set_last_error("db handle must not be NULL");
+            return -1;
         }
-    }
+        if handle_is_closed(db as usize) {
+            set_last_error("db handle is already closed");
+            return -1;
+        }
+        let sql = match unsafe { cstr_to_str(&sql, "sql") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+
+        let db = unsafe { &*db };
+        match db.conn.execute_batch(sql) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(&format!("exec failed: {}", e));
+                -1
+            }
+        }
+    })
 }
 
 /// Execute a SQL query and return results as a JSON array of objects.
@@ -600,18 +697,17 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// or NULL on error.
 #[no_mangle]
 pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
+  ffi_guard(std::ptr::null_mut(), || {
     clear_last_error();
     if db.is_null() {
         set_last_error("db handle must not be NULL");
         return std::ptr::null_mut();
     }
-    let addr = db as u64;
-    let is_closed = CLOSED_HANDLES.with(|h| h.borrow().contains(&addr));
-    if is_closed {
+    if handle_is_closed(db as usize) {
         set_last_error("db handle is already closed");
         return std::ptr::null_mut();
     }
-    let sql = match cstr_to_str(sql, "sql") {
+    let sql = match unsafe { cstr_to_str(&sql, "sql") } {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
@@ -665,54 +761,73 @@ pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char)
             std::ptr::null_mut()
         }
     }
+  })
 }
 
 /// Free a string returned by `turbolite_query_json`.
 #[no_mangle]
 pub extern "C" fn turbolite_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            drop(CString::from_raw(s));
+    ffi_guard((), || {
+        if !s.is_null() {
+            unsafe {
+                drop(CString::from_raw(s));
+            }
         }
-    }
+    });
 }
 
 /// Close a database connection opened with `turbolite_open`.
 #[no_mangle]
 pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
-    if db.is_null() {
-        return;
-    }
-    let addr = db as u64;
-    let already_closed = CLOSED_HANDLES.with(|handles| handles.borrow().contains(&addr));
-    if already_closed {
-        return;
-    }
-    CLOSED_HANDLES.with(|handles| {
-        handles.borrow_mut().insert(addr);
+    ffi_guard((), || {
+        if db.is_null() {
+            return;
+        }
+        // Atomically claim the free under the process-global guard. Only the
+        // caller that transitions the handle from open->closed owns the
+        // `Box::from_raw`. A concurrent or duplicate close (any thread) sees
+        // the address already in the set and returns without freeing, so the
+        // pointer is dropped exactly once.
+        if !mark_handle_closed(db as usize) {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(db));
+        }
     });
-    unsafe {
-        drop(Box::from_raw(db));
-    }
 }
 
 // --- Internal helpers ---
 
-fn cstr_to_str<'a>(ptr: *const c_char, param_name: &str) -> Result<&'a str, c_int> {
+/// Borrow a `&str` from a C string pointer, tying the returned reference's
+/// lifetime to the borrow of `ptr` itself.
+///
+/// The previous signature returned `&'a str` with `'a` chosen freely by the
+/// caller (an *unbounded* lifetime synthesized from a raw pointer): nothing
+/// stopped a caller from holding the `&str` past the point the C buffer was
+/// freed, which is a use-after-free. Taking `ptr: &'a *const c_char` ties `'a`
+/// to the pointer binding's scope so the borrow checker rejects any use that
+/// outlives the pointer.
+///
+/// # Safety
+/// `*ptr` must be NULL or point to a NUL-terminated C string that stays valid
+/// and immutable for the entire lifetime `'a` (i.e. for as long as the
+/// returned `&str` is held).
+unsafe fn cstr_to_str<'a>(ptr: &'a *const c_char, param_name: &str) -> Result<&'a str, c_int> {
     if ptr.is_null() {
         set_last_error(&format!("{} must not be NULL", param_name));
         return Err(-1);
     }
-    unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|_| {
+    CStr::from_ptr(*ptr).to_str().map_err(|_| {
         set_last_error(&format!("{} is not valid UTF-8", param_name));
         -1
     })
 }
 
 #[cfg(feature = "cli-s3")]
-fn nullable_cstr_to_option<'a>(ptr: *const c_char) -> Option<&'a str> {
+unsafe fn nullable_cstr_to_option<'a>(ptr: &'a *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    CStr::from_ptr(*ptr).to_str().ok()
 }
