@@ -40,6 +40,7 @@ const turbolite_register_local = lib.func(
   ["str", "str", "int"]
 );
 const turbolite_open = lib.func("turbolite_open", "void*", ["str", "str"]);
+const turbolite_open_local = lib.func("turbolite_open_local", "void*", ["str"]);
 const turbolite_exec = lib.func("turbolite_exec", "int", ["void*", "str"]);
 const turbolite_query_json = lib.func("turbolite_query_json", "str", [
   "void*",

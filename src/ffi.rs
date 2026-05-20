@@ -361,6 +361,44 @@ pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -
     }
 }
 
+/// Open (or create) a single-file compressed local database.
+///
+/// Unlike [`turbolite_open`], this needs no separately registered VFS — it
+/// self-registers a compressed single-file VFS for `path`. There is no
+/// manifest, page-group sidecar, staging directory, or remote storage; the
+/// database is exactly one file at rest (zstd-compressed pages). Opening the
+/// same path twice concurrently fails (single writer).
+///
+/// # Parameters
+/// - `path`: Database file path (UTF-8).
+///
+/// # Returns
+/// Opaque handle on success, NULL on error (see `turbolite_last_error`).
+/// Must be closed with `turbolite_close`.
+#[no_mangle]
+pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb {
+    clear_last_error();
+    let path = match cstr_to_str(path, "path") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    match crate::open_local(path) {
+        Ok(conn) => {
+            let db = Box::into_raw(Box::new(TurboliteDb { conn }));
+            let addr = db as u64;
+            CLOSED_HANDLES.with(|handles| {
+                handles.borrow_mut().remove(&addr);
+            });
+            db
+        }
+        Err(e) => {
+            set_last_error(&format!("open_local failed: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Execute a SQL statement (DDL/DML) that returns no rows.
 ///
 /// # Returns
