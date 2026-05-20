@@ -11,9 +11,9 @@ crash/DoS fixes, and the full FFI soundness cluster (F19–F24): the C boundary
 is now panic-safe (`catch_unwind` on every `extern "C"` body + `panic = "abort"`
 on the release profile), the close-guard is process-global (no cross-thread
 double-free), and the smaller FFI lifetime/leak/validation issues are closed.
-The remaining findings below (F3, F9–F18) are documented with precise fixes for
-focused follow-ups, several gated behind the live-S3 suite that does not run in
-this environment.
+The remaining findings below are documented with precise fixes for focused
+follow-ups, several gated behind the live-S3 suite that does not run in this
+environment.
 
 ---
 
@@ -147,12 +147,16 @@ this environment.
   Tests: `test_compressed_compaction_reclaims_dead_space_and_preserves_live_pages`,
   `test_compressed_single_write_marks_tracker`.
 
-### F10 — [Med] `assemble()` recovery never shrinks page_count; fragile page-size special-case — **Documented**
-- `src/tiered/vfs.rs:282-306` (and `sync_after_external_restore`/
+### F10 — [Med] `assemble()` recovery never shrinks page_count; fragile page-size special-case — **Fixed**
+- `src/tiered/vfs.rs` recovery path (and `sync_after_external_restore`/
   `mark_all_pages_present` not clearing bits above a shrunk count).
-- **Fix:** adopt the trailer manifest's exact `page_count` (not max), derive
-  page_size from the staging header unconditionally, and clear bitmap bits above
-  the new count.
+- **Fix:** recovery anchors `page_count` to the adopted trailer manifest (not
+  the max of stray staging page numbers), derives `page_size` from the staging
+  header unconditionally, and clears bitmap bits at or above the committed count.
+  `mark_all_pages_present` clears bits above a shrunk count; new
+  `clear_pages_at_or_above` drops stray-page state on recovery. Tests:
+  `mark_all_pages_present` shrink clears bits above count;
+  `clear_pages_at_or_above` clears stray pages.
 
 ### F11 — [Med] Torn staging-log page body is a poison pill — **Documented**
 - `src/tiered/staging.rs:134-148` returns a hard error on a torn trailing page
@@ -171,15 +175,20 @@ this environment.
 - **Fix:** inside `evict_to_budget` re-check `group_state(gid) == Fetching` and
   skip currently-fetching groups.
 
-### F15 — [Med] S3 range GET `len==0` underflow; `list_all_keys` infinite loop — **Documented**
-- `src/tiered/s3_client.rs:179-201` (`start + len - 1` underflows when len==0 →
-  full-tail GET; returned length unchecked) and `:528-532,558-562` (truncated
-  with no continuation token re-issues the first page forever).
-- **Fix:** guard `len==0`; verify returned length == requested; `break`/error on
-  truncated-without-token.
+### F15 — [Med] S3 range GET `len==0` underflow; `list_all_keys` infinite loop — **Fixed**
+- `src/tiered/s3_client.rs` (`start + len - 1` underflowed when len==0 →
+  full-tail GET; returned length unchecked) and `list_all_keys`/
+  `list_all_keys_with_prefix` (truncated with no continuation token re-issued
+  the first page forever).
+- **Fix:** `range_get_async` guards `len == 0` (no underflow into a full-tail
+  GET) and verifies the returned body length matches the requested range;
+  `list_all_keys`/`list_all_keys_with_prefix` error instead of looping forever
+  when a response is truncated but carries no continuation token.
 
-### F17 — [Low] `xRandomness` uses a time-seeded LCG — **Documented**
-- `src/tiered/vfs.rs:1586-1596`. **Fix:** `rand::thread_rng().fill_bytes`.
+### F17 — [Low] `xRandomness` uses a time-seeded LCG — **Fixed**
+- `src/tiered/vfs.rs` `xRandomness`. **Fix:** fills from `rand::thread_rng()`
+  (OS CSPRNG) via `fill_bytes` instead of a time-seeded LCG; `rand` is now a
+  non-optional dependency.
 
 ### F18 — [Low] `stat_misses.fetch_sub(1)` underflow under a prefetch re-check race — **Documented**
 - `src/tiered/handle.rs:1341`. **Fix:** `saturating_sub`/CAS, or count the miss
