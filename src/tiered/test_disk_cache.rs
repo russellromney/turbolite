@@ -2527,3 +2527,44 @@ fn test_mem_cache_invalidated_on_evict_group() {
         "after evict_group + new write, should read new data"
     );
 }
+
+#[test]
+fn test_mark_all_pages_present_shrink_clears_bits_above_count() {
+    // F10 regression: after a shrink, pages at or above the new count must
+    // not read as present (they would serve stale bytes past EOF).
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    // Grow: every page 0..16 present.
+    cache.mark_all_pages_present(16);
+    for p in 0..16u64 {
+        assert!(cache.is_present(p), "page {p} should be present after grow");
+    }
+    // Shrink to 5 pages (simulates adopting a smaller trailer page_count).
+    cache.mark_all_pages_present(5);
+    for p in 0..5u64 {
+        assert!(cache.is_present(p), "page {p} should remain present");
+    }
+    for p in 5..16u64 {
+        assert!(
+            !cache.is_present(p),
+            "page {p} above shrunk count must be cleared"
+        );
+    }
+}
+
+#[test]
+fn test_clear_pages_at_or_above() {
+    // F10 regression: recovery clears stray pages above the committed count.
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    for p in 0..16u64 {
+        cache.write_page(p, &vec![1u8; 64]).unwrap();
+    }
+    cache.clear_pages_at_or_above(10);
+    for p in 0..10u64 {
+        assert!(cache.is_present(p), "page {p} below floor stays present");
+    }
+    for p in 10..16u64 {
+        assert!(!cache.is_present(p), "page {p} at/above floor is cleared");
+    }
+}

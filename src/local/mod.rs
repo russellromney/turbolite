@@ -36,13 +36,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use fs2::FileExt;
-use sqlite_vfs::{
-    DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs, WalDisabled,
-};
+use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs, WalDisabled};
 
 use file_format::{
     decode_directory, decode_page, encode_directory, encode_page, Header, PageCodec,
-    DIR_ENTRY_LEN, DEFAULT_PAGE_SIZE, FORMAT_VERSION, HEADER_LEN,
+    DEFAULT_PAGE_SIZE, DIR_ENTRY_LEN, FORMAT_VERSION, HEADER_LEN,
 };
 
 /// The tiered (cloud/replicated) mode keeps its metadata in this sidecar
@@ -154,11 +152,11 @@ pub fn open_local_with<P: AsRef<Path>>(
     // on every open would leak unboundedly.
     let vfs_name = register_or_reuse_vfs(&path, &options)?;
 
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| LocalError::Io(io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 path")))?;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let path_str = path.to_str().ok_or_else(|| {
+        LocalError::Io(io::Error::new(io::ErrorKind::InvalidInput, "non-utf8 path"))
+    })?;
     let conn = rusqlite::Connection::open_with_flags_and_vfs(path_str, flags, &vfs_name)?;
     Ok(conn)
 }
@@ -392,9 +390,8 @@ impl MainHandle {
         for chunk in self.image.chunks(page_size) {
             let blob = encode_page(chunk, &self.codec)?;
             let offset = (HEADER_LEN + data.len()) as u64;
-            let len = u32::try_from(blob.len()).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "page blob too large")
-            })?;
+            let len = u32::try_from(blob.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "page blob too large"))?;
             data.extend_from_slice(&blob);
             directory.push((offset, len));
         }
@@ -436,7 +433,10 @@ impl Drop for MainHandle {
 
 /// Sibling lock-file path for a database path: `<name>.tl-lock`.
 fn lock_path_for(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".tl-lock");
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(name),
@@ -548,7 +548,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
 fn tmp_path(path: &Path) -> PathBuf {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     // Unique per-write suffix so concurrent persists never share a temp file.
     name.push(format!(".tmp-local-{}-{}", std::process::id(), seq));
     match path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -563,7 +566,10 @@ fn tmp_path(path: &Path) -> PathBuf {
 fn image_read(image: &[u8], buf: &mut [u8], offset: u64) -> Result<(), io::Error> {
     let start = offset as usize;
     if start >= image.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past end"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "read past end",
+        ));
     }
     let avail = &image[start..];
     let n = avail.len().min(buf.len());
@@ -706,7 +712,10 @@ mod tests {
         assert!(db.exists(), "db file present");
         assert!(!dir.join("data.db-journal").exists(), "no journal at rest");
         assert!(!dir.join(TIERED_SIDECAR).exists(), "no tiered sidecar");
-        assert!(!dir.join("data.db.tl-lock").exists(), "lock file removed at rest");
+        assert!(
+            !dir.join("data.db.tl-lock").exists(),
+            "lock file removed at rest"
+        );
 
         let conn = open_local(&db).expect("reopen");
         let count: i64 = conn
@@ -740,8 +749,12 @@ mod tests {
         // Reopen and measure the logical (uncompressed) image size, which
         // is what a plain SQLite file would occupy.
         let logical = {
-            let h = MainHandle::open(db.clone(), LocalOptions::default().codec(), DEFAULT_PAGE_SIZE)
-                .unwrap();
+            let h = MainHandle::open(
+                db.clone(),
+                LocalOptions::default().codec(),
+                DEFAULT_PAGE_SIZE,
+            )
+            .unwrap();
             h.image.len() as u64
         };
 
@@ -765,7 +778,11 @@ mod tests {
         // After the first connection closes, reopen succeeds.
         let reopened = open_local(&db).expect("reopen after close");
         let n: i64 = reopened
-            .query_row("SELECT count(*) FROM sqlite_master WHERE name='t'", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='t'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -830,9 +847,7 @@ mod tests {
             "plaintext leaked into encrypted file"
         );
         let conn = open_local_with(&db, opts).expect("reopen");
-        let v: String = conn
-            .query_row("SELECT v FROM t", [], |r| r.get(0))
-            .unwrap();
+        let v: String = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, "secret");
         std::fs::remove_dir_all(&dir).ok();
     }

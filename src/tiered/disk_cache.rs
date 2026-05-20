@@ -2060,14 +2060,44 @@ impl DiskCache {
         for p in 0..page_count {
             bitmap.mark_present(p);
         }
+        // If this is a shrink (external restore / recovery adopting a smaller
+        // page_count), any leftover bits above the new count would read as
+        // present and serve stale bytes past EOF. Clear them.
+        bitmap.clear_at_or_above(page_count);
+        drop(bitmap);
         let ppg = self.pages_per_group as u64;
         if ppg > 0 {
             let group_count = (page_count + ppg - 1) / ppg;
             let states = self.group_states.lock();
             self.ensure_group_states_capacity(&states, group_count.saturating_sub(1));
-            for gid in 0..group_count as usize {
-                if let Some(s) = states.get(gid) {
+            // Mark live groups Present and any group entirely above the new
+            // page_count None, so a shrink also drops stale group state.
+            for (gid, s) in states.iter().enumerate() {
+                if (gid as u64) < group_count {
                     s.store(GroupState::Present as u8, Ordering::Release);
+                } else {
+                    s.store(GroupState::None as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Clear bitmap bits (and drop group state) for every page at or above
+    /// `page_count`. Used by recovery after adopting a committed page_count so
+    /// a stray higher page from a partial write can't be served as present.
+    pub(crate) fn clear_pages_at_or_above(&self, page_count: u64) {
+        {
+            let bitmap = self.bitmap.read();
+            bitmap.clear_at_or_above(page_count);
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            // First fully-above-count group: ceil(page_count / ppg).
+            let first_dead_group = page_count.div_ceil(ppg) as usize;
+            let states = self.group_states.lock();
+            for (gid, s) in states.iter().enumerate() {
+                if gid >= first_dead_group {
+                    s.store(GroupState::None as u8, Ordering::Release);
                 }
             }
         }

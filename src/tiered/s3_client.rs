@@ -2,7 +2,7 @@
 // be constructed. The type exists so Option<Arc<S3Client>> compiles everywhere.
 #[cfg(not(feature = "cloud"))]
 pub(crate) struct S3Client {
-    _private: (),  // prevent construction
+    _private: (), // prevent construction
 }
 
 #[cfg(feature = "cloud")]
@@ -36,8 +36,7 @@ impl S3Client {
 
         if let Some(region) = &config.region {
             turbolite_debug!("[s3] setting region: {}", region);
-            aws_config =
-                aws_config.region(aws_sdk_s3::config::Region::new(region.clone()));
+            aws_config = aws_config.region(aws_sdk_s3::config::Region::new(region.clone()));
         }
 
         let aws_config = aws_config.load().await;
@@ -79,7 +78,10 @@ impl S3Client {
     }
 
     /// Blocking constructor.
-    pub(crate) fn new_blocking(config: &TurboliteConfig, runtime: &TokioHandle) -> io::Result<Self> {
+    pub(crate) fn new_blocking(
+        config: &TurboliteConfig,
+        runtime: &TokioHandle,
+    ) -> io::Result<Self> {
         Self::block_on(runtime, Self::new_async(config))
     }
 
@@ -127,7 +129,12 @@ impl S3Client {
     }
 
     /// Phase Drift: override frame key.
-    pub(crate) fn override_frame_key(&self, group_id: u64, frame_idx: usize, version: u64) -> String {
+    pub(crate) fn override_frame_key(
+        &self,
+        group_id: u64,
+        frame_idx: usize,
+        version: u64,
+    ) -> String {
         self.s3_key(&format!("p/d/{}_f{}_v{}", group_id, frame_idx, version))
     }
 
@@ -152,7 +159,8 @@ impl S3Client {
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                         .into_bytes();
                     self.fetch_count.fetch_add(1, Ordering::Relaxed);
-                    self.fetch_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.fetch_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     return Ok(Some(bytes.to_vec()));
                 }
                 Err(e) => {
@@ -166,17 +174,26 @@ impl S3Client {
                             format!("S3 GET {} failed after 3 retries: {:?}", key, e),
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * (1 << retries),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << retries)))
+                        .await;
                 }
             }
         }
     }
 
     /// Byte-range GET: fetch [start..start+len) from an S3 object.
-    pub(crate) async fn range_get_async(&self, key: &str, start: u64, len: u32) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) async fn range_get_async(
+        &self,
+        key: &str,
+        start: u64,
+        len: u32,
+    ) -> io::Result<Option<Vec<u8>>> {
+        // A zero-length range is a logic error: `bytes=start-(start-1)` would
+        // underflow and S3 treats a malformed range as a full-object GET, so a
+        // caller asking for nothing would silently receive the whole tail.
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
         let range = format!("bytes={}-{}", start, start + len as u64 - 1);
         let mut retries = 0u32;
         loop {
@@ -196,8 +213,25 @@ impl S3Client {
                         .await
                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                         .into_bytes();
+                    // The server must honor the requested range exactly. A
+                    // short/over-long body (e.g. a range-ignoring endpoint
+                    // returning the full object) would silently corrupt the
+                    // page math downstream, so reject it loudly.
+                    if bytes.len() != len as usize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "S3 range GET {} ({}) returned {} bytes, expected {}",
+                                key,
+                                range,
+                                bytes.len(),
+                                len
+                            ),
+                        ));
+                    }
                     self.fetch_count.fetch_add(1, Ordering::Relaxed);
-                    self.fetch_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.fetch_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     return Ok(Some(bytes.to_vec()));
                 }
                 Err(e) => {
@@ -208,13 +242,14 @@ impl S3Client {
                     if retries >= 3 {
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
-                            format!("S3 range GET {} ({}) failed after 3 retries: {:?}", key, range, e),
+                            format!(
+                                "S3 range GET {} ({}) failed after 3 retries: {:?}",
+                                key, range, e
+                            ),
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * (1 << retries),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << retries)))
+                        .await;
                 }
             }
         }
@@ -225,7 +260,12 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.range_get_async(key, start, len))
     }
 
-    pub(crate) async fn put_object_async(&self, key: &str, data: Vec<u8>, content_type: Option<&str>) -> io::Result<()> {
+    pub(crate) async fn put_object_async(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> io::Result<()> {
         let mut retries = 0u32;
         loop {
             let body = aws_sdk_s3::primitives::ByteStream::from(data.clone());
@@ -253,10 +293,8 @@ impl S3Client {
                             format!("S3 PUT {} failed after 3 retries: {}", key, e),
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * (1 << retries),
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << retries)))
+                        .await;
                 }
             }
         }
@@ -272,12 +310,18 @@ impl S3Client {
     /// Fetch multiple page groups in parallel by S3 key.
     /// Returns key → bytes for found objects.
     #[allow(dead_code)]
-    pub(crate) fn get_page_groups_by_key(&self, keys: &[String]) -> io::Result<HashMap<String, Vec<u8>>> {
+    pub(crate) fn get_page_groups_by_key(
+        &self,
+        keys: &[String],
+    ) -> io::Result<HashMap<String, Vec<u8>>> {
         S3Client::block_on(&self.runtime, self.get_page_groups_by_key_async(keys))
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn get_page_groups_by_key_async(&self, keys: &[String]) -> io::Result<HashMap<String, Vec<u8>>> {
+    pub(crate) async fn get_page_groups_by_key_async(
+        &self,
+        keys: &[String],
+    ) -> io::Result<HashMap<String, Vec<u8>>> {
         let mut handles = Vec::with_capacity(keys.len());
         for key in keys {
             let client = self.client.clone();
@@ -286,13 +330,7 @@ impl S3Client {
             handles.push(tokio::spawn(async move {
                 let mut retries = 0u32;
                 loop {
-                    match client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send()
-                        .await
-                    {
+                    match client.get_object().bucket(&bucket).key(&key).send().await {
                         Ok(resp) => {
                             let bytes = resp
                                 .body
@@ -330,7 +368,8 @@ impl S3Client {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
             if let Some(bytes) = data {
                 self.fetch_count.fetch_add(1, Ordering::Relaxed);
-                self.fetch_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                self.fetch_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 result.insert(key, bytes);
             }
         }
@@ -342,7 +381,10 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.put_page_groups_async(groups))
     }
 
-    pub(crate) async fn put_page_groups_async(&self, groups: &[(String, Vec<u8>)]) -> io::Result<()> {
+    pub(crate) async fn put_page_groups_async(
+        &self,
+        groups: &[(String, Vec<u8>)],
+    ) -> io::Result<()> {
         let total_bytes: u64 = groups.iter().map(|(_, d)| d.len() as u64).sum();
         let total_puts = groups.len() as u64;
         let mut handles = Vec::with_capacity(groups.len());
@@ -354,8 +396,7 @@ impl S3Client {
             handles.push(tokio::spawn(async move {
                 let mut retries = 0u32;
                 loop {
-                    let body =
-                        aws_sdk_s3::primitives::ByteStream::from(data.clone());
+                    let body = aws_sdk_s3::primitives::ByteStream::from(data.clone());
                     match client
                         .put_object()
                         .bucket(&bucket)
@@ -438,9 +479,10 @@ impl S3Client {
     /// Phase Thermopylae: always write msgpack.
     pub(crate) async fn put_manifest_async(&self, manifest: &Manifest) -> io::Result<()> {
         let key = self.manifest_key_msgpack();
-        let data = rmp_serde::to_vec(manifest)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.put_object_async(&key, data, Some("application/msgpack")).await
+        let data =
+            rmp_serde::to_vec(manifest).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.put_object_async(&key, data, Some("application/msgpack"))
+            .await
     }
 
     /// Delete a batch of S3 objects by key. Handles batching (AWS limit: 1000/request).
@@ -495,7 +537,10 @@ impl S3Client {
     pub(crate) async fn delete_objects_async_owned(&self, keys: Vec<String>) {
         let count = keys.len();
         if let Err(e) = self.delete_objects_async(&keys).await {
-            eprintln!("[gc] ERROR: background delete of {} objects failed: {}", count, e);
+            eprintln!(
+                "[gc] ERROR: background delete of {} objects failed: {}",
+                count, e
+            );
         } else {
             turbolite_debug!("[gc] deleted {} old versions", count);
         }
@@ -510,7 +555,8 @@ impl S3Client {
         let mut all_keys = Vec::new();
         let mut continuation_token: Option<String> = None;
         loop {
-            let mut req = self.client
+            let mut req = self
+                .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(&self.prefix);
@@ -526,7 +572,18 @@ impl S3Client {
                 }
             }
             if resp.is_truncated() == Some(true) {
-                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+                match resp.next_continuation_token() {
+                    Some(token) => continuation_token = Some(token.to_string()),
+                    // Truncated with no token: re-issuing the request would
+                    // refetch the first page forever. Treat as a protocol
+                    // error rather than spin.
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "S3 list truncated but returned no continuation token",
+                        ));
+                    }
+                }
             } else {
                 break;
             }
@@ -540,7 +597,8 @@ impl S3Client {
         let mut all_keys = Vec::new();
         let mut continuation_token: Option<String> = None;
         loop {
-            let mut req = self.client
+            let mut req = self
+                .client
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix);
@@ -548,7 +606,10 @@ impl S3Client {
                 req = req.continuation_token(token);
             }
             let resp = req.send().await.map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("S3 list (prefix={}) failed: {}", prefix, e))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("S3 list (prefix={}) failed: {}", prefix, e),
+                )
             })?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
@@ -556,7 +617,15 @@ impl S3Client {
                 }
             }
             if resp.is_truncated() == Some(true) {
-                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
+                match resp.next_continuation_token() {
+                    Some(token) => continuation_token = Some(token.to_string()),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "S3 list truncated but returned no continuation token",
+                        ));
+                    }
+                }
             } else {
                 break;
             }

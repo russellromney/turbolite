@@ -251,6 +251,10 @@ impl TurboliteVfs {
             // Prefer the newest manifest embedded in staging log trailers
             // over the one we loaded above (the background flush may not
             // have run yet, leaving the on-disk / remote manifest stale).
+            // The adopted trailer's page_count is authoritative — it reflects
+            // the committed file length (including any truncate), so we anchor
+            // to it and never re-grow from stray staging page numbers below.
+            let mut adopted_trailer = false;
             for flush_entry in recovered_staging.iter().rev() {
                 if let Ok(Some(manifest_bytes)) =
                     staging::read_staging_manifest(&flush_entry.staging_path, flush_entry.page_size)
@@ -265,6 +269,7 @@ impl TurboliteVfs {
                             );
                             manifest = m;
                             manifest.detect_and_normalize_strategy();
+                            adopted_trailer = true;
                             let new_groups = manifest.total_groups() as usize;
                             cache.ensure_group_capacity(new_groups);
                             if !manifest.group_pages.is_empty() {
@@ -281,15 +286,18 @@ impl TurboliteVfs {
             // flush to materialise them.
             for flush_entry in &recovered_staging {
                 if flush_entry.page_size > 0 {
+                    // The staging header carries the real page size for these
+                    // records; derive from it unconditionally so a default
+                    // 4096 placeholder never masks the true geometry.
                     let current_ps = cache.page_size.load(Ordering::Relaxed);
-                    if current_ps == 0 || (current_ps == 4096 && flush_entry.page_size != 4096) {
+                    if current_ps != flush_entry.page_size {
                         cache.set_page_size(flush_entry.page_size);
-                        if manifest.page_size == 0 {
-                            manifest.page_size = flush_entry.page_size;
-                        }
-                        if manifest.pages_per_group == 0 {
-                            manifest.pages_per_group = ppg;
-                        }
+                    }
+                    if manifest.page_size == 0 {
+                        manifest.page_size = flush_entry.page_size;
+                    }
+                    if manifest.pages_per_group == 0 {
+                        manifest.pages_per_group = ppg;
                     }
                 }
                 if let Ok(pages) =
@@ -297,13 +305,24 @@ impl TurboliteVfs {
                 {
                     for (page_num, data) in &pages {
                         let _ = cache.write_page(*page_num, data);
-                        let new_count = *page_num + 1;
-                        if new_count > manifest.page_count {
-                            manifest.page_count = new_count;
+                        // Only grow page_count from stray pages when no trailer
+                        // manifest pinned the committed length. If a trailer was
+                        // adopted, its page_count is exact: a higher stray page
+                        // is a partial/rolled-back write and must not re-grow it.
+                        if !adopted_trailer {
+                            let new_count = *page_num + 1;
+                            if new_count > manifest.page_count {
+                                manifest.page_count = new_count;
+                            }
                         }
                     }
                 }
             }
+
+            // After replay, drop any cache bitmap bits for pages at or above
+            // the committed page_count so a stale page above a truncate point
+            // can never be served as present.
+            cache.clear_pages_at_or_above(manifest.page_count);
 
             // For local mode, we clean staging logs after cache replay;
             // remote mode keeps them until the background flush runs.
@@ -1592,15 +1611,13 @@ impl Vfs for TurboliteVfs {
     }
 
     fn random(&self, buffer: &mut [i8]) {
-        use std::time::SystemTime;
-        let mut seed = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("SystemTime::now before UNIX_EPOCH")
-            .as_nanos() as u64;
-        for b in buffer.iter_mut() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *b = (seed >> 33) as i8;
-        }
+        // Use the OS CSPRNG, not a time-seeded LCG: SQLite relies on this for
+        // values that must be unpredictable (e.g. rollback-journal salts).
+        use rand::RngCore;
+        // i8 and u8 have the same layout; fill the bytes directly.
+        let bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, buffer.len()) };
+        rand::thread_rng().fill_bytes(bytes);
     }
 
     fn sleep(&self, duration: Duration) -> Duration {

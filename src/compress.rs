@@ -372,7 +372,10 @@ mod crypto_regression_tests {
         let plain = b"a sqlite page worth of bytes (pretend)".to_vec();
         let c1 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
         let c2 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
-        assert_ne!(c1, c2, "rewrite must not reuse nonce/ciphertext (two-time pad)");
+        assert_ne!(
+            c1, c2,
+            "rewrite must not reuse nonce/ciphertext (two-time pad)"
+        );
         assert_eq!(decrypt_gcm_random_nonce(&c1, &KEY).unwrap(), plain);
         assert_eq!(decrypt_gcm_random_nonce(&c2, &KEY).unwrap(), plain);
         // Inline nonce is 12 bytes + 16-byte GCM tag overhead.

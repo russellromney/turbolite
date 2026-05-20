@@ -163,9 +163,7 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, PayloadVersionError> {
         return Err(PayloadVersionError::Truncated(bytes.len()));
     }
 
-    let got: [u8; 4] = bytes[..MAGIC.len()]
-        .try_into()
-        .expect("len-checked above");
+    let got: [u8; 4] = bytes[..MAGIC.len()].try_into().expect("len-checked above");
     if got != MAGIC {
         return Err(PayloadVersionError::MagicMismatch { got });
     }
@@ -182,8 +180,8 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, PayloadVersionError> {
     }
 
     let body = &bytes[MAGIC.len() + 2..];
-    let canonical: CanonicalManifestV1 = ciborium::from_reader(body)
-        .map_err(|e| PayloadVersionError::BodyDecode(e.to_string()))?;
+    let canonical: CanonicalManifestV1 =
+        ciborium::from_reader(body).map_err(|e| PayloadVersionError::BodyDecode(e.to_string()))?;
     Ok(Manifest::from(canonical))
 }
 
@@ -391,7 +389,10 @@ mod tests {
             3usize,
             SubframeOverride {
                 key: "override/3".into(),
-                entry: FrameEntry { offset: 0, len: 128 },
+                entry: FrameEntry {
+                    offset: 0,
+                    len: 128,
+                },
             },
         );
         subframe_inner.insert(

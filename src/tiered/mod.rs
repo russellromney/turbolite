@@ -106,9 +106,9 @@ pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
 pub use instrumented_storage::{CountingStorageBackend, StorageBackendStats};
 pub use manifest::{FrameEntry, Manifest, ReplayCursor, SubframeOverride};
-pub use wire::{base_anchor_checksum, PayloadVersionError};
 pub use replay::{FinalizeReport, ReplayHandle};
 pub use vfs::TurboliteVfs;
+pub use wire::{base_anchor_checksum, PayloadVersionError};
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{
     check_and_clear_end_query, parse_eqp_output, push_planned_accesses, run_eqp_and_parse,

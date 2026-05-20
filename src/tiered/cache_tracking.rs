@@ -87,6 +87,20 @@ impl PageBitmap {
         }
     }
 
+    /// Number of pages the bitmap currently has storage for (a multiple of 8).
+    pub(crate) fn bit_capacity(&self) -> u64 {
+        self.bits.len() as u64 * 8
+    }
+
+    /// Clear every present bit for page >= `floor`, up to current capacity.
+    /// Used after a shrink so pages above the new count can't read as present.
+    pub(crate) fn clear_at_or_above(&self, floor: u64) {
+        let cap = self.bit_capacity();
+        for p in floor..cap {
+            self.clear(p);
+        }
+    }
+
     /// Grow the bitmap if needed. NOT thread-safe for concurrent resize,
     /// but safe to call while readers use `is_present()` on existing pages
     /// (they only access indices < current len).

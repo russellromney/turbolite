@@ -22,7 +22,7 @@ zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
 gzip = ["dep:flate2"]
-encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2", "dep:rand"]
+encryption = ["dep:aes-gcm", "dep:aes", "dep:ctr", "dep:sha2"]
 parallel = []
 # Binaries in this package that want an S3-backed StorageBackend pull in
 # hadb-storage-s3 through this feature. The library itself never depends
@@ -57,7 +57,8 @@ aes-gcm = { version = "0.10", optional = true }
 aes = { version = "0.8", optional = true }
 ctr = { version = "0.9", optional = true }
 sha2 = { version = "0.10", optional = true }
-rand = { version = "0.8", optional = true }
+# Non-optional: also used for VFS xRandomness (CSPRNG), not just encryption.
+rand = "0.8"
 
 # Parallel compression (optional)
 rayon = "1.10"
