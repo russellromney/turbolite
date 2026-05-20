@@ -77,15 +77,32 @@ verified — not bundled in unverified.
 
 ## Documented (verified real; fix specified)
 
-### F3 — [Med] Tiered GCM frames carry no AAD → swappable/replayable across slots — **Documented**
-- `src/tiered/encoding.rs:84-89,149-161,379-385`
+### F3 — [Med] Tiered GCM frames carry no AAD → swappable/replayable across slots — **Partial**
+- `src/tiered/encoding.rs` page-group / seekable-frame / interior-bundle /
+  override encode+decode.
 - **Fix:** pass AAD binding each frame to its identity (S3 object key /
   group_id + version) via aes-gcm `Payload { msg, aad }` on encrypt + decrypt.
+- **Status — Partial (deferred, not landed):** AAD must be threaded through all
+  60+ encode/decode call sites (handle, flush, compact, prefetch, rotation,
+  import, vfs) and must match byte-for-byte between every encode and the
+  corresponding decode, including the key-rotation re-encrypt and override-merge
+  paths. A mismatch silently fails GCM auth on cold read. That full pipeline is
+  only validated by the gated live-S3 suite (`tests/tiered/*`), which is not
+  runnable in this environment, so threading AAD here could not be landed
+  test-green safely. The confidentiality fix (F1/F2 random nonce) is unaffected;
+  this is an integrity/anti-replay hardening that needs the live suite to verify
+  and is left for a focused follow-up with S3 access.
 
-### F5 — [High] Tiered `decompress` has no output cap (decompression bomb) — **Documented**
+### F5 — [High] Tiered `decompress` has no output cap (decompression bomb) — **Fixed**
 - `src/compress.rs` (tiered path; the local path caps at `max_page`).
-- **Fix:** add a max-decompressed-size parameter to the tiered decompress path
-  (`pages_per_group * page_size + header`) and enforce it.
+- **Fix:** added `compress::decompress_capped(data, dict, max_len)` for every
+  compression backend (zstd/lz4/snappy/gzip/none); it bounds the decoder via
+  `Read::take(max_len + 1)` so a hostile blob can never allocate past the cap
+  before erroring. All five tiered decode paths in `encoding.rs` (page group,
+  bulk, seekable subframe, seekable full, interior bundle) now decompress under
+  a cap — the seekable-full path caps each frame at the exact group page-byte
+  bound (`actual_pages * page_size`); the rest use the absolute ceiling
+  `MAX_TIERED_DECOMPRESSED_BYTES` (1 GiB), well above any legitimate group.
 
 ### F6 — [High] Read-after-truncate returns stale bytes (fast path skips the page-count bound) — **Documented**
 - `src/tiered/handle.rs:944-952` fast-path read checks `cache.is_present` with

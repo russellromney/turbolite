@@ -49,6 +49,43 @@ pub fn decompress(
     }
 }
 
+/// Decompress with a hard output cap (anti decompression-bomb).
+///
+/// `max_len` is the largest legitimate decompressed size for the frame
+/// (`pages_per_group * page_size + header`). The decoder is bounded so a
+/// crafted blob can never allocate more than `max_len + 1` bytes before the
+/// call errors — a hostile S3 object cannot drive the tiered decode path into
+/// an OOM. Mirrors the per-page cap on the local file-format path.
+#[cfg(feature = "zstd")]
+pub fn decompress_capped(
+    data: &[u8],
+    decoder_dict: Option<&DecoderDictionary<'static>>,
+    max_len: usize,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    // Read at most max_len + 1 bytes: the extra byte lets us detect overflow
+    // without allocating the full bomb.
+    let cap = max_len.saturating_add(1);
+    let mut output = Vec::new();
+    let n = if let Some(decoder_dict) = decoder_dict {
+        let decoder = zstd::stream::Decoder::with_prepared_dictionary(data, decoder_dict)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        decoder.take(cap as u64).read_to_end(&mut output)?
+    } else {
+        let decoder = zstd::stream::Decoder::new(data)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        decoder.take(cap as u64).read_to_end(&mut output)?
+    };
+    if n > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed output exceeds cap (possible decompression bomb)",
+        ));
+    }
+    Ok(output)
+}
+
 // ===== LZ4 Compression =====
 
 #[cfg(all(feature = "lz4", not(feature = "zstd")))]
@@ -61,6 +98,19 @@ pub fn compress(data: &[u8], _level: i32, _: Option<&()>) -> io::Result<Vec<u8>>
 pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     use lz4_flex::decompress_size_prepended;
     decompress_size_prepended(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Decompress with a hard output cap (anti decompression-bomb).
+#[cfg(all(feature = "lz4", not(feature = "zstd")))]
+pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
+    let out = decompress(data, None)?;
+    if out.len() > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed output exceeds cap (possible decompression bomb)",
+        ));
+    }
+    Ok(out)
 }
 
 // ===== Snappy Compression =====
@@ -84,6 +134,25 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     let mut decoder = FrameDecoder::new(data);
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+/// Decompress with a hard output cap (anti decompression-bomb).
+#[cfg(all(feature = "snappy", not(feature = "zstd"), not(feature = "lz4")))]
+pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
+    use snap::read::FrameDecoder;
+    use std::io::Read;
+    let cap = max_len.saturating_add(1);
+    let mut output = Vec::new();
+    let n = FrameDecoder::new(data)
+        .take(cap as u64)
+        .read_to_end(&mut output)?;
+    if n > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed output exceeds cap (possible decompression bomb)",
+        ));
+    }
     Ok(output)
 }
 
@@ -118,6 +187,30 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Decompress with a hard output cap (anti decompression-bomb).
+#[cfg(all(
+    feature = "gzip",
+    not(feature = "zstd"),
+    not(feature = "lz4"),
+    not(feature = "snappy")
+))]
+pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let cap = max_len.saturating_add(1);
+    let mut output = Vec::new();
+    let n = GzDecoder::new(data)
+        .take(cap as u64)
+        .read_to_end(&mut output)?;
+    if n > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed output exceeds cap (possible decompression bomb)",
+        ));
+    }
+    Ok(output)
+}
+
 // ===== No Compression (fallback) =====
 
 #[cfg(not(any(
@@ -137,6 +230,23 @@ pub fn compress(data: &[u8], _level: i32, _: Option<&()>) -> io::Result<Vec<u8>>
     feature = "gzip"
 )))]
 pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
+    Ok(data.to_vec())
+}
+
+/// Decompress with a hard output cap (anti decompression-bomb).
+#[cfg(not(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "gzip"
+)))]
+pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
+    if data.len() > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed output exceeds cap (possible decompression bomb)",
+        ));
+    }
     Ok(data.to_vec())
 }
 

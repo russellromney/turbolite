@@ -1,5 +1,13 @@
 use super::*;
 
+/// Absolute ceiling on a single tiered decompressed frame/group (anti
+/// decompression-bomb). A page group holds at most `pages_per_group` pages of
+/// at most `MAX_PAGE_SIZE` bytes; with a generous `pages_per_group` ceiling of
+/// 16384 that is 1 GiB. A hostile S3 object that decompresses past this can
+/// only be malformed, so we error before allocating the bomb instead of OOMing.
+/// Callers that know the exact bound pass it directly; the rest use this.
+pub(crate) const MAX_TIERED_DECOMPRESSED_BYTES: usize = 1usize << 30;
+
 // ===== Page group encoding/decoding =====
 //
 // Whole-group compression: raw pages packed together, then single zstd frame.
@@ -172,12 +180,13 @@ pub(crate) fn decode_seekable_subchunk(
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     let data = decrypt_if_needed(compressed_frame, encryption_key)?;
-    compress::decompress(
+    compress::decompress_capped(
         &data,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
+        MAX_TIERED_DECOMPRESSED_BYTES,
     )
 }
 
@@ -214,12 +223,20 @@ pub(crate) fn decode_page_group_seekable_full(
             ));
         }
         let decrypted = decrypt_if_needed(&data[start..end], encryption_key)?;
-        let decompressed = compress::decompress(
+        // A single frame decompresses to at most the whole group's page bytes;
+        // cap there (anti decompression-bomb) and fall back to the absolute
+        // ceiling if the precise product overflows / is zero.
+        let frame_cap = (actual_pages as usize)
+            .checked_mul(page_size as usize)
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_TIERED_DECOMPRESSED_BYTES);
+        let decompressed = compress::decompress_capped(
             &decrypted,
             #[cfg(feature = "zstd")]
             decoder_dict,
             #[cfg(not(feature = "zstd"))]
             None,
+            frame_cap,
         )?;
         output.extend_from_slice(&decompressed);
     }
@@ -262,12 +279,13 @@ pub(crate) fn decode_page_group(
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<Vec<u8>>)> {
     let decrypted = decrypt_if_needed(compressed, encryption_key)?;
-    let raw = compress::decompress(
+    let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
+        MAX_TIERED_DECOMPRESSED_BYTES,
     )?;
 
     if raw.len() < 8 {
@@ -310,12 +328,13 @@ pub(crate) fn decode_page_group_bulk(
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
     let decrypted = decrypt_if_needed(compressed, encryption_key)?;
-    let raw = compress::decompress(
+    let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
+        MAX_TIERED_DECOMPRESSED_BYTES,
     )?;
 
     if raw.len() < 8 {
@@ -410,12 +429,13 @@ pub(crate) fn decode_interior_bundle(
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<(u64, Vec<u8>)>> {
     let decrypted = decrypt_if_needed(compressed, encryption_key)?;
-    let raw = compress::decompress(
+    let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
         decoder_dict,
         #[cfg(not(feature = "zstd"))]
         None,
+        MAX_TIERED_DECOMPRESSED_BYTES,
     )?;
 
     if raw.len() < 8 {
