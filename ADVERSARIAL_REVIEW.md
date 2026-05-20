@@ -190,9 +190,13 @@ environment.
   (OS CSPRNG) via `fill_bytes` instead of a time-seeded LCG; `rand` is now a
   non-optional dependency.
 
-### F18 — [Low] `stat_misses.fetch_sub(1)` underflow under a prefetch re-check race — **Documented**
-- `src/tiered/handle.rs:1341`. **Fix:** `saturating_sub`/CAS, or count the miss
-  only after the re-check fails.
+### F18 — [Low] `stat_misses.fetch_sub(1)` underflow under a prefetch re-check race — **Fixed**
+- `src/tiered/handle.rs` prefetch re-check. A miss is counted before the slow
+  path; the re-check then `fetch_sub`'d it when a sibling prefetch landed.
+  Under a race the subtraction could outrun the additions and wrap the `u64`
+  counter to `u64::MAX`.
+- **Fix:** the re-check now reconciles the miss via a saturating `fetch_update`
+  (`m.saturating_sub(1)`) so the counter can never wrap past zero.
 
 ### F19 — [High] FFI: no `catch_unwind`, no `panic=abort` → panic across C is UB — **Fixed**
 - `turbolite-ffi/src/ext.rs:701` (`CString::new(json).unwrap()`),

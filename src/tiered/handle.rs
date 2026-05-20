@@ -1557,7 +1557,14 @@ impl DatabaseHandle for TurboliteHandle {
             self.detect_interior_page(buf, page_num, cache);
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
-            cache.stat_misses.fetch_sub(1, Ordering::Relaxed);
+            // Undo the miss counted at step 4 now that a sibling prefetch made
+            // the page present. Saturating CAS: never wrap past zero if the
+            // miss was already reconciled on another thread.
+            let _ = cache
+                .stat_misses
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                    Some(m.saturating_sub(1))
+                });
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
