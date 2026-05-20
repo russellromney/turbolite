@@ -185,12 +185,37 @@ const SHARED_SIZE: u64 = 510;
 /// nonce)` in this map (persisted to a `.tlnonce` sidecar). Reads find the
 /// write extent covering their range, seek the CTR keystream by the in-extent
 /// byte offset, and decrypt. The data file stays byte-for-byte the same size.
+///
+/// # Sidecar durability and write amplification
+///
+/// The sidecar is an **append-only** log of fixed 24-byte records
+/// (`[start u64 LE][len u64 LE][nonce u64 LE]`). Each WAL write appends exactly
+/// one record and `fdatasync`s it before the corresponding encrypted data write
+/// proceeds, so the nonce is durable no later than the ciphertext it decrypts.
+/// (The previous design rewrote the entire map on every write — O(n) bytes per
+/// write, O(n²) total — and never fsync'd, so a crash could lose a nonce and
+/// leave ciphertext undecryptable.)
+///
+/// On `load`, all records are replayed in append order; a later record for a
+/// region supersedes earlier ones (newest write wins, exactly as `record_write`
+/// dedups in memory). The compacted map is then rewritten atomically
+/// (tmp + rename + fsync) so the on-disk log is bounded by the live extent
+/// count at every open rather than growing without limit across restarts.
+///
+/// Crash consistency: a record appended but not yet matched by a data write is
+/// harmless (it just describes a region whose ciphertext SQLite's WAL recovery
+/// discards). The dangerous direction — ciphertext on disk but its nonce lost —
+/// cannot happen because the nonce is fsync'd before the data write.
 #[cfg(feature = "encryption")]
 pub(crate) struct PassthroughNonceMap {
     /// Sidecar file path (`<wal_path>.tlnonce`).
     path: PathBuf,
     /// start_offset -> (len, nonce). Sorted for range lookup.
     entries: std::collections::BTreeMap<u64, (u64, u64)>,
+    /// Open append handle to the sidecar log. Lazily (re)opened on first
+    /// write; kept so each `record_write` appends one record without a
+    /// full rewrite.
+    append: Option<std::fs::File>,
 }
 
 #[cfg(feature = "encryption")]
@@ -202,26 +227,61 @@ impl PassthroughNonceMap {
         PathBuf::from(s)
     }
 
-    /// Load the sidecar if present; otherwise start empty.
+    /// Apply one log record to the in-memory map with newest-wins dedup
+    /// (the same semantics as a fresh `record_write`).
+    fn apply_record(
+        entries: &mut std::collections::BTreeMap<u64, (u64, u64)>,
+        start: u64,
+        len: u64,
+        nonce: u64,
+    ) {
+        let end = start.saturating_add(len);
+        let covered: Vec<u64> = entries
+            .range(start..end)
+            .filter(|(&s, &(l, _))| s >= start && s.saturating_add(l) <= end)
+            .map(|(&s, _)| s)
+            .collect();
+        for s in covered {
+            entries.remove(&s);
+        }
+        entries.insert(start, (len, nonce));
+    }
+
+    /// Load the sidecar if present (replaying the append-only log), then
+    /// compact it back to disk so the on-disk log can't grow unbounded.
     fn load(wal_path: &std::path::Path) -> Self {
         let path = Self::sidecar_path(wal_path);
         let mut entries = std::collections::BTreeMap::new();
         if let Ok(bytes) = std::fs::read(&path) {
-            // Layout: repeated [start u64 LE][len u64 LE][nonce u64 LE].
+            // Layout: repeated [start u64 LE][len u64 LE][nonce u64 LE],
+            // applied in append order (newest record wins). A torn trailing
+            // partial record (< 24 bytes) is ignored.
             let mut i = 0usize;
             while i + 24 <= bytes.len() {
                 let start = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
                 let len = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
                 let nonce = u64::from_le_bytes(bytes[i + 16..i + 24].try_into().unwrap());
-                entries.insert(start, (len, nonce));
+                Self::apply_record(&mut entries, start, len, nonce);
                 i += 24;
             }
         }
-        Self { path, entries }
+        let mut map = Self {
+            path,
+            entries,
+            append: None,
+        };
+        // Best-effort compaction at open: rewrite the log as exactly the live
+        // extents. If it fails we keep the (possibly larger) existing log,
+        // which is still correct.
+        let _ = map.compact();
+        map
     }
 
-    /// Persist the map atomically (tmp + rename).
-    fn persist(&self) -> io::Result<()> {
+    /// Rewrite the sidecar atomically as exactly the current live extents
+    /// (tmp + fsync + rename), and reopen the append handle on the freshly
+    /// compacted file.
+    fn compact(&mut self) -> io::Result<()> {
+        use std::io::Write;
         let mut buf = Vec::with_capacity(self.entries.len() * 24);
         for (start, (len, nonce)) in &self.entries {
             buf.extend_from_slice(&start.to_le_bytes());
@@ -229,32 +289,57 @@ impl PassthroughNonceMap {
             buf.extend_from_slice(&nonce.to_le_bytes());
         }
         let tmp = self.path.with_extension("tlnonce.tmp");
-        std::fs::write(&tmp, &buf)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
+        // Reopen for append so subsequent writes extend the compacted file.
+        self.append = Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
         Ok(())
     }
 
-    /// Record a fresh random nonce for a write at `[start, start+len)`.
+    /// Append a single record to the sidecar log and fdatasync it. Opens the
+    /// append handle on demand if compaction hasn't already.
+    fn append_record(&mut self, start: u64, len: u64, nonce: u64) -> io::Result<()> {
+        use std::io::Write;
+        if self.append.is_none() {
+            self.append = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        let f = self.append.as_mut().unwrap();
+        let mut rec = [0u8; 24];
+        rec[0..8].copy_from_slice(&start.to_le_bytes());
+        rec[8..16].copy_from_slice(&len.to_le_bytes());
+        rec[16..24].copy_from_slice(&nonce.to_le_bytes());
+        f.write_all(&rec)?;
+        // Durable before the caller writes the matching ciphertext.
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Record a fresh random nonce for a write at `[start, start+len)`,
+    /// append it durably to the sidecar log, and update the in-memory map.
     /// Drops any prior entries fully contained in the new extent so stale
     /// sub-writes can't shadow this one. Returns the chosen nonce.
-    fn record_write(&mut self, start: u64, len: u64) -> u64 {
+    fn record_write(&mut self, start: u64, len: u64) -> io::Result<u64> {
         use rand::RngCore;
         let mut b = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut b);
         let nonce = u64::from_le_bytes(b);
-        let end = start + len;
-        // Remove entries fully covered by the new write.
-        let covered: Vec<u64> = self
-            .entries
-            .range(start..end)
-            .filter(|(&s, &(l, _))| s >= start && s + l <= end)
-            .map(|(&s, _)| s)
-            .collect();
-        for s in covered {
-            self.entries.remove(&s);
-        }
-        self.entries.insert(start, (len, nonce));
-        nonce
+        self.append_record(start, len, nonce)?;
+        Self::apply_record(&mut self.entries, start, len, nonce);
+        Ok(nonce)
     }
 
     /// Find the nonce + extent start covering `[offset, offset+len)`.
@@ -1862,9 +1947,9 @@ impl DatabaseHandle for TurboliteHandle {
                 // the same size — only the sidecar carries the nonce.
                 let nonce = {
                     let mut nonces = self.passthrough_nonces.as_ref().unwrap().write();
-                    let nonce = nonces.record_write(offset, buf.len() as u64);
-                    nonces.persist()?;
-                    nonce
+                    // record_write appends the nonce to the sidecar log and
+                    // fdatasyncs it before we write the matching ciphertext.
+                    nonces.record_write(offset, buf.len() as u64)?
                 };
                 let encrypted = compress::ctr_xor_at(buf, nonce, 0, key)?;
                 return file.write_all_at(&encrypted, offset);

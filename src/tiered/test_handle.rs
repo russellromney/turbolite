@@ -251,3 +251,101 @@ fn test_passthrough_different_offsets_different_ciphertext() {
         "same data at different offsets must produce different ciphertext"
     );
 }
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_passthrough_same_offset_rewrite_decrypts_and_no_keystream_reuse() {
+    // Rewriting the same WAL slot must (a) decrypt to the newest plaintext and
+    // (b) use a fresh nonce so the two ciphertexts differ — the property the
+    // append-only nonce sidecar exists to guarantee.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.wal");
+    let open = || {
+        FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap()
+    };
+    let key = test_key();
+    let mut handle = TurboliteHandle::new_passthrough(open(), path.clone(), Some(key));
+
+    let v1 = vec![0x11u8; 128];
+    handle.write_all_at(&v1, 0).unwrap();
+    let raw1 = std::fs::read(&path).unwrap()[..128].to_vec();
+
+    let v2 = vec![0x22u8; 128];
+    handle.write_all_at(&v2, 0).unwrap();
+    let raw2 = std::fs::read(&path).unwrap()[..128].to_vec();
+
+    // Same offset, but XOR of the two ciphertexts must not equal XOR of the
+    // two plaintexts (that equality is the two-time-pad signature).
+    let ct_xor: Vec<u8> = raw1.iter().zip(&raw2).map(|(a, b)| a ^ b).collect();
+    let pt_xor: Vec<u8> = v1.iter().zip(&v2).map(|(a, b)| a ^ b).collect();
+    assert_ne!(ct_xor, pt_xor, "rewrite must not reuse the keystream");
+
+    // Newest write decrypts.
+    let mut buf = vec![0u8; 128];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(buf, v2, "read after rewrite must return the newest value");
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn test_passthrough_sidecar_reloads_and_compacts_across_restart() {
+    // The append-only sidecar must survive a reopen (the load path replays the
+    // log) and compact down to one record per live extent rather than growing
+    // unbounded with rewrites.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.wal");
+    let sidecar = {
+        let mut s = path.clone().into_os_string();
+        s.push(".tlnonce");
+        std::path::PathBuf::from(s)
+    };
+    let open = || {
+        FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap()
+    };
+    let key = test_key();
+
+    // Many rewrites of the same single extent: the append log grows by one
+    // record each, but the live extent count stays at 1.
+    {
+        let mut handle = TurboliteHandle::new_passthrough(open(), path.clone(), Some(key));
+        for i in 0..20u8 {
+            handle.write_all_at(&vec![i; 128], 0).unwrap();
+        }
+        // Drop handle (simulates shutdown).
+    }
+    let grown = std::fs::metadata(&sidecar).unwrap().len();
+    assert!(grown >= 24, "sidecar should hold at least one record");
+
+    // Reopen: load() replays the log and compacts it to the single live extent
+    // (24 bytes), and the newest plaintext still decrypts.
+    let mut handle = TurboliteHandle::new_passthrough(open(), path.clone(), Some(key));
+    let compacted = std::fs::metadata(&sidecar).unwrap().len();
+    assert_eq!(
+        compacted, 24,
+        "load must compact the log to one record per live extent"
+    );
+
+    let mut buf = vec![0u8; 128];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(
+        buf,
+        vec![19u8; 128],
+        "newest value must survive the reload + compaction"
+    );
+
+    // A further write after reload still appends durably and reads back.
+    handle.write_all_at(&vec![0x55u8; 128], 0).unwrap();
+    let mut buf2 = vec![0u8; 128];
+    handle.read_exact_at(&mut buf2, 0).unwrap();
+    assert_eq!(buf2, vec![0x55u8; 128]);
+}

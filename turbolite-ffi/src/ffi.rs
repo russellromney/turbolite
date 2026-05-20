@@ -406,11 +406,10 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
 
         if local_data_path_present && !cache_dir_present {
             if let Some(db_path) = config.local_data_path.clone() {
-                config.cache_dir =
-                    turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
-                        &db_path,
-                        "-turbolite",
-                    );
+                config.cache_dir = turbolite::tiered::TurboliteConfig::state_dir_for_database_path(
+                    &db_path,
+                    "-turbolite",
+                );
             }
         }
 
@@ -697,71 +696,71 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// or NULL on error.
 #[no_mangle]
 pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
-  ffi_guard(std::ptr::null_mut(), || {
-    clear_last_error();
-    if db.is_null() {
-        set_last_error("db handle must not be NULL");
-        return std::ptr::null_mut();
-    }
-    if handle_is_closed(db as usize) {
-        set_last_error("db handle is already closed");
-        return std::ptr::null_mut();
-    }
-    let sql = match unsafe { cstr_to_str(&sql, "sql") } {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-
-    let db = unsafe { &*db };
-    let result = (|| -> Result<String, String> {
-        let mut stmt = db
-            .conn
-            .prepare(sql)
-            .map_err(|e| format!("prepare: {}", e))?;
-        let col_count = stmt.column_count();
-        let col_names: Vec<String> = (0..col_count)
-            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-            .collect();
-
-        let mut rows_json = Vec::new();
-        let mut rows = stmt.query([]).map_err(|e| format!("query: {}", e))?;
-        while let Some(row) = rows.next().map_err(|e| format!("next: {}", e))? {
-            let mut obj = serde_json::Map::new();
-            for (i, name) in col_names.iter().enumerate() {
-                let val: serde_json::Value = match row.get_ref(i) {
-                    Ok(rusqlite::types::ValueRef::Null) => serde_json::Value::Null,
-                    Ok(rusqlite::types::ValueRef::Integer(n)) => serde_json::json!(n),
-                    Ok(rusqlite::types::ValueRef::Real(f)) => serde_json::json!(f),
-                    Ok(rusqlite::types::ValueRef::Text(s)) => {
-                        serde_json::Value::String(String::from_utf8_lossy(s).into_owned())
-                    }
-                    Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                        // Encode blobs as base64 for JSON safety.
-                        serde_json::Value::String(format!("blob:{} bytes", b.len()))
-                    }
-                    Err(e) => serde_json::Value::String(format!("error: {}", e)),
-                };
-                obj.insert(name.clone(), val);
-            }
-            rows_json.push(serde_json::Value::Object(obj));
+    ffi_guard(std::ptr::null_mut(), || {
+        clear_last_error();
+        if db.is_null() {
+            set_last_error("db handle must not be NULL");
+            return std::ptr::null_mut();
         }
-        serde_json::to_string(&rows_json).map_err(|e| format!("json: {}", e))
-    })();
+        if handle_is_closed(db as usize) {
+            set_last_error("db handle is already closed");
+            return std::ptr::null_mut();
+        }
+        let sql = match unsafe { cstr_to_str(&sql, "sql") } {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-    match result {
-        Ok(json) => match CString::new(json) {
-            Ok(cs) => cs.into_raw(),
-            Err(e) => {
-                set_last_error(&format!("json contains null byte: {}", e));
+        let db = unsafe { &*db };
+        let result = (|| -> Result<String, String> {
+            let mut stmt = db
+                .conn
+                .prepare(sql)
+                .map_err(|e| format!("prepare: {}", e))?;
+            let col_count = stmt.column_count();
+            let col_names: Vec<String> = (0..col_count)
+                .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+                .collect();
+
+            let mut rows_json = Vec::new();
+            let mut rows = stmt.query([]).map_err(|e| format!("query: {}", e))?;
+            while let Some(row) = rows.next().map_err(|e| format!("next: {}", e))? {
+                let mut obj = serde_json::Map::new();
+                for (i, name) in col_names.iter().enumerate() {
+                    let val: serde_json::Value = match row.get_ref(i) {
+                        Ok(rusqlite::types::ValueRef::Null) => serde_json::Value::Null,
+                        Ok(rusqlite::types::ValueRef::Integer(n)) => serde_json::json!(n),
+                        Ok(rusqlite::types::ValueRef::Real(f)) => serde_json::json!(f),
+                        Ok(rusqlite::types::ValueRef::Text(s)) => {
+                            serde_json::Value::String(String::from_utf8_lossy(s).into_owned())
+                        }
+                        Ok(rusqlite::types::ValueRef::Blob(b)) => {
+                            // Encode blobs as base64 for JSON safety.
+                            serde_json::Value::String(format!("blob:{} bytes", b.len()))
+                        }
+                        Err(e) => serde_json::Value::String(format!("error: {}", e)),
+                    };
+                    obj.insert(name.clone(), val);
+                }
+                rows_json.push(serde_json::Value::Object(obj));
+            }
+            serde_json::to_string(&rows_json).map_err(|e| format!("json: {}", e))
+        })();
+
+        match result {
+            Ok(json) => match CString::new(json) {
+                Ok(cs) => cs.into_raw(),
+                Err(e) => {
+                    set_last_error(&format!("json contains null byte: {}", e));
+                    std::ptr::null_mut()
+                }
+            },
+            Err(msg) => {
+                set_last_error(&msg);
                 std::ptr::null_mut()
             }
-        },
-        Err(msg) => {
-            set_last_error(&msg);
-            std::ptr::null_mut()
         }
-    }
-  })
+    })
 }
 
 /// Free a string returned by `turbolite_query_json`.
