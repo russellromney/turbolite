@@ -353,3 +353,65 @@ pub fn ctr_xor_at(data: &[u8], nonce: u64, skip: u64, key: &[u8; 32]) -> io::Res
     cipher.apply_keystream(&mut result);
     Ok(result)
 }
+
+#[cfg(all(test, feature = "encryption"))]
+mod crypto_regression_tests {
+    //! Regression tests for the page/WAL encryption nonce-reuse fix.
+    //! These pin the property that makes in-place rewrites safe: a fresh
+    //! random nonce per encryption, so the same plaintext at the same
+    //! position never produces the same ciphertext/keystream twice.
+    use super::*;
+
+    const KEY: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn gcm_random_nonce_differs_on_rewrite_and_round_trips() {
+        // Encrypting the same plaintext twice (a page rewrite) must yield
+        // different ciphertext — proves the nonce is fresh per write, not
+        // derived from a fixed position. Both must still decrypt back.
+        let plain = b"a sqlite page worth of bytes (pretend)".to_vec();
+        let c1 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
+        let c2 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
+        assert_ne!(c1, c2, "rewrite must not reuse nonce/ciphertext (two-time pad)");
+        assert_eq!(decrypt_gcm_random_nonce(&c1, &KEY).unwrap(), plain);
+        assert_eq!(decrypt_gcm_random_nonce(&c2, &KEY).unwrap(), plain);
+        // Inline nonce is 12 bytes + 16-byte GCM tag overhead.
+        assert_eq!(c1.len(), plain.len() + 12 + 16);
+    }
+
+    #[test]
+    fn gcm_wrong_key_fails_to_decrypt() {
+        let plain = b"secret".to_vec();
+        let c = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
+        let wrong = [8u8; 32];
+        assert!(decrypt_gcm_random_nonce(&c, &wrong).is_err());
+    }
+
+    #[test]
+    fn ctr_distinct_nonces_give_distinct_keystreams() {
+        // The WAL passthrough draws a fresh random nonce per write; distinct
+        // nonces must yield distinct ciphertext for identical plaintext, so
+        // an in-place frame rewrite under a new nonce can't reuse keystream.
+        let plain = vec![0xABu8; 64];
+        let a = encrypt_ctr(&plain, 1, &KEY).unwrap();
+        let b = encrypt_ctr(&plain, 2, &KEY).unwrap();
+        assert_ne!(a, b, "different nonces must not reuse keystream");
+        // Same nonce round-trips (decrypt == encrypt for CTR).
+        assert_eq!(decrypt_ctr(&a, 1, &KEY).unwrap(), plain);
+    }
+
+    #[test]
+    fn ctr_xor_at_partial_read_seek_matches_full_frame() {
+        // A frame is encrypted whole at `skip = 0`; a later sub-range read
+        // seeks the keystream by its in-extent byte offset and must decrypt
+        // to exactly that slice of the original plaintext.
+        let plain: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let nonce = 0x1234_5678_9abc_def0u64;
+        let whole_ct = ctr_xor_at(&plain, nonce, 0, &KEY).unwrap();
+        // Read bytes [50, 90) of the frame: decrypt that ciphertext slice
+        // with skip = 50.
+        let sub_ct = &whole_ct[50..90];
+        let sub_plain = ctr_xor_at(sub_ct, nonce, 50, &KEY).unwrap();
+        assert_eq!(sub_plain, &plain[50..90]);
+    }
+}
