@@ -172,12 +172,14 @@ environment.
   eviction (default off).
 - **Fix:** the lazy hook also calls `evict_to_budget(limit, skip_in_flight)`.
 
-### F14 — [Med] Eviction vs in-flight prefetch TOCTOU — **Documented**
-- `src/tiered/handle.rs:1060-1069` snapshots the Fetching set, then
-  `disk_cache.rs:1797-1816` can hole-punch a group that became Fetching after
-  the snapshot, zeroing a page being installed.
-- **Fix:** inside `evict_to_budget` re-check `group_state(gid) == Fetching` and
-  skip currently-fetching groups.
+### F14 — [Med] Eviction vs in-flight prefetch TOCTOU — **Fixed**
+- The caller (`handle.rs`) snapshots the Fetching set into `skip_groups`, then
+  `evict_to_budget` (`disk_cache.rs`) could hole-punch a group that became
+  Fetching *after* the snapshot, zeroing a page being installed.
+- **Fix:** `evict_to_budget` now re-checks `group_state(id.group_id) ==
+  Fetching` live inside the per-victim loop (not only the pre-snapshot skip
+  set) and `continue`s past any group currently being fetched, so a hole-punch
+  can't race a page install.
 
 ### F15 — [Med] S3 range GET `len==0` underflow; `list_all_keys` infinite loop — **Fixed**
 - `src/tiered/s3_client.rs` (`start + len - 1` underflowed when len==0 →

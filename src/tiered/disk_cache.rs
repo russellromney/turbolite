@@ -1908,6 +1908,12 @@ impl DiskCache {
                     break;
                 }
             }
+            // TOCTOU guard: a group can transition None/Present -> Fetching after
+            // the caller built `skip_groups`. Re-check the live state here so a
+            // hole-punch can never zero a page that a prefetch is installing.
+            if self.group_state(id.group_id as u64) == GroupState::Fetching {
+                continue;
+            }
             // Remove from tracker, then clean disk
             let scbs = {
                 let mut tracker = self.tracker.lock();
