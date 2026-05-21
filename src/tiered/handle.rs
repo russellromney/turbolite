@@ -72,6 +72,14 @@ pub struct TurboliteHandle {
     /// successful sync. Used to detect transaction rollback (lock downgrade
     /// from EXCLUSIVE/RESERVED without sync having been called).
     dirty_since_sync: bool,
+    /// True if xSync (`sync`) has fired since the most recent xWrite. Set in
+    /// `sync`, cleared in `write_all_at`. The lock-downgrade flush gates on
+    /// THIS, not `dirty_since_sync`: under `synchronous=OFF` a rolled-back or
+    /// aborted transaction writes speculative pages (sets `dirty_since_sync`)
+    /// but never calls xSync, so flushing on downgrade would publish those
+    /// uncommitted bytes to S3. Requiring an intervening xSync means only a
+    /// committed (durably-synced) transaction triggers the downgrade flush.
+    synced_since_write: bool,
     /// Cached generation from DiskCache. When this doesn't match cache.generation,
     /// another handle has written pages and the fast path must be skipped.
     cached_generation: u64,
@@ -583,6 +591,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool,
             dirty_since_sync: false,
+            synced_since_write: false,
             cached_generation: 0,
             gc_enabled,
             override_threshold,
@@ -645,6 +654,7 @@ impl TurboliteHandle {
             search_trees: HashSet::new(),
             prefetch_pool: None,
             dirty_since_sync: false,
+            synced_since_write: false,
             cached_generation: 0,
             gc_enabled: false,
             override_threshold: 0,
@@ -2067,6 +2077,10 @@ impl DatabaseHandle for TurboliteHandle {
 
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
+        // A new write invalidates any prior xSync: the bytes now in the cache
+        // are again speculative until the next xSync makes them durable. The
+        // lock-downgrade flush must not publish them unless xSync fires again.
+        self.synced_since_write = false;
 
         // Update manifest page_count if this page extends the database.
         // Fast path: read lock to check if update is needed (common case: no).
@@ -2127,6 +2141,13 @@ impl DatabaseHandle for TurboliteHandle {
         if self.read_only {
             return Ok(());
         }
+
+        // Record that xSync fired. The lock-downgrade flush gates on this
+        // (not `dirty_since_sync`): only a transaction whose writes were
+        // followed by an xSync is treated as committed/durable and eligible
+        // to publish to S3 on downgrade. Set before the early return so an
+        // xSync with nothing dirty (a no-op commit) still counts.
+        self.synced_since_write = true;
 
         // Snapshot is just page numbers, not page data.
         let dirty_snapshot: HashSet<u64> = {
@@ -3238,17 +3259,23 @@ impl DatabaseHandle for TurboliteHandle {
         //   (via xWrite) before releasing the lock, so our dirty set
         //   ends up holding the original (rolled-back) page bytes.
         //
-        // Earlier code treated "lock downgrade without intervening xSync"
-        // as a signal to discard dirty pages (assumed rollback). That
-        // heuristic silently drops every write under
-        // PRAGMA synchronous=OFF, where SQLite skips xSync on every
-        // commit — so each commit looked like a rollback. Replacing the
-        // heuristic with an unconditional sync() keeps both the commit
-        // and rollback cases correct: turbolite's manifest+bitmap end
-        // up matching whatever SQLite finished writing.
-        if (current == LockKind::Exclusive || current == LockKind::Reserved)
+        // Gate the downgrade flush on "xSync fired since the last write"
+        // (`synced_since_write`), NOT "dirty pages exist since last sync"
+        // (`dirty_since_sync`). Under PRAGMA synchronous=OFF, SQLite writes
+        // speculative pages and may then ROLL BACK without ever calling xSync;
+        // those rolled-back bytes set `dirty_since_sync` but were never made
+        // durable. Flushing them on downgrade would publish uncommitted bytes
+        // to S3. Requiring an intervening xSync means only a committed
+        // (durably-synced) transaction publishes here; a rolled-back/aborted
+        // transaction under synchronous=OFF leaves the cache dirty but does
+        // NOT push to S3 — the next genuine commit's xSync will. The source
+        // lock set includes Pending (SQLite escalates Reserved->Pending->
+        // Exclusive, and a transaction can end from any of them).
+        if (current == LockKind::Exclusive
+            || current == LockKind::Reserved
+            || current == LockKind::Pending)
             && (lock == LockKind::Shared || lock == LockKind::None)
-            && self.dirty_since_sync
+            && self.synced_since_write
         {
             if let Err(e) = self.sync(false) {
                 eprintln!("[turbolite] flush-on-lock-downgrade failed: {e}");

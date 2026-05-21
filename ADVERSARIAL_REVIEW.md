@@ -129,11 +129,19 @@ environment.
 - **Fix:** take `replay_gate.write()` for the whole cache-mutation + manifest-swap
   block (mirrors `ReplayHandle::finalize`).
 
-### F9 — [High/Med] Lock-downgrade flush keyed on `dirty_since_sync` can publish uncommitted bytes — **Documented**
-- `src/tiered/handle.rs:2986-2993`; can publish rolled-back bytes under
-  `synchronous=OFF` and excludes the `Pending` source lock.
-- **Fix:** gate the flush on an explicit "xSync since last write" flag, not
-  `dirty_since_sync`; include `Pending` in the source-lock set.
+### F9 — [High/Med] Lock-downgrade flush keyed on `dirty_since_sync` can publish uncommitted bytes — **Fixed**
+- `src/tiered/handle.rs` `lock()` Exclusive/Reserved -> Shared/None downgrade.
+  Gating the flush on `dirty_since_sync` published rolled-back bytes under
+  `synchronous=OFF` (SQLite writes speculative pages, rolls back, and never
+  calls xSync — yet `dirty_since_sync` was set), and the source-lock set
+  excluded `Pending`.
+- **Fix:** added an explicit `synced_since_write` flag — set in `sync()`
+  (xSync), cleared in `write_all_at()` (xWrite). The downgrade flush now gates
+  on `synced_since_write` instead of `dirty_since_sync`, so only a transaction
+  whose writes were followed by a genuine xSync (a durable commit) publishes to
+  S3 on downgrade; a rolled-back/aborted transaction under `synchronous=OFF`
+  leaves the cache dirty but does NOT push (the next real commit's xSync will).
+  The source-lock set now also includes `Pending`.
 
 ### F12 — [High] Compressed cache file grows unbounded; single-page compressed writes are eviction-blind — **Fixed**
 - `src/tiered/disk_cache.rs` (compressed mode skips hole-punch and `next_offset`
