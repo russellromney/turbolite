@@ -167,10 +167,17 @@ environment.
   `staging_torn_trailing_page_body_recovers_complete_records`: a log with two
   complete records plus a truncated trailing body recovers exactly the two.
 
-### F13 — [Med] Cache trimmed only at end-of-query → unbounded mid-query — **Documented**
-- `src/tiered/handle.rs:1041-1069`; the 64-fetch lazy hook only does TTL
-  eviction (default off).
-- **Fix:** the lazy hook also calls `evict_to_budget(limit, skip_in_flight)`.
+### F13 — [Med] Cache trimmed only at end-of-query → unbounded mid-query — **Fixed**
+- `src/tiered/disk_cache.rs` `mark_group_present`; the every-64-fetch lazy hook
+  only did TTL eviction (default off), so a single large scan grew the cache
+  unbounded until the end-of-query boundary fired the budget trim.
+- **Fix:** the lazy hook now also calls `evict_to_budget(budget, skip_in_flight)`
+  when a size budget is set. The budget is mirrored into the cache via a new
+  `cache_budget_bytes` field + `set_cache_budget_bytes`, kept in sync with the
+  handle's `cache_limit` (set on construction and on the `cache_limit` PRAGMA).
+  The skip set is the live `Fetching` group set (`fetching_group_ids`), and
+  `evict_to_budget` additionally re-checks `Fetching` per victim (F14), so a
+  mid-query hole-punch can't race an in-flight page install.
 
 ### F14 — [Med] Eviction vs in-flight prefetch TOCTOU — **Fixed**
 - The caller (`handle.rs`) snapshots the Fetching set into `skip_groups`, then

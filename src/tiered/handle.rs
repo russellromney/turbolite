@@ -548,6 +548,15 @@ impl TurboliteHandle {
         // Drop the snapshot; handle uses the shared Arc from now on
         drop(manifest);
 
+        // Mirror the size budget into the cache so the lazy mid-query trim
+        // (every-64-fetch hook) can keep a large scan near budget instead of
+        // growing unbounded until the end-of-query boundary.
+        cache.set_cache_budget_bytes(
+            max_cache_bytes
+                .map(|n| if n == 0 { 0 } else { n })
+                .unwrap_or(0),
+        );
+
         let staging_dir = cache.cache_dir.join("staging");
 
         // Per-handle settings queue. Register on the thread-local stack
@@ -1238,6 +1247,10 @@ impl DatabaseHandle for TurboliteHandle {
                     "cache_limit" => {
                         if let Some(bytes) = settings::parse_byte_size(&update.value) {
                             self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                            // Keep the lazy mid-query trim budget in sync.
+                            if let Some(cache) = &self.cache {
+                                cache.set_cache_budget_bytes(bytes);
+                            }
                         }
                     }
                     "evict_on_checkpoint" => {

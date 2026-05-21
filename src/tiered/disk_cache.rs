@@ -296,6 +296,13 @@ pub(crate) struct DiskCache {
     /// consistent state, and the new VFS instance starts with a
     /// fresh (untainted) flag.
     pub(crate) tainted: std::sync::atomic::AtomicBool,
+
+    /// Disk-cache size budget in bytes for the lazy mid-query trim (0 =
+    /// disabled). Mirrors the handle's `cache_limit` so the every-64-fetch
+    /// hook in `mark_group_present` can trim toward budget without an
+    /// end-of-query boundary. A single large scan would otherwise grow the
+    /// cache unbounded until the query ends.
+    pub(crate) cache_budget_bytes: AtomicU64,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -569,6 +576,7 @@ impl DiskCache {
             #[cfg(test)]
             fail_rollback_after: std::sync::atomic::AtomicI64::new(i64::MAX),
             tainted: std::sync::atomic::AtomicBool::new(false),
+            cache_budget_bytes: AtomicU64::new(0),
         })
     }
 
@@ -1499,7 +1507,38 @@ impl DiskCache {
         if count % 64 == 0 {
             drop(states);
             self.evict_expired();
+            // Mid-query budget trim: TTL eviction alone (default off) lets a
+            // single large scan grow the cache unbounded until the query ends.
+            // Trim toward the size budget here too, skipping in-flight
+            // (Fetching) groups so a hole-punch can't race a page install.
+            let budget = self.cache_budget_bytes.load(Ordering::Relaxed);
+            if budget > 0 {
+                let skip = self.fetching_group_ids();
+                self.evict_to_budget(budget, &skip);
+            }
         }
+    }
+
+    /// Snapshot the set of groups currently in the `Fetching` state. Used by
+    /// the lazy mid-query trim to skip in-flight prefetch groups. (Note:
+    /// `evict_to_budget` also re-checks `Fetching` live per victim, so this is
+    /// a best-effort pre-filter, not the only guard.)
+    fn fetching_group_ids(&self) -> HashSet<u64> {
+        let states = self.group_states.lock();
+        let mut set = HashSet::new();
+        for (i, s) in states.iter().enumerate() {
+            if s.load(Ordering::Acquire) == GroupState::Fetching as u8 {
+                set.insert(i as u64);
+            }
+        }
+        set
+    }
+
+    /// Set the disk-cache size budget for the lazy mid-query trim (0 = disabled).
+    /// Mirrors the handle's `cache_limit`; called on construction and whenever
+    /// the limit changes via PRAGMA.
+    pub(crate) fn set_cache_budget_bytes(&self, budget: u64) {
+        self.cache_budget_bytes.store(budget, Ordering::Relaxed);
     }
 
     /// Reset a group from Fetching back to None (e.g., submit failed or claim no longer needed).
