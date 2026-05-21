@@ -769,6 +769,7 @@ fn test_encode_cache_read_roundtrip() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -778,6 +779,7 @@ fn test_encode_cache_read_roundtrip() {
         &encoded,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None,
     )
     .unwrap();

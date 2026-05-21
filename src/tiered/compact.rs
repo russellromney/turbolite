@@ -421,6 +421,7 @@ pub(crate) fn compact_override_group(
             0,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            &keys::aad_page_group(gid),
             encryption_key,
         )?;
         let ps = page_size as usize;
@@ -436,6 +437,7 @@ pub(crate) fn compact_override_group(
             &base_data,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            &keys::aad_page_group(gid),
             encryption_key,
         )?;
         for (i, page) in pages.into_iter().enumerate() {
@@ -460,6 +462,7 @@ pub(crate) fn compact_override_group(
             &ovr_data,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            &keys::aad_override_frame(gid, frame_idx),
             encryption_key,
         )?;
         let frame_start = frame_idx * sub_ppf as usize;
@@ -484,6 +487,7 @@ pub(crate) fn compact_override_group(
             compression_level,
             #[cfg(feature = "zstd")]
             encoder_dict,
+            &keys::aad_page_group(gid),
             encryption_key,
         )?;
         Ok(OverrideCompactResult {
@@ -500,6 +504,7 @@ pub(crate) fn compact_override_group(
             compression_level,
             #[cfg(feature = "zstd")]
             encoder_dict,
+            &keys::aad_page_group(gid),
             encryption_key,
         )?;
         Ok(OverrideCompactResult {

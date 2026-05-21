@@ -465,6 +465,7 @@ impl TurboliteHandle {
                                                             zstd::dict::DecoderDictionary::copy(d)
                                                         })
                                                         .as_ref(),
+                                                    &keys::aad_override_frame(0, frame_idx),
                                                     encryption_key.as_ref(),
                                                 ) {
                                                     let frame_start = frame_idx * spf;
@@ -819,6 +820,7 @@ impl TurboliteHandle {
                     0, // B-tree groups: size from group_page_nums
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key,
                 )?;
                 (c, d)
@@ -828,6 +830,7 @@ impl TurboliteHandle {
                     pg_data,
                     #[cfg(feature = "zstd")]
                     decoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key,
                 )?;
                 (c, d)
@@ -887,6 +890,7 @@ impl TurboliteHandle {
             pg_data,
             #[cfg(feature = "zstd")]
             self.decoder_dict.as_ref(),
+            &keys::aad_page_group(gid),
             self.encryption_key.as_ref(),
         )?;
 
@@ -1485,6 +1489,7 @@ impl DatabaseHandle for TurboliteHandle {
                                     0,
                                     #[cfg(feature = "zstd")]
                                     self.decoder_dict.as_ref(),
+                                    &keys::aad_page_group(gid),
                                     self.encryption_key.as_ref(),
                                 ) {
                                     cache.write_pages_scattered(
@@ -1501,6 +1506,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
                                 self.decoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 self.encryption_key.as_ref(),
                             ) {
                                 cache.write_pages_scattered(&pages_in_group, &bulk_data, gid, 0)?;
@@ -1528,6 +1534,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                     &ovr_data,
                                                     #[cfg(feature = "zstd")]
                                                     self.decoder_dict.as_ref(),
+                                                    &keys::aad_override_frame(gid, frame_idx),
                                                     self.encryption_key.as_ref(),
                                                 ) {
                                                     let frame_start = frame_idx * spf;
@@ -1688,10 +1695,19 @@ impl DatabaseHandle for TurboliteHandle {
                         Ok(Some(compressed_frame)) => {
                             let s3_ms = s3_start.elapsed().as_millis();
                             let decode_start = Instant::now();
+                            // The fetched frame is an override frame when
+                            // override_entry is set, otherwise a base seekable
+                            // page-group frame — bind to the matching slot AAD.
+                            let frame_aad = if override_entry.is_some() {
+                                keys::aad_override_frame(gid, frame_idx)
+                            } else {
+                                keys::aad_page_group(gid)
+                            };
                             let decompressed = decode_seekable_subchunk(
                                 &compressed_frame,
                                 #[cfg(feature = "zstd")]
                                 self.decoder_dict.as_ref(),
+                                &frame_aad,
                                 self.encryption_key.as_ref(),
                             )?;
                             let decode_ms = decode_start.elapsed().as_millis();
@@ -1842,6 +1858,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             0, // not used for scattered writes
                                             #[cfg(feature = "zstd")]
                                             self.decoder_dict.as_ref(),
+                                            &keys::aad_page_group(gid),
                                             self.encryption_key.as_ref(),
                                         )
                                     } else {
@@ -1849,6 +1866,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             &pg_data,
                                             #[cfg(feature = "zstd")]
                                             self.decoder_dict.as_ref(),
+                                            &keys::aad_page_group(gid),
                                             self.encryption_key.as_ref(),
                                         )
                                     };
@@ -2622,6 +2640,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                     0,
                                                     #[cfg(feature = "zstd")]
                                                     None::<&zstd::dict::DecoderDictionary<'static>>,
+                                                    &keys::aad_page_group(gid),
                                                     encryption_key.as_ref(),
                                                 )
                                             {
@@ -2646,6 +2665,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                 &pg_data,
                                                 #[cfg(feature = "zstd")]
                                                 None::<&zstd::dict::DecoderDictionary<'static>>,
+                                                &keys::aad_page_group(gid),
                                                 encryption_key.as_ref(),
                                             )
                                         {
@@ -2683,6 +2703,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 compression_level,
                                 #[cfg(feature = "zstd")]
                                 encoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 encryption_key.as_ref(),
                             )?;
                             Ok(GroupResult {
@@ -2699,6 +2720,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 compression_level,
                                 #[cfg(feature = "zstd")]
                                 encoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 encryption_key.as_ref(),
                             )?;
                             Ok(GroupResult {
@@ -2838,6 +2860,7 @@ impl DatabaseHandle for TurboliteHandle {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         self.encoder_dict.as_ref(),
+                        &keys::aad_interior_bundle(chunk_id),
                         self.encryption_key.as_ref(),
                     )?;
                     let key = keys::interior_chunk_key(chunk_id, next_version);
@@ -2979,6 +3002,7 @@ impl DatabaseHandle for TurboliteHandle {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         self.encoder_dict.as_ref(),
+                        &keys::aad_index_bundle(chunk_id),
                         self.encryption_key.as_ref(),
                     )?;
                     let key = keys::index_chunk_key(chunk_id, next_version);

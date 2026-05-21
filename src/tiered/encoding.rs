@@ -19,15 +19,21 @@ pub(crate) const MAX_TIERED_DECOMPRESSED_BYTES: usize = 1usize << 30;
 // (page_count tells us how many pages are in the group).
 
 /// Decrypt data if an encryption key is provided, otherwise return as-is (zero-copy).
+///
+/// `aad` is the slot-identity additional authenticated data (see `keys`): it must
+/// match the AAD used when the frame was encrypted, or the GCM tag check fails.
+/// This binds an encrypted frame to its slot so it can't be swapped elsewhere.
 pub(crate) fn decrypt_if_needed(
     data: &[u8],
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
-        return compress::decrypt_gcm_random_nonce(data, key);
+        return compress::decrypt_gcm_random_nonce(data, aad, key);
     }
     let _ = encryption_key; // suppress unused warnings when encryption feature is off
+    let _ = aad;
     Ok(data.to_vec())
 }
 
@@ -39,10 +45,11 @@ pub(crate) fn encode_page_group(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     #[cfg(not(feature = "encryption"))]
-    let _ = encryption_key;
+    let _ = (encryption_key, aad);
 
     // Emit exactly `pages.len()` pages — never strip trailing None.
     //
@@ -91,7 +98,7 @@ pub(crate) fn encode_page_group(
 
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
-        return compress::encrypt_gcm_random_nonce(&compressed, key);
+        return compress::encrypt_gcm_random_nonce(&compressed, aad, key);
     }
 
     Ok(compressed)
@@ -107,10 +114,11 @@ pub(crate) fn encode_page_group_seekable(
     sub_ppg: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(Vec<u8>, Vec<FrameEntry>)> {
     #[cfg(not(feature = "encryption"))]
-    let _ = encryption_key;
+    let _ = (encryption_key, aad);
 
     // Emit exactly `pages.len()` pages — never strip trailing None. See the
     // detailed rationale on `encode_page_group` above; the same correctness
@@ -154,10 +162,11 @@ pub(crate) fn encode_page_group_seekable(
             None,
         )?;
 
-        // Per-frame encryption: random nonce prepended to each frame
+        // Per-frame encryption: random nonce prepended to each frame. Every
+        // frame in the group shares the group's AAD (slot = the page group).
         #[cfg(feature = "encryption")]
         let frame_data = if let Some(key) = encryption_key {
-            compress::encrypt_gcm_random_nonce(&frame_data, key)?
+            compress::encrypt_gcm_random_nonce(&frame_data, aad, key)?
         } else {
             frame_data
         };
@@ -177,9 +186,10 @@ pub(crate) fn encode_page_group_seekable(
 pub(crate) fn decode_seekable_subchunk(
     compressed_frame: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
-    let data = decrypt_if_needed(compressed_frame, encryption_key)?;
+    let data = decrypt_if_needed(compressed_frame, aad, encryption_key)?;
     compress::decompress_capped(
         &data,
         #[cfg(feature = "zstd")]
@@ -200,6 +210,7 @@ pub(crate) fn decode_page_group_seekable_full(
     total_page_count: u64,
     group_start: u64,
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
     let actual_pages = std::cmp::min(
@@ -222,7 +233,7 @@ pub(crate) fn decode_page_group_seekable_full(
                 ),
             ));
         }
-        let decrypted = decrypt_if_needed(&data[start..end], encryption_key)?;
+        let decrypted = decrypt_if_needed(&data[start..end], aad, encryption_key)?;
         // A single frame decompresses to at most the whole group's page bytes;
         // cap there (anti decompression-bomb) and fall back to the absolute
         // ceiling if the precise product overflows / is zero.
@@ -276,9 +287,10 @@ fn checked_group_expected_len(page_count: u32, page_size: u32) -> io::Result<usi
 pub(crate) fn decode_page_group(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<Vec<u8>>)> {
-    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
+    let decrypted = decrypt_if_needed(compressed, aad, encryption_key)?;
     let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
@@ -325,9 +337,10 @@ pub(crate) fn decode_page_group(
 pub(crate) fn decode_page_group_bulk(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
-    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
+    let decrypted = decrypt_if_needed(compressed, aad, encryption_key)?;
     let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
@@ -379,10 +392,11 @@ pub(crate) fn encode_interior_bundle(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     #[cfg(not(feature = "encryption"))]
-    let _ = encryption_key;
+    let _ = (encryption_key, aad);
 
     let page_count = pages.len() as u32;
     let header_len = 8 + pages.len() * 8; // 2×u32 + page_count×u64
@@ -416,19 +430,23 @@ pub(crate) fn encode_interior_bundle(
 
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
-        return compress::encrypt_gcm_random_nonce(&compressed, key);
+        return compress::encrypt_gcm_random_nonce(&compressed, aad, key);
     }
 
     Ok(compressed)
 }
 
 /// Decode an interior bundle: returns Vec of (page_number, raw_page_data).
+///
+/// `aad` distinguishes interior vs index bundles (and which chunk id) — pass
+/// `keys::aad_interior_bundle` / `keys::aad_index_bundle` to match the encode.
 pub(crate) fn decode_interior_bundle(
     compressed: &[u8],
     #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<(u64, Vec<u8>)>> {
-    let decrypted = decrypt_if_needed(compressed, encryption_key)?;
+    let decrypted = decrypt_if_needed(compressed, aad, encryption_key)?;
     let raw = compress::decompress_capped(
         &decrypted,
         #[cfg(feature = "zstd")]
@@ -502,6 +520,7 @@ pub(crate) fn encode_override_frame(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
+    aad: &[u8],
     encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
     let mut raw = Vec::with_capacity(dirty_pages.len() * page_size as usize);
@@ -521,12 +540,12 @@ pub(crate) fn encode_override_frame(
     )?;
     #[cfg(feature = "encryption")]
     let frame_data = if let Some(key) = encryption_key {
-        compress::encrypt_gcm_random_nonce(&frame_data, key)?
+        compress::encrypt_gcm_random_nonce(&frame_data, aad, key)?
     } else {
         frame_data
     };
     #[cfg(not(feature = "encryption"))]
-    let _ = encryption_key;
+    let _ = (encryption_key, aad);
     Ok(frame_data)
 }
 

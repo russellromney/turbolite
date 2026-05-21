@@ -232,7 +232,7 @@ fn decompress_zstd(_data: &[u8], _max_page: usize) -> io::Result<Vec<u8>> {
 #[cfg(feature = "encryption")]
 fn maybe_encrypt(payload: Vec<u8>, codec: &PageCodec) -> io::Result<Vec<u8>> {
     match codec.key {
-        Some(key) => crate::compress::encrypt_gcm_random_nonce(&payload, &key),
+        Some(key) => crate::compress::encrypt_gcm_random_nonce(&payload, &[], &key),
         None => Ok(payload),
     }
 }
@@ -251,7 +251,7 @@ fn maybe_encrypt(payload: Vec<u8>, codec: &PageCodec) -> io::Result<Vec<u8>> {
 #[cfg(feature = "encryption")]
 fn maybe_decrypt(payload: &[u8], codec: &PageCodec) -> io::Result<Vec<u8>> {
     match codec.key {
-        Some(key) => crate::compress::decrypt_gcm_random_nonce(payload, &key),
+        Some(key) => crate::compress::decrypt_gcm_random_nonce(payload, &[], &key),
         None => Ok(payload.to_vec()),
     }
 }

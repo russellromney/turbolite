@@ -42,19 +42,21 @@ fn test_rotate_page_group_non_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     )
     .unwrap();
 
     // Rotate: decrypt with A, re-encrypt with B
-    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &key_a).unwrap();
-    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &key_b).unwrap();
+    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &[], &key_a).unwrap();
+    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &[], &key_b).unwrap();
 
     // Decrypt with B should work
     let (pc, ps, decoded_pages) = decode_page_group(
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_b),
     )
     .unwrap();
@@ -69,6 +71,7 @@ fn test_rotate_page_group_non_seekable() {
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     );
     assert!(result.is_err(), "old key must fail after rotation");
@@ -90,6 +93,7 @@ fn test_rotate_page_group_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     )
     .unwrap();
@@ -103,8 +107,8 @@ fn test_rotate_page_group_seekable() {
     for frame in &frame_table {
         let end = frame.offset as usize + frame.len as usize;
         let frame_data = &encoded[frame.offset as usize..end];
-        let compressed = compress::decrypt_gcm_random_nonce(frame_data, &key_a).unwrap();
-        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &key_b).unwrap();
+        let compressed = compress::decrypt_gcm_random_nonce(frame_data, &[], &key_a).unwrap();
+        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &[], &key_b).unwrap();
 
         new_frames.push(FrameEntry {
             offset: new_blob.len() as u64,
@@ -129,6 +133,7 @@ fn test_rotate_page_group_seekable() {
             frame_data,
             #[cfg(feature = "zstd")]
             None,
+            &[],
             Some(&key_b),
         )
         .unwrap();
@@ -162,19 +167,21 @@ fn test_rotate_interior_bundle() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     )
     .unwrap();
 
     // Rotate: decrypt A, re-encrypt B
-    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &key_a).unwrap();
-    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &key_b).unwrap();
+    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &[], &key_a).unwrap();
+    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &[], &key_b).unwrap();
 
     // Decrypt with B
     let decoded = decode_interior_bundle(
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_b),
     )
     .unwrap();
@@ -190,6 +197,7 @@ fn test_rotate_interior_bundle() {
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     );
     assert!(result.is_err(), "old key must fail after rotation");
@@ -222,11 +230,11 @@ fn test_rotate_nonce_uniqueness() {
     let key_b = test_key_2();
 
     let data = vec![0x42u8; 4096];
-    let enc_a = compress::encrypt_gcm_random_nonce(&data, &key_a).unwrap();
+    let enc_a = compress::encrypt_gcm_random_nonce(&data, &[], &key_a).unwrap();
 
     // Decrypt then re-encrypt with B
-    let plaintext = compress::decrypt_gcm_random_nonce(&enc_a, &key_a).unwrap();
-    let enc_b = compress::encrypt_gcm_random_nonce(&plaintext, &key_b).unwrap();
+    let plaintext = compress::decrypt_gcm_random_nonce(&enc_a, &[], &key_a).unwrap();
+    let enc_b = compress::encrypt_gcm_random_nonce(&plaintext, &[], &key_b).unwrap();
 
     // Nonces (first 12 bytes) must differ
     assert_ne!(
@@ -246,9 +254,9 @@ fn test_rotate_wrong_old_key_fails() {
     let wrong = wrong_key();
 
     let data = vec![0x42u8; 4096];
-    let encrypted = compress::encrypt_gcm_random_nonce(&data, &key_a).unwrap();
+    let encrypted = compress::encrypt_gcm_random_nonce(&data, &[], &key_a).unwrap();
 
-    let result = compress::decrypt_gcm_random_nonce(&encrypted, &wrong);
+    let result = compress::decrypt_gcm_random_nonce(&encrypted, &[], &wrong);
     assert!(result.is_err(), "wrong old key must fail decryption");
 }
 
@@ -266,13 +274,14 @@ fn test_rotate_same_key_idempotent() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
 
     // Rotate to same key
-    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &key).unwrap();
-    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &key).unwrap();
+    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &[], &key).unwrap();
+    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &[], &key).unwrap();
 
     // Different ciphertext (new random nonce)
     assert_ne!(encoded, rotated);
@@ -282,6 +291,7 @@ fn test_rotate_same_key_idempotent() {
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -312,15 +322,17 @@ fn test_rotate_empty_page_group_vec() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     )
     .unwrap();
-    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &key_a).unwrap();
-    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &key_b).unwrap();
+    let compressed = compress::decrypt_gcm_random_nonce(&encoded, &[], &key_a).unwrap();
+    let rotated = compress::encrypt_gcm_random_nonce(&compressed, &[], &key_b).unwrap();
     let (_, _, decoded) = decode_page_group(
         &rotated,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_b),
     )
     .unwrap();
@@ -345,6 +357,7 @@ fn test_rotate_large_page_group() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key_a),
     )
     .unwrap();
@@ -358,8 +371,8 @@ fn test_rotate_large_page_group() {
     for frame in &frame_table {
         let end = frame.offset as usize + frame.len as usize;
         let frame_data = &encoded[frame.offset as usize..end];
-        let compressed = compress::decrypt_gcm_random_nonce(frame_data, &key_a).unwrap();
-        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &key_b).unwrap();
+        let compressed = compress::decrypt_gcm_random_nonce(frame_data, &[], &key_a).unwrap();
+        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &[], &key_b).unwrap();
         new_frames.push(FrameEntry {
             offset: new_blob.len() as u64,
             len: re_encrypted.len() as u32,
@@ -374,6 +387,7 @@ fn test_rotate_large_page_group() {
             &new_blob[frame.offset as usize..end],
             #[cfg(feature = "zstd")]
             None,
+            &[],
             Some(&key_b),
         )
         .unwrap();
@@ -401,18 +415,20 @@ fn test_add_encryption_non_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None, // no encryption
     )
     .unwrap();
 
     // "Add encryption": encrypt the compressed blob
-    let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &key).unwrap();
+    let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &[], &key).unwrap();
 
     // Decrypt with key should work
     let (pc, ps, decoded_pages) = decode_page_group(
         &encrypted,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -437,18 +453,20 @@ fn test_remove_encryption_non_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
 
     // "Remove encryption": decrypt to get raw compressed data
-    let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &key).unwrap();
+    let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &[], &key).unwrap();
 
     // Should be decodable without encryption
     let (pc, ps, decoded_pages) = decode_page_group(
         &decrypted,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None, // no encryption
     )
     .unwrap();
@@ -474,6 +492,7 @@ fn test_add_encryption_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None, // no encryption
     )
     .unwrap();
@@ -487,7 +506,7 @@ fn test_add_encryption_seekable() {
     for frame in &frame_table {
         let end = frame.offset as usize + frame.len as usize;
         let frame_data = &encoded[frame.offset as usize..end];
-        let encrypted = compress::encrypt_gcm_random_nonce(frame_data, &key).unwrap();
+        let encrypted = compress::encrypt_gcm_random_nonce(frame_data, &[], &key).unwrap();
 
         new_frames.push(FrameEntry {
             offset: new_blob.len() as u64,
@@ -508,6 +527,7 @@ fn test_add_encryption_seekable() {
             &new_blob[frame.offset as usize..end],
             #[cfg(feature = "zstd")]
             None,
+            &[],
             Some(&key),
         )
         .unwrap();
@@ -532,6 +552,7 @@ fn test_remove_encryption_seekable() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -545,7 +566,7 @@ fn test_remove_encryption_seekable() {
     for frame in &frame_table {
         let end = frame.offset as usize + frame.len as usize;
         let frame_data = &encoded[frame.offset as usize..end];
-        let decrypted = compress::decrypt_gcm_random_nonce(frame_data, &key).unwrap();
+        let decrypted = compress::decrypt_gcm_random_nonce(frame_data, &[], &key).unwrap();
 
         new_frames.push(FrameEntry {
             offset: new_blob.len() as u64,
@@ -566,6 +587,7 @@ fn test_remove_encryption_seekable() {
             &new_blob[frame.offset as usize..end],
             #[cfg(feature = "zstd")]
             None,
+            &[],
             None, // no encryption
         )
         .unwrap();
@@ -594,18 +616,20 @@ fn test_add_encryption_interior_bundle() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None, // no encryption
     )
     .unwrap();
 
     // Add encryption
-    let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &key).unwrap();
+    let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &[], &key).unwrap();
 
     // Decode with key
     let decoded = decode_interior_bundle(
         &encrypted,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
@@ -636,18 +660,20 @@ fn test_remove_encryption_interior_bundle() {
         3,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         Some(&key),
     )
     .unwrap();
 
     // Remove encryption
-    let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &key).unwrap();
+    let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &[], &key).unwrap();
 
     // Decode without key
     let decoded = decode_interior_bundle(
         &decrypted,
         #[cfg(feature = "zstd")]
         None,
+        &[],
         None, // no encryption
     )
     .unwrap();

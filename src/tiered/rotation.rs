@@ -55,15 +55,20 @@ pub fn rotate_encryption_key(
 
     // Helpers: decrypt if old_key present, encrypt if new_key present.
     // When key is None, data passes through unchanged.
-    let maybe_decrypt = |data: &[u8]| -> io::Result<Vec<u8>> {
+    //
+    // `aad` is the slot-identity AAD (see `keys`). It is slot-bound but
+    // version-INDEPENDENT, so the old object (one version) decrypts and the new
+    // object (next version) re-encrypts under the SAME AAD — rotation does not
+    // move a frame across slots, only across versions.
+    let maybe_decrypt = |data: &[u8], aad: &[u8]| -> io::Result<Vec<u8>> {
         match old_key.as_ref() {
-            Some(k) => compress::decrypt_gcm_random_nonce(data, k),
+            Some(k) => compress::decrypt_gcm_random_nonce(data, aad, k),
             None => Ok(data.to_vec()),
         }
     };
-    let maybe_encrypt = |data: &[u8]| -> io::Result<Vec<u8>> {
+    let maybe_encrypt = |data: &[u8], aad: &[u8]| -> io::Result<Vec<u8>> {
         match new_key.as_ref() {
-            Some(k) => compress::encrypt_gcm_random_nonce(data, k),
+            Some(k) => compress::encrypt_gcm_random_nonce(data, aad, k),
             None => Ok(data.to_vec()),
         }
     };
@@ -124,6 +129,7 @@ pub fn rotate_encryption_key(
             // old_key is Some here (validated_old_key starts true when old_key is None)
             compress::decrypt_gcm_random_nonce(
                 test_data,
+                &keys::aad_page_group(gid as u64),
                 old_key
                     .as_ref()
                     .expect("old_key must be Some for validation"),
@@ -146,11 +152,12 @@ pub fn rotate_encryption_key(
             let mut new_blob = Vec::with_capacity(blob.len());
             let mut new_frames = Vec::with_capacity(frames.len());
 
+            let pg_aad = keys::aad_page_group(gid as u64);
             for frame in frames {
                 let end = frame.offset as usize + frame.len as usize;
                 let frame_data = &blob[frame.offset as usize..end];
-                let compressed = maybe_decrypt(frame_data)?;
-                let output = maybe_encrypt(&compressed)?;
+                let compressed = maybe_decrypt(frame_data, &pg_aad)?;
+                let output = maybe_encrypt(&compressed, &pg_aad)?;
 
                 new_frames.push(FrameEntry {
                     offset: new_blob.len() as u64,
@@ -171,8 +178,9 @@ pub fn rotate_encryption_key(
             new_manifest.frame_tables[gid] = new_frames;
         } else {
             // Non-seekable: whole-blob decrypt + re-encrypt
-            let compressed = maybe_decrypt(&blob)?;
-            let output = maybe_encrypt(&compressed)?;
+            let pg_aad = keys::aad_page_group(gid as u64);
+            let compressed = maybe_decrypt(&blob, &pg_aad)?;
+            let output = maybe_encrypt(&compressed, &pg_aad)?;
 
             let new_s3_key = keys::page_group_key(gid as u64, new_version);
             storage_helpers::put_page_groups(
@@ -209,8 +217,9 @@ pub fn rotate_encryption_key(
                     format!("Interior chunk {} not found", old_s3_key),
                 )
             })?;
-        let compressed = maybe_decrypt(&blob)?;
-        let output = maybe_encrypt(&compressed)?;
+        let int_aad = keys::aad_interior_bundle(*chunk_id);
+        let compressed = maybe_decrypt(&blob, &int_aad)?;
+        let output = maybe_encrypt(&compressed, &int_aad)?;
 
         let new_s3_key = keys::interior_chunk_key(*chunk_id, new_version);
         storage_helpers::put_page_groups(
@@ -241,8 +250,9 @@ pub fn rotate_encryption_key(
                     format!("Index chunk {} not found", old_s3_key),
                 )
             })?;
-        let compressed = maybe_decrypt(&blob)?;
-        let output = maybe_encrypt(&compressed)?;
+        let idx_aad = keys::aad_index_bundle(*chunk_id);
+        let compressed = maybe_decrypt(&blob, &idx_aad)?;
+        let output = maybe_encrypt(&compressed, &idx_aad)?;
 
         let new_s3_key = keys::index_chunk_key(*chunk_id, new_version);
         storage_helpers::put_page_groups(
@@ -286,7 +296,11 @@ pub fn rotate_encryption_key(
                 ));
             }
             let frame_data = &verify_blob[frame.offset as usize..end];
-            let decrypted = decrypt_if_needed(frame_data, new_key.as_ref())?;
+            let decrypted = decrypt_if_needed(
+                frame_data,
+                &keys::aad_page_group(verify_gid as u64),
+                new_key.as_ref(),
+            )?;
             compress::decompress(
                 &decrypted,
                 #[cfg(feature = "zstd")]
@@ -302,7 +316,11 @@ pub fn rotate_encryption_key(
             })?;
         } else {
             // Non-seekable: verify whole blob
-            let decrypted = decrypt_if_needed(&verify_blob, new_key.as_ref())?;
+            let decrypted = decrypt_if_needed(
+                &verify_blob,
+                &keys::aad_page_group(verify_gid as u64),
+                new_key.as_ref(),
+            )?;
             compress::decompress(
                 &decrypted,
                 #[cfg(feature = "zstd")]

@@ -18,7 +18,7 @@ use super::async_rt::block_on;
 use super::manifest::{FrameEntry, Manifest, SubframeOverride};
 use super::{
     decode_page_group_bulk, decode_page_group_seekable_full, decode_seekable_subchunk,
-    is_valid_btree_page, DiskCache, GroupState,
+    is_valid_btree_page, keys, DiskCache, GroupState,
 };
 
 /// A job for the prefetch thread pool.
@@ -322,6 +322,7 @@ impl PrefetchPool {
                             0,
                             #[cfg(feature = "zstd")]
                             decoder_dict.as_ref(),
+                            &keys::aad_page_group(gid),
                             encryption_key.as_ref().as_ref(),
                         )
                     } else {
@@ -329,6 +330,7 @@ impl PrefetchPool {
                             &pg_data,
                             #[cfg(feature = "zstd")]
                             decoder_dict.as_ref(),
+                            &keys::aad_page_group(gid),
                             encryption_key.as_ref().as_ref(),
                         )
                     };
@@ -416,6 +418,7 @@ impl PrefetchPool {
                                 &ovr_data,
                                 #[cfg(feature = "zstd")]
                                 ovr_decoder.as_ref(),
+                                &keys::aad_override_frame(gid, frame_idx),
                                 encryption_key.as_ref().as_ref(),
                             ) {
                                 Ok(bytes) => bytes,

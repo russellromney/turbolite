@@ -262,6 +262,7 @@ fn flush_inner(
                     compression_level,
                     #[cfg(feature = "zstd")]
                     encoder_dict.as_ref(),
+                    &keys::aad_override_frame(gid, frame_idx),
                     encryption_key.as_ref(),
                 )?;
                 if let Some(old_ov) = new_subframe_overrides[gid as usize].get(&frame_idx) {
@@ -325,6 +326,7 @@ fn flush_inner(
                                     0,
                                     #[cfg(feature = "zstd")]
                                     decoder_dict.as_ref(),
+                                    &keys::aad_page_group(gid),
                                     encryption_key.as_ref(),
                                 ) {
                                     let ps = page_size as usize;
@@ -345,6 +347,7 @@ fn flush_inner(
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
                                 decoder_dict.as_ref(),
+                                &keys::aad_page_group(gid),
                                 encryption_key.as_ref(),
                             ) {
                                 for (j, existing_page) in existing_pages.into_iter().enumerate() {
@@ -373,6 +376,7 @@ fn flush_inner(
                     compression_level,
                     #[cfg(feature = "zstd")]
                     encoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key.as_ref(),
                 )?;
                 uploads.push((key.clone(), encoded));
@@ -387,6 +391,7 @@ fn flush_inner(
                     compression_level,
                     #[cfg(feature = "zstd")]
                     encoder_dict.as_ref(),
+                    &keys::aad_page_group(gid),
                     encryption_key.as_ref(),
                 )?;
                 uploads.push((key.clone(), encoded));
@@ -466,6 +471,7 @@ fn flush_inner(
                     compression_level,
                     #[cfg(feature = "zstd")]
                     encoder_dict.as_ref(),
+                    &keys::aad_interior_bundle(chunk_id),
                     encryption_key.as_ref(),
                 )?;
                 let key = keys::interior_chunk_key(chunk_id, next_version);
@@ -586,6 +592,7 @@ fn flush_inner(
                     compression_level,
                     #[cfg(feature = "zstd")]
                     encoder_dict.as_ref(),
+                    &keys::aad_index_bundle(chunk_id),
                     encryption_key.as_ref(),
                 )?;
                 let key = keys::index_chunk_key(chunk_id, next_version);

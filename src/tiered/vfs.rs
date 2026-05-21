@@ -734,6 +734,7 @@ impl TurboliteVfs {
                                     0,
                                     #[cfg(feature = "zstd")]
                                     None,
+                                    &keys::aad_page_group(gid as u64),
                                     encryption_key,
                                 ) {
                                     decode_errors.push((key.clone(), format!("{}", e)));
@@ -744,6 +745,7 @@ impl TurboliteVfs {
                         &data,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_page_group(gid as u64),
                         encryption_key,
                     ) {
                         decode_errors.push((key.clone(), format!("{}", e)));
@@ -772,6 +774,7 @@ impl TurboliteVfs {
                         &data,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_interior_bundle(*chunk_id),
                         encryption_key,
                     ) {
                         decode_errors
@@ -801,6 +804,7 @@ impl TurboliteVfs {
                         &data,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_index_bundle(*chunk_id),
                         encryption_key,
                     ) {
                         decode_errors

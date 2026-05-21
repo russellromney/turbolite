@@ -806,7 +806,9 @@ impl DiskCache {
             let mut frame = vec![0u8; stride];
             self.cache_file
                 .read_exact_at(&mut frame, page_num * stride as u64)?;
-            let plain = compress::decrypt_gcm_random_nonce(&frame, key)?;
+            // Local positional cache slot (keyed by file offset, never moved
+            // across slots), so no slot-identity AAD is needed.
+            let plain = compress::decrypt_gcm_random_nonce(&frame, &[], key)?;
             let copy_len = buf.len().min(plain.len());
             buf[..copy_len].copy_from_slice(&plain[..copy_len]);
             return Ok(());
@@ -846,7 +848,7 @@ impl DiskCache {
         // Decrypt if encrypted (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         if let Some(ref key) = self.encryption_key {
-            let decrypted = compress::decrypt_gcm_random_nonce(&compressed, key)?;
+            let decrypted = compress::decrypt_gcm_random_nonce(&compressed, &[], key)?;
             compressed = decrypted;
         }
 
@@ -956,7 +958,7 @@ impl DiskCache {
         let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _enc_buf = compress::encrypt_gcm_random_nonce(data, key)?;
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, &[], key)?;
             _enc_buf.as_slice()
         } else {
             data
@@ -986,7 +988,7 @@ impl DiskCache {
         let _enc_buf: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            _enc_buf = compress::encrypt_gcm_random_nonce(data, key)?;
+            _enc_buf = compress::encrypt_gcm_random_nonce(data, &[], key)?;
             _enc_buf.as_slice()
         } else {
             data
@@ -1042,7 +1044,7 @@ impl DiskCache {
         // Encrypt compressed blob (random-nonce GCM; nonce stored inline)
         #[cfg(feature = "encryption")]
         let blob = if let Some(ref key) = self.encryption_key {
-            compress::encrypt_gcm_random_nonce(&blob, key)?
+            compress::encrypt_gcm_random_nonce(&blob, &[], key)?
         } else {
             blob
         };
@@ -1104,6 +1106,7 @@ impl DiskCache {
                 let end = (start + page_sz).min(data.len());
                 encrypted.extend_from_slice(&compress::encrypt_gcm_random_nonce(
                     &data[start..end],
+                    &[],
                     key,
                 )?);
             }
@@ -1189,7 +1192,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_gcm_random_nonce(&compressed, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, &[], key)?
             } else {
                 compressed
             };
@@ -1296,7 +1299,7 @@ impl DiskCache {
             // Fresh random-nonce GCM frame per page (nonce stored inline).
             #[cfg(feature = "encryption")]
             let page_data = if let Some(ref key) = self.encryption_key {
-                &compress::encrypt_gcm_random_nonce(page_data, key)?
+                &compress::encrypt_gcm_random_nonce(page_data, &[], key)?
             } else {
                 page_data
             };
@@ -1369,7 +1372,7 @@ impl DiskCache {
 
             #[cfg(feature = "encryption")]
             let compressed = if let Some(ref key) = self.encryption_key {
-                compress::encrypt_gcm_random_nonce(&compressed, key)?
+                compress::encrypt_gcm_random_nonce(&compressed, &[], key)?
             } else {
                 compressed
             };

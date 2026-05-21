@@ -619,6 +619,7 @@ impl TurboliteSharedState {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_page_group(gid),
                         self.encryption_key.as_ref(),
                     )?;
                     uploads.push((key.clone(), encoded));
@@ -630,6 +631,7 @@ impl TurboliteSharedState {
                         self.compression_level,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_page_group(gid),
                         self.encryption_key.as_ref(),
                     )?;
                     uploads.push((key.clone(), encoded));
@@ -827,6 +829,7 @@ impl TurboliteSharedState {
                         0,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_page_group(gid),
                         self.encryption_key.as_ref(),
                     )?;
                     bulk
@@ -835,6 +838,7 @@ impl TurboliteSharedState {
                         pg_data,
                         #[cfg(feature = "zstd")]
                         None,
+                        &keys::aad_page_group(gid),
                         self.encryption_key.as_ref(),
                     )?;
                     pages.into_iter().flatten().collect()
@@ -877,6 +881,7 @@ impl TurboliteSharedState {
                                 &ovr_data,
                                 #[cfg(feature = "zstd")]
                                 None,
+                                &keys::aad_override_frame(gid, frame_idx),
                                 self.encryption_key.as_ref(),
                             )?;
                             let frame_start = frame_idx * spf;
@@ -1023,6 +1028,7 @@ mod tests {
             shared.compression_level,
             #[cfg(feature = "zstd")]
             None,
+            &keys::aad_page_group(0),
             None,
         )
         .unwrap();
@@ -1037,6 +1043,7 @@ mod tests {
             shared.compression_level,
             #[cfg(feature = "zstd")]
             None,
+            &keys::aad_override_frame(0, 1),
             None,
         )
         .unwrap();
@@ -1123,6 +1130,7 @@ mod tests {
             shared.compression_level,
             #[cfg(feature = "zstd")]
             None,
+            &keys::aad_page_group(0),
             None,
         )
         .unwrap();

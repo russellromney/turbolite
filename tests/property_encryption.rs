@@ -26,10 +26,10 @@ proptest! {
         key in proptest::collection::vec(any::<u8>(), 32..=32),
     ) {
         let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm_random_nonce(&data, &key).expect("encrypt");
+        let encrypted = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt");
         // Output is nonce (12 bytes) + ciphertext + tag (16 bytes)
         prop_assert_eq!(encrypted.len(), 12 + data.len() + 16);
-        let decrypted = decrypt_gcm_random_nonce(&encrypted, &key).expect("decrypt");
+        let decrypted = decrypt_gcm_random_nonce(&encrypted, &[], &key).expect("decrypt");
         prop_assert_eq!(&data, &decrypted);
     }
 
@@ -39,8 +39,8 @@ proptest! {
         key in proptest::collection::vec(any::<u8>(), 32..=32),
     ) {
         let key: [u8; 32] = key.try_into().expect("key len");
-        let enc_a = encrypt_gcm_random_nonce(&data, &key).expect("encrypt a");
-        let enc_b = encrypt_gcm_random_nonce(&data, &key).expect("encrypt b");
+        let enc_a = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt a");
+        let enc_b = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt b");
         // Random nonces mean different ciphertext each time
         prop_assert_ne!(enc_a, enc_b);
     }
@@ -53,11 +53,11 @@ proptest! {
         tamper_byte in any::<u8>(),
     ) {
         let key: [u8; 32] = key.try_into().expect("key len");
-        let encrypted = encrypt_gcm_random_nonce(&data, &key).expect("encrypt");
+        let encrypted = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt");
         if tamper_pos < encrypted.len() {
             let mut tampered = encrypted.clone();
             tampered[tamper_pos] ^= tamper_byte | 1;
-            let result = decrypt_gcm_random_nonce(&tampered, &key);
+            let result = decrypt_gcm_random_nonce(&tampered, &[], &key);
             prop_assert!(result.is_err(), "tampered random-nonce ciphertext should fail");
         }
     }
@@ -68,7 +68,7 @@ proptest! {
         key in proptest::collection::vec(any::<u8>(), 32..=32),
     ) {
         let key: [u8; 32] = key.try_into().expect("key len");
-        let result = decrypt_gcm_random_nonce(&short_data, &key);
+        let result = decrypt_gcm_random_nonce(&short_data, &[], &key);
         prop_assert!(result.is_err(), "data shorter than nonce should fail");
     }
 
@@ -126,10 +126,10 @@ proptest! {
         // must produce DIFFERENT ciphertext (fresh random nonce), and BOTH
         // ciphertexts must decrypt back to the original plaintext.
         let key: [u8; 32] = key.try_into().expect("key len");
-        let enc1 = encrypt_gcm_random_nonce(&data, &key).expect("encrypt 1");
-        let enc2 = encrypt_gcm_random_nonce(&data, &key).expect("encrypt 2");
+        let enc1 = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt 1");
+        let enc2 = encrypt_gcm_random_nonce(&data, &[], &key).expect("encrypt 2");
         prop_assert_ne!(&enc1, &enc2, "page rewrite must not reuse nonce/keystream");
-        prop_assert_eq!(decrypt_gcm_random_nonce(&enc1, &key).expect("dec 1"), data.clone());
-        prop_assert_eq!(decrypt_gcm_random_nonce(&enc2, &key).expect("dec 2"), data);
+        prop_assert_eq!(decrypt_gcm_random_nonce(&enc1, &[], &key).expect("dec 1"), data.clone());
+        prop_assert_eq!(decrypt_gcm_random_nonce(&enc2, &[], &key).expect("dec 2"), data);
     }
 }

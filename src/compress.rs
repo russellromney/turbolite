@@ -263,9 +263,16 @@ pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Res
 #[cfg(feature = "encryption")]
 pub const GCM_RANDOM_NONCE_OVERHEAD: usize = 12 + 16;
 
+/// Encrypt with a fresh random GCM nonce, binding `aad` into the auth tag.
+///
+/// `aad` is additional authenticated data: not encrypted, not stored inline, but
+/// covered by the GCM tag. Decryption only succeeds when the same `aad` is
+/// supplied. Callers pass a slot-identity AAD (see `tiered::keys`) so a valid
+/// frame cannot be swapped onto another slot. Pass `&[]` when there is no slot
+/// to bind (e.g. positional local-cache frames keyed by file offset).
 #[cfg(feature = "encryption")]
-pub fn encrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
-    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
+pub fn encrypt_gcm_random_nonce(data: &[u8], aad: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
+    use aes_gcm::{aead::Aead, aead::KeyInit, aead::Payload, Aes256Gcm, Nonce};
     use rand::RngCore;
 
     let cipher = Aes256Gcm::new(key.into());
@@ -274,7 +281,7 @@ pub fn encrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(nonce, Payload { msg: data, aad })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
 
     // Prepend nonce to ciphertext
@@ -284,9 +291,13 @@ pub fn encrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u
     Ok(result)
 }
 
+/// Decrypt a random-nonce GCM frame, authenticating it against `aad`.
+///
+/// Must be the same `aad` passed to `encrypt_gcm_random_nonce`; a mismatch (e.g.
+/// a frame relocated to a different slot) fails the tag check and errors.
 #[cfg(feature = "encryption")]
-pub fn decrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
-    use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
+pub fn decrypt_gcm_random_nonce(data: &[u8], aad: &[u8], key: &[u8; 32]) -> io::Result<Vec<u8>> {
+    use aes_gcm::{aead::Aead, aead::KeyInit, aead::Payload, Aes256Gcm, Nonce};
 
     if data.len() < 12 {
         return Err(io::Error::new(
@@ -299,7 +310,13 @@ pub fn decrypt_gcm_random_nonce(data: &[u8], key: &[u8; 32]) -> io::Result<Vec<u
     let cipher = Aes256Gcm::new(key.into());
 
     cipher
-        .decrypt(nonce, &data[12..])
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &data[12..],
+                aad,
+            },
+        )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
 }
 
@@ -370,14 +387,14 @@ mod crypto_regression_tests {
         // different ciphertext — proves the nonce is fresh per write, not
         // derived from a fixed position. Both must still decrypt back.
         let plain = b"a sqlite page worth of bytes (pretend)".to_vec();
-        let c1 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
-        let c2 = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
+        let c1 = encrypt_gcm_random_nonce(&plain, &[], &KEY).unwrap();
+        let c2 = encrypt_gcm_random_nonce(&plain, &[], &KEY).unwrap();
         assert_ne!(
             c1, c2,
             "rewrite must not reuse nonce/ciphertext (two-time pad)"
         );
-        assert_eq!(decrypt_gcm_random_nonce(&c1, &KEY).unwrap(), plain);
-        assert_eq!(decrypt_gcm_random_nonce(&c2, &KEY).unwrap(), plain);
+        assert_eq!(decrypt_gcm_random_nonce(&c1, &[], &KEY).unwrap(), plain);
+        assert_eq!(decrypt_gcm_random_nonce(&c2, &[], &KEY).unwrap(), plain);
         // Inline nonce is 12 bytes + 16-byte GCM tag overhead.
         assert_eq!(c1.len(), plain.len() + 12 + 16);
     }
@@ -385,9 +402,31 @@ mod crypto_regression_tests {
     #[test]
     fn gcm_wrong_key_fails_to_decrypt() {
         let plain = b"secret".to_vec();
-        let c = encrypt_gcm_random_nonce(&plain, &KEY).unwrap();
+        let c = encrypt_gcm_random_nonce(&plain, &[], &KEY).unwrap();
         let wrong = [8u8; 32];
-        assert!(decrypt_gcm_random_nonce(&c, &wrong).is_err());
+        assert!(decrypt_gcm_random_nonce(&c, &[], &wrong).is_err());
+    }
+
+    #[test]
+    fn gcm_aad_mismatch_fails_round_trips_when_matched() {
+        // A frame bound to one slot's AAD must not decrypt under another's,
+        // and must round-trip under its own. This is the swap-prevention
+        // property: a valid encrypted blob can't be relocated to a foreign slot.
+        // (The slot-identity AAD helpers themselves are exercised in
+        // tiered::test_encoding; here we pin the underlying GCM AAD contract.)
+        let plain = b"a sqlite page worth of bytes (pretend)".to_vec();
+        let aad1 = b"slot-1";
+        let aad2 = b"slot-2";
+        let c = encrypt_gcm_random_nonce(&plain, aad1, &KEY).unwrap();
+        assert!(
+            decrypt_gcm_random_nonce(&c, aad2, &KEY).is_err(),
+            "frame bound to slot 1 must not decrypt under slot 2's AAD"
+        );
+        assert_eq!(
+            decrypt_gcm_random_nonce(&c, aad1, &KEY).unwrap(),
+            plain,
+            "frame must round-trip under its own slot AAD"
+        );
     }
 
     #[test]

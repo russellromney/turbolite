@@ -78,21 +78,33 @@ environment.
 
 ## Documented (verified real; fix specified)
 
-### F3 — [Med] Tiered GCM frames carry no AAD → swappable/replayable across slots — **Partial**
+### F3 — [Med] Tiered GCM frames carry no AAD → swappable/replayable across slots — **Fixed**
 - `src/tiered/encoding.rs` page-group / seekable-frame / interior-bundle /
-  override encode+decode.
-- **Fix:** pass AAD binding each frame to its identity (S3 object key /
-  group_id + version) via aes-gcm `Payload { msg, aad }` on encrypt + decrypt.
-- **Status — Partial (deferred, not landed):** AAD must be threaded through all
-  60+ encode/decode call sites (handle, flush, compact, prefetch, rotation,
-  import, vfs) and must match byte-for-byte between every encode and the
-  corresponding decode, including the key-rotation re-encrypt and override-merge
-  paths. A mismatch silently fails GCM auth on cold read. That full pipeline is
-  only validated by the gated live-S3 suite (`tests/tiered/*`), which is not
-  runnable in this environment, so threading AAD here could not be landed
-  test-green safely. The confidentiality fix (F1/F2 random nonce) is unaffected;
-  this is an integrity/anti-replay hardening that needs the live suite to verify
-  and is left for a focused follow-up with S3 access.
+  override encode+decode, plus `src/compress.rs` GCM primitives.
+- **Fix:** `encrypt_gcm_random_nonce` / `decrypt_gcm_random_nonce` now take an
+  `aad: &[u8]` and feed it through aes-gcm `Payload { msg, aad }`, so the GCM tag
+  authenticates the slot identity. Slot-identity helpers live in `keys.rs`:
+  `aad_page_group(gid)`, `aad_interior_bundle(chunk_id)`,
+  `aad_index_bundle(chunk_id)`, `aad_override_frame(gid, frame_idx)`. Each carries
+  a leading domain tag so the four namespaces are disjoint (an index bundle can't
+  be presented as an interior bundle, a page group can't be presented as an
+  override frame, etc.). The AAD is **slot-bound but version-independent** — id
+  only, no version — so cross-version compact/merge/rotation reads (which read an
+  old versioned object and re-encode under a new version) still authenticate.
+- **Threaded** through every encode/decode site and `decrypt_if_needed`:
+  encoding, handle, flush, compact, import, prefetch, vfs, bench, rotation. The
+  per-machine local cache (`disk_cache.rs`) and local single-file format
+  (`local/file_format.rs`) use `&[]` — those frames are positional slots keyed by
+  file offset and are never moved across slots, so no slot-identity binding is
+  needed there.
+- **Tests:** regression test `test_page_group_aad_binds_to_slot` (a blob bound to
+  `aad_page_group(1)` fails to decrypt under `aad_page_group(2)`, round-trips
+  under `aad_page_group(1)`), plus `gcm_aad_mismatch_fails_round_trips_when_matched`
+  (compress) and cross-slot interior/index checks. `cargo build --features
+  encryption` and `cargo test --features encryption --lib` are green. The full
+  cold-read round trip (object fetched from S3, decoded under its slot AAD) is
+  exercised only by the gated live-S3 suite, which is not runnable here; the
+  `--lib` bar plus the slot-binding regression test is the verification target.
 
 ### F5 — [High] Tiered `decompress` has no output cap (decompression bomb) — **Fixed**
 - `src/compress.rs` (tiered path; the local path caps at `max_page`).

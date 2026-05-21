@@ -212,6 +212,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
+                &keys::aad_page_group(gid as u64),
                 config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
@@ -223,6 +224,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
+                &keys::aad_page_group(gid as u64),
                 config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
@@ -269,6 +271,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
+            &keys::aad_interior_bundle(chunk_id),
             config.encryption.key.as_ref(),
         )?;
         let key = keys::interior_chunk_key(chunk_id, version);
@@ -307,6 +310,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
+            &keys::aad_index_bundle(chunk_id),
             config.encryption.key.as_ref(),
         )?;
         let key = keys::index_chunk_key(chunk_id, version);
