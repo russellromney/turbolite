@@ -1,5 +1,13 @@
 use super::*;
 
+// The end-query signal (`signal_end_query` / `check_and_clear_end_query`) is
+// process-global, so the tests asserting its exact set/clear semantics must not
+// run concurrently with each other — cargo runs tests in parallel, and a
+// sibling's `check_and_clear_end_query()` would steal a set signal mid-test.
+// Serialize them on this lock. `unwrap_or_else(into_inner)` keeps one test's
+// panic from poisoning the rest.
+static END_QUERY_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_parse_search_with_index() {
     let eqp = "SEARCH users USING INDEX idx_users_email (email=?)";
@@ -224,12 +232,18 @@ SEARCH users USING INDEX idx_users_email (email=?)";
 
 #[test]
 fn test_end_query_signal_default_false() {
+    let _guard = END_QUERY_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     check_and_clear_end_query();
     assert!(!check_and_clear_end_query());
 }
 
 #[test]
 fn test_end_query_signal_set_and_clear() {
+    let _guard = END_QUERY_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     check_and_clear_end_query();
     signal_end_query();
     assert!(check_and_clear_end_query());
@@ -238,6 +252,9 @@ fn test_end_query_signal_set_and_clear() {
 
 #[test]
 fn test_end_query_signal_multiple_signals_collapse() {
+    let _guard = END_QUERY_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     check_and_clear_end_query();
     signal_end_query();
     signal_end_query();
@@ -252,6 +269,9 @@ fn test_end_query_signal_multiple_signals_collapse() {
 
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {
+    let _guard = END_QUERY_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     check_and_clear_end_query();
     drain_planned_accesses();
 
