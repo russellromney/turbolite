@@ -35,7 +35,14 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
+// `local` returns a `rusqlite::Connection`, so it only exists when rusqlite is
+// linked (the `bundled-sqlite` feature). The loadable-extension build is
+// `--no-default-features` and has no rusqlite; gating here keeps that build
+// compiling (it has no use for `open_local` anyway — it runs inside a host
+// sqlite3, not its own bundled one).
+#[cfg(feature = "bundled-sqlite")]
 pub mod local;
+#[cfg(feature = "bundled-sqlite")]
 pub use local::{open_local, open_local_with, LocalError, LocalOptions};
 pub mod tiered;
 pub use tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteHandle, TurboliteVfs};
