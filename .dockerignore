@@ -1,0 +1,17 @@
+# Keep the Docker build context small. The benchmark image only needs the
+# root crate (Cargo.toml/lock, src/, bin/) + benchmark/ + the turbolite-ffi
+# manifest/src for workspace parsing. Everything below is build artifacts,
+# language-binding packages, fixtures, or history that no build step reads.
+.git
+**/target
+examples
+fuzz
+docs
+vendor
+**/vendor
+**/node_modules
+packages
+turbolite-ffi/packages
+turbolite-ffi/tests
+**/*.db
+**/*.cache

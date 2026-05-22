@@ -17,7 +17,10 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY bin/ bin/
 COPY benchmark/ benchmark/
-RUN cargo build --release --features tiered,zstd,bundled-sqlite --bin tiered-bench --bin tiered-tune
+# turbolite-ffi is a workspace member; cargo needs its manifest to parse the
+# workspace even though we only build the root crate's bench binaries.
+COPY turbolite-ffi/ turbolite-ffi/
+RUN cargo build --release --features bench-s3,zstd,bundled-sqlite --bin tiered-bench --bin tiered-tune
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl unzip && \
