@@ -1658,9 +1658,11 @@ impl Vfs for TurboliteVfs {
 #[cfg(feature = "plugin-vfs")]
 mod plugin_backend {
     use super::{TurboliteHandle, TurboliteVfs};
-    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts};
+    use core::ptr::NonNull;
+    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts, ShmLockMode};
     use sqlite_plugin::vars;
     use sqlite_plugin::vfs::{Vfs, VfsResult};
+    use sqlite_vfs::wip::{WalIndex, WalIndexLock};
     use sqlite_vfs::{DatabaseHandle, LockKind};
     use std::io::ErrorKind;
 
@@ -1776,6 +1778,60 @@ mod plugin_backend {
             // TurboliteHandle's Drop releases locks and tears down handle state.
             drop(h);
             Ok(())
+        }
+
+        // ── WAL-index shared memory ─────────────────────────────────────────
+        // The architectural payoff of the migration: hand SQLite a *live*
+        // pointer into the mmap'd `-shm` file. The sqlite-vfs path copied each
+        // region in and out (map/pull/push), which could tear the WAL-index
+        // under concurrency; here SQLite reads and writes the shared mapping
+        // directly, and the byte-range lock protocol (reused verbatim from
+        // FileWalIndex) is what serializes access.
+
+        fn shm_map(
+            &self,
+            h: &mut TurboliteHandle,
+            region_idx: usize,
+            region_size: usize,
+            extend: bool,
+        ) -> VfsResult<Option<NonNull<u8>>> {
+            let shm = h.ensure_plugin_shm();
+            match shm.map_ptr(region_idx as u32, region_size, extend) {
+                Ok(Some(ptr)) => Ok(NonNull::new(ptr)),
+                Ok(None) => Ok(None),
+                Err(_) => Err(vars::SQLITE_IOERR_SHMMAP),
+            }
+        }
+
+        fn shm_lock(
+            &self,
+            h: &mut TurboliteHandle,
+            offset: u32,
+            count: u32,
+            mode: ShmLockMode,
+        ) -> VfsResult<()> {
+            let walock = match mode {
+                ShmLockMode::LockShared => WalIndexLock::Shared,
+                ShmLockMode::LockExclusive => WalIndexLock::Exclusive,
+                ShmLockMode::UnlockShared | ShmLockMode::UnlockExclusive => WalIndexLock::None,
+            };
+            let range = (offset as u8)..((offset + count) as u8);
+            let shm = h.ensure_plugin_shm();
+            match WalIndex::lock(shm, range, walock) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(vars::SQLITE_BUSY),
+                Err(_) => Err(vars::SQLITE_IOERR_SHMLOCK),
+            }
+        }
+
+        fn shm_barrier(&self, _h: &mut TurboliteHandle) {
+            // Full fence: pair the writes a connection made to the shared
+            // mapping with the reads another connection is about to make.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn shm_unmap(&self, h: &mut TurboliteHandle, delete: bool) -> VfsResult<()> {
+            h.unmap_plugin_shm(delete).map_err(|_| vars::SQLITE_IOERR)
         }
     }
 }

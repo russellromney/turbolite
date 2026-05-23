@@ -2692,3 +2692,165 @@ fn plugin_vfs_crud_memory_journal() {
         .unwrap();
     assert_eq!(n, 2, "rolled-back insert is not visible");
 }
+
+/// WAL gate: same CRUD but in journal_mode=WAL, which drives the live-pointer
+/// shared memory (`shm_map`/`shm_lock`/`shm_barrier`/`shm_unmap`) end-to-end.
+/// A passing WAL checkpoint proves the WAL-index is wired correctly.
+#[cfg(feature = "plugin-vfs")]
+#[test]
+fn plugin_vfs_crud_wal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_wal_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_wal.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal", "WAL mode engaged through the plugin VFS");
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    for i in 0..50 {
+        conn.execute("INSERT INTO t (val) VALUES (?1)", [format!("row-{i}")])
+            .unwrap();
+    }
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 50, "rows visible through WAL-mode plugin VFS");
+
+    // Force a checkpoint: drains the WAL back into the main db, exercising the
+    // exclusive WAL-index locks + shared-memory reads.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 50", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "row-49", "content survives checkpoint");
+}
+
+/// The test the migration exists for: concurrent readers against a live writer
+/// in WAL mode, checking an invariant that a torn WAL-index read would break.
+///
+/// The writer commits `INSERT INTO ta(k); INSERT INTO tb(k)` as one
+/// transaction, so `SUM(ta) - SUM(tb)` is always 0 at any commit boundary. Each
+/// reader evaluates that difference in a single statement; transaction
+/// isolation must show it both inserts or neither. With the old copy-based
+/// WAL-index a reader could pull a torn index header, compute the wrong frame
+/// bound, and observe a half-applied commit (non-zero) or `DatabaseCorrupt`.
+/// The live-pointer shm has no copy to tear, so every read must see 0.
+#[cfg(feature = "plugin-vfs")]
+#[test]
+fn plugin_vfs_concurrent_wal_isolation() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_iso_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+    let db_uri = format!("file:plugin_iso.db?vfs={}", vfs_name);
+
+    // Seed: WAL mode + the two tables.
+    {
+        let conn = rusqlite::Connection::open(&db_uri).expect("seed open");
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        conn.execute_batch("CREATE TABLE ta (k INTEGER); CREATE TABLE tb (k INTEGER);")
+            .unwrap();
+    }
+
+    const READERS: usize = 16;
+    const WRITES: i64 = 400;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let partial_reads = Arc::new(AtomicI64::new(0));
+    let reads_done = Arc::new(AtomicI64::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS {
+        let uri = db_uri.clone();
+        let stop = Arc::clone(&stop);
+        let partial = Arc::clone(&partial_reads);
+        let done = Arc::clone(&reads_done);
+        handles.push(std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&uri).expect("reader open");
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                let diff: i64 = conn
+                    .query_row(
+                        "SELECT (SELECT COALESCE(SUM(k),0) FROM ta) \
+                              - (SELECT COALESCE(SUM(k),0) FROM tb)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("reader query must not error (no DatabaseCorrupt)");
+                if diff != 0 {
+                    partial.fetch_add(1, Ordering::Relaxed);
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // Writer: one connection, WRITES atomic transactions, periodic checkpoints.
+    let writer = {
+        let uri = db_uri.clone();
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&uri).expect("writer open");
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            for k in 1..=WRITES {
+                conn.execute_batch(&format!(
+                    "BEGIN; INSERT INTO ta(k) VALUES({k}); INSERT INTO tb(k) VALUES({k}); COMMIT;"
+                ))
+                .expect("writer txn");
+                if k % 50 == 0 {
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                }
+            }
+        })
+    };
+
+    writer.join().expect("writer thread");
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("reader thread");
+    }
+
+    assert!(
+        reads_done.load(Ordering::Relaxed) > 0,
+        "readers must have actually run"
+    );
+    assert_eq!(
+        partial_reads.load(Ordering::Relaxed),
+        0,
+        "no reader may observe a half-applied commit (torn WAL-index)"
+    );
+
+    // Final state is consistent and complete.
+    let conn = rusqlite::Connection::open(&db_uri).expect("final open");
+    let total_ta: i64 = conn
+        .query_row("SELECT COALESCE(SUM(k),0) FROM ta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total_ta,
+        WRITES * (WRITES + 1) / 2,
+        "every committed write is durable"
+    );
+}

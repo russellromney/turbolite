@@ -161,6 +161,13 @@ pub struct TurboliteHandle {
     /// pushes land on the main-db handle even when SQLite opens the WAL
     /// after the main file. Removed on `Drop`.
     settings_queue: settings::SettingsQueue,
+
+    /// Live WAL-index shared memory for the sqlite-plugin backend. Holds the
+    /// mmap'd `-shm` regions whose pointers `shm_map` hands straight to SQLite
+    /// — no copy, which is the whole point of the migration. Lazily created on
+    /// the first `shm_map`; only ever set for a main-db handle in WAL mode.
+    #[cfg(feature = "plugin-vfs")]
+    plugin_shm: Option<crate::FileWalIndex>,
 }
 
 impl Drop for TurboliteHandle {
@@ -622,6 +629,8 @@ impl TurboliteHandle {
             active_db_locks: HashMap::new(),
             replay_gate: Some(replay_gate),
             replay_read_guard: None,
+            #[cfg(feature = "plugin-vfs")]
+            plugin_shm: None,
             settings_queue,
         })
     }
@@ -690,6 +699,8 @@ impl TurboliteHandle {
             // SQL pushes bypass the journal/WAL file and land on the
             // main-db handle.
             settings_queue: settings::new_queue(),
+            #[cfg(feature = "plugin-vfs")]
+            plugin_shm: None,
         }
     }
 
@@ -1130,6 +1141,32 @@ impl sqlite_plugin::vfs::VfsHandle for TurboliteHandle {
     }
     fn in_memory(&self) -> bool {
         false
+    }
+}
+
+#[cfg(feature = "plugin-vfs")]
+impl TurboliteHandle {
+    /// Lazily create (on first `shm_map`) and return the live WAL-index shared
+    /// memory for this handle. The `-shm` path matches `wal_index()` so the
+    /// sqlite-plugin and sqlite-vfs backends key the same file + in-process
+    /// lock table.
+    pub(crate) fn ensure_plugin_shm(&mut self) -> &mut crate::FileWalIndex {
+        if self.plugin_shm.is_none() {
+            let shm_path = self.db_path.with_extension("db-shm");
+            self.plugin_shm = Some(crate::FileWalIndex::new(shm_path));
+        }
+        self.plugin_shm.as_mut().expect("just set")
+    }
+
+    /// Tear down the WAL-index shared memory: drop unmaps the regions and frees
+    /// the in-process locks; `delete` additionally unlinks the `-shm` file.
+    pub(crate) fn unmap_plugin_shm(&mut self, delete: bool) -> std::io::Result<()> {
+        if let Some(shm) = self.plugin_shm.take() {
+            if delete {
+                <crate::FileWalIndex as sqlite_vfs::wip::WalIndex>::delete(shm)?;
+            }
+        }
+        Ok(())
     }
 }
 

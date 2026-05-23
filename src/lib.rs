@@ -425,6 +425,40 @@ impl FileWalIndex {
         self.mmap_regions.insert(region, ptr);
         Ok(ptr)
     }
+
+    /// Live-pointer region map for the sqlite-plugin shm interface: hand back a
+    /// pointer straight into the mmap'd `-shm` region instead of copying it out
+    /// (the copy is what `map`/`pull` do for the sqlite-vfs path — and what tore
+    /// WAL-index reads under concurrency). With `extend = false`, decline rather
+    /// than grow the file: SQLite probes with `extend = false` to learn whether
+    /// a region already exists.
+    #[cfg(feature = "plugin-vfs")]
+    pub(crate) fn map_ptr(
+        &mut self,
+        region: u32,
+        region_size: usize,
+        extend: bool,
+    ) -> io::Result<Option<*mut u8>> {
+        if let Some(&ptr) = self.mmap_regions.get(&region) {
+            return Ok(Some(ptr));
+        }
+        // SQLite's WAL-index region size is a fixed 32 KiB; the byte-range lock
+        // offsets below assume it, so refuse anything else loudly.
+        if region_size != WAL_REGION_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unexpected shm region size",
+            ));
+        }
+        if !extend {
+            let needed = (region as usize + 1) * WAL_REGION_SIZE;
+            let file = self.ensure_file()?;
+            if (file.metadata()?.len() as usize) < needed {
+                return Ok(None);
+            }
+        }
+        self.ensure_mmap_region(region).map(Some)
+    }
 }
 
 impl Drop for FileWalIndex {
