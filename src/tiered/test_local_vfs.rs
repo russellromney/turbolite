@@ -2645,3 +2645,50 @@ fn test_settings_set_per_connection_isolation() {
         .unwrap();
     assert_eq!(n, 1);
 }
+
+/// Migration gate: drive a real SQLite database through the *sqlite-plugin*
+/// backend of the tiered VFS end-to-end. journal_mode=MEMORY keeps the rollback
+/// journal in RAM, so this needs no journal companion and no shared memory —
+/// it isolates the file-op delegation (open → full lock ladder → write → read
+/// → sync → file_size) from the WAL shared-memory work that lands next.
+#[cfg(feature = "plugin-vfs")]
+#[test]
+fn plugin_vfs_crud_memory_journal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_mem_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_mem.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+    conn.execute_batch("PRAGMA journal_mode=MEMORY").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'world')", [])
+        .unwrap();
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rows visible through sqlite-plugin tiered VFS");
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "world", "row content round-trips through the plugin VFS");
+
+    // A transaction that rolls back must leave no trace — exercises the
+    // lock upgrade/downgrade path (Shared → Reserved → Exclusive → Shared).
+    conn.execute_batch("BEGIN; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;")
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rolled-back insert is not visible");
+}

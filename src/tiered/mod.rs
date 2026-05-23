@@ -376,6 +376,23 @@ pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Register a TurboliteVfs with SQLite through sqlite-plugin (the migration
+/// target) under the given name, as a non-default VFS. Parallel to
+/// [`register`]; selected by the `plugin-vfs` feature.
+#[cfg(feature = "plugin-vfs")]
+pub fn register_plugin(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
+    let cname = std::ffi::CString::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    sqlite_plugin::vfs::register_static(
+        cname,
+        vfs,
+        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::Other, format!("sqlite code {code}")))?;
+    REGISTERED_VFS_NAMES.lock().insert(name.to_string());
+    Ok(())
+}
+
 /// Shared VFS wrapper: holds the VFS behind an Arc so it can be registered
 /// with SQLite while keeping a handle for `manifest()` / `set_manifest()`.
 ///

@@ -1644,6 +1644,142 @@ impl Vfs for TurboliteVfs {
     }
 }
 
+/// sqlite-plugin backend for the tiered VFS — the migration target.
+///
+/// Every file op delegates to the same [`DatabaseHandle`] methods the
+/// production sqlite-vfs path drives, so the storage/cache/manifest logic is
+/// shared verbatim (`open` reuses [`TurboliteVfs::open_inner`]). Only two
+/// things translate at the boundary: the lock-level enum (the two ladders are
+/// identical, so it's a 1:1 map) and the read EOF convention (sqlite-plugin's
+/// `xRead` discards the byte count, so a short read is signalled by returning
+/// `Err(SQLITE_IOERR_SHORT_READ)` — same mapping sqlite-vfs makes from
+/// `read_exact_at`'s `UnexpectedEof`). WAL shared memory (`shm_*`) is the next
+/// increment; until then this backend serves rollback-journal modes.
+#[cfg(feature = "plugin-vfs")]
+mod plugin_backend {
+    use super::{TurboliteHandle, TurboliteVfs};
+    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts};
+    use sqlite_plugin::vars;
+    use sqlite_plugin::vfs::{Vfs, VfsResult};
+    use sqlite_vfs::{DatabaseHandle, LockKind};
+    use std::io::ErrorKind;
+
+    /// sqlite-plugin lock level → the sqlite-vfs `LockKind` the handle speaks.
+    /// The five SQLite locking levels are the same in both crates and in the
+    /// same order; this is a pure rename.
+    fn to_lock_kind(level: LockLevel) -> LockKind {
+        match level {
+            LockLevel::Unlocked => LockKind::None,
+            LockLevel::Shared => LockKind::Shared,
+            LockLevel::Reserved => LockKind::Reserved,
+            LockLevel::Pending => LockKind::Pending,
+            LockLevel::Exclusive => LockKind::Exclusive,
+        }
+    }
+
+    /// Best-effort io::Error → SQLite result code for the vfs-level ops.
+    fn map_io(e: std::io::Error) -> i32 {
+        match e.kind() {
+            ErrorKind::NotFound => vars::SQLITE_CANTOPEN,
+            ErrorKind::PermissionDenied => vars::SQLITE_READONLY,
+            _ => vars::SQLITE_IOERR,
+        }
+    }
+
+    impl Vfs for TurboliteVfs {
+        type Handle = TurboliteHandle;
+
+        fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<TurboliteHandle> {
+            let is_main_db = matches!(opts.kind(), OpenKind::MainDb);
+            // SQLite passes NULL for temp/transient files; synthesize a name so
+            // the passthrough branch has somewhere to land.
+            let temp_name;
+            let name = match path {
+                Some(p) => p,
+                None => {
+                    temp_name = <TurboliteVfs as sqlite_vfs::Vfs>::temporary_name(self);
+                    temp_name.as_str()
+                }
+            };
+            self.open_inner(name, is_main_db).map_err(map_io)
+        }
+
+        fn delete(&self, path: &str) -> VfsResult<()> {
+            <TurboliteVfs as sqlite_vfs::Vfs>::delete(self, path).map_err(map_io)
+        }
+
+        fn access(&self, path: &str, flags: AccessFlags) -> VfsResult<bool> {
+            match flags {
+                // Exists drives hot-journal detection — it must report the real
+                // file state, so defer to the tiered existence check.
+                AccessFlags::Exists => {
+                    <TurboliteVfs as sqlite_vfs::Vfs>::exists(self, path).map_err(map_io)
+                }
+                // Read / ReadWrite: if it's there, the tiered backend can serve it.
+                _ => <TurboliteVfs as sqlite_vfs::Vfs>::exists(self, path).map_err(map_io),
+            }
+        }
+
+        fn file_size(&self, h: &mut TurboliteHandle) -> VfsResult<usize> {
+            DatabaseHandle::size(h)
+                .map(|s| s as usize)
+                .map_err(|_| vars::SQLITE_IOERR_FSTAT)
+        }
+
+        fn truncate(&self, h: &mut TurboliteHandle, size: usize) -> VfsResult<()> {
+            DatabaseHandle::set_len(h, size as u64).map_err(|_| vars::SQLITE_IOERR_TRUNCATE)
+        }
+
+        fn write(&self, h: &mut TurboliteHandle, offset: usize, buf: &[u8]) -> VfsResult<usize> {
+            DatabaseHandle::write_all_at(h, buf, offset as u64)
+                .map(|()| buf.len())
+                .map_err(|_| vars::SQLITE_IOERR_WRITE)
+        }
+
+        fn read(&self, h: &mut TurboliteHandle, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+            match DatabaseHandle::read_exact_at(h, buf, offset as u64) {
+                Ok(()) => Ok(buf.len()),
+                // EOF: read_exact_at couldn't fill the buffer. SQLite expects a
+                // short-read signal here (and treats it as zero-filled), exactly
+                // as the sqlite-vfs wrapper does.
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    Err(vars::SQLITE_IOERR_SHORT_READ)
+                }
+                Err(_) => Err(vars::SQLITE_IOERR_READ),
+            }
+        }
+
+        fn lock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::lock(h, to_lock_kind(level)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(vars::SQLITE_BUSY),
+                Err(_) => Err(vars::SQLITE_IOERR_LOCK),
+            }
+        }
+
+        fn unlock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::unlock(h, to_lock_kind(level)) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(vars::SQLITE_IOERR_UNLOCK),
+            }
+        }
+
+        fn check_reserved_lock(&self, h: &mut TurboliteHandle) -> VfsResult<bool> {
+            DatabaseHandle::reserved(h).map_err(|_| vars::SQLITE_IOERR_CHECKRESERVEDLOCK)
+        }
+
+        fn sync(&self, h: &mut TurboliteHandle) -> VfsResult<()> {
+            DatabaseHandle::sync(h, false).map_err(|_| vars::SQLITE_IOERR_FSYNC)
+        }
+
+        fn close(&self, h: TurboliteHandle) -> VfsResult<()> {
+            // TurboliteHandle's Drop releases locks and tears down handle state.
+            drop(h);
+            Ok(())
+        }
+    }
+}
+
 impl Drop for TurboliteVfs {
     fn drop(&mut self) {
         // Drop prefetch pool first so worker threads join before the
