@@ -46,6 +46,28 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::{Mutex, OnceLock};
 
+/// Register a tiered VFS with SQLite. With the `plugin-vfs` feature this routes
+/// through sqlite-plugin (the migration backend); otherwise through the
+/// production sqlite-vfs path. Identical signature either way, so the FFI
+/// registration entry points don't care which backend is compiled in.
+#[cfg(not(feature = "plugin-vfs"))]
+#[inline]
+fn register_turbolite_vfs(
+    name: &str,
+    vfs: turbolite::tiered::TurboliteVfs,
+) -> Result<(), std::io::Error> {
+    turbolite::tiered::register(name, vfs)
+}
+
+#[cfg(feature = "plugin-vfs")]
+#[inline]
+fn register_turbolite_vfs(
+    name: &str,
+    vfs: turbolite::tiered::TurboliteVfs,
+) -> Result<(), std::io::Error> {
+    turbolite::tiered::register_plugin(name, vfs)
+}
+
 // --- Error handling ---
 
 thread_local! {
@@ -220,7 +242,7 @@ pub extern "C" fn turbolite_register_local_file_first(
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -283,7 +305,7 @@ pub extern "C" fn turbolite_register_local(
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -420,7 +442,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -512,7 +534,7 @@ pub extern "C" fn turbolite_register_cloud(
         // Leak the runtime for the process lifetime; the VFS captures a handle
         // into it. The FFI boundary owns no cleanup hook.
         std::mem::forget(runtime);
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("cloud register failed: {}", e));

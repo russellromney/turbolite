@@ -24,6 +24,11 @@ bundled-sqlite = ["turbolite/bundled-sqlite", "dep:rusqlite"]
 # provides sqlite3 symbols via the extension API table. Typically
 # invoked as `--no-default-features --features loadable-extension,zstd`.
 loadable-extension = []
+# Migration backend: register VFSes through sqlite-plugin instead of
+# sqlite-vfs. Additive + off by default so the shipping cdylib is unchanged;
+# drop the feature to roll back. Standalone (bundled) mode only for now —
+# loadable-extension dynamic registration is a follow-up.
+plugin-vfs = ["turbolite/plugin-vfs"]
 # Passthrough turbolite features.
 zstd = ["turbolite/zstd"]
 lz4 = ["turbolite/lz4"]
