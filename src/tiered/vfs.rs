@@ -1366,19 +1366,25 @@ impl TurboliteVfs {
         // storage, not encoded into the page/base manifest.
         self.manifest_bytes()
     }
-}
 
-impl Vfs for TurboliteVfs {
-    type Handle = TurboliteHandle;
-
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        let path = if matches!(opts.kind, OpenKind::MainDb) {
+    /// Backend-agnostic handle setup, shared by the sqlite-vfs `Vfs::open`
+    /// and the (migration) sqlite-plugin `Vfs::open`. `is_main_db` picks the
+    /// tiered main-db path (manifest load, cache validate, new_tiered) over the
+    /// passthrough companion path (WAL/journal/temp). The only varying input
+    /// across backends is this bool, so each `open` maps its own open-flags to
+    /// it and calls here.
+    pub(crate) fn open_inner(
+        &self,
+        db: &str,
+        is_main_db: bool,
+    ) -> Result<TurboliteHandle, io::Error> {
+        let path = if is_main_db {
             self.local_main_db_path(db)?
         } else {
             self.local_sqlite_companion_path(db)
         };
 
-        if matches!(opts.kind, OpenKind::MainDb) {
+        if is_main_db {
             let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
 
@@ -1567,6 +1573,14 @@ impl Vfs for TurboliteVfs {
                 self.config.encryption.key,
             ))
         }
+    }
+}
+
+impl Vfs for TurboliteVfs {
+    type Handle = TurboliteHandle;
+
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
+        self.open_inner(db, matches!(opts.kind, OpenKind::MainDb))
     }
 
     fn delete(&self, db: &str) -> Result<(), io::Error> {
