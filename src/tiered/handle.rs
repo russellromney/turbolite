@@ -1119,6 +1119,20 @@ impl TurboliteHandle {
     }
 }
 
+/// Phase Soyuz migration: let `TurboliteHandle` serve as the handle for the
+/// sqlite-plugin `Vfs` too, so that impl can delegate file ops to the existing
+/// `DatabaseHandle` methods rather than reimplementing the tiered read/write/
+/// sync logic. Both trait impls coexist during the migration.
+#[cfg(feature = "plugin-vfs")]
+impl sqlite_plugin::vfs::VfsHandle for TurboliteHandle {
+    fn readonly(&self) -> bool {
+        self.read_only
+    }
+    fn in_memory(&self) -> bool {
+        false
+    }
+}
+
 impl DatabaseHandle for TurboliteHandle {
     type WalIndex = FileWalIndex;
 
