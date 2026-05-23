@@ -35,6 +35,9 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
+// Phase Soyuz migration spike: sqlite-plugin-backed VFS, off by default.
+#[cfg(feature = "plugin-vfs")]
+pub mod plugin_vfs;
 // `local` returns a `rusqlite::Connection`, so it only exists when rusqlite is
 // linked (the `bundled-sqlite` feature). The loadable-extension build is
 // `--no-default-features` and has no rusqlite; gating here keeps that build

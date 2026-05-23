@@ -37,9 +37,16 @@ bench-s3 = ["cli-s3"]
 # When turning on `wal` the concrete S3 impl must be compiled in too.
 wal = ["dep:walrust-core", "cli-s3"]
 lambda = ["dep:lambda_runtime", "bench-s3", "zstd"]
+# Phase Soyuz (migration spike): build the sqlite-plugin-backed VFS alongside
+# the production sqlite-vfs path. Additive + off by default so nothing changes
+# until the migration is complete. Drop this feature + src/plugin_vfs.rs to roll back.
+plugin-vfs = ["dep:sqlite-plugin"]
 
 [dependencies]
 sqlite-vfs = { git = "https://github.com/russellromney/sqlite-vfs.git", version = "0.2.0", branch = "fix/shm-barrier-wal-push" }
+# Migration target (Phase Soyuz). Forked branch carries the concurrent-WAL /
+# iVersion fixes; revisit upstreaming to orbitinghail/sqlite-plugin in Phase 0.
+sqlite-plugin = { git = "https://github.com/russellromney/sqlite-plugin.git", branch = "fix/concurrent-wal-segfault", default-features = false, features = ["static"], optional = true }
 zstd = { version = "0.13", optional = true }
 lz4_flex = { version = "0.11", optional = true }
 snap = { version = "1.1", optional = true }
