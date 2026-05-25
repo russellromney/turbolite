@@ -11,15 +11,23 @@ fn main() {
         // Use vendored SQLite headers — the macOS SDK headers define
         // SQLITE_OMIT_LOAD_EXTENSION which makes SQLITE_EXTENSION_INIT1
         // a no-op, breaking the extension entry point.
-        cc::Build::new()
+        let mut build = cc::Build::new();
+        build
             .file("src/ext_entry.c")
             .include("vendor/sqlite3")
             .define(
                 "TURBOLITE_VERSION",
                 Some(format!("\"{}\"", version).as_str()),
             )
-            .warnings(true)
-            .compile("ext_entry");
+            .warnings(true);
+        // sqlite-plugin's static registration needs a few extra API-table shims
+        // (libversion_number / mprintf / log). Compile them only when the plugin
+        // backend is present — the sqlite-vfs path neither needs nor tolerates
+        // the extra exported symbols.
+        if std::env::var("CARGO_FEATURE_PLUGIN_VFS").is_ok() {
+            build.define("TURBOLITE_PLUGIN_VFS", None);
+        }
+        build.compile("ext_entry");
 
         // Force the entry point symbol to be exported — the linker would
         // otherwise strip it because no Rust code references it.

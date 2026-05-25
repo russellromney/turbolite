@@ -343,6 +343,30 @@ pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
     })
 }
 
+/// Register a tiered VFS with SQLite. With the `plugin-vfs` feature this routes
+/// through sqlite-plugin (the migration backend), otherwise through the
+/// production sqlite-vfs path. In loadable-extension mode the sqlite-plugin
+/// registration resolves its `sqlite3_*` symbols through the API-table shims in
+/// ext_entry.c, the same mechanism sqlite-vfs uses. Mirrors the helper in
+/// `ffi.rs` so both FFI front-ends select the backend identically.
+#[cfg(not(feature = "plugin-vfs"))]
+#[inline]
+fn register_turbolite_vfs(
+    name: &str,
+    vfs: turbolite::tiered::TurboliteVfs,
+) -> Result<(), std::io::Error> {
+    turbolite::tiered::register(name, vfs)
+}
+
+#[cfg(feature = "plugin-vfs")]
+#[inline]
+fn register_turbolite_vfs(
+    name: &str,
+    vfs: turbolite::tiered::TurboliteVfs,
+) -> Result<(), std::io::Error> {
+    turbolite::tiered::register_plugin(name, vfs)
+}
+
 fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
     use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
@@ -364,7 +388,7 @@ fn register_local() -> Result<(), std::io::Error> {
         },
     };
     let vfs = TurboliteVfs::new_local(config)?;
-    turbolite::tiered::register("turbolite", vfs)
+    register_turbolite_vfs("turbolite", vfs)
 }
 
 #[cfg(feature = "cli-s3")]
@@ -432,7 +456,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     // The VFS holds a runtime handle for async storage work. Keep the owned
     // runtime alive for the process lifetime, matching the standalone FFI path.
     std::mem::forget(runtime);
-    turbolite::tiered::register("turbolite-s3", vfs)
+    register_turbolite_vfs("turbolite-s3", vfs)
 }
 
 // ── Bench SQL functions (FFI, called from ext_entry.c) ──────────────────
@@ -836,7 +860,7 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
             ..turbolite::tiered::TurboliteConfig::from_env()
         };
         match turbolite::tiered::TurboliteVfs::new_local(config) {
-            Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
+            Ok(vfs) => match register_turbolite_vfs(&name, vfs) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("turbolite: failed to register VFS '{}': {}", name, e);
@@ -890,7 +914,7 @@ pub extern "C" fn turbolite_ext_register_file_first_vfs(
 
         let config = turbolite::tiered::TurboliteConfig::from_env().with_database_path(db_path);
         match turbolite::tiered::TurboliteVfs::new_local(config) {
-            Ok(vfs) => match turbolite::tiered::register(&name, vfs) {
+            Ok(vfs) => match register_turbolite_vfs(&name, vfs) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!(
@@ -1012,7 +1036,7 @@ pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
                 return 1;
             }
         };
-        match turbolite::tiered::register(&name, vfs) {
+        match register_turbolite_vfs(&name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!(
