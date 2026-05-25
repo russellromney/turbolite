@@ -1574,16 +1574,11 @@ impl TurboliteVfs {
             ))
         }
     }
-}
 
-impl Vfs for TurboliteVfs {
-    type Handle = TurboliteHandle;
-
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        self.open_inner(db, matches!(opts.kind, OpenKind::MainDb))
-    }
-
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
+    /// Backend-agnostic VFS-level operations, shared by the sqlite-vfs and
+    /// sqlite-plugin faces (both delegate here) so the logic lives in one place
+    /// and survives the eventual removal of the sqlite-vfs face.
+    pub(crate) fn delete_inner(&self, db: &str) -> Result<(), io::Error> {
         if self.is_file_first_main_db_name(db) || self.is_file_first_main_db_basename(db) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1599,7 +1594,7 @@ impl Vfs for TurboliteVfs {
         Ok(())
     }
 
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+    pub(crate) fn exists_inner(&self, db: &str) -> Result<bool, io::Error> {
         if self.config.local_data_path.is_some() {
             if let Ok(path) = self.local_main_db_path(db) {
                 if path.exists() {
@@ -1624,8 +1619,28 @@ impl Vfs for TurboliteVfs {
         storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime)
     }
 
-    fn temporary_name(&self) -> String {
+    pub(crate) fn temporary_name_inner(&self) -> String {
         format!("temp_{}", std::process::id())
+    }
+}
+
+impl Vfs for TurboliteVfs {
+    type Handle = TurboliteHandle;
+
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
+        self.open_inner(db, matches!(opts.kind, OpenKind::MainDb))
+    }
+
+    fn delete(&self, db: &str) -> Result<(), io::Error> {
+        self.delete_inner(db)
+    }
+
+    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+        self.exists_inner(db)
+    }
+
+    fn temporary_name(&self) -> String {
+        self.temporary_name_inner()
     }
 
     fn random(&self, buffer: &mut [i8]) {
@@ -1699,7 +1714,7 @@ mod plugin_backend {
             let name = match path {
                 Some(p) => p,
                 None => {
-                    temp_name = <TurboliteVfs as sqlite_vfs::Vfs>::temporary_name(self);
+                    temp_name = self.temporary_name_inner();
                     temp_name.as_str()
                 }
             };
@@ -1707,19 +1722,13 @@ mod plugin_backend {
         }
 
         fn delete(&self, path: &str) -> VfsResult<()> {
-            <TurboliteVfs as sqlite_vfs::Vfs>::delete(self, path).map_err(map_io)
+            self.delete_inner(path).map_err(map_io)
         }
 
-        fn access(&self, path: &str, flags: AccessFlags) -> VfsResult<bool> {
-            match flags {
-                // Exists drives hot-journal detection — it must report the real
-                // file state, so defer to the tiered existence check.
-                AccessFlags::Exists => {
-                    <TurboliteVfs as sqlite_vfs::Vfs>::exists(self, path).map_err(map_io)
-                }
-                // Read / ReadWrite: if it's there, the tiered backend can serve it.
-                _ => <TurboliteVfs as sqlite_vfs::Vfs>::exists(self, path).map_err(map_io),
-            }
+        fn access(&self, path: &str, _flags: AccessFlags) -> VfsResult<bool> {
+            // Exists drives hot-journal detection (must report real file state);
+            // Read/ReadWrite likewise resolve to "is it there?" for this backend.
+            self.exists_inner(path).map_err(map_io)
         }
 
         fn file_size(&self, h: &mut TurboliteHandle) -> VfsResult<usize> {
