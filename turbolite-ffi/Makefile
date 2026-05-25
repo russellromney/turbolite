@@ -84,7 +84,12 @@ install: lib header ## Install shared library + header to PREFIX (default /usr/l
 
 .PHONY: test
 test: ## Run Rust-level FFI integration tests
-	cargo test --features zstd,bundled-sqlite
+	# --test-threads=4: each test stands up a full TurboliteVfs (tokio runtime
+	# + prefetch pool). Running all ~67 of them at once on a typical CI box
+	# over-subscribes threads/IO and occasionally trips a transient IOERR or
+	# recovery-assertion (backend-independent; product paths are unaffected).
+	# A modest cap keeps the suite deterministic without hiding real failures.
+	cargo test --features zstd,bundled-sqlite -- --test-threads=4
 
 .PHONY: test-auto-ext-python
 test-auto-ext-python: ext ## Python e2e: loadable-ext + sqlite3_auto_extension
