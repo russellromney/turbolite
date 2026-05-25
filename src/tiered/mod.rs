@@ -368,12 +368,19 @@ pub fn is_registered_vfs_name(name: &str) -> bool {
     REGISTERED_VFS_NAMES.lock().contains(name)
 }
 
-/// Register a TurboliteVfs with SQLite under the given name.
+/// Register a TurboliteVfs with SQLite under the given name. The active backend
+/// is sqlite-plugin when the `plugin-vfs` feature is on (now the default),
+/// falling back to sqlite-vfs otherwise.
 pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
-    sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
-    REGISTERED_VFS_NAMES.lock().insert(name.to_string());
-    Ok(())
+    #[cfg(feature = "plugin-vfs")]
+    return register_plugin(name, vfs);
+    #[cfg(not(feature = "plugin-vfs"))]
+    {
+        sqlite_vfs::register(name, vfs, false)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
+        REGISTERED_VFS_NAMES.lock().insert(name.to_string());
+        Ok(())
+    }
 }
 
 /// Register a TurboliteVfs with SQLite through sqlite-plugin (the migration

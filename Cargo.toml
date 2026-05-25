@@ -16,7 +16,10 @@ keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
 categories = ["database", "compression"]
 
 [features]
-default = ["zstd", "bundled-sqlite"]
+# sqlite-plugin is the default VFS backend (the migration cut-over). It needs
+# libclang at build time (bindgen). sqlite-vfs remains as a non-default fallback
+# until it's fully removed.
+default = ["zstd", "bundled-sqlite", "plugin-vfs"]
 bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "rusqlite/functions", "dep:libsqlite3-sys"]
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]

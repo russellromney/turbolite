@@ -15,7 +15,8 @@ crate-type = ["lib", "cdylib"]
 [features]
 # Default mirrors the old turbolite default: standalone cdylib linking a
 # bundled SQLite through turbolite's rusqlite. `make lib-bundled` path.
-default = ["zstd", "bundled-sqlite"]
+# plugin-vfs is on by default now (sqlite-plugin is the active VFS backend).
+default = ["zstd", "bundled-sqlite", "plugin-vfs"]
 # Bundles sqlite3 for consumers that don't already have one linked.
 # Required by the `turbolite_open` / `turbolite_exec` rusqlite wrappers.
 bundled-sqlite = ["turbolite/bundled-sqlite", "dep:rusqlite"]
