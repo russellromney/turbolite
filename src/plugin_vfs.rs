@@ -1,12 +1,9 @@
-//! Phase Soyuz migration spike — a minimal in-memory VFS implemented against
-//! [`sqlite_plugin`], the migration target.
+//! A minimal in-memory VFS implemented against [`sqlite_plugin`].
 //!
-//! Purpose: prove end-to-end on **current `main`** that we can build + link
-//! sqlite-plugin alongside the existing stack, register a sqlite-plugin VFS,
-//! and run a real SQLite database through it (open + CRUD). It is **not** wired
-//! to turbolite's tiered storage / cache yet — that is Phase 2. Kept additive
-//! and behind the `plugin-vfs` feature so the production sqlite-vfs path is
-//! untouched and the whole thing can be deleted to roll back.
+//! It proves end-to-end that we can register a sqlite-plugin VFS and run a real
+//! SQLite database through it (open + CRUD), independent of turbolite's tiered
+//! storage / cache. The tiered backend in [`crate::tiered`] is the real VFS;
+//! this is a standalone smoke check and a candidate for removal.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

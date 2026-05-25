@@ -52,12 +52,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
 
 use crate::compress;
-
-// Re-use the FileWalIndex from the main lib
-use crate::FileWalIndex;
 
 // --- Extracted submodules ---
 mod async_rt;
@@ -368,25 +364,14 @@ pub fn is_registered_vfs_name(name: &str) -> bool {
     REGISTERED_VFS_NAMES.lock().contains(name)
 }
 
-/// Register a TurboliteVfs with SQLite under the given name. The active backend
-/// is sqlite-plugin when the `plugin-vfs` feature is on (now the default),
-/// falling back to sqlite-vfs otherwise.
+/// Register a TurboliteVfs with SQLite under the given name. The VFS backend is
+/// sqlite-plugin.
 pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
-    #[cfg(feature = "plugin-vfs")]
-    return register_plugin(name, vfs);
-    #[cfg(not(feature = "plugin-vfs"))]
-    {
-        sqlite_vfs::register(name, vfs, false)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
-        REGISTERED_VFS_NAMES.lock().insert(name.to_string());
-        Ok(())
-    }
+    register_plugin(name, vfs)
 }
 
-/// Register a TurboliteVfs with SQLite through sqlite-plugin (the migration
-/// target) under the given name, as a non-default VFS. Parallel to
-/// [`register`]; selected by the `plugin-vfs` feature.
-#[cfg(feature = "plugin-vfs")]
+/// Register a TurboliteVfs with SQLite through sqlite-plugin under the given
+/// name, as a non-default VFS.
 pub fn register_plugin(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
     let cname = std::ffi::CString::new(name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -431,39 +416,78 @@ impl std::ops::Deref for SharedTurboliteVfs {
     }
 }
 
-impl Vfs for SharedTurboliteVfs {
-    type Handle = TurboliteHandle;
+/// sqlite-plugin `Vfs` for the shared wrapper: every op delegates to the
+/// wrapped `TurboliteVfs` through the `Arc`, so SQLite drives the same backend
+/// while the caller keeps a clone for `manifest()` / `set_manifest()`.
+mod shared_plugin_backend {
+    use super::{SharedTurboliteVfs, TurboliteHandle};
+    use core::ptr::NonNull;
+    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenOpts, ShmLockMode};
+    use sqlite_plugin::vfs::{Vfs, VfsResult};
 
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<TurboliteHandle, io::Error> {
-        self.0.open(db, opts)
-    }
+    impl Vfs for SharedTurboliteVfs {
+        type Handle = TurboliteHandle;
 
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
-        self.0.delete(db)
-    }
-
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
-        self.0.exists(db)
-    }
-
-    fn temporary_name(&self) -> String {
-        self.0.temporary_name()
-    }
-
-    fn random(&self, buffer: &mut [i8]) {
-        self.0.random(buffer)
-    }
-
-    fn sleep(&self, duration: Duration) -> Duration {
-        self.0.sleep(duration)
-    }
-
-    fn access(&self, db: &str, write: bool) -> Result<bool, io::Error> {
-        self.0.access(db, write)
-    }
-
-    fn full_pathname<'a>(&self, db: &'a str) -> Result<std::borrow::Cow<'a, str>, io::Error> {
-        self.0.full_pathname(db)
+        fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<TurboliteHandle> {
+            self.0.open(path, opts)
+        }
+        fn delete(&self, path: &str) -> VfsResult<()> {
+            self.0.delete(path)
+        }
+        fn access(&self, path: &str, flags: AccessFlags) -> VfsResult<bool> {
+            self.0.access(path, flags)
+        }
+        fn file_size(&self, h: &mut TurboliteHandle) -> VfsResult<usize> {
+            self.0.file_size(h)
+        }
+        fn truncate(&self, h: &mut TurboliteHandle, size: usize) -> VfsResult<()> {
+            self.0.truncate(h, size)
+        }
+        fn write(&self, h: &mut TurboliteHandle, offset: usize, buf: &[u8]) -> VfsResult<usize> {
+            self.0.write(h, offset, buf)
+        }
+        fn read(&self, h: &mut TurboliteHandle, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+            self.0.read(h, offset, buf)
+        }
+        fn lock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            self.0.lock(h, level)
+        }
+        fn unlock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            self.0.unlock(h, level)
+        }
+        fn check_reserved_lock(&self, h: &mut TurboliteHandle) -> VfsResult<bool> {
+            self.0.check_reserved_lock(h)
+        }
+        fn sync(&self, h: &mut TurboliteHandle) -> VfsResult<()> {
+            self.0.sync(h)
+        }
+        fn close(&self, h: TurboliteHandle) -> VfsResult<()> {
+            self.0.close(h)
+        }
+        fn shm_map(
+            &self,
+            h: &mut TurboliteHandle,
+            region_idx: usize,
+            region_size: usize,
+            extend: bool,
+        ) -> VfsResult<Option<NonNull<u8>>> {
+            self.0.shm_map(h, region_idx, region_size, extend)
+        }
+        fn shm_lock(
+            &self,
+            h: &mut TurboliteHandle,
+            offset: u32,
+            count: u32,
+            mode: ShmLockMode,
+        ) -> VfsResult<()> {
+            self.0.shm_lock(h, offset, count, mode)
+        }
+        fn shm_barrier(&self, h: &mut TurboliteHandle) {
+            self.0.shm_barrier(h)
+        }
+        fn shm_unmap(&self, h: &mut TurboliteHandle, delete: bool) -> VfsResult<()> {
+            self.0.shm_unmap(h, delete)
+        }
     }
 }
 
@@ -473,8 +497,14 @@ impl Vfs for SharedTurboliteVfs {
 /// so you can call `manifest()` and `set_manifest()` on it after registration.
 /// This is required for haqlite's shared-mode turbolite integration.
 pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
-    sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
+    let cname = std::ffi::CString::new(name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    sqlite_plugin::vfs::register_static(
+        cname,
+        vfs,
+        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+    )
+    .map_err(|code| io::Error::other(format!("sqlite code {code}")))?;
     REGISTERED_VFS_NAMES.lock().insert(name.to_string());
     Ok(())
 }

@@ -26,17 +26,15 @@
 
 pub mod file_format;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use fs2::FileExt;
-use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs, WalDisabled};
+use crate::{DatabaseHandle, LockKind};
 
 use file_format::{
     decode_directory, decode_page, encode_directory, encode_page, Header, PageCodec,
@@ -209,8 +207,14 @@ fn register_or_reuse_vfs(path: &Path, options: &LocalOptions) -> Result<String, 
         codec: options.codec(),
         page_size: options.page_size,
     };
-    sqlite_vfs::register(&vfs_name, vfs, false)
-        .map_err(|e| LocalError::Io(io::Error::new(io::ErrorKind::Other, format!("{e:?}"))))?;
+    let cname = std::ffi::CString::new(vfs_name.clone())
+        .map_err(|e| LocalError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+    sqlite_plugin::vfs::register_static(
+        cname,
+        vfs,
+        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+    )
+    .map_err(|code| LocalError::Io(io::Error::other(format!("sqlite code {code}"))))?;
     map.insert(key, vfs_name.clone());
     Ok(vfs_name)
 }
@@ -252,11 +256,9 @@ impl LocalCompressedVfs {
     }
 }
 
-impl Vfs for LocalCompressedVfs {
-    type Handle = LocalHandle;
-
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<LocalHandle, io::Error> {
-        if opts.kind == OpenKind::MainDb && self.is_main(db) {
+impl LocalCompressedVfs {
+    fn open_inner(&self, db: &str, is_main_db: bool) -> Result<LocalHandle, io::Error> {
+        if is_main_db && self.is_main(db) {
             let main = MainHandle::open(self.path.clone(), self.codec.clone(), self.page_size)?;
             Ok(LocalHandle::Main(main))
         } else {
@@ -265,7 +267,7 @@ impl Vfs for LocalCompressedVfs {
         }
     }
 
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
+    fn delete_inner(&self, db: &str) -> Result<(), io::Error> {
         if self.is_main(db) {
             match std::fs::remove_file(&self.path) {
                 Ok(()) => Ok(()),
@@ -278,7 +280,7 @@ impl Vfs for LocalCompressedVfs {
         }
     }
 
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+    fn exists_inner(&self, db: &str) -> Result<bool, io::Error> {
         if self.is_main(db) {
             Ok(self.path.exists())
         } else {
@@ -288,33 +290,135 @@ impl Vfs for LocalCompressedVfs {
         }
     }
 
-    fn temporary_name(&self) -> String {
+    fn temporary_name_inner(&self) -> String {
         format!("turbolite-local-temp-{}", unique_vfs_name())
     }
+}
 
-    fn random(&self, buffer: &mut [i8]) {
-        // Cheap, dependency-free PRNG seeded from time + address. The VFS
-        // only uses this for temp names and SQLite's rollback salt.
-        let mut x = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            ^ (buffer.as_ptr() as u64);
-        for slot in buffer.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *slot = (x & 0xff) as i8;
+/// sqlite-plugin backend for the local VFS. Local databases are WAL-disabled
+/// (rollback journal in memory), so the `shm_*` methods keep their trait
+/// defaults — SQLite never asks for shared memory here. File ops delegate to
+/// the same [`DatabaseHandle`] methods, and `delete`/`access` reuse the
+/// inherent `*_inner` helpers.
+mod plugin_backend {
+    use super::{LocalCompressedVfs, LocalHandle};
+    use crate::DatabaseHandle;
+    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts};
+    use sqlite_plugin::vars;
+    use sqlite_plugin::vfs::{Vfs, VfsHandle, VfsResult};
+    use std::io::ErrorKind;
+
+    /// sqlite-plugin lock level → the `LockKind` the handle speaks. A pure
+    /// rename: the five SQLite levels match in both enums and order.
+    fn to_lock_kind(level: LockLevel) -> crate::LockKind {
+        match level {
+            LockLevel::Unlocked => crate::LockKind::None,
+            LockLevel::Shared => crate::LockKind::Shared,
+            LockLevel::Reserved => crate::LockKind::Reserved,
+            LockLevel::Pending => crate::LockKind::Pending,
+            LockLevel::Exclusive => crate::LockKind::Exclusive,
         }
     }
 
-    fn sleep(&self, duration: Duration) -> Duration {
-        std::thread::sleep(duration);
-        duration
+    fn map_io(e: std::io::Error) -> i32 {
+        match e.kind() {
+            ErrorKind::NotFound => vars::SQLITE_CANTOPEN,
+            ErrorKind::PermissionDenied => vars::SQLITE_READONLY,
+            ErrorKind::WouldBlock => vars::SQLITE_BUSY,
+            _ => vars::SQLITE_IOERR,
+        }
     }
 
-    fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, io::Error> {
-        Ok(Cow::Borrowed(db))
+    impl VfsHandle for LocalHandle {
+        fn readonly(&self) -> bool {
+            false
+        }
+        fn in_memory(&self) -> bool {
+            matches!(self, LocalHandle::Mem(_))
+        }
+    }
+
+    impl Vfs for LocalCompressedVfs {
+        type Handle = LocalHandle;
+
+        fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<LocalHandle> {
+            let is_main_db = matches!(opts.kind(), OpenKind::MainDb);
+            // SQLite passes NULL for temp/transient files; synthesize a name so
+            // the in-memory branch has somewhere to land.
+            let temp_name;
+            let name = match path {
+                Some(p) => p,
+                None => {
+                    temp_name = self.temporary_name_inner();
+                    temp_name.as_str()
+                }
+            };
+            self.open_inner(name, is_main_db).map_err(map_io)
+        }
+
+        fn delete(&self, path: &str) -> VfsResult<()> {
+            self.delete_inner(path).map_err(map_io)
+        }
+
+        fn access(&self, path: &str, _flags: AccessFlags) -> VfsResult<bool> {
+            self.exists_inner(path).map_err(map_io)
+        }
+
+        fn file_size(&self, h: &mut LocalHandle) -> VfsResult<usize> {
+            DatabaseHandle::size(h)
+                .map(|s| s as usize)
+                .map_err(|_| vars::SQLITE_IOERR_FSTAT)
+        }
+
+        fn truncate(&self, h: &mut LocalHandle, size: usize) -> VfsResult<()> {
+            DatabaseHandle::set_len(h, size as u64).map_err(|_| vars::SQLITE_IOERR_TRUNCATE)
+        }
+
+        fn write(&self, h: &mut LocalHandle, offset: usize, buf: &[u8]) -> VfsResult<usize> {
+            DatabaseHandle::write_all_at(h, buf, offset as u64)
+                .map(|()| buf.len())
+                .map_err(|_| vars::SQLITE_IOERR_WRITE)
+        }
+
+        fn read(&self, h: &mut LocalHandle, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+            match DatabaseHandle::read_exact_at(h, buf, offset as u64) {
+                Ok(()) => Ok(buf.len()),
+                // EOF: SQLite expects a short-read signal (and zero-fills).
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    Err(vars::SQLITE_IOERR_SHORT_READ)
+                }
+                Err(_) => Err(vars::SQLITE_IOERR_READ),
+            }
+        }
+
+        fn lock(&self, h: &mut LocalHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::lock(h, to_lock_kind(level)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(vars::SQLITE_BUSY),
+                Err(_) => Err(vars::SQLITE_IOERR_LOCK),
+            }
+        }
+
+        fn unlock(&self, h: &mut LocalHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::unlock(h, to_lock_kind(level)) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(vars::SQLITE_IOERR_UNLOCK),
+            }
+        }
+
+        fn check_reserved_lock(&self, h: &mut LocalHandle) -> VfsResult<bool> {
+            DatabaseHandle::reserved(h).map_err(|_| vars::SQLITE_IOERR_CHECKRESERVEDLOCK)
+        }
+
+        fn sync(&self, h: &mut LocalHandle) -> VfsResult<()> {
+            DatabaseHandle::sync(h, false).map_err(|_| vars::SQLITE_IOERR_FSYNC)
+        }
+
+        fn close(&self, h: LocalHandle) -> VfsResult<()> {
+            // LocalHandle's Drop releases the file lock and persists if dirty.
+            drop(h);
+            Ok(())
+        }
     }
 }
 
@@ -599,8 +703,6 @@ pub struct MemHandle {
 }
 
 impl DatabaseHandle for LocalHandle {
-    type WalIndex = WalDisabled;
-
     fn size(&self) -> Result<u64, io::Error> {
         match self {
             LocalHandle::Main(h) => Ok(h.image.len() as u64),
@@ -666,17 +768,6 @@ impl DatabaseHandle for LocalHandle {
 
     fn reserved(&mut self) -> Result<bool, io::Error> {
         Ok(false)
-    }
-
-    fn current_lock(&self) -> Result<LockKind, io::Error> {
-        Ok(match self {
-            LocalHandle::Main(h) => h.lock,
-            LocalHandle::Mem(h) => h.lock,
-        })
-    }
-
-    fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, io::Error> {
-        Ok(WalDisabled)
     }
 }
 

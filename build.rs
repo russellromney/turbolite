@@ -5,7 +5,7 @@ fn main() {
         // etc. through the extension API table.
         //
         // Do NOT link libsqlite3 — the host process provides SQLite.
-        // The C shim's symbol implementations satisfy sqlite-vfs's extern "C".
+        // The C shim's symbol implementations satisfy the Rust extern "C" calls.
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
 
         // Use vendored SQLite headers — the macOS SDK headers define
@@ -39,9 +39,7 @@ fn main() {
         println!("cargo:rerun-if-changed=src/ext_entry.c");
     } else {
         // Normal mode: link SQLite for the cdylib (FFI shared library) and bins.
-        //
-        // `sqlite-vfs` references sqlite3_vfs_register, sqlite3_snprintf, etc.
-        // directly via extern "C" blocks.
+        // rusqlite / libsqlite3-sys need the sqlite3 symbols available.
         //
         // Without bundled-sqlite: link system libsqlite3.
         // With bundled-sqlite: libsqlite3-sys compiles SQLite from source.

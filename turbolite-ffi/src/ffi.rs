@@ -46,26 +46,13 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::{Mutex, OnceLock};
 
-/// Register a tiered VFS with SQLite. With the `plugin-vfs` feature this routes
-/// through sqlite-plugin (the migration backend); otherwise through the
-/// production sqlite-vfs path. Identical signature either way, so the FFI
-/// registration entry points don't care which backend is compiled in.
-#[cfg(not(feature = "plugin-vfs"))]
+/// Register a tiered VFS with SQLite through sqlite-plugin.
 #[inline]
 fn register_turbolite_vfs(
     name: &str,
     vfs: turbolite::tiered::TurboliteVfs,
 ) -> Result<(), std::io::Error> {
     turbolite::tiered::register(name, vfs)
-}
-
-#[cfg(feature = "plugin-vfs")]
-#[inline]
-fn register_turbolite_vfs(
-    name: &str,
-    vfs: turbolite::tiered::TurboliteVfs,
-) -> Result<(), std::io::Error> {
-    turbolite::tiered::register_plugin(name, vfs)
 }
 
 // --- Error handling ---
@@ -681,8 +668,12 @@ pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb 
 ///
 /// # Returns
 /// 0 on success, -1 on error.
+///
+/// # Safety
+/// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
+/// a valid NUL-terminated C string.
 #[no_mangle]
-pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
+pub unsafe extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
     ffi_guard(-1, || {
         clear_last_error();
         if db.is_null() {
@@ -716,8 +707,15 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// # Returns
 /// Heap-allocated JSON string on success (caller must free with `turbolite_free_string`),
 /// or NULL on error.
+///
+/// # Safety
+/// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
+/// a valid NUL-terminated C string.
 #[no_mangle]
-pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn turbolite_query_json(
+    db: *mut TurboliteDb,
+    sql: *const c_char,
+) -> *mut c_char {
     ffi_guard(std::ptr::null_mut(), || {
         clear_last_error();
         if db.is_null() {
@@ -786,8 +784,12 @@ pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char)
 }
 
 /// Free a string returned by `turbolite_query_json`.
+///
+/// # Safety
+/// `s` must be NULL or a pointer returned by `turbolite_query_json` that has
+/// not already been freed.
 #[no_mangle]
-pub extern "C" fn turbolite_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn turbolite_free_string(s: *mut c_char) {
     ffi_guard((), || {
         if !s.is_null() {
             unsafe {
@@ -798,8 +800,12 @@ pub extern "C" fn turbolite_free_string(s: *mut c_char) {
 }
 
 /// Close a database connection opened with `turbolite_open`.
+///
+/// # Safety
+/// `db` must be NULL or a handle from `turbolite_open`. A double close is safe
+/// (the handle is freed exactly once).
 #[no_mangle]
-pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
+pub unsafe extern "C" fn turbolite_close(db: *mut TurboliteDb) {
     ffi_guard((), || {
         if db.is_null() {
             return;

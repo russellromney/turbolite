@@ -5,7 +5,7 @@ fn main() {
         // etc. through the extension API table.
         //
         // Do NOT link libsqlite3 — the host process provides SQLite.
-        // The C shim's symbol implementations satisfy sqlite-vfs's extern "C".
+        // The C shim's symbol implementations satisfy the Rust extern "C" calls.
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
 
         // Use vendored SQLite headers — the macOS SDK headers define
@@ -20,13 +20,6 @@ fn main() {
                 Some(format!("\"{}\"", version).as_str()),
             )
             .warnings(true);
-        // sqlite-plugin's static registration needs a few extra API-table shims
-        // (libversion_number / mprintf / log). Compile them only when the plugin
-        // backend is present — the sqlite-vfs path neither needs nor tolerates
-        // the extra exported symbols.
-        if std::env::var("CARGO_FEATURE_PLUGIN_VFS").is_ok() {
-            build.define("TURBOLITE_PLUGIN_VFS", None);
-        }
         build.compile("ext_entry");
 
         // Force the entry point symbol to be exported — the linker would

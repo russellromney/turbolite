@@ -1367,12 +1367,10 @@ impl TurboliteVfs {
         self.manifest_bytes()
     }
 
-    /// Backend-agnostic handle setup, shared by the sqlite-vfs `Vfs::open`
-    /// and the (migration) sqlite-plugin `Vfs::open`. `is_main_db` picks the
+    /// Handle setup for the sqlite-plugin `Vfs::open`. `is_main_db` picks the
     /// tiered main-db path (manifest load, cache validate, new_tiered) over the
-    /// passthrough companion path (WAL/journal/temp). The only varying input
-    /// across backends is this bool, so each `open` maps its own open-flags to
-    /// it and calls here.
+    /// passthrough companion path (WAL/journal/temp); `open` maps its open-flags
+    /// to that bool and calls here.
     pub(crate) fn open_inner(
         &self,
         db: &str,
@@ -1575,9 +1573,8 @@ impl TurboliteVfs {
         }
     }
 
-    /// Backend-agnostic VFS-level operations, shared by the sqlite-vfs and
-    /// sqlite-plugin faces (both delegate here) so the logic lives in one place
-    /// and survives the eventual removal of the sqlite-vfs face.
+    /// VFS-level operations the sqlite-plugin `Vfs` face delegates to, so the
+    /// logic lives in one place rather than in the trait impl.
     pub(crate) fn delete_inner(&self, db: &str) -> Result<(), io::Error> {
         if self.is_file_first_main_db_name(db) || self.is_file_first_main_db_basename(db) {
             return Err(io::Error::new(
@@ -1624,66 +1621,27 @@ impl TurboliteVfs {
     }
 }
 
-impl Vfs for TurboliteVfs {
-    type Handle = TurboliteHandle;
-
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        self.open_inner(db, matches!(opts.kind, OpenKind::MainDb))
-    }
-
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
-        self.delete_inner(db)
-    }
-
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
-        self.exists_inner(db)
-    }
-
-    fn temporary_name(&self) -> String {
-        self.temporary_name_inner()
-    }
-
-    fn random(&self, buffer: &mut [i8]) {
-        // Use the OS CSPRNG, not a time-seeded LCG: SQLite relies on this for
-        // values that must be unpredictable (e.g. rollback-journal salts).
-        use rand::RngCore;
-        // i8 and u8 have the same layout; fill the bytes directly.
-        let bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, buffer.len()) };
-        rand::thread_rng().fill_bytes(bytes);
-    }
-
-    fn sleep(&self, duration: Duration) -> Duration {
-        std::thread::sleep(duration);
-        duration
-    }
-}
-
-/// sqlite-plugin backend for the tiered VFS — the migration target.
+/// sqlite-plugin backend for the tiered VFS.
 ///
-/// Every file op delegates to the same [`DatabaseHandle`] methods the
-/// production sqlite-vfs path drives, so the storage/cache/manifest logic is
-/// shared verbatim (`open` reuses [`TurboliteVfs::open_inner`]). Only two
-/// things translate at the boundary: the lock-level enum (the two ladders are
-/// identical, so it's a 1:1 map) and the read EOF convention (sqlite-plugin's
-/// `xRead` discards the byte count, so a short read is signalled by returning
-/// `Err(SQLITE_IOERR_SHORT_READ)` — same mapping sqlite-vfs makes from
-/// `read_exact_at`'s `UnexpectedEof`). WAL shared memory (`shm_*`) is the next
-/// increment; until then this backend serves rollback-journal modes.
-#[cfg(feature = "plugin-vfs")]
+/// Every file op delegates to the same `DatabaseHandle` methods the handle
+/// provides, so the storage/cache/manifest logic is shared verbatim (`open`
+/// reuses [`TurboliteVfs::open_inner`]; `delete`/`access`/temp-name reuse the
+/// inherent `*_inner` helpers). Two things translate at the boundary: the
+/// lock-level enum (`LockLevel` → `LockKind`, a 1:1 rename) and the read EOF
+/// convention (sqlite-plugin's `xRead` discards the byte count, so a short read
+/// is signalled by `Err(SQLITE_IOERR_SHORT_READ)`).
 mod plugin_backend {
     use super::{TurboliteHandle, TurboliteVfs};
     use core::ptr::NonNull;
     use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts, ShmLockMode};
     use sqlite_plugin::vars;
     use sqlite_plugin::vfs::{Vfs, VfsResult};
-    use sqlite_vfs::wip::{WalIndex, WalIndexLock};
-    use sqlite_vfs::{DatabaseHandle, LockKind};
+    use crate::{DatabaseHandle, LockKind, WalIndexLock};
     use std::io::ErrorKind;
 
-    /// sqlite-plugin lock level → the sqlite-vfs `LockKind` the handle speaks.
-    /// The five SQLite locking levels are the same in both crates and in the
-    /// same order; this is a pure rename.
+    /// sqlite-plugin lock level → the `LockKind` the handle speaks. The five
+    /// SQLite locking levels are the same in both enums and in the same order;
+    /// this is a pure rename.
     fn to_lock_kind(level: LockLevel) -> LockKind {
         match level {
             LockLevel::Unlocked => LockKind::None,
@@ -1835,7 +1793,7 @@ mod plugin_backend {
                 .ok_or(vars::SQLITE_IOERR_SHMLOCK)?;
             let range = start..end;
             let shm = h.ensure_plugin_shm();
-            match WalIndex::lock(shm, range, walock) {
+            match shm.lock(range, walock) {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(vars::SQLITE_BUSY),
                 Err(_) => Err(vars::SQLITE_IOERR_SHMLOCK),

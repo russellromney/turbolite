@@ -343,28 +343,15 @@ pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
     })
 }
 
-/// Register a tiered VFS with SQLite. With the `plugin-vfs` feature this routes
-/// through sqlite-plugin (the migration backend), otherwise through the
-/// production sqlite-vfs path. In loadable-extension mode the sqlite-plugin
-/// registration resolves its `sqlite3_*` symbols through the API-table shims in
-/// ext_entry.c, the same mechanism sqlite-vfs uses. Mirrors the helper in
-/// `ffi.rs` so both FFI front-ends select the backend identically.
-#[cfg(not(feature = "plugin-vfs"))]
+/// Register a tiered VFS with SQLite through sqlite-plugin. In loadable-extension
+/// mode the registration resolves its `sqlite3_*` symbols through the API-table
+/// shims in ext_entry.c.
 #[inline]
 fn register_turbolite_vfs(
     name: &str,
     vfs: turbolite::tiered::TurboliteVfs,
 ) -> Result<(), std::io::Error> {
     turbolite::tiered::register(name, vfs)
-}
-
-#[cfg(feature = "plugin-vfs")]
-#[inline]
-fn register_turbolite_vfs(
-    name: &str,
-    vfs: turbolite::tiered::TurboliteVfs,
-) -> Result<(), std::io::Error> {
-    turbolite::tiered::register_plugin(name, vfs)
 }
 
 fn register_local() -> Result<(), std::io::Error> {
@@ -836,8 +823,11 @@ pub extern "C" fn turbolite_gc() -> i32 {
 /// the local image.
 ///
 /// Returns 0 on success, 1 on error.
+///
+/// # Safety
+/// `name_ptr` and `cache_dir_ptr` must be valid, NUL-terminated C strings.
 #[no_mangle]
-pub extern "C" fn turbolite_ext_register_named_vfs(
+pub unsafe extern "C" fn turbolite_ext_register_named_vfs(
     name_ptr: *const std::os::raw::c_char,
     cache_dir_ptr: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
@@ -893,8 +883,11 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
 /// overridden to match the database path.
 ///
 /// Returns 0 on success, 1 on error.
+///
+/// # Safety
+/// `name_ptr` and `db_path_ptr` must be valid, NUL-terminated C strings.
 #[no_mangle]
-pub extern "C" fn turbolite_ext_register_file_first_vfs(
+pub unsafe extern "C" fn turbolite_ext_register_file_first_vfs(
     name_ptr: *const std::os::raw::c_char,
     db_path_ptr: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
@@ -951,9 +944,14 @@ fn optional_cstr(ptr: *const std::os::raw::c_char) -> Option<String> {
 /// VFS with caller-supplied name and caller-supplied bucket/prefix. Bindings
 /// that open many volumes in one process should use this path so each volume
 /// has a distinct VFS identity.
+///
+/// # Safety
+/// `name_ptr`, `db_path_ptr`, and `bucket_ptr` must be valid, NUL-terminated C
+/// strings. `prefix_ptr`/`endpoint_ptr`/`region_ptr` must each be either NULL
+/// or a valid NUL-terminated C string.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
-pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
+pub unsafe extern "C" fn turbolite_ext_register_s3_file_first_vfs(
     name_ptr: *const std::os::raw::c_char,
     db_path_ptr: *const std::os::raw::c_char,
     bucket_ptr: *const std::os::raw::c_char,
@@ -1049,9 +1047,11 @@ pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
     })
 }
 
+/// # Safety
+/// See the `cli-s3` build of this function; this stub dereferences nothing.
 #[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
-pub extern "C" fn turbolite_ext_register_s3_file_first_vfs(
+pub unsafe extern "C" fn turbolite_ext_register_s3_file_first_vfs(
     _name_ptr: *const std::os::raw::c_char,
     _db_path_ptr: *const std::os::raw::c_char,
     _bucket_ptr: *const std::os::raw::c_char,

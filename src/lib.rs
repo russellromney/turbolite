@@ -35,8 +35,9 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
-// Phase Soyuz migration spike: sqlite-plugin-backed VFS, off by default.
-#[cfg(feature = "plugin-vfs")]
+// Minimal standalone sqlite-plugin smoke VFS (the original migration spike).
+// Superseded by the tiered backend; kept as an independent integration check.
+// TODO: candidate for removal now that the real backend ships.
 pub mod plugin_vfs;
 // `local` returns a `rusqlite::Connection`, so it only exists when rusqlite is
 // linked (the `bundled-sqlite` feature). The loadable-extension build is
@@ -318,6 +319,46 @@ const WAL_LOCK_OFFSET: u64 = 120;
 /// Lock tracing events are emitted under the `turbolite::locks` tracing
 /// target. Filter with `RUST_LOG=turbolite::locks=trace`.
 
+/// The five SQLite database lock levels, ordered from weakest to strongest.
+/// Turbolite's own type (the VFS backend is sqlite-plugin; we no longer pull
+/// these from sqlite-vfs). See <https://www.sqlite.org/lockingv3.html>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum LockKind {
+    #[default]
+    None,
+    Shared,
+    Reserved,
+    Pending,
+    Exclusive,
+}
+
+/// WAL-index (`-shm`) byte-range lock modes. `None` releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalIndexLock {
+    None,
+    Shared,
+    Exclusive,
+}
+
+/// The file operations a VFS handle must provide. Formerly sqlite-vfs's
+/// `DatabaseHandle`; now turbolite's own, since the VFS backend is
+/// sqlite-plugin. The sqlite-plugin `Vfs` impls delegate their file ops here.
+pub(crate) trait DatabaseHandle {
+    fn size(&self) -> Result<u64, io::Error>;
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), io::Error>;
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error>;
+    fn sync(&mut self, data_only: bool) -> Result<(), io::Error>;
+    fn set_len(&mut self, size: u64) -> Result<(), io::Error>;
+    /// Acquire `lock`. Returns whether the requested lock could be acquired.
+    fn lock(&mut self, lock: LockKind) -> Result<bool, io::Error>;
+    /// Downgrade/release. Defaults to `lock` (a downgrade is just a weaker lock).
+    fn unlock(&mut self, lock: LockKind) -> Result<bool, io::Error> {
+        self.lock(lock)
+    }
+    /// Whether a Reserved/Pending/Exclusive lock is held on the database.
+    fn reserved(&mut self) -> Result<bool, io::Error>;
+}
+
 // ── FileWalIndex (shared by TurboliteVfs) ─────────────────────────────
 
 /// WAL-index implementation backed by a memory-mapped -shm file on disk.
@@ -427,12 +468,11 @@ impl FileWalIndex {
     }
 
     /// Live-pointer region map for the sqlite-plugin shm interface: hand back a
-    /// pointer straight into the mmap'd `-shm` region instead of copying it out
-    /// (the copy is what `map`/`pull` do for the sqlite-vfs path — and what tore
-    /// WAL-index reads under concurrency). With `extend = false`, decline rather
-    /// than grow the file: SQLite probes with `extend = false` to learn whether
-    /// a region already exists.
-    #[cfg(feature = "plugin-vfs")]
+    /// pointer straight into the mmap'd `-shm` region instead of copying it out.
+    /// A copy-in/copy-out model is what tore WAL-index reads under concurrency;
+    /// the live mapping has nothing to tear. With `extend = false`, decline
+    /// rather than grow the file: SQLite probes with `extend = false` to learn
+    /// whether a region already exists.
     pub(crate) fn map_ptr(
         &mut self,
         region: u32,
@@ -474,25 +514,15 @@ impl Drop for FileWalIndex {
     }
 }
 
-impl sqlite_vfs::wip::WalIndex for FileWalIndex {
-    fn map(&mut self, region: u32) -> Result<[u8; 32768], io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        let mut data = [0u8; 32768];
-        // Safety: ptr is a valid mmap'd region of 32KB, backed by MAP_SHARED file.
-        // SQLite's WAL protocol ensures no concurrent writes without proper locking.
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
-        }
-        Ok(data)
-    }
-
-    fn lock(
+impl FileWalIndex {
+    /// Acquire or release WAL-index byte-range locks (in-process table + fcntl
+    /// file locks for cross-process). `WalIndexLock::None` releases the range;
+    /// returns `Ok(false)` on contention.
+    pub(crate) fn lock(
         &mut self,
         locks: Range<u8>,
-        lock: sqlite_vfs::wip::WalIndexLock,
+        lock: WalIndexLock,
     ) -> Result<bool, io::Error> {
-        use sqlite_vfs::wip::WalIndexLock;
-
         let conn_id = self.conn_id;
         let lock_file = self.ensure_lock_file()?;
 
@@ -589,26 +619,8 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
         Ok(true)
     }
 
-    fn pull(&mut self, region: u32, data: &mut [u8; 32768]) -> Result<(), io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        // Safety: mmap'd MAP_SHARED region, reads are always current.
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), WAL_REGION_SIZE);
-        }
-        Ok(())
-    }
-
-    fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), io::Error> {
-        let ptr = self.ensure_mmap_region(region)?;
-        // Safety: MAP_SHARED write. Immediately visible to other processes via mmap.
-        // SQLite holds EXCLUSIVE WAL lock before calling push.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, WAL_REGION_SIZE);
-        }
-        Ok(())
-    }
-
-    fn delete(mut self) -> Result<(), io::Error> {
+    /// Unmap all regions, release in-process locks, and unlink the `-shm` file.
+    pub(crate) fn delete(mut self) -> Result<(), io::Error> {
         // Unmap all regions before removing the file
         for (_, ptr) in self.mmap_regions.drain() {
             unsafe {
@@ -818,7 +830,7 @@ mod tests {
 
     // ── FileWalIndex tests ────────────────────────────────────────────
 
-    use sqlite_vfs::wip::{WalIndex, WalIndexLock};
+    use crate::WalIndexLock;
 
     #[test]
     fn test_wal_index_region_map_returns_zeroed_data() {
@@ -826,34 +838,46 @@ mod tests {
         let shm_path = dir.path().join("test.db-shm");
         let mut idx = FileWalIndex::new(shm_path.clone());
 
-        let data = idx.map(0).expect("map region 0");
-        assert_eq!(data, [0u8; 32768]);
+        // A freshly-extended region maps to zero-filled shared memory.
+        let ptr = idx
+            .map_ptr(0, WAL_REGION_SIZE, true)
+            .expect("map region 0")
+            .expect("region present");
+        let region = unsafe { std::slice::from_raw_parts(ptr, WAL_REGION_SIZE) };
+        assert_eq!(region, &[0u8; WAL_REGION_SIZE][..]);
 
-        // File should exist and be at least 32KB
+        // File should exist and be at least 32KB.
         let meta = std::fs::metadata(&shm_path).expect("shm file metadata");
-        assert!(meta.len() >= 32768);
+        assert!(meta.len() >= WAL_REGION_SIZE as u64);
     }
 
     #[test]
-    fn test_wal_index_push_pull_roundtrip() {
+    fn test_wal_index_live_pointer_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shm_path = dir.path().join("test.db-shm");
         let mut idx = FileWalIndex::new(shm_path);
 
-        // Map first to ensure file exists
-        let _ = idx.map(0).expect("map region 0");
-
-        // Write known data
-        let mut write_buf = [0u8; 32768];
-        for i in 0..32768 {
-            write_buf[i] = (i % 256) as u8;
+        // Write known data straight through the live mapping.
+        let ptr = idx
+            .map_ptr(0, WAL_REGION_SIZE, true)
+            .expect("map region 0")
+            .expect("region present");
+        let region = unsafe { std::slice::from_raw_parts_mut(ptr, WAL_REGION_SIZE) };
+        for (i, b) in region.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
         }
-        idx.push(0, &write_buf).expect("push region 0");
 
-        // Read it back
-        let mut read_buf = [0u8; 32768];
-        idx.pull(0, &mut read_buf).expect("pull region 0");
-        assert_eq!(read_buf, write_buf);
+        // Re-mapping the same region returns the same live memory — the writes
+        // are visible with no copy-back step (the point of the live-pointer shm).
+        let ptr2 = idx
+            .map_ptr(0, WAL_REGION_SIZE, true)
+            .expect("re-map region 0")
+            .expect("region present");
+        assert_eq!(ptr2, ptr, "same region maps to the same pointer");
+        let read = unsafe { std::slice::from_raw_parts(ptr2, WAL_REGION_SIZE) };
+        for i in 0..WAL_REGION_SIZE {
+            assert_eq!(read[i], (i % 256) as u8);
+        }
     }
 
     #[test]
@@ -862,34 +886,35 @@ mod tests {
         let shm_path = dir.path().join("test.db-shm");
         let mut idx = FileWalIndex::new(shm_path);
 
-        // Map three regions
-        let _ = idx.map(0).expect("map 0");
-        let _ = idx.map(1).expect("map 1");
-        let _ = idx.map(2).expect("map 2");
+        // Map three regions and fill each with a distinct byte.
+        let p0 = idx
+            .map_ptr(0, WAL_REGION_SIZE, true)
+            .expect("map 0")
+            .expect("present");
+        let p1 = idx
+            .map_ptr(1, WAL_REGION_SIZE, true)
+            .expect("map 1")
+            .expect("present");
+        let p2 = idx
+            .map_ptr(2, WAL_REGION_SIZE, true)
+            .expect("map 2")
+            .expect("present");
+        unsafe {
+            std::slice::from_raw_parts_mut(p0, WAL_REGION_SIZE).fill(0xAA);
+            std::slice::from_raw_parts_mut(p1, WAL_REGION_SIZE).fill(0xBB);
+            std::slice::from_raw_parts_mut(p2, WAL_REGION_SIZE).fill(0xCC);
 
-        // Write distinct data to each
-        let buf0 = [0xAAu8; 32768];
-        let buf1 = [0xBBu8; 32768];
-        let buf2 = [0xCCu8; 32768];
-        idx.push(0, &buf0).expect("push 0");
-        idx.push(1, &buf1).expect("push 1");
-        idx.push(2, &buf2).expect("push 2");
-
-        // Read back and verify independence
-        let mut read = [0u8; 32768];
-        idx.pull(0, &mut read).expect("pull 0");
-        assert_eq!(read, buf0);
-
-        idx.pull(1, &mut read).expect("pull 1");
-        assert_eq!(read, buf1);
-
-        idx.pull(2, &mut read).expect("pull 2");
-        assert_eq!(read, buf2);
-
-        // File should be at least 3 * 32KB
-        let _ = buf0;
-        let _ = buf1;
-        let _ = buf2;
+            // Each region keeps its own bytes — independent mappings.
+            assert!(std::slice::from_raw_parts(p0, WAL_REGION_SIZE)
+                .iter()
+                .all(|&b| b == 0xAA));
+            assert!(std::slice::from_raw_parts(p1, WAL_REGION_SIZE)
+                .iter()
+                .all(|&b| b == 0xBB));
+            assert!(std::slice::from_raw_parts(p2, WAL_REGION_SIZE)
+                .iter()
+                .all(|&b| b == 0xCC));
+        }
     }
 
     #[test]
@@ -902,8 +927,8 @@ mod tests {
         let mut idx_b = FileWalIndex::new(shm_path.clone());
 
         // Ensure files exist
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.map_ptr(0, WAL_REGION_SIZE, true).expect("map a");
+        let _ = idx_b.map_ptr(0, WAL_REGION_SIZE, true).expect("map b");
 
         let ok_a = idx_a
             .lock(0..1, WalIndexLock::Shared)
@@ -927,8 +952,8 @@ mod tests {
         let mut idx_a = FileWalIndex::new(shm_path.clone());
         let mut idx_b = FileWalIndex::new(shm_path.clone());
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.map_ptr(0, WAL_REGION_SIZE, true).expect("map a");
+        let _ = idx_b.map_ptr(0, WAL_REGION_SIZE, true).expect("map b");
 
         let ok_a = idx_a
             .lock(0..1, WalIndexLock::Exclusive)
@@ -955,8 +980,8 @@ mod tests {
         let mut idx_a = FileWalIndex::new(shm_path.clone());
         let mut idx_b = FileWalIndex::new(shm_path.clone());
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.map_ptr(0, WAL_REGION_SIZE, true).expect("map a");
+        let _ = idx_b.map_ptr(0, WAL_REGION_SIZE, true).expect("map b");
 
         let ok_a = idx_a
             .lock(0..1, WalIndexLock::Exclusive)
@@ -982,8 +1007,8 @@ mod tests {
         let mut idx_a = FileWalIndex::new(shm_path.clone());
         let mut idx_b = FileWalIndex::new(shm_path.clone());
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.map_ptr(0, WAL_REGION_SIZE, true).expect("map a");
+        let _ = idx_b.map_ptr(0, WAL_REGION_SIZE, true).expect("map b");
 
         let ok_a = idx_a
             .lock(0..1, WalIndexLock::Shared)
@@ -1009,8 +1034,8 @@ mod tests {
         let mut idx_a = FileWalIndex::new(shm_path.clone());
         let mut idx_b = FileWalIndex::new(shm_path.clone());
 
-        let _ = idx_a.map(0).expect("map a");
-        let _ = idx_b.map(0).expect("map b");
+        let _ = idx_a.map_ptr(0, WAL_REGION_SIZE, true).expect("map a");
+        let _ = idx_b.map_ptr(0, WAL_REGION_SIZE, true).expect("map b");
 
         // A takes exclusive
         let ok = idx_a
@@ -1042,7 +1067,7 @@ mod tests {
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx = FileWalIndex::new(shm_path);
-        let _ = idx.map(0).expect("map");
+        let _ = idx.map_ptr(0, WAL_REGION_SIZE, true).expect("map");
 
         let ok = idx.lock(0..1, WalIndexLock::Shared).expect("shared");
         assert!(ok);
@@ -1061,7 +1086,7 @@ mod tests {
         let shm_path = dir.path().join("test.db-shm");
 
         let mut idx = FileWalIndex::new(shm_path.clone());
-        let _ = idx.map(0).expect("map");
+        let _ = idx.map_ptr(0, WAL_REGION_SIZE, true).expect("map");
         assert!(shm_path.exists(), "shm file should exist after map");
 
         idx.delete().expect("delete");

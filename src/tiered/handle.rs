@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::{DatabaseHandle, LockKind};
 use hadb_storage::StorageBackend;
 use tokio::runtime::Handle as TokioHandle;
 
@@ -166,7 +167,6 @@ pub struct TurboliteHandle {
     /// mmap'd `-shm` regions whose pointers `shm_map` hands straight to SQLite
     /// — no copy, which is the whole point of the migration. Lazily created on
     /// the first `shm_map`; only ever set for a main-db handle in WAL mode.
-    #[cfg(feature = "plugin-vfs")]
     plugin_shm: Option<crate::FileWalIndex>,
 }
 
@@ -629,7 +629,6 @@ impl TurboliteHandle {
             active_db_locks: HashMap::new(),
             replay_gate: Some(replay_gate),
             replay_read_guard: None,
-            #[cfg(feature = "plugin-vfs")]
             plugin_shm: None,
             settings_queue,
         })
@@ -699,7 +698,6 @@ impl TurboliteHandle {
             // SQL pushes bypass the journal/WAL file and land on the
             // main-db handle.
             settings_queue: settings::new_queue(),
-            #[cfg(feature = "plugin-vfs")]
             plugin_shm: None,
         }
     }
@@ -1130,11 +1128,9 @@ impl TurboliteHandle {
     }
 }
 
-/// Phase Soyuz migration: let `TurboliteHandle` serve as the handle for the
-/// sqlite-plugin `Vfs` too, so that impl can delegate file ops to the existing
-/// `DatabaseHandle` methods rather than reimplementing the tiered read/write/
-/// sync logic. Both trait impls coexist during the migration.
-#[cfg(feature = "plugin-vfs")]
+/// `TurboliteHandle` is the handle for the sqlite-plugin `Vfs`; that impl
+/// delegates file ops to the inherent/`DatabaseHandle` methods rather than
+/// reimplementing the tiered read/write/sync logic.
 impl sqlite_plugin::vfs::VfsHandle for TurboliteHandle {
     fn readonly(&self) -> bool {
         self.read_only
@@ -1144,11 +1140,10 @@ impl sqlite_plugin::vfs::VfsHandle for TurboliteHandle {
     }
 }
 
-#[cfg(feature = "plugin-vfs")]
 impl TurboliteHandle {
     /// Lazily create (on first `shm_map`) and return the live WAL-index shared
-    /// memory for this handle. The `-shm` path matches `wal_index()` so the
-    /// sqlite-plugin and sqlite-vfs backends key the same file + in-process
+    /// memory for this handle. The `-shm` path is derived from the database
+    /// path so every handle on the same db keys the same file + in-process
     /// lock table.
     pub(crate) fn ensure_plugin_shm(&mut self) -> &mut crate::FileWalIndex {
         if self.plugin_shm.is_none() {
@@ -1163,7 +1158,7 @@ impl TurboliteHandle {
     pub(crate) fn unmap_plugin_shm(&mut self, delete: bool) -> std::io::Result<()> {
         if let Some(shm) = self.plugin_shm.take() {
             if delete {
-                <crate::FileWalIndex as sqlite_vfs::wip::WalIndex>::delete(shm)?;
+                shm.delete()?;
             }
         }
         Ok(())
@@ -1171,8 +1166,6 @@ impl TurboliteHandle {
 }
 
 impl DatabaseHandle for TurboliteHandle {
-    type WalIndex = FileWalIndex;
-
     fn size(&self) -> Result<u64, io::Error> {
         if self.is_passthrough() {
             let file = self.passthrough_file.as_ref().unwrap().read();
@@ -3542,14 +3535,6 @@ impl DatabaseHandle for TurboliteHandle {
         ))
     }
 
-    fn current_lock(&self) -> Result<LockKind, io::Error> {
-        Ok(*self.lock.read())
-    }
-
-    fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, io::Error> {
-        let shm_path = self.db_path.with_extension("db-shm");
-        Ok(FileWalIndex::new(shm_path))
-    }
 }
 
 #[cfg(test)]

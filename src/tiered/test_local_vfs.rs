@@ -42,8 +42,7 @@ fn test_local_vfs_exists_empty() {
     };
     let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     // Empty dir: no manifest in the backend.
-    use sqlite_vfs::Vfs;
-    assert!(!vfs.exists("main.db").unwrap());
+    assert!(!vfs.exists_inner("main.db").unwrap());
 }
 
 /// RED TEST: Local VFS can register with SQLite, open a db, and do CRUD.
@@ -127,8 +126,6 @@ fn file_first_vfs_rejects_mismatched_main_db_name() {
 
 #[test]
 fn file_first_vfs_refuses_to_delete_main_db_image() {
-    use sqlite_vfs::Vfs;
-
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("app.db");
     let config = TurboliteConfig::for_database_path(&db_path);
@@ -136,14 +133,14 @@ fn file_first_vfs_refuses_to_delete_main_db_image() {
 
     std::fs::write(&db_path, b"turbolite-owned").unwrap();
     assert!(
-        vfs.exists(db_path.to_str().unwrap()).unwrap(),
+        vfs.exists_inner(db_path.to_str().unwrap()).unwrap(),
         "main image should exist"
     );
-    let err = vfs.delete(db_path.to_str().unwrap()).unwrap_err();
+    let err = vfs.delete_inner(db_path.to_str().unwrap()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(db_path.exists(), "main image must survive delete refusal");
 
-    let err = vfs.delete("app.db").unwrap_err();
+    let err = vfs.delete_inner("app.db").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
         db_path.exists(),
@@ -151,7 +148,7 @@ fn file_first_vfs_refuses_to_delete_main_db_image() {
     );
 
     assert!(
-        !vfs.exists("app.db").unwrap(),
+        !vfs.exists_inner("app.db").unwrap(),
         "bare basename must not alias the bound absolute main image"
     );
 }
@@ -2651,7 +2648,6 @@ fn test_settings_set_per_connection_isolation() {
 /// journal in RAM, so this needs no journal companion and no shared memory —
 /// it isolates the file-op delegation (open → full lock ladder → write → read
 /// → sync → file_size) from the WAL shared-memory work that lands next.
-#[cfg(feature = "plugin-vfs")]
 #[test]
 fn plugin_vfs_crud_memory_journal() {
     let dir = TempDir::new().unwrap();
@@ -2696,7 +2692,6 @@ fn plugin_vfs_crud_memory_journal() {
 /// WAL gate: same CRUD but in journal_mode=WAL, which drives the live-pointer
 /// shared memory (`shm_map`/`shm_lock`/`shm_barrier`/`shm_unmap`) end-to-end.
 /// A passing WAL checkpoint proves the WAL-index is wired correctly.
-#[cfg(feature = "plugin-vfs")]
 #[test]
 fn plugin_vfs_crud_wal() {
     let dir = TempDir::new().unwrap();
@@ -2748,7 +2743,6 @@ fn plugin_vfs_crud_wal() {
 /// WAL-index a reader could pull a torn index header, compute the wrong frame
 /// bound, and observe a half-applied commit (non-zero) or `DatabaseCorrupt`.
 /// The live-pointer shm has no copy to tear, so every read must see 0.
-#[cfg(feature = "plugin-vfs")]
 #[test]
 fn plugin_vfs_concurrent_wal_isolation() {
     use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -2865,7 +2859,6 @@ fn plugin_vfs_concurrent_wal_isolation() {
 /// and checks (a) no reader process ever observes a half-applied commit
 /// (`SUM(ta)-SUM(tb) != 0`) or a corrupt read, and (b) a fresh process sees all
 /// committed writes afterward (cross-process durability + final consistency).
-#[cfg(feature = "plugin-vfs")]
 #[test]
 fn plugin_vfs_cross_process_wal_isolation() {
     use std::time::{Duration, Instant};
