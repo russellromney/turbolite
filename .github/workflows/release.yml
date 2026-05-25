@@ -40,6 +40,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install libclang (sqlite-plugin bindgen)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
+          else
+            echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+          fi
+
       - name: Install cross-compilation tools
         if: matrix.cross
         run: |

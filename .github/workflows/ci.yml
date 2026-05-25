@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (sqlite-plugin bindgen)
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
       - run: cargo test -p turbolite --features zstd,bundled-sqlite
 
   build-ext:
@@ -21,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (sqlite-plugin bindgen)
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
       - name: Build loadable extension
         run: make -C turbolite-ffi ext
 
@@ -33,6 +37,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (sqlite-plugin bindgen)
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -46,6 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (sqlite-plugin bindgen)
+        run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
       - uses: actions/setup-go@v5
         with:
           go-version: "1.21"
