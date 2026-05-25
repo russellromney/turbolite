@@ -209,7 +209,7 @@ pub fn get_manifest(
     runtime: &tokio::runtime::Handle,
 ) -> std::io::Result<Option<Manifest>> {
     let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY)).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("fetch manifest: {e}"))
+        std::io::Error::other(format!("fetch manifest: {e}"))
     })?;
     match bytes {
         None => Ok(None),
@@ -527,8 +527,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     let current_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("failed to read journal_mode: {}", e),
             )
         })?;
@@ -541,7 +540,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
         // Checkpoint to flush WAL contents into the main database file
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("checkpoint failed: {}", e))
+                io::Error::other(format!("checkpoint failed: {}", e))
             })?;
     }
 
@@ -572,8 +571,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
 
     // We cannot modify page 0 via SQL (it is read-only in the database header).
     // Return an error so the caller knows manual steps are needed.
-    Err(io::Error::new(
-        io::ErrorKind::Other,
+    Err(io::Error::other(
         format!(
             "PRAGMA journal_mode=OFF returned '{}'. WAL checkpoint complete, but manual steps required: \
              1) Close this connection, \

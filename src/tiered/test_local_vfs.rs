@@ -2616,13 +2616,13 @@ fn test_settings_set_per_connection_isolation() {
         .expect("reg B");
 
     let conn_a =
-        rusqlite::Connection::open(&format!("file:a.db?vfs={}", vfs_a_name)).expect("open A");
+        rusqlite::Connection::open(format!("file:a.db?vfs={}", vfs_a_name)).expect("open A");
     conn_a
         .execute_batch("CREATE TABLE a (id INTEGER); INSERT INTO a VALUES (1);")
         .unwrap();
 
     let conn_b =
-        rusqlite::Connection::open(&format!("file:b.db?vfs={}", vfs_b_name)).expect("open B");
+        rusqlite::Connection::open(format!("file:b.db?vfs={}", vfs_b_name)).expect("open B");
     conn_b
         .execute_batch("CREATE TABLE b (id INTEGER); INSERT INTO b VALUES (2);")
         .unwrap();

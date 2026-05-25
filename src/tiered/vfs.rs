@@ -95,7 +95,7 @@ impl TurboliteVfs {
             .worker_threads(2)
             .enable_all()
             .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build tokio rt: {e}")))?;
+            .map_err(|e| io::Error::other(format!("build tokio rt: {e}")))?;
         let runtime = owned.handle().clone();
         config.apply_legacy_flat_fields();
 
@@ -113,9 +113,7 @@ impl TurboliteVfs {
                 .block_on(async {
                     hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await
                 })
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("create S3 backend: {e}"))
-                })?
+                .map_err(|e| io::Error::other(format!("create S3 backend: {e}")))?
                 .with_prefix(prefix);
             let storage: Arc<dyn StorageBackend> = Arc::new(storage);
             #[cfg(feature = "bundled-sqlite")]
@@ -759,7 +757,7 @@ impl TurboliteVfs {
                 }
             }
             processed += 1;
-            if processed % 20 == 0 || processed == total_pg {
+            if processed.is_multiple_of(20) || processed == total_pg {
                 eprintln!("  decoded {}/{} page groups", processed, total_pg);
             }
         }
@@ -1484,6 +1482,7 @@ impl TurboliteVfs {
             }
             FsOpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .write(true)
                 .open(&lock_path)?;
 
@@ -1504,6 +1503,7 @@ impl TurboliteVfs {
                 }
                 let _ = FsOpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .write(true)
                     .open(&wal_path);
             }
@@ -1564,6 +1564,7 @@ impl TurboliteVfs {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&path)?;
             Ok(TurboliteHandle::new_passthrough(
                 file,

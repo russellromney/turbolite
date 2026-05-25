@@ -954,7 +954,7 @@ fn test_write_pages_scattered_data_integrity() {
     let page_nums = vec![3u64, 0, 7, 15];
     let mut data = Vec::with_capacity(4 * 64);
     for (i, &pnum) in page_nums.iter().enumerate() {
-        data.extend(std::iter::repeat(((pnum + 1) as u8) * 10 + i as u8).take(64));
+        data.extend(std::iter::repeat_n(((pnum + 1) as u8) * 10 + i as u8, 64));
     }
     cache
         .write_pages_scattered(&page_nums, &data, 0, 0)
@@ -1310,7 +1310,7 @@ fn test_write_pages_scattered_sparse_page_distribution() {
     let page_nums = vec![10u64, 500, 1000, 3999];
     let mut data = Vec::with_capacity(4 * 64);
     for &pnum in &page_nums {
-        data.extend(std::iter::repeat((pnum % 256) as u8).take(64));
+        data.extend(std::iter::repeat_n((pnum % 256) as u8, 64));
     }
     cache
         .write_pages_scattered(&page_nums, &data, 0, 0)

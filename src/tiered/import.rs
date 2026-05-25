@@ -45,9 +45,9 @@ pub fn import_sqlite_file(
     } else {
         raw_page_size as u32
     };
-    let page_count = (file_len / page_size as u64) as u64;
+    let page_count = file_len / page_size as u64;
     let ppg = config.cache.pages_per_group;
-    let total_groups = (page_count + ppg as u64 - 1) / ppg as u64;
+    let total_groups = page_count.div_ceil(ppg as u64);
 
     eprintln!(
         "[import] file={} size={:.1}MB page_size={} pages={} groups={}",
@@ -99,7 +99,7 @@ pub fn import_sqlite_file(
         // Sort B-trees by size descending (large first)
         let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
             walk_result.btrees.iter().collect();
-        btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+        btree_list.sort_by_key(|b| std::cmp::Reverse(b.1.pages.len()));
 
         let threshold = std::cmp::max(ppg as usize / 4, 1);
         let mut small_pages: Vec<u64> = Vec::new();

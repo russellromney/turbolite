@@ -120,7 +120,7 @@ unsafe fn install(db: *mut ffi::sqlite3) {
 
     let queue_ptr = Arc::into_raw(queue) as *mut std::ffi::c_void;
 
-    let name = b"turbolite_config_set\0".as_ptr() as *const c_char;
+    let name = c"turbolite_config_set".as_ptr() as *const c_char;
     let rc = ffi::sqlite3_create_function_v2(
         db,
         name,
@@ -220,7 +220,7 @@ unsafe extern "C" fn destroy(ptr: *mut std::ffi::c_void) {
 /// connection was opened with `vfs=<some name passed to turbolite::tiered::register>`.
 unsafe fn connection_uses_turbolite_vfs(db: *mut ffi::sqlite3) -> bool {
     let mut vfs_ptr: *mut ffi::sqlite3_vfs = std::ptr::null_mut();
-    let main = b"main\0".as_ptr() as *const c_char;
+    let main = c"main".as_ptr() as *const c_char;
     let rc = ffi::sqlite3_file_control(
         db,
         main,

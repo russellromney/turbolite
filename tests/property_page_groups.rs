@@ -43,7 +43,7 @@ fn compute_total_groups(page_count: u64, ppg: u32) -> u64 {
     if ppg == 0 || page_count == 0 {
         return 0;
     }
-    (page_count + ppg as u64 - 1) / ppg as u64
+    page_count.div_ceil(ppg as u64)
 }
 
 proptest! {

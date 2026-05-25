@@ -80,8 +80,7 @@ pub(crate) fn persist(cache_dir: &Path, state: &LocalState) -> io::Result<()> {
     let mut state = state.clone().normalized();
     state.format_version = 1;
     let data = rmp_serde::to_vec(&state).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("serialize local_state.msgpack: {e}"),
         )
     })?;
@@ -129,6 +128,7 @@ where
     let _guard = lock.lock().expect("local_state update lock poisoned");
     let file_lock = FsOpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_file_path(cache_dir))?;

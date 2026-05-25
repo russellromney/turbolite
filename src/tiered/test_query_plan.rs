@@ -85,7 +85,7 @@ fn test_parse_ignores_non_scan_search() {
 USE TEMP B-TREE FOR ORDER BY
 COMPOUND SUBQUERY 1";
     let result = parse_eqp_output(eqp);
-    assert_eq!(result.is_empty(), true);
+    assert!(result.is_empty());
 }
 
 #[test]

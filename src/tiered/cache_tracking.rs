@@ -105,7 +105,7 @@ impl PageBitmap {
     /// but safe to call while readers use `is_present()` on existing pages
     /// (they only access indices < current len).
     pub(crate) fn resize(&mut self, page_count: u64) {
-        let needed_bytes = (page_count as usize + 7) / 8;
+        let needed_bytes = (page_count as usize).div_ceil(8);
         if self.bits.len() < needed_bytes {
             self.bits.resize_with(needed_bytes, || AtomicU8::new(0));
         }
@@ -309,7 +309,7 @@ impl SubChunkTracker {
     /// Correct for B-tree-aware groups where pages are non-positional.
     pub(crate) fn sub_chunk_id_for(&self, gid: u64, index_in_group: u32) -> SubChunkId {
         let spf = self.sub_pages_per_frame;
-        let frame_idx = if spf > 0 { index_in_group / spf } else { 0 };
+        let frame_idx = index_in_group.checked_div(spf).unwrap_or(0);
         SubChunkId {
             group_id: gid as u32,
             frame_index: frame_idx as u16,
@@ -647,8 +647,7 @@ impl SubChunkTracker {
             })
             .collect();
         let data = serde_json::to_vec(&entries).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("serialize sub-chunk tracker: {}", e),
             )
         })?;

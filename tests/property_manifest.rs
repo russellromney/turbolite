@@ -1,5 +1,4 @@
 use proptest::prelude::*;
-use rmp_serde;
 use std::collections::HashMap;
 use turbolite::tiered::{FrameEntry, GroupingStrategy, Manifest};
 

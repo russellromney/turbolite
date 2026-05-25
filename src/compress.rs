@@ -20,13 +20,13 @@ pub fn compress(
 
     if let Some(encoder_dict) = encoder_dict {
         let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         encoder.write_all(data)?;
         encoder
             .finish()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     } else {
-        encode_all(data, level).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        encode_all(data, level).map_err(io::Error::other)
     }
 }
 
@@ -40,12 +40,12 @@ pub fn decompress(
 
     if let Some(decoder_dict) = decoder_dict {
         let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(data, decoder_dict)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let mut output = Vec::new();
         decoder.read_to_end(&mut output)?;
         Ok(output)
     } else {
-        decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        decode_all(data).map_err(io::Error::other)
     }
 }
 
@@ -70,11 +70,11 @@ pub fn decompress_capped(
     let mut output = Vec::new();
     let n = if let Some(decoder_dict) = decoder_dict {
         let decoder = zstd::stream::Decoder::with_prepared_dictionary(data, decoder_dict)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         decoder.take(cap as u64).read_to_end(&mut output)?
     } else {
         let decoder = zstd::stream::Decoder::new(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         decoder.take(cap as u64).read_to_end(&mut output)?
     };
     if n > max_len {

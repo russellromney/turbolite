@@ -434,8 +434,8 @@ impl TurboliteHandle {
             // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
             if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
                 if let Some(key) = manifest.page_group_keys.first() {
-                    if !key.is_empty() {
-                        if cache.try_claim_group(0) {
+                    if !key.is_empty()
+                        && cache.try_claim_group(0) {
                             // Capture replay epoch BEFORE the fetch so a
                             // finalize racing between this point and the
                             // cache write is detected.
@@ -453,7 +453,7 @@ impl TurboliteHandle {
                                 // readers.
                                 let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> = Vec::new();
                                 let gp0 = manifest.group_page_nums(0).into_owned();
-                                if let Some(overrides) = manifest.subframe_overrides.get(0) {
+                                if let Some(overrides) = manifest.subframe_overrides.first() {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
                                         for (&frame_idx, ovr) in overrides {
@@ -544,7 +544,6 @@ impl TurboliteHandle {
                                 cache.unclaim_if_fetching(0);
                             }
                         }
-                    }
                 }
             }
         } // end non-local eager fetch block (group 0 only)
@@ -1121,6 +1120,7 @@ impl TurboliteHandle {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&lock_path)?;
             self.lock_file = Some(std::sync::Arc::new(file));
         }
@@ -1509,7 +1509,7 @@ impl DatabaseHandle for TurboliteHandle {
         // directory (backed by hadb-storage-local), decode, populate cache,
         // then read the page.
         if self.is_local {
-            if let (Some(ref storage), Some(ref runtime)) =
+            if let (Some(ref storage), Some(runtime)) =
                 (self.storage.as_ref(), self.runtime.as_ref())
             {
                 let manifest = (**self.manifest.load()).clone();
@@ -1979,8 +1979,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 }
                                 Err(e) => {
                                     cache.unclaim_if_fetching(gid);
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::Other,
+                                    return Err(io::Error::other(
                                         format!("S3 GET failed for gid={}: {}", gid, e),
                                     ));
                                 }
@@ -2260,7 +2259,7 @@ impl DatabaseHandle for TurboliteHandle {
                             let type_byte = if page_num == 0 {
                                 type_buf.get(100)
                             } else {
-                                type_buf.get(0)
+                                type_buf.first()
                             };
                             if let Some(&b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
@@ -2307,8 +2306,7 @@ impl DatabaseHandle for TurboliteHandle {
                 // in their own sibling file, see persist_dirty_groups).
                 let m = (**self.manifest.load()).clone();
                 let manifest_bytes = rmp_serde::to_vec(&m).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("serialize manifest for staging: {e}"),
                     )
                 })?;
@@ -2360,7 +2358,7 @@ impl DatabaseHandle for TurboliteHandle {
             //     network. `flush_to_storage()` drains pending_flushes later,
             //     outside the lock, via the same flush_dirty_groups path.
             if self.is_local {
-                if let (Some(ref storage), Some(ref runtime)) =
+                if let (Some(ref storage), Some(runtime)) =
                     (self.storage.as_ref(), self.runtime.as_ref())
                 {
                     let flush_res = flush::flush_dirty_groups(
@@ -2447,7 +2445,7 @@ impl DatabaseHandle for TurboliteHandle {
                             let mut new_group_pages: Vec<Vec<u64>> = Vec::new();
                             let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
                                 walk.btrees.iter().collect();
-                            btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+                            btree_list.sort_by_key(|b| std::cmp::Reverse(b.1.pages.len()));
 
                             let threshold = std::cmp::max(ppg as usize / 4, 1);
                             let mut small_pages: Vec<u64> = Vec::new();
@@ -2816,7 +2814,7 @@ impl DatabaseHandle for TurboliteHandle {
                             let type_byte = if pnum == 0 {
                                 read_buf.get(100)
                             } else {
-                                read_buf.get(0)
+                                read_buf.first()
                             };
                             if let Some(&b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
@@ -2829,8 +2827,7 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                         }
                         Err(e) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
+                            return Err(io::Error::other(
                                 format!(
                                     "cache.read_page({}) failed during interior collection: {}",
                                     pnum, e
@@ -2959,8 +2956,7 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                         }
                         Err(e) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
+                            return Err(io::Error::other(
                                 format!(
                                     "cache.read_page({}) failed during index leaf collection: {}",
                                     pnum, e
@@ -3245,8 +3241,7 @@ impl DatabaseHandle for TurboliteHandle {
             if let Some(cache) = &self.cache {
                 let m = (**self.manifest.load()).clone();
                 manifest::persist_manifest_local(&cache.cache_dir, &m).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("local manifest persist failed after remote sync: {}", e),
                     )
                 })?;
@@ -3275,7 +3270,7 @@ impl DatabaseHandle for TurboliteHandle {
         let new_page_count = if size == 0 {
             0
         } else {
-            (size + page_size as u64 - 1) / page_size as u64
+            size.div_ceil(page_size as u64)
         };
 
         let old_page_count = self.manifest.load().page_count;
@@ -3298,9 +3293,7 @@ impl DatabaseHandle for TurboliteHandle {
         // file resize (slot-stride aware under encryption) and bit clearing.
         if let Some(cache) = &self.cache {
             if new_page_count < old_page_count {
-                if let Err(e) = cache.truncate_to_page_count(new_page_count, page_size) {
-                    return Err(e);
-                }
+                cache.truncate_to_page_count(new_page_count, page_size)?;
                 self.cached_generation = cache.bump_generation();
             }
         }
@@ -3510,8 +3503,7 @@ impl DatabaseHandle for TurboliteHandle {
                                     .insert("shared".to_string(), Box::new(guard));
                             }
                             Err(restore_err) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
+                                return Err(io::Error::other(
                                     format!("Lock restore failed: {}", restore_err),
                                 ));
                             }

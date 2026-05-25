@@ -124,8 +124,7 @@ impl CacheIndex {
             next_offset: self.next_offset,
         })
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("serialize cache index: {}", e),
             )
         })?;
@@ -393,6 +392,7 @@ impl DiskCache {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(cache_file_path)?;
         let cache_file_was_empty = cache_file.metadata()?.len() == 0;
 
@@ -488,7 +488,7 @@ impl DiskCache {
         }
 
         let total_groups = if pages_per_group > 0 && page_count > 0 {
-            ((page_count + pages_per_group as u64 - 1) / pages_per_group as u64) as usize
+            page_count.div_ceil(pages_per_group as u64) as usize
         } else {
             0
         };
@@ -564,7 +564,7 @@ impl DiskCache {
             cache_index: parking_lot::Mutex::new(cache_index),
             compaction_lock: parking_lot::RwLock::new(()),
             #[cfg(feature = "zstd")]
-            dictionary: dictionary.map(|d| Arc::new(d)),
+            dictionary: dictionary.map(Arc::new),
             stat_hits: AtomicU64::new(0),
             stat_misses: AtomicU64::new(0),
             stat_evictions: AtomicU64::new(0),
@@ -649,7 +649,7 @@ impl DiskCache {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
                         unsafe {
-                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(new_ptr, ps)));
                         }
                     }
                 }
@@ -699,7 +699,7 @@ impl DiskCache {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
                         unsafe {
-                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(new_ptr, ps)));
                         }
                     }
                 }
@@ -768,8 +768,7 @@ impl DiskCache {
         // cache back to consistent state. Until then, serving any
         // read would risk returning torn / inconsistent data.
         if self.tainted.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "DiskCache is tainted (replay rollback failed); restart the VFS to recover from the staging log",
             ));
         }
@@ -901,8 +900,7 @@ impl DiskCache {
         {
             let remaining = self.fail_no_visibility_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!(
                         "test-injected forward write_page_no_visibility failure on page {}",
                         page_num
@@ -927,8 +925,7 @@ impl DiskCache {
         {
             let remaining = self.fail_rollback_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!(
                         "test-injected rollback write_page_no_visibility failure on page {}",
                         page_num
@@ -1303,8 +1300,6 @@ impl DiskCache {
             } else {
                 page_data
             };
-            #[cfg(not(feature = "encryption"))]
-            let page_data = page_data;
             let offset = pnum * stride as u64;
             self.cache_file.write_all_at(page_data, offset)?;
         }
@@ -1507,7 +1502,7 @@ impl DiskCache {
         self.group_condvar.notify_all();
         // Lazy eviction check
         let count = EVICTION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if count % 64 == 0 {
+        if count.is_multiple_of(64) {
             drop(states);
             self.evict_expired();
             // Mid-query budget trim: TTL eviction alone (default off) lets a
@@ -1638,7 +1633,7 @@ impl DiskCache {
         drop(gp);
         let mut tracker = self.tracker.lock();
         let frames = if self.sub_pages_per_frame > 0 {
-            (num_pages + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
+            num_pages.div_ceil(self.sub_pages_per_frame)
         } else {
             1
         };
@@ -1760,7 +1755,7 @@ impl DiskCache {
                     if !old.is_null() && ps > 0 {
                         // Reconstruct the Box to defer its drop (no UAF risk)
                         let boxed =
-                            unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
+                            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(old, ps)) };
                         self.deferred_frees.lock().push(boxed);
                         self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                     }
@@ -2114,7 +2109,7 @@ impl DiskCache {
         drop(bitmap);
         let ppg = self.pages_per_group as u64;
         if ppg > 0 {
-            let group_count = (page_count + ppg - 1) / ppg;
+            let group_count = page_count.div_ceil(ppg);
             let states = self.group_states.lock();
             self.ensure_group_states_capacity(&states, group_count.saturating_sub(1));
             // Mark live groups Present and any group entirely above the new
@@ -2166,9 +2161,8 @@ impl DiskCache {
             }
         }
         let ppg = self.pages_per_group as u64;
-        if ppg > 0 {
+        if let Some(max_group) = max_page.checked_div(ppg) {
             let states = self.group_states.lock();
-            let max_group = max_page / ppg;
             self.ensure_group_states_capacity(&states, max_group);
             for &pnum in page_nums {
                 let gid = (pnum / ppg) as usize;
@@ -2209,7 +2203,7 @@ impl Drop for DiskCache {
                     let ptr = slot.swap(std::ptr::null_mut(), Ordering::Relaxed);
                     if !ptr.is_null() {
                         unsafe {
-                            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps)));
+                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, ps)));
                         }
                     }
                 }

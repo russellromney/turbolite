@@ -46,8 +46,7 @@ pub fn train_dictionary(samples: &[Vec<u8>], dict_size: usize) -> io::Result<Vec
     let sample_refs: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
 
     from_samples(&sample_refs, dict_size).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("Dictionary training failed: {}", e),
         )
     })
@@ -101,11 +100,11 @@ pub fn compress_with_dict(data: &[u8], dict: &[u8], level: i32) -> io::Result<Ve
 
     let encoder_dict = EncoderDictionary::copy(dict, level);
     let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), &encoder_dict)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     encoder.write_all(data)?;
     encoder
         .finish()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 /// Decompress data using a dictionary.
@@ -116,7 +115,7 @@ pub fn decompress_with_dict(data: &[u8], dict: &[u8]) -> io::Result<Vec<u8>> {
 
     let decoder_dict = DecoderDictionary::copy(dict);
     let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(data, &decoder_dict)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)?;
     Ok(output)

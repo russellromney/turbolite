@@ -449,9 +449,7 @@ impl TurboliteSharedState {
         let mut groups_submitted = 0u32;
 
         let Some(ref pool) = self.prefetch_pool else {
-            return format!(
-                "{{\"trees_warmed\":[],\"groups_submitted\":0,\"note\":\"no prefetch pool (local mode)\"}}",
-            );
+            return "{\"trees_warmed\":[],\"groups_submitted\":0,\"note\":\"no prefetch pool (local mode)\"}".to_string();
         };
 
         for access in accesses {

@@ -450,6 +450,7 @@ impl MainHandle {
         let lock_path = lock_path_for(&path);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
@@ -588,8 +589,7 @@ fn decode_file(bytes: &[u8], codec: &PageCodec) -> Result<(Vec<u8>, u32), io::Er
     }
     // Exact-tail invariant: the directory occupies the remainder of the file.
     if dir_off
-        .checked_add(page_count * DIR_ENTRY_LEN)
-        .map_or(true, |end| end != bytes.len())
+        .checked_add(page_count * DIR_ENTRY_LEN) != Some(bytes.len())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

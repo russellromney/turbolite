@@ -8,7 +8,7 @@ fn positional_group_pages(pages_per_group: u32, page_count: u64) -> Vec<Vec<u64>
     if ppg == 0 || page_count == 0 {
         return Vec::new();
     }
-    let num_groups = (page_count + ppg - 1) / ppg;
+    let num_groups = page_count.div_ceil(ppg);
     (0..num_groups)
         .map(|g| {
             let start = g * ppg;
@@ -102,7 +102,7 @@ fn test_bitmap_large_page_numbers() {
     assert!(!bm.is_present(big - 1));
     assert!(!bm.is_present(big + 1));
     // Bitmap should be big enough
-    assert!(bm.bits.len() >= (big as usize / 8) + 1);
+    assert!(bm.bits.len() > (big as usize / 8));
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn test_bitmap_ensure_capacity_auto_extends() {
     let mut bm = PageBitmap::new(dir.path().join("bm"));
     assert_eq!(bm.bits.len(), 0);
     bm.ensure_capacity(0);
-    assert!(bm.bits.len() >= 1);
+    assert!(!bm.bits.is_empty());
     bm.mark_present(0);
     assert!(bm.is_present(0));
     bm.ensure_capacity(255);
@@ -231,7 +231,7 @@ fn test_disk_cache_write_multiple_pages() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
     for i in 0..16u64 {
-        cache.write_page(i, &vec![i as u8; 64]).unwrap();
+        cache.write_page(i, &[i as u8; 64]).unwrap();
     }
     for i in 0..16u64 {
         assert!(cache.is_present(i));
@@ -245,8 +245,8 @@ fn test_disk_cache_write_multiple_pages() {
 fn test_disk_cache_write_page_overwrite() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
-    cache.write_page(3, &vec![0xAA; 64]).unwrap();
-    cache.write_page(3, &vec![0xBB; 64]).unwrap(); // overwrite
+    cache.write_page(3, &[0xAA; 64]).unwrap();
+    cache.write_page(3, &[0xBB; 64]).unwrap(); // overwrite
     let mut buf = vec![0u8; 64];
     cache.read_page(3, &mut buf).unwrap();
     assert_eq!(buf, vec![0xBB; 64]);
@@ -257,7 +257,7 @@ fn test_disk_cache_write_extends_file() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0, None, Vec::new()).unwrap(); // page_count=0
                                                                                           // Writing page 10 should extend the file
-    cache.write_page(10, &vec![42u8; 64]).unwrap();
+    cache.write_page(10, &[42u8; 64]).unwrap();
     assert!(cache.is_present(10));
     let mut buf = vec![0u8; 64];
     cache.read_page(10, &mut buf).unwrap();
@@ -382,7 +382,7 @@ fn test_disk_cache_evict_group_clears_bitmap_and_state() {
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp).unwrap();
     // Write pages in group 0 (pages 0-3)
     for i in 0..4u64 {
-        cache.write_page(i, &vec![i as u8; 64]).unwrap();
+        cache.write_page(i, &[i as u8; 64]).unwrap();
     }
     cache.try_claim_group(0);
     cache.mark_group_present(0);
@@ -406,7 +406,7 @@ fn test_disk_cache_evict_group_preserves_other_groups() {
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp).unwrap();
     // Write pages in groups 0 and 1
     for i in 0..8u64 {
-        cache.write_page(i, &vec![i as u8; 64]).unwrap();
+        cache.write_page(i, &[i as u8; 64]).unwrap();
     }
     cache.evict_group(0); // Evict only group 0
     assert!(!cache.is_present(0));
@@ -423,7 +423,7 @@ fn test_disk_cache_evict_expired_with_real_ttl() {
 
     // Write and touch group 0
     for i in 0..4u64 {
-        cache.write_page(i, &vec![i as u8; 64]).unwrap();
+        cache.write_page(i, &[i as u8; 64]).unwrap();
     }
     cache.try_claim_group(0);
     cache.mark_group_present(0);
@@ -446,7 +446,7 @@ fn test_disk_cache_evict_expired_protects_interior() {
     let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16, None, gp).unwrap(); // TTL = 1s
 
     for i in 0..8u64 {
-        cache.write_page(i, &vec![i as u8; 64]).unwrap();
+        cache.write_page(i, &[i as u8; 64]).unwrap();
     }
     cache.try_claim_group(0);
     cache.mark_group_present(0);
@@ -589,7 +589,7 @@ fn test_disk_cache_bitmap_persistence() {
     let dir = TempDir::new().unwrap();
     {
         let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
-        cache.write_page(3, &vec![1u8; 64]).unwrap();
+        cache.write_page(3, &[1u8; 64]).unwrap();
         cache.persist_bitmap().unwrap();
     }
     let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
@@ -602,7 +602,7 @@ fn test_disk_cache_persists_unified_local_state() {
     let dir = TempDir::new().unwrap();
     {
         let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
-        cache.write_page(3, &vec![1u8; 64]).unwrap();
+        cache.write_page(3, &[1u8; 64]).unwrap();
         cache.persist_bitmap().unwrap();
     }
 
@@ -659,7 +659,7 @@ fn test_disk_cache_reopen_initializes_group_states_from_bitmap() {
         let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, gp.clone()).unwrap();
         // Write ALL pages in group 0 (pages 0-3)
         for i in 0..4u64 {
-            cache.write_page(i, &vec![i as u8; 64]).unwrap();
+            cache.write_page(i, &[i as u8; 64]).unwrap();
         }
         cache.persist_bitmap().unwrap();
     }
@@ -676,8 +676,8 @@ fn test_disk_cache_reopen_partial_group_is_none() {
     {
         let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
         // Write only 2 of 4 pages in group 0
-        cache.write_page(0, &vec![0u8; 64]).unwrap();
-        cache.write_page(1, &vec![1u8; 64]).unwrap();
+        cache.write_page(0, &[0u8; 64]).unwrap();
+        cache.write_page(1, &[1u8; 64]).unwrap();
         cache.persist_bitmap().unwrap();
     }
     let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
@@ -912,18 +912,18 @@ fn test_disk_cache_sub_chunk_boundary_pages() {
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
 
     // Write frame 0 of group 0 (pages 0,1)
-    cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();
+    cache.write_pages_bulk(0, &[1u8; 128], 2).unwrap();
     assert!(cache.is_present(0));
     assert!(cache.is_present(1));
     assert!(!cache.is_present(2)); // frame 1
 
     // Write frame 1 of group 0 (pages 2,3)
-    cache.write_pages_bulk(2, &vec![2u8; 128], 2).unwrap();
+    cache.write_pages_bulk(2, &[2u8; 128], 2).unwrap();
     assert!(cache.is_present(2));
     assert!(cache.is_present(3));
 
     // Write frame 0 of group 1 (pages 4,5)
-    cache.write_pages_bulk(4, &vec![3u8; 128], 2).unwrap();
+    cache.write_pages_bulk(4, &[3u8; 128], 2).unwrap();
     assert!(cache.is_present(4));
     assert!(cache.is_present(5));
     assert!(!cache.is_present(6)); // frame 1 of group 1
@@ -1050,7 +1050,7 @@ fn test_wait_for_group_returns_on_reset_to_none() {
     std::thread::sleep(Duration::from_millis(10));
     {
         let states = cache.group_states.lock();
-        if let Some(s) = states.get(0) {
+        if let Some(s) = states.first() {
             s.store(GroupState::None as u8, Ordering::Release);
         }
     }
@@ -1550,7 +1550,7 @@ fn test_compressed_single_write_marks_tracker() {
     let dir = TempDir::new().unwrap();
     let cache = compressed_cache(dir.path(), 64, 16);
     let before = cache.cache_bytes();
-    cache.write_page(0, &vec![0xABu8; 64]).unwrap();
+    cache.write_page(0, &[0xABu8; 64]).unwrap();
     assert!(
         cache.cache_bytes() > before,
         "single compressed write must register bytes in the tracker"
@@ -1775,7 +1775,7 @@ fn test_compressed_index_persistence() {
     {
         let cache = compressed_cache(dir.path(), 64, 16);
         for p in 0..4u64 {
-            let data: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            let data: Vec<u8> = (0..64).map(|i| (p as u8 + i)).collect();
             cache.write_page(p, &data).unwrap();
         }
         cache.persist_bitmap().unwrap();
@@ -1790,7 +1790,7 @@ fn test_compressed_index_persistence() {
                 "page {} should be present after reopen",
                 p
             );
-            let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i) as u8).collect();
+            let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i)).collect();
             let mut buf = vec![0u8; 64];
             cache.read_page(p, &mut buf).unwrap();
             assert_eq!(buf, expected, "page {} content mismatch after reopen", p);
@@ -2560,7 +2560,7 @@ fn test_clear_pages_at_or_above() {
     let dir = TempDir::new().unwrap();
     let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
     for p in 0..16u64 {
-        cache.write_page(p, &vec![1u8; 64]).unwrap();
+        cache.write_page(p, &[1u8; 64]).unwrap();
     }
     cache.clear_pages_at_or_above(10);
     for p in 0..10u64 {

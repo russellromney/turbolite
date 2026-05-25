@@ -127,7 +127,7 @@ pub(crate) fn encode_page_group_seekable(
     // decoder later trusts to contain `group_page_nums.len()` entries).
     let page_count = pages.len();
 
-    let num_frames = (page_count + sub_ppg as usize - 1) / sub_ppg as usize;
+    let num_frames = page_count.div_ceil(sub_ppg as usize);
     let mut blob = Vec::new();
     let mut frame_table = Vec::with_capacity(num_frames);
 
@@ -219,7 +219,7 @@ pub(crate) fn decode_page_group_seekable_full(
     ) as u32;
     let mut output = Vec::with_capacity(actual_pages as usize * page_size as usize);
 
-    for (_frame_idx, entry) in frame_table.iter().enumerate() {
+    for entry in frame_table.iter() {
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
         if end > data.len() {

@@ -425,11 +425,11 @@ pub(crate) fn compact_override_group(
             encryption_key,
         )?;
         let ps = page_size as usize;
-        for i in 0..group_size {
+        for (i, slot) in page_buffers.iter_mut().enumerate().take(group_size) {
             let start = i * ps;
             let end = start + ps;
             if end <= bulk_data.len() {
-                page_buffers[i] = Some(bulk_data[start..end].to_vec());
+                *slot = Some(bulk_data[start..end].to_vec());
             }
         }
     } else {
@@ -468,11 +468,11 @@ pub(crate) fn compact_override_group(
         let frame_start = frame_idx * sub_ppf as usize;
         let frame_end = std::cmp::min(frame_start + sub_ppf as usize, group_size);
         let ps = page_size as usize;
-        for pos in frame_start..frame_end {
-            let offset_in_frame = (pos - frame_start) * ps;
+        for (i, slot) in page_buffers[frame_start..frame_end].iter_mut().enumerate() {
+            let offset_in_frame = i * ps;
             let end = offset_in_frame + ps;
             if end <= decompressed.len() {
-                page_buffers[pos] = Some(decompressed[offset_in_frame..end].to_vec());
+                *slot = Some(decompressed[offset_in_frame..end].to_vec());
             }
         }
     }

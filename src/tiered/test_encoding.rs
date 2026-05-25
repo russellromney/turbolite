@@ -211,7 +211,7 @@ fn test_page_type_detection() {
         let type_byte = if page_num == 0 {
             buf.get(100)
         } else {
-            buf.get(0)
+            buf.first()
         };
         matches!(type_byte, Some(&0x05) | Some(&0x02))
     };
@@ -233,7 +233,7 @@ fn test_page_type_page_zero_offset_100() {
         let type_byte = if page_num == 0 {
             buf.get(100)
         } else {
-            buf.get(0)
+            buf.first()
         };
         matches!(type_byte, Some(&0x05) | Some(&0x02))
     };

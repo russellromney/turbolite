@@ -464,8 +464,8 @@ mod tests {
 
         // Write 2 pages + manifest trailer
         let mut writer = StagingWriter::open(&staging_dir, 1, 64).unwrap();
-        writer.append(0, &vec![10u8; 64]).unwrap();
-        writer.append(1, &vec![20u8; 64]).unwrap();
+        writer.append(0, &[10u8; 64]).unwrap();
+        writer.append(1, &[20u8; 64]).unwrap();
         writer.append_manifest(b"test-manifest-data").unwrap();
         let (path, pages) = writer.finalize().unwrap();
         assert_eq!(pages, 2);
@@ -485,7 +485,7 @@ mod tests {
 
         // Write a staging log with manifest trailer (non-multiple of record_size)
         let mut writer = StagingWriter::open(&staging_dir, 42, 64).unwrap();
-        writer.append(0, &vec![1u8; 64]).unwrap();
+        writer.append(0, &[1u8; 64]).unwrap();
         writer.append_manifest(b"some-manifest").unwrap();
         let (_path, _) = writer.finalize().unwrap();
 

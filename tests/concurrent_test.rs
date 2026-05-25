@@ -2,7 +2,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]

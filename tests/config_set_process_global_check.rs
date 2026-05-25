@@ -36,7 +36,7 @@ fn plain_connection_does_not_inherit_scalar_from_alive_turbolite_handle() {
 
     // Turbolite connection stays alive — its queue is on the thread-local stack.
     let tlite = Connection::open_with_flags_and_vfs(
-        &format!("file:{}/tlite.db?vfs={}", tmp.path().display(), vfs_name),
+        format!("file:{}/tlite.db?vfs={}", tmp.path().display(), vfs_name),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )

@@ -78,8 +78,7 @@ fn handle_commit_phase_failure(
     match rollback_pre_images(cache, pre_images) {
         RollbackOutcome::AllRestored => {
             let _ = std::fs::remove_file(staging_log_path);
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!(
                     "{primary_msg} (rolled back {} pre-images; staging log {} removed; cache consistent)",
                     pre_images.len(),
@@ -95,8 +94,7 @@ fn handle_commit_phase_failure(
             cache
                 .tainted
                 .store(true, std::sync::atomic::Ordering::Release);
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!(
                     "{primary_msg} (rollback FAILED for {} of {} pre-images at pages {:?}; staging log {} KEPT for restart recovery; cache TAINTED)",
                     failed_pages.len(),
@@ -721,8 +719,7 @@ impl ReplayHandle {
             .pending_flushes
             .lock()
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     format!("pending_flushes poisoned: {e}"),
                 )
             })?
@@ -838,8 +835,7 @@ impl ReplayHandle {
 
     fn check_not_consumed(&self, method: &str) -> io::Result<()> {
         if self.consumed {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("ReplayHandle::{method} called after finalize/abort"),
             ));
         }

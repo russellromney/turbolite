@@ -22,6 +22,12 @@
 //! turbolite::tiered::register("mydb", vfs)?;
 //! ```
 
+// The tiered storage pipeline threads many parameters (offsets, codecs,
+// counters, manifests) through its flush/compact/prefetch paths. Grouping them
+// into structs is a worthwhile refactor but a separate one; until then these
+// signatures are intentional, not an oversight.
+#![allow(clippy::too_many_arguments)]
+
 /// Debug logging macro. Emits a `tracing::debug!` event under the
 /// `turbolite` target. Users filter via `RUST_LOG=turbolite=debug` like any
 /// other tracing-instrumented library. Silent by default — no subscriber
@@ -144,7 +150,7 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
 /// # SQL function return codes
 ///
 /// - `0` — update queued successfully; the handle applies it on the next
-///    slow-path read.
+///   slow-path read.
 /// - SQL error — validation failed (unknown key or bad value). The
 ///   captured queue makes "no active handle" unreachable through this
 ///   function: the closure holds an `Arc` to its queue for the function's
@@ -314,7 +320,7 @@ const WAL_LOCK_OFFSET: u64 = 120;
 
 /// Lock tracing events are emitted under the `turbolite::locks` tracing
 /// target. Filter with `RUST_LOG=turbolite::locks=trace`.
-
+///
 /// The five SQLite database lock levels, ordered from weakest to strongest.
 /// Turbolite's own type (the VFS backend is sqlite-plugin; we no longer pull
 /// these from sqlite-vfs). See <https://www.sqlite.org/lockingv3.html>.
@@ -405,6 +411,7 @@ impl FileWalIndex {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&self.path)?;
             self.file = Some(file);
         }
@@ -417,6 +424,7 @@ impl FileWalIndex {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&self.path)?;
             self.lock_file = Some(std::sync::Arc::new(file));
         }

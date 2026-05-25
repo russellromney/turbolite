@@ -31,7 +31,7 @@ pub(crate) fn get_page_group(
     key: &str,
 ) -> io::Result<Option<Vec<u8>>> {
     block_on(runtime, backend.get(key))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage get {key}: {e}")))
+        .map_err(|e| io::Error::other(format!("storage get {key}: {e}")))
 }
 
 /// Fetch a byte range from an object. `start`/`len` semantics match the
@@ -44,8 +44,7 @@ pub(crate) fn range_get(
     len: u32,
 ) -> io::Result<Option<Vec<u8>>> {
     block_on(runtime, backend.range_get(key, start, len)).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("storage range_get {key}: {e}"),
         )
     })
@@ -63,7 +62,7 @@ pub(crate) fn put_page_groups(
         return Ok(());
     }
     block_on(runtime, backend.put_many(uploads))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage put_many: {e}")))
+        .map_err(|e| io::Error::other(format!("storage put_many: {e}")))
 }
 
 /// Single-key put. Thin wrapper over `StorageBackend::put`.
@@ -74,7 +73,7 @@ pub(crate) fn put(
     data: &[u8],
 ) -> io::Result<()> {
     block_on(runtime, backend.put(key, data))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage put {key}: {e}")))
+        .map_err(|e| io::Error::other(format!("storage put {key}: {e}")))
 }
 
 /// Batch delete. See `StorageBackend::delete_many`.
@@ -87,7 +86,7 @@ pub(crate) fn delete_objects(
         return Ok(0);
     }
     block_on(runtime, backend.delete_many(keys_))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage delete_many: {e}")))
+        .map_err(|e| io::Error::other(format!("storage delete_many: {e}")))
 }
 
 /// List all keys. Paginates under the hood via the trait's `after` cursor.
@@ -111,7 +110,7 @@ pub(crate) fn list_all_keys_with_prefix(
             let batch = backend
                 .list(prefix, after.as_deref())
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage list: {e}")))?;
+                .map_err(|e| io::Error::other(format!("storage list: {e}")))?;
             if batch.is_empty() {
                 break;
             }
@@ -127,8 +126,7 @@ pub(crate) fn list_all_keys_with_prefix(
             // Guard against pathological backends that always return at
             // least one key.
             if out.len() > 10_000_000 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "list overran 10M keys",
                 ));
             }
@@ -163,7 +161,7 @@ pub(crate) fn put_manifest(
     manifest: &Manifest,
 ) -> io::Result<()> {
     let bytes = rmp_serde::to_vec(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("encode manifest: {e}")))?;
+        .map_err(|e| io::Error::other(format!("encode manifest: {e}")))?;
     put(backend, runtime, keys::MANIFEST_KEY, &bytes)
 }
 
@@ -185,8 +183,7 @@ pub(crate) fn get_page_groups_by_key(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("storage get {k}: {e}"),
                     ));
                 }
@@ -204,5 +201,5 @@ pub(crate) fn manifest_exists(
     runtime: &TokioHandle,
 ) -> io::Result<bool> {
     block_on(runtime, backend.exists(keys::MANIFEST_KEY))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("storage exists: {e}")))
+        .map_err(|e| io::Error::other(format!("storage exists: {e}")))
 }

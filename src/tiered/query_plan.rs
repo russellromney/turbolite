@@ -140,8 +140,8 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
         let constraint_columns = extract_constraint_columns(rest);
 
         // For SCAN: always emit the table (we need all data groups)
-        if access_type == AccessType::Scan {
-            if seen.insert((table_name.to_string(), AccessType::Scan)) {
+        if access_type == AccessType::Scan
+            && seen.insert((table_name.to_string(), AccessType::Scan)) {
                 accesses.push(PlannedAccess {
                     tree_name: table_name.to_string(),
                     access_type: AccessType::Scan,
@@ -149,7 +149,6 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
                     constraint_columns: constraint_columns.clone(),
                 });
             }
-        }
 
         // Check for USING [COVERING] INDEX <index_name>
         if let Some(idx_pos) = rest
@@ -167,10 +166,7 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
                 .get(idx_name_start..)
                 .and_then(|s| s.split_whitespace().next())
             {
-                let idx_access = match access_type {
-                    AccessType::Search => AccessType::Search,
-                    AccessType::Scan => AccessType::Scan,
-                };
+                let idx_access = access_type;
                 if seen.insert((idx_name.to_string(), idx_access)) {
                     accesses.push(PlannedAccess {
                         tree_name: idx_name.to_string(),
@@ -254,8 +250,8 @@ pub unsafe fn run_eqp_and_parse(db: *mut std::ffi::c_void, sql: &str) -> Vec<Pla
         db,
         c_sql.as_ptr(),
         -1,
-        &mut stmt as *mut *mut std::ffi::c_void as *mut *mut _,
-        &mut tail as *mut *const std::ffi::c_char as *mut *const _,
+        &mut stmt as *mut *mut std::ffi::c_void,
+        &mut tail as *mut *const std::ffi::c_char,
     );
     if rc != 0 || stmt.is_null() {
         return Vec::new();

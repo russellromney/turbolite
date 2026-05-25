@@ -311,7 +311,7 @@ impl Manifest {
         if self.pages_per_group == 0 || self.page_count == 0 {
             return 0;
         }
-        (self.page_count + self.pages_per_group as u64 - 1) / self.pages_per_group as u64
+        self.page_count.div_ceil(self.pages_per_group as u64)
     }
 
     /// Build the reverse index (page_num -> PageLocation) from group_pages.
@@ -344,7 +344,7 @@ impl Manifest {
             }
         }
         // Build btree_groups + page_to_tree_name + tree_name_to_groups from B-tree manifest entries
-        for (_, entry) in &self.btrees {
+        for entry in self.btrees.values() {
             for &gid in &entry.group_ids {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
                 self.group_to_tree_name.insert(gid, entry.name.clone());

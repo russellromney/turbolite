@@ -275,7 +275,7 @@ fn test_btree_groups_overwrite_when_group_in_multiple_btrees() {
 #[test]
 fn test_fraction_prefetch_first_miss_33_percent() {
     // With hops=[0.33, 0.33] and consecutive_misses=1, prefetch 33% of siblings
-    let hops = vec![0.33f32, 0.33];
+    let hops = [0.33f32, 0.33];
     let hop_idx = 0usize; // consecutive_misses=1, so hop_idx=0
     let fraction = hops[hop_idx];
     // 10 eligible siblings -> ceil(10 * 0.33) = 4
@@ -286,7 +286,7 @@ fn test_fraction_prefetch_first_miss_33_percent() {
 
 #[test]
 fn test_fraction_prefetch_second_miss_66_percent() {
-    let hops = vec![0.33f32, 0.33];
+    let hops = [0.33f32, 0.33];
     let hop_idx = 1usize; // consecutive_misses=2
     let fraction = hops[hop_idx];
     let eligible = 10;
@@ -297,13 +297,9 @@ fn test_fraction_prefetch_second_miss_66_percent() {
 
 #[test]
 fn test_fraction_prefetch_third_miss_all() {
-    let hops = vec![0.33f32, 0.33];
+    let hops = [0.33f32, 0.33];
     let hop_idx = 2usize; // consecutive_misses=3, beyond hops.len()
-    let fraction = if hop_idx < hops.len() {
-        hops[hop_idx]
-    } else {
-        1.0
-    };
+    let fraction = hops.get(hop_idx).copied().unwrap_or(1.0);
     assert_eq!(fraction, 1.0);
     let eligible = 10;
     let max_submit = ((eligible as f32) * fraction).ceil() as usize;
@@ -313,7 +309,7 @@ fn test_fraction_prefetch_third_miss_all() {
 #[test]
 fn test_fraction_prefetch_single_sibling() {
     // With only 1 eligible sibling, even 33% rounds up to 1
-    let hops = vec![0.33f32, 0.33];
+    let hops = [0.33f32, 0.33];
     let fraction = hops[0];
     let eligible = 1;
     let max_submit = ((eligible as f32) * fraction).ceil() as usize;
@@ -323,7 +319,7 @@ fn test_fraction_prefetch_single_sibling() {
 #[test]
 fn test_fraction_prefetch_zero_eligible() {
     // All siblings already fetching/present -> 0 eligible -> 0 to submit
-    let hops = vec![0.33f32, 0.33];
+    let hops = [0.33f32, 0.33];
     let fraction = hops[0];
     let eligible = 0;
     let max_submit = ((eligible as f32) * fraction).ceil() as usize;

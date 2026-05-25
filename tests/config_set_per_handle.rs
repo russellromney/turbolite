@@ -26,7 +26,7 @@ fn unique_name(prefix: &str) -> String {
 
 fn open_connection(vfs_name: &str, db_file: &str) -> Connection {
     let conn = Connection::open_with_flags_and_vfs(
-        &format!("file:{}?vfs={}", db_file, vfs_name),
+        format!("file:{}?vfs={}", db_file, vfs_name),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         vfs_name,
     )

@@ -51,12 +51,12 @@ fn test_local_checkpoint_interior_page_detection() {
     // B-tree interior index page (type 0x02) — not page 0
     let mut interior_index = vec![0u8; page_size];
     interior_index[0] = 0x02;
-    assert_eq!(interior_index.get(0), Some(&0x02));
+    assert_eq!(interior_index.first(), Some(&0x02));
 
     // B-tree interior table page (type 0x05) — not page 0
     let mut interior_table = vec![0u8; page_size];
     interior_table[0] = 0x05;
-    assert_eq!(interior_table.get(0), Some(&0x05));
+    assert_eq!(interior_table.first(), Some(&0x05));
 
     // Page 0: type byte at offset 100 (after SQLite header)
     let mut page0 = vec![0u8; page_size];
@@ -103,8 +103,8 @@ fn test_override_threshold_boundary() {
     // When dirty_frames >= threshold: full rewrite
     let threshold = 4u32;
     assert!(3 < threshold); // override
-    assert!(!(4 < threshold)); // full rewrite
-    assert!(!(5 < threshold)); // full rewrite
+    assert!((4 >= threshold)); // full rewrite
+    assert!((5 >= threshold)); // full rewrite
 }
 
 #[test]

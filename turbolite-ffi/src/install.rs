@@ -190,7 +190,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
         // Force xOpen on the main-db file so THIS connection's handle
         // queue is top-of-stack on the thread-local. `PRAGMA schema_version`
         // reads page 1 which is enough to trigger the VFS open.
-        let pragma = CStr::from_bytes_with_nul(b"PRAGMA schema_version\0").expect("static cstring");
+        let pragma = c"PRAGMA schema_version";
         let mut err_msg: *mut c_char = std::ptr::null_mut();
         let rc = sqlite3_exec(
             db,
@@ -211,7 +211,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
             return SQLITE_MISUSE;
         }
 
-        let fn_name = CStr::from_bytes_with_nul(b"turbolite_config_set\0").expect("static cstring");
+        let fn_name = c"turbolite_config_set";
         sqlite3_create_function_v2(
             db,
             fn_name.as_ptr(),
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
 /// `vfs=<some name passed to turbolite::tiered::register>`.
 unsafe fn connection_uses_turbolite_vfs(db: *mut sqlite3) -> bool {
     let mut vfs_ptr: *mut sqlite3_vfs_prefix = std::ptr::null_mut();
-    let main = b"main\0".as_ptr() as *const c_char;
+    let main = c"main".as_ptr() as *const c_char;
     let rc = sqlite3_file_control(
         db,
         main,

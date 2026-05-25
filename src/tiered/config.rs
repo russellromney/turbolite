@@ -4,9 +4,11 @@ use super::*;
 
 /// Where to load the manifest on connection open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ManifestSource {
     /// Use local manifest if present, fall back to remote. Correct for single-writer.
     /// Checkpoints keep the local cache fresh; no remote fetch on warm reconnect.
+    #[default]
     Auto,
     /// Always fetch from the remote backend on open. For HA followers and
     /// multi-reader setups where another process may have checkpointed.
@@ -15,19 +17,16 @@ pub enum ManifestSource {
     S3,
 }
 
-impl Default for ManifestSource {
-    fn default() -> Self {
-        ManifestSource::Auto
-    }
-}
 
 // ===== Checkpoint mode =====
 
 /// How checkpoints interact with the configured storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum CheckpointMode {
     /// A SQLite checkpoint uploads dirty page groups to the backend before
     /// returning. This is the default durability mode.
+    #[default]
     Durable,
     /// A SQLite checkpoint commits into the local cache/staging log and returns
     /// without backend I/O. Call `flush_to_storage()` to publish the exact
@@ -35,11 +34,6 @@ pub enum CheckpointMode {
     LocalThenFlush,
 }
 
-impl Default for CheckpointMode {
-    fn default() -> Self {
-        CheckpointMode::Durable
-    }
-}
 
 // ===== Legacy sync mode =====
 
@@ -53,16 +47,14 @@ impl Default for CheckpointMode {
     note = "use TurboliteConfig.cache.checkpoint_mode instead"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
+// S3Primary is the deprecated default; the derived Default references it on
+// purpose for back-compat with existing serialized configs.
+#[allow(deprecated)]
 pub enum SyncMode {
+    #[default]
     S3Primary,
     LocalThenFlush,
-}
-
-#[allow(deprecated)]
-impl Default for SyncMode {
-    fn default() -> Self {
-        SyncMode::S3Primary
-    }
 }
 
 // ===== Grouping strategy =====
@@ -70,19 +62,16 @@ impl Default for SyncMode {
 /// Grouping strategy marker. Only BTreeAware is supported.
 /// Kept as an enum for serde backward compatibility with existing manifests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum GroupingStrategy {
     /// Legacy positional mapping. No longer used for new databases.
     /// Existing Positional manifests are read-only compatible.
     Positional,
     /// B-tree-aware: explicit page-to-group mapping from btree walking.
+    #[default]
     BTreeAware,
 }
 
-impl Default for GroupingStrategy {
-    fn default() -> Self {
-        GroupingStrategy::BTreeAware
-    }
-}
 
 // ===== Group state for prefetch coordination =====
 
@@ -315,7 +304,6 @@ impl PrefetchConfig {
                     _ => ManifestSource::Auto,
                 })
                 .unwrap_or(d.manifest_source),
-            ..d
         }
     }
 }

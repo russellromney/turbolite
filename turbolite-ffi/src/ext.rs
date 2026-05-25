@@ -67,6 +67,10 @@ extern "C" {
 /// The implementation lives in the C shim so it can use SQLite's extension
 /// API-table macros, but the exported symbol is Rust-owned. That keeps the
 /// cdylib export behavior consistent across macOS and Linux.
+///
+/// # Safety
+/// Called by SQLite during extension load. `db`, `pz_err_msg`, and `api` must
+/// be the valid pointers SQLite passes to an extension entry point.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_turbolite_init(
     db: *mut c_void,
@@ -126,25 +130,13 @@ struct StorageCounters {
 }
 
 #[cfg(feature = "cli-s3")]
+#[derive(Default)]
 struct CounterBaselines {
     counters: Option<std::sync::Arc<StorageCounters>>,
     base_gets: u64,
     base_get_bytes: u64,
     base_puts: u64,
     base_put_bytes: u64,
-}
-
-#[cfg(feature = "cli-s3")]
-impl Default for CounterBaselines {
-    fn default() -> Self {
-        Self {
-            counters: None,
-            base_gets: 0,
-            base_get_bytes: 0,
-            base_puts: 0,
-            base_put_bytes: 0,
-        }
-    }
 }
 
 #[cfg(feature = "cli-s3")]
@@ -406,7 +398,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
                 .await
                 .map(|storage| storage.with_prefix(prefix))
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(backend);
     let (counting_backend, counters_handle) = CountingStorageBackend::new(backend);
     let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(counting_backend);
@@ -428,6 +420,10 @@ fn register_tiered() -> Result<(), std::io::Error> {
             ..TurboliteConfig::from_env()
         },
     };
+    // Legacy process-global shim; new VFS instances derive checkpoint mode from
+    // config.cache.checkpoint_mode and ignore this flag. Kept as-is to preserve
+    // existing behavior; allow the deprecation rather than change semantics.
+    #[allow(deprecated)]
     turbolite::tiered::set_local_checkpoint_only(
         std::env::var("TURBOLITE_LOCAL_THEN_FLUSH")
             .map(|v| !matches!(v.as_str(), "false" | "0"))
@@ -580,6 +576,9 @@ pub extern "C" fn turbolite_bench_flush_to_storage() -> i32 {
 
 /// Evict cached data for named trees. tree_names is a comma-separated C string.
 /// Returns number of groups evicted, or -1 if no tiered VFS.
+///
+/// # Safety
+/// `tree_names` must be NULL or a valid, NUL-terminated C string.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
@@ -635,6 +634,10 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 /// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
 /// Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
 /// db must be a valid sqlite3 handle, sql must be a valid C string.
+///
+/// # Safety
+/// `db` must be a valid `sqlite3*` handle. `sql` must be NULL or a valid,
+/// NUL-terminated C string.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_warm(
@@ -681,6 +684,10 @@ pub unsafe extern "C" fn turbolite_warm(
 
 /// Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
 /// tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
+///
+/// # Safety
+/// `db` must be a valid `sqlite3*` handle. `sql` must be NULL or a valid,
+/// NUL-terminated C string.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_query(
@@ -716,6 +723,9 @@ pub unsafe extern "C" fn turbolite_evict_query(
 
 /// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
 /// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
+///
+/// # Safety
+/// `tier` must be NULL or a valid, NUL-terminated C string.
 #[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {

@@ -186,7 +186,7 @@ fn flush_inner(
     let effective_threshold = if override_threshold > 0 {
         override_threshold as usize
     } else if use_seekable && old_sub_ppf > 0 {
-        let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
+        let frames_per_group = (ppg as usize).div_ceil(old_sub_ppf as usize);
         std::cmp::max(1, frames_per_group / 4)
     } else {
         0
