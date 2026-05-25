@@ -14,6 +14,10 @@ env:
 jobs:
   # ── Build loadable extension for all platforms ──────────────────
   build-ext:
+    # Override the workspace's configured target-dir to a job-local one so the
+    # artifact-copy paths below resolve.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +66,8 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --lib --target ${{ matrix.target }} \
-            --no-default-features --features loadable-extension,zstd,cloud,wal
+            -p turbolite-ffi \
+            --no-default-features --features loadable-extension,zstd,cli-s3
 
       - name: Build CLI binary
         env:
@@ -71,12 +76,12 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --bin turbolite --target ${{ matrix.target }} \
-            --features cloud,zstd,bundled-sqlite,wal
+            --features cli-s3,zstd,bundled-sqlite
 
       - name: Package extension artifact
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/libturbolite.${{ matrix.ext }} \
+          cp target/${{ matrix.target }}/release/libturbolite_ffi.${{ matrix.ext }} \
             artifacts/turbolite-${{ matrix.target }}.${{ matrix.ext }}
           cp target/${{ matrix.target }}/release/turbolite \
             artifacts/turbolite-cli-${{ matrix.target }}
