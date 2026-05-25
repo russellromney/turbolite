@@ -2689,6 +2689,62 @@ fn plugin_vfs_crud_memory_journal() {
     assert_eq!(n, 2, "rolled-back insert is not visible");
 }
 
+/// DELETE-journal gate: SQLite's default mode keeps the rollback journal as an
+/// on-disk `-journal` companion file. This proves that companion path works
+/// through the plugin VFS — open/write/sync/delete of the journal file, and a
+/// real ROLLBACK that reads it back — so WAL is not silently load-bearing.
+#[test]
+fn plugin_vfs_crud_delete_journal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_delete_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_delete.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete", "DELETE journal mode engaged via the plugin VFS");
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'world')", [])
+        .unwrap();
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rows visible through DELETE-mode plugin VFS");
+
+    // A rolled-back transaction must restore the prior image from the on-disk
+    // rollback journal — the companion-file open/write/read/delete path.
+    conn.execute_batch("BEGIN; UPDATE t SET val='changed' WHERE id=1; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;")
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rolled-back insert is not visible");
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "hello", "rolled-back update is reverted from the journal");
+
+    // Committed data survives reopening the connection.
+    drop(conn);
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen through plugin vfs");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "committed rows persist across reopen in DELETE mode");
+}
+
 /// WAL gate: same CRUD but in journal_mode=WAL, which drives the live-pointer
 /// shared memory (`shm_map`/`shm_lock`/`shm_barrier`/`shm_unmap`) end-to-end.
 /// A passing WAL checkpoint proves the WAL-index is wired correctly.

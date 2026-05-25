@@ -35,10 +35,6 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
-// Minimal standalone sqlite-plugin smoke VFS (the original migration spike).
-// Superseded by the tiered backend; kept as an independent integration check.
-// TODO: candidate for removal now that the real backend ships.
-pub mod plugin_vfs;
 // `local` returns a `rusqlite::Connection`, so it only exists when rusqlite is
 // linked (the `bundled-sqlite` feature). The loadable-extension build is
 // `--no-default-features` and has no rusqlite; gating here keeps that build
