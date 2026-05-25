@@ -395,7 +395,7 @@ pub fn register_plugin(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
         vfs,
         sqlite_plugin::vfs::RegisterOpts { make_default: false },
     )
-    .map_err(|code| io::Error::new(io::ErrorKind::Other, format!("sqlite code {code}")))?;
+    .map_err(|code| io::Error::other(format!("sqlite code {code}")))?;
     REGISTERED_VFS_NAMES.lock().insert(name.to_string());
     Ok(())
 }

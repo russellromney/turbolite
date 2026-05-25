@@ -2854,3 +2854,157 @@ fn plugin_vfs_concurrent_wal_isolation() {
         "every committed write is durable"
     );
 }
+
+/// Cross-PROCESS WAL isolation: closes hostile-review finding #4 (the in-process
+/// isolation test only exercises `IN_PROCESS_LOCKS`; this exercises the
+/// `MAP_SHARED` `-shm` + fcntl file locks across real OS processes).
+///
+/// Uses the re-exec pattern: when `TURBOLITE_XPROC_ROLE` is set we're a spawned
+/// worker — do the role's work and `process::exit`. The parent seeds a WAL db,
+/// spawns one writer + several reader processes against the same file-first db,
+/// and checks (a) no reader process ever observes a half-applied commit
+/// (`SUM(ta)-SUM(tb) != 0`) or a corrupt read, and (b) a fresh process sees all
+/// committed writes afterward (cross-process durability + final consistency).
+#[cfg(feature = "plugin-vfs")]
+#[test]
+fn plugin_vfs_cross_process_wal_isolation() {
+    use std::time::{Duration, Instant};
+
+    const XWRITES: i64 = 300;
+    let total_expected = XWRITES * (XWRITES + 1) / 2;
+
+    // ── Worker mode (a spawned child) ────────────────────────────────────
+    if let Ok(role) = std::env::var("TURBOLITE_XPROC_ROLE") {
+        let dir = std::path::PathBuf::from(std::env::var("TURBOLITE_XPROC_DIR").unwrap());
+        let db_path = dir.join("x.db");
+        let vfs_name = format!("xproc_{}_{}", role, std::process::id());
+        let config = TurboliteConfig::for_database_path(&db_path);
+        let code: i32 = (|| {
+            let vfs = TurboliteVfs::new_local(config).map_err(|_| 4)?;
+            crate::tiered::register(&vfs_name, vfs).map_err(|_| 4)?;
+            let uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+            let conn = rusqlite::Connection::open(&uri).map_err(|_| 4)?;
+            conn.busy_timeout(Duration::from_secs(20)).map_err(|_| 4)?;
+            // Ensure WAL is engaged on this connection.
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                .map_err(|_| 4)?;
+            if mode != "wal" {
+                return Err(4);
+            }
+            let done = dir.join("writer_done");
+            let invariant = |c: &rusqlite::Connection| -> Result<i64, i32> {
+                c.query_row(
+                    "SELECT (SELECT COALESCE(SUM(k),0) FROM ta) \
+                          - (SELECT COALESCE(SUM(k),0) FROM tb)",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|_| 3)
+            };
+            match role.as_str() {
+                "writer" => {
+                    for k in 1..=XWRITES {
+                        conn.execute_batch(&format!(
+                            "BEGIN IMMEDIATE; INSERT INTO ta(k) VALUES({k}); \
+                             INSERT INTO tb(k) VALUES({k}); COMMIT;"
+                        ))
+                        .map_err(|_| 2)?;
+                    }
+                    std::fs::write(&done, b"1").map_err(|_| 2)?;
+                    Ok(0)
+                }
+                "reader" => {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        if invariant(&conn)? != 0 {
+                            return Err(1); // torn read — a half-applied commit
+                        }
+                        if done.exists() {
+                            // Drain a few more snapshots after the writer finished.
+                            for _ in 0..100 {
+                                if invariant(&conn)? != 0 {
+                                    return Err(1);
+                                }
+                            }
+                            return Ok(0);
+                        }
+                        if Instant::now() > deadline {
+                            return Ok(0);
+                        }
+                    }
+                }
+                _ => Err(5),
+            }
+        })()
+        .unwrap_or_else(|e| e);
+        std::process::exit(code);
+    }
+
+    // ── Parent ───────────────────────────────────────────────────────────
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("x.db");
+    {
+        let vfs_name = format!("xproc_seed_{}", std::process::id());
+        let vfs = TurboliteVfs::new_local(TurboliteConfig::for_database_path(&db_path))
+            .expect("seed vfs");
+        crate::tiered::register(&vfs_name, vfs).expect("seed register");
+        let uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+        let conn = rusqlite::Connection::open(&uri).expect("seed open");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "WAL must engage for cross-process coordination");
+        conn.execute_batch("CREATE TABLE ta (k INTEGER); CREATE TABLE tb (k INTEGER);")
+            .unwrap();
+    }
+
+    let exe = std::env::current_exe().unwrap();
+    let test_name = "tiered::vfs::local_vfs_tests::plugin_vfs_cross_process_wal_isolation";
+    let spawn = |role: &str| {
+        std::process::Command::new(&exe)
+            .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("TURBOLITE_XPROC_ROLE", role)
+            .env("TURBOLITE_XPROC_DIR", dir.path())
+            .spawn()
+            .expect("spawn worker")
+    };
+
+    let writer = spawn("writer");
+    let readers: Vec<_> = (0..3).map(|_| spawn("reader")).collect();
+
+    let writer_code = writer.wait_with_output().unwrap().status.code().unwrap_or(-1);
+    assert_eq!(
+        writer_code, 0,
+        "writer process failed (code {writer_code}: 2=txn 4=setup)"
+    );
+    for (i, r) in readers.into_iter().enumerate() {
+        let code = r.wait_with_output().unwrap().status.code().unwrap_or(-1);
+        assert_eq!(
+            code, 0,
+            "reader {i} failed (code {code}: 1=TORN READ, 3=db error, 4=setup)"
+        );
+    }
+
+    // Cross-process durability + final consistency: a fresh process/cache sees
+    // every committed write and a balanced final state.
+    let vfs_name = format!("xproc_final_{}", std::process::id());
+    let vfs =
+        TurboliteVfs::new_local(TurboliteConfig::for_database_path(&db_path)).expect("final vfs");
+    crate::tiered::register(&vfs_name, vfs).expect("final register");
+    let conn = rusqlite::Connection::open(format!("file:{}?vfs={}", db_path.display(), vfs_name))
+        .expect("final open");
+    let (sum_ta, diff): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(k),0) FROM ta), \
+                    (SELECT COALESCE(SUM(k),0) FROM ta) - (SELECT COALESCE(SUM(k),0) FROM tb)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("final read");
+    assert_eq!(diff, 0, "final state must be balanced");
+    assert_eq!(
+        sum_ta, total_expected,
+        "a fresh process must see all cross-process-committed writes"
+    );
+}

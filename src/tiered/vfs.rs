@@ -1815,7 +1815,16 @@ mod plugin_backend {
                 ShmLockMode::LockExclusive => WalIndexLock::Exclusive,
                 ShmLockMode::UnlockShared | ShmLockMode::UnlockExclusive => WalIndexLock::None,
             };
-            let range = (offset as u8)..((offset + count) as u8);
+            // SQLite uses at most SQLITE_SHM_NLOCK (8) wal-index lock slots, so
+            // offset+count always fits a u8. Convert checked rather than `as u8`
+            // so a contract change surfaces as an error, not a silent truncation
+            // to a wrong lock range.
+            let start = u8::try_from(offset).map_err(|_| vars::SQLITE_IOERR_SHMLOCK)?;
+            let end = offset
+                .checked_add(count)
+                .and_then(|e| u8::try_from(e).ok())
+                .ok_or(vars::SQLITE_IOERR_SHMLOCK)?;
+            let range = start..end;
             let shm = h.ensure_plugin_shm();
             match WalIndex::lock(shm, range, walock) {
                 Ok(true) => Ok(()),
