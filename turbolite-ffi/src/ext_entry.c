@@ -834,6 +834,43 @@ int sqlite3_uri_boolean(const char *zFilename, const char *zParam, int bDflt) {
     return sqlite3_api->uri_boolean(zFilename, zParam, bDflt);
 }
 
+/*
+ * sqlite-plugin's SqliteApi::new_static (the static registration path) takes
+ * the addresses of three more symbols. Route them through the API table too,
+ * so the sqlite-plugin backend links in loadable-extension mode.
+ *
+ * libversion_number is plain. mprintf/log are variadic and the API-table
+ * pointers are variadic as well, so we can't forward a va_list through them;
+ * pre-format with vsnprintf and hand the result over a fixed "%s". (turbolite's
+ * VFS never emits pragma messages and only logs on error, so these are cold
+ * paths; libversion_number is the only one called during registration.)
+ */
+#undef sqlite3_libversion_number
+#undef sqlite3_mprintf
+#undef sqlite3_log
+
+int sqlite3_libversion_number(void) {
+    return sqlite3_api->libversion_number();
+}
+
+char *sqlite3_mprintf(const char *zFormat, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, zFormat);
+    vsnprintf(buf, sizeof(buf), zFormat, ap);
+    va_end(ap);
+    return sqlite3_api->mprintf("%s", buf);
+}
+
+void sqlite3_log(int iErrCode, const char *zFormat, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, zFormat);
+    vsnprintf(buf, sizeof(buf), zFormat, ap);
+    va_end(ap);
+    sqlite3_api->log(iErrCode, "%s", buf);
+}
+
 /* shims for EQP execution from Rust (query_plan.rs).
  * The Rust code declares these as extern "C" and calls them directly.
  * In the loadable extension, they must route through the API table. */

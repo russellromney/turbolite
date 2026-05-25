@@ -1,6 +1,16 @@
 # turbolite Changelog
 
-(Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
+(Formerly `sqlite-compress-encrypt-vfs`)
+
+## Soyuz: sqlite-plugin VFS backend
+
+Migrated the VFS from `sqlite-vfs` to `sqlite-plugin` and removed sqlite-vfs entirely — it is now the sole backend.
+
+- **Live-pointer WAL-index.** `shm_map` hands SQLite a direct pointer into the mmap'd `-shm` region instead of copying regions in and out. The copy-based model could tear WAL-index reads under concurrent writers + readers (a rare, load-only corruption); there is no copy to tear now.
+- Turbolite owns its `LockKind` / `WalIndexLock` / `DatabaseHandle`; the sqlite-plugin `Vfs` impls delegate file ops to the handle, so storage/cache/manifest logic is unchanged.
+- Tiered, local, and shared VFSes plus the FFI cdylib and loadable extension all run on sqlite-plugin.
+- **libclang is now a build dependency** (sqlite-plugin uses bindgen).
+- Verified: WAL + DELETE (on-disk rollback) journal modes, concurrent and cross-process WAL isolation (0 torn reads), full lib + FFI + loadable-extension suites.
 
 ## Apollo: Standardized Language SDKs (Node + Go)
 

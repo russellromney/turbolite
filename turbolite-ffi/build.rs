@@ -5,21 +5,22 @@ fn main() {
         // etc. through the extension API table.
         //
         // Do NOT link libsqlite3 — the host process provides SQLite.
-        // The C shim's symbol implementations satisfy sqlite-vfs's extern "C".
+        // The C shim's symbol implementations satisfy the Rust extern "C" calls.
         let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
 
         // Use vendored SQLite headers — the macOS SDK headers define
         // SQLITE_OMIT_LOAD_EXTENSION which makes SQLITE_EXTENSION_INIT1
         // a no-op, breaking the extension entry point.
-        cc::Build::new()
+        let mut build = cc::Build::new();
+        build
             .file("src/ext_entry.c")
             .include("vendor/sqlite3")
             .define(
                 "TURBOLITE_VERSION",
                 Some(format!("\"{}\"", version).as_str()),
             )
-            .warnings(true)
-            .compile("ext_entry");
+            .warnings(true);
+        build.compile("ext_entry");
 
         // Force the entry point symbol to be exported — the linker would
         // otherwise strip it because no Rust code references it.

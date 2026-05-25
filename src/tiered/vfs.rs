@@ -1366,19 +1366,23 @@ impl TurboliteVfs {
         // storage, not encoded into the page/base manifest.
         self.manifest_bytes()
     }
-}
 
-impl Vfs for TurboliteVfs {
-    type Handle = TurboliteHandle;
-
-    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        let path = if matches!(opts.kind, OpenKind::MainDb) {
+    /// Handle setup for the sqlite-plugin `Vfs::open`. `is_main_db` picks the
+    /// tiered main-db path (manifest load, cache validate, new_tiered) over the
+    /// passthrough companion path (WAL/journal/temp); `open` maps its open-flags
+    /// to that bool and calls here.
+    pub(crate) fn open_inner(
+        &self,
+        db: &str,
+        is_main_db: bool,
+    ) -> Result<TurboliteHandle, io::Error> {
+        let path = if is_main_db {
             self.local_main_db_path(db)?
         } else {
             self.local_sqlite_companion_path(db)
         };
 
-        if matches!(opts.kind, OpenKind::MainDb) {
+        if is_main_db {
             let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
 
@@ -1569,7 +1573,9 @@ impl Vfs for TurboliteVfs {
         }
     }
 
-    fn delete(&self, db: &str) -> Result<(), io::Error> {
+    /// VFS-level operations the sqlite-plugin `Vfs` face delegates to, so the
+    /// logic lives in one place rather than in the trait impl.
+    pub(crate) fn delete_inner(&self, db: &str) -> Result<(), io::Error> {
         if self.is_file_first_main_db_name(db) || self.is_file_first_main_db_basename(db) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1585,7 +1591,7 @@ impl Vfs for TurboliteVfs {
         Ok(())
     }
 
-    fn exists(&self, db: &str) -> Result<bool, io::Error> {
+    pub(crate) fn exists_inner(&self, db: &str) -> Result<bool, io::Error> {
         if self.config.local_data_path.is_some() {
             if let Ok(path) = self.local_main_db_path(db) {
                 if path.exists() {
@@ -1610,23 +1616,199 @@ impl Vfs for TurboliteVfs {
         storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime)
     }
 
-    fn temporary_name(&self) -> String {
+    pub(crate) fn temporary_name_inner(&self) -> String {
         format!("temp_{}", std::process::id())
     }
+}
 
-    fn random(&self, buffer: &mut [i8]) {
-        // Use the OS CSPRNG, not a time-seeded LCG: SQLite relies on this for
-        // values that must be unpredictable (e.g. rollback-journal salts).
-        use rand::RngCore;
-        // i8 and u8 have the same layout; fill the bytes directly.
-        let bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, buffer.len()) };
-        rand::thread_rng().fill_bytes(bytes);
+/// sqlite-plugin backend for the tiered VFS.
+///
+/// Every file op delegates to the same `DatabaseHandle` methods the handle
+/// provides, so the storage/cache/manifest logic is shared verbatim (`open`
+/// reuses [`TurboliteVfs::open_inner`]; `delete`/`access`/temp-name reuse the
+/// inherent `*_inner` helpers). Two things translate at the boundary: the
+/// lock-level enum (`LockLevel` → `LockKind`, a 1:1 rename) and the read EOF
+/// convention (sqlite-plugin's `xRead` discards the byte count, so a short read
+/// is signalled by `Err(SQLITE_IOERR_SHORT_READ)`).
+mod plugin_backend {
+    use super::{TurboliteHandle, TurboliteVfs};
+    use core::ptr::NonNull;
+    use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts, ShmLockMode};
+    use sqlite_plugin::vars;
+    use sqlite_plugin::vfs::{Vfs, VfsResult};
+    use crate::{DatabaseHandle, LockKind, WalIndexLock};
+    use std::io::ErrorKind;
+
+    /// sqlite-plugin lock level → the `LockKind` the handle speaks. The five
+    /// SQLite locking levels are the same in both enums and in the same order;
+    /// this is a pure rename.
+    fn to_lock_kind(level: LockLevel) -> LockKind {
+        match level {
+            LockLevel::Unlocked => LockKind::None,
+            LockLevel::Shared => LockKind::Shared,
+            LockLevel::Reserved => LockKind::Reserved,
+            LockLevel::Pending => LockKind::Pending,
+            LockLevel::Exclusive => LockKind::Exclusive,
+        }
     }
 
-    fn sleep(&self, duration: Duration) -> Duration {
-        std::thread::sleep(duration);
-        duration
+    /// Best-effort io::Error → SQLite result code for the vfs-level ops.
+    fn map_io(e: std::io::Error) -> i32 {
+        match e.kind() {
+            ErrorKind::NotFound => vars::SQLITE_CANTOPEN,
+            ErrorKind::PermissionDenied => vars::SQLITE_READONLY,
+            _ => vars::SQLITE_IOERR,
+        }
+    }
+
+    impl Vfs for TurboliteVfs {
+        type Handle = TurboliteHandle;
+
+        fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<TurboliteHandle> {
+            let is_main_db = matches!(opts.kind(), OpenKind::MainDb);
+            // SQLite passes NULL for temp/transient files; synthesize a name so
+            // the passthrough branch has somewhere to land.
+            let temp_name;
+            let name = match path {
+                Some(p) => p,
+                None => {
+                    temp_name = self.temporary_name_inner();
+                    temp_name.as_str()
+                }
+            };
+            self.open_inner(name, is_main_db).map_err(map_io)
+        }
+
+        fn delete(&self, path: &str) -> VfsResult<()> {
+            self.delete_inner(path).map_err(map_io)
+        }
+
+        fn access(&self, path: &str, _flags: AccessFlags) -> VfsResult<bool> {
+            // Exists drives hot-journal detection (must report real file state);
+            // Read/ReadWrite likewise resolve to "is it there?" for this backend.
+            self.exists_inner(path).map_err(map_io)
+        }
+
+        fn file_size(&self, h: &mut TurboliteHandle) -> VfsResult<usize> {
+            DatabaseHandle::size(h)
+                .map(|s| s as usize)
+                .map_err(|_| vars::SQLITE_IOERR_FSTAT)
+        }
+
+        fn truncate(&self, h: &mut TurboliteHandle, size: usize) -> VfsResult<()> {
+            DatabaseHandle::set_len(h, size as u64).map_err(|_| vars::SQLITE_IOERR_TRUNCATE)
+        }
+
+        fn write(&self, h: &mut TurboliteHandle, offset: usize, buf: &[u8]) -> VfsResult<usize> {
+            DatabaseHandle::write_all_at(h, buf, offset as u64)
+                .map(|()| buf.len())
+                .map_err(|_| vars::SQLITE_IOERR_WRITE)
+        }
+
+        fn read(&self, h: &mut TurboliteHandle, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+            match DatabaseHandle::read_exact_at(h, buf, offset as u64) {
+                Ok(()) => Ok(buf.len()),
+                // EOF: read_exact_at couldn't fill the buffer. SQLite expects a
+                // short-read signal here (and treats it as zero-filled), exactly
+                // as the sqlite-vfs wrapper does.
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    Err(vars::SQLITE_IOERR_SHORT_READ)
+                }
+                Err(_) => Err(vars::SQLITE_IOERR_READ),
+            }
+        }
+
+        fn lock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::lock(h, to_lock_kind(level)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(vars::SQLITE_BUSY),
+                Err(_) => Err(vars::SQLITE_IOERR_LOCK),
+            }
+        }
+
+        fn unlock(&self, h: &mut TurboliteHandle, level: LockLevel) -> VfsResult<()> {
+            match DatabaseHandle::unlock(h, to_lock_kind(level)) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(vars::SQLITE_IOERR_UNLOCK),
+            }
+        }
+
+        fn check_reserved_lock(&self, h: &mut TurboliteHandle) -> VfsResult<bool> {
+            DatabaseHandle::reserved(h).map_err(|_| vars::SQLITE_IOERR_CHECKRESERVEDLOCK)
+        }
+
+        fn sync(&self, h: &mut TurboliteHandle) -> VfsResult<()> {
+            DatabaseHandle::sync(h, false).map_err(|_| vars::SQLITE_IOERR_FSYNC)
+        }
+
+        fn close(&self, h: TurboliteHandle) -> VfsResult<()> {
+            // TurboliteHandle's Drop releases locks and tears down handle state.
+            drop(h);
+            Ok(())
+        }
+
+        // ── WAL-index shared memory ─────────────────────────────────────────
+        // The architectural payoff of the migration: hand SQLite a *live*
+        // pointer into the mmap'd `-shm` file. The sqlite-vfs path copied each
+        // region in and out (map/pull/push), which could tear the WAL-index
+        // under concurrency; here SQLite reads and writes the shared mapping
+        // directly, and the byte-range lock protocol (reused verbatim from
+        // FileWalIndex) is what serializes access.
+
+        fn shm_map(
+            &self,
+            h: &mut TurboliteHandle,
+            region_idx: usize,
+            region_size: usize,
+            extend: bool,
+        ) -> VfsResult<Option<NonNull<u8>>> {
+            let shm = h.ensure_plugin_shm();
+            match shm.map_ptr(region_idx as u32, region_size, extend) {
+                Ok(Some(ptr)) => Ok(NonNull::new(ptr)),
+                Ok(None) => Ok(None),
+                Err(_) => Err(vars::SQLITE_IOERR_SHMMAP),
+            }
+        }
+
+        fn shm_lock(
+            &self,
+            h: &mut TurboliteHandle,
+            offset: u32,
+            count: u32,
+            mode: ShmLockMode,
+        ) -> VfsResult<()> {
+            let walock = match mode {
+                ShmLockMode::LockShared => WalIndexLock::Shared,
+                ShmLockMode::LockExclusive => WalIndexLock::Exclusive,
+                ShmLockMode::UnlockShared | ShmLockMode::UnlockExclusive => WalIndexLock::None,
+            };
+            // SQLite uses at most SQLITE_SHM_NLOCK (8) wal-index lock slots, so
+            // offset+count always fits a u8. Convert checked rather than `as u8`
+            // so a contract change surfaces as an error, not a silent truncation
+            // to a wrong lock range.
+            let start = u8::try_from(offset).map_err(|_| vars::SQLITE_IOERR_SHMLOCK)?;
+            let end = offset
+                .checked_add(count)
+                .and_then(|e| u8::try_from(e).ok())
+                .ok_or(vars::SQLITE_IOERR_SHMLOCK)?;
+            let range = start..end;
+            let shm = h.ensure_plugin_shm();
+            match shm.lock(range, walock) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(vars::SQLITE_BUSY),
+                Err(_) => Err(vars::SQLITE_IOERR_SHMLOCK),
+            }
+        }
+
+        fn shm_barrier(&self, _h: &mut TurboliteHandle) {
+            // Full fence: pair the writes a connection made to the shared
+            // mapping with the reads another connection is about to make.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn shm_unmap(&self, h: &mut TurboliteHandle, delete: bool) -> VfsResult<()> {
+            h.unmap_plugin_shm(delete).map_err(|_| vars::SQLITE_IOERR)
+        }
     }
 }
 

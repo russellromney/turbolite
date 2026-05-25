@@ -1579,13 +1579,12 @@ impl DiskCache {
 
     pub(crate) fn ensure_group_states_capacity(
         &self,
-        states: &parking_lot::MutexGuard<'_, Vec<std::sync::atomic::AtomicU8>>,
-        gid: u64,
+        _states: &parking_lot::MutexGuard<'_, Vec<std::sync::atomic::AtomicU8>>,
+        _gid: u64,
     ) {
-        // Note: Can't actually resize through a shared ref. In practice, group_states
-        // is sized at open time. If we encounter a new group (from writes extending the DB),
-        // we handle it in the write path by resizing before accessing.
-        let _ = (states, gid);
+        // No-op: can't resize through a shared ref. In practice group_states is
+        // sized at open time; a new group (from writes extending the DB) is
+        // handled in the write path by resizing before accessing.
     }
 
     /// Grow group_states to accommodate new groups (e.g., after database grows).

@@ -42,8 +42,7 @@ fn test_local_vfs_exists_empty() {
     };
     let vfs = TurboliteVfs::new_local(config).expect("local VFS");
     // Empty dir: no manifest in the backend.
-    use sqlite_vfs::Vfs;
-    assert!(!vfs.exists("main.db").unwrap());
+    assert!(!vfs.exists_inner("main.db").unwrap());
 }
 
 /// RED TEST: Local VFS can register with SQLite, open a db, and do CRUD.
@@ -127,8 +126,6 @@ fn file_first_vfs_rejects_mismatched_main_db_name() {
 
 #[test]
 fn file_first_vfs_refuses_to_delete_main_db_image() {
-    use sqlite_vfs::Vfs;
-
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("app.db");
     let config = TurboliteConfig::for_database_path(&db_path);
@@ -136,14 +133,14 @@ fn file_first_vfs_refuses_to_delete_main_db_image() {
 
     std::fs::write(&db_path, b"turbolite-owned").unwrap();
     assert!(
-        vfs.exists(db_path.to_str().unwrap()).unwrap(),
+        vfs.exists_inner(db_path.to_str().unwrap()).unwrap(),
         "main image should exist"
     );
-    let err = vfs.delete(db_path.to_str().unwrap()).unwrap_err();
+    let err = vfs.delete_inner(db_path.to_str().unwrap()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(db_path.exists(), "main image must survive delete refusal");
 
-    let err = vfs.delete("app.db").unwrap_err();
+    let err = vfs.delete_inner("app.db").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
         db_path.exists(),
@@ -151,7 +148,7 @@ fn file_first_vfs_refuses_to_delete_main_db_image() {
     );
 
     assert!(
-        !vfs.exists("app.db").unwrap(),
+        !vfs.exists_inner("app.db").unwrap(),
         "bare basename must not alias the bound absolute main image"
     );
 }
@@ -2644,4 +2641,419 @@ fn test_settings_set_per_connection_isolation() {
         .query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
+}
+
+/// Migration gate: drive a real SQLite database through the *sqlite-plugin*
+/// backend of the tiered VFS end-to-end. journal_mode=MEMORY keeps the rollback
+/// journal in RAM, so this needs no journal companion and no shared memory —
+/// it isolates the file-op delegation (open → full lock ladder → write → read
+/// → sync → file_size) from the WAL shared-memory work that lands next.
+#[test]
+fn plugin_vfs_crud_memory_journal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_mem_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_mem.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+    conn.execute_batch("PRAGMA journal_mode=MEMORY").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'world')", [])
+        .unwrap();
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rows visible through sqlite-plugin tiered VFS");
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "world", "row content round-trips through the plugin VFS");
+
+    // A transaction that rolls back must leave no trace — exercises the
+    // lock upgrade/downgrade path (Shared → Reserved → Exclusive → Shared).
+    conn.execute_batch("BEGIN; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;")
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rolled-back insert is not visible");
+}
+
+/// DELETE-journal gate: SQLite's default mode keeps the rollback journal as an
+/// on-disk `-journal` companion file. This proves that companion path works
+/// through the plugin VFS — open/write/sync/delete of the journal file, and a
+/// real ROLLBACK that reads it back — so WAL is not silently load-bearing.
+#[test]
+fn plugin_vfs_crud_delete_journal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_delete_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_delete.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete", "DELETE journal mode engaged via the plugin VFS");
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')", [])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'world')", [])
+        .unwrap();
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rows visible through DELETE-mode plugin VFS");
+
+    // A rolled-back transaction must restore the prior image from the on-disk
+    // rollback journal — the companion-file open/write/read/delete path.
+    conn.execute_batch("BEGIN; UPDATE t SET val='changed' WHERE id=1; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;")
+        .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "rolled-back insert is not visible");
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "hello", "rolled-back update is reverted from the journal");
+
+    // Committed data survives reopening the connection.
+    drop(conn);
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen through plugin vfs");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2, "committed rows persist across reopen in DELETE mode");
+}
+
+/// WAL gate: same CRUD but in journal_mode=WAL, which drives the live-pointer
+/// shared memory (`shm_map`/`shm_lock`/`shm_barrier`/`shm_unmap`) end-to-end.
+/// A passing WAL checkpoint proves the WAL-index is wired correctly.
+#[test]
+fn plugin_vfs_crud_wal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_crud_wal_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+
+    let db_path = format!("file:plugin_wal.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open through plugin vfs");
+
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal", "WAL mode engaged through the plugin VFS");
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
+    for i in 0..50 {
+        conn.execute("INSERT INTO t (val) VALUES (?1)", [format!("row-{i}")])
+            .unwrap();
+    }
+
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 50, "rows visible through WAL-mode plugin VFS");
+
+    // Force a checkpoint: drains the WAL back into the main db, exercising the
+    // exclusive WAL-index locks + shared-memory reads.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+    let v: String = conn
+        .query_row("SELECT val FROM t WHERE id = 50", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, "row-49", "content survives checkpoint");
+}
+
+/// The test the migration exists for: concurrent readers against a live writer
+/// in WAL mode, checking an invariant that a torn WAL-index read would break.
+///
+/// The writer commits `INSERT INTO ta(k); INSERT INTO tb(k)` as one
+/// transaction, so `SUM(ta) - SUM(tb)` is always 0 at any commit boundary. Each
+/// reader evaluates that difference in a single statement; transaction
+/// isolation must show it both inserts or neither. With the old copy-based
+/// WAL-index a reader could pull a torn index header, compute the wrong frame
+/// bound, and observe a half-applied commit (non-zero) or `DatabaseCorrupt`.
+/// The live-pointer shm has no copy to tear, so every read must see 0.
+#[test]
+fn plugin_vfs_concurrent_wal_isolation() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("plugin_iso_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register_plugin(&vfs_name, vfs).expect("register plugin vfs");
+    let db_uri = format!("file:plugin_iso.db?vfs={}", vfs_name);
+
+    // Seed: WAL mode + the two tables.
+    {
+        let conn = rusqlite::Connection::open(&db_uri).expect("seed open");
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        conn.execute_batch("CREATE TABLE ta (k INTEGER); CREATE TABLE tb (k INTEGER);")
+            .unwrap();
+    }
+
+    const READERS: usize = 16;
+    const WRITES: i64 = 400;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let partial_reads = Arc::new(AtomicI64::new(0));
+    let reads_done = Arc::new(AtomicI64::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS {
+        let uri = db_uri.clone();
+        let stop = Arc::clone(&stop);
+        let partial = Arc::clone(&partial_reads);
+        let done = Arc::clone(&reads_done);
+        handles.push(std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&uri).expect("reader open");
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                let diff: i64 = conn
+                    .query_row(
+                        "SELECT (SELECT COALESCE(SUM(k),0) FROM ta) \
+                              - (SELECT COALESCE(SUM(k),0) FROM tb)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("reader query must not error (no DatabaseCorrupt)");
+                if diff != 0 {
+                    partial.fetch_add(1, Ordering::Relaxed);
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // Writer: one connection, WRITES atomic transactions, periodic checkpoints.
+    let writer = {
+        let uri = db_uri.clone();
+        std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&uri).expect("writer open");
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            for k in 1..=WRITES {
+                conn.execute_batch(&format!(
+                    "BEGIN; INSERT INTO ta(k) VALUES({k}); INSERT INTO tb(k) VALUES({k}); COMMIT;"
+                ))
+                .expect("writer txn");
+                if k % 50 == 0 {
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+                }
+            }
+        })
+    };
+
+    writer.join().expect("writer thread");
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().expect("reader thread");
+    }
+
+    assert!(
+        reads_done.load(Ordering::Relaxed) > 0,
+        "readers must have actually run"
+    );
+    assert_eq!(
+        partial_reads.load(Ordering::Relaxed),
+        0,
+        "no reader may observe a half-applied commit (torn WAL-index)"
+    );
+
+    // Final state is consistent and complete.
+    let conn = rusqlite::Connection::open(&db_uri).expect("final open");
+    let total_ta: i64 = conn
+        .query_row("SELECT COALESCE(SUM(k),0) FROM ta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        total_ta,
+        WRITES * (WRITES + 1) / 2,
+        "every committed write is durable"
+    );
+}
+
+/// Cross-PROCESS WAL isolation: closes hostile-review finding #4 (the in-process
+/// isolation test only exercises `IN_PROCESS_LOCKS`; this exercises the
+/// `MAP_SHARED` `-shm` + fcntl file locks across real OS processes).
+///
+/// Uses the re-exec pattern: when `TURBOLITE_XPROC_ROLE` is set we're a spawned
+/// worker — do the role's work and `process::exit`. The parent seeds a WAL db,
+/// spawns one writer + several reader processes against the same file-first db,
+/// and checks (a) no reader process ever observes a half-applied commit
+/// (`SUM(ta)-SUM(tb) != 0`) or a corrupt read, and (b) a fresh process sees all
+/// committed writes afterward (cross-process durability + final consistency).
+#[test]
+fn plugin_vfs_cross_process_wal_isolation() {
+    use std::time::{Duration, Instant};
+
+    const XWRITES: i64 = 300;
+    let total_expected = XWRITES * (XWRITES + 1) / 2;
+
+    // ── Worker mode (a spawned child) ────────────────────────────────────
+    if let Ok(role) = std::env::var("TURBOLITE_XPROC_ROLE") {
+        let dir = std::path::PathBuf::from(std::env::var("TURBOLITE_XPROC_DIR").unwrap());
+        let db_path = dir.join("x.db");
+        let vfs_name = format!("xproc_{}_{}", role, std::process::id());
+        let config = TurboliteConfig::for_database_path(&db_path);
+        let code: i32 = (|| {
+            let vfs = TurboliteVfs::new_local(config).map_err(|_| 4)?;
+            crate::tiered::register(&vfs_name, vfs).map_err(|_| 4)?;
+            let uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+            let conn = rusqlite::Connection::open(&uri).map_err(|_| 4)?;
+            conn.busy_timeout(Duration::from_secs(20)).map_err(|_| 4)?;
+            // Ensure WAL is engaged on this connection.
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                .map_err(|_| 4)?;
+            if mode != "wal" {
+                return Err(4);
+            }
+            let done = dir.join("writer_done");
+            let invariant = |c: &rusqlite::Connection| -> Result<i64, i32> {
+                c.query_row(
+                    "SELECT (SELECT COALESCE(SUM(k),0) FROM ta) \
+                          - (SELECT COALESCE(SUM(k),0) FROM tb)",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|_| 3)
+            };
+            match role.as_str() {
+                "writer" => {
+                    for k in 1..=XWRITES {
+                        conn.execute_batch(&format!(
+                            "BEGIN IMMEDIATE; INSERT INTO ta(k) VALUES({k}); \
+                             INSERT INTO tb(k) VALUES({k}); COMMIT;"
+                        ))
+                        .map_err(|_| 2)?;
+                    }
+                    std::fs::write(&done, b"1").map_err(|_| 2)?;
+                    Ok(0)
+                }
+                "reader" => {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        if invariant(&conn)? != 0 {
+                            return Err(1); // torn read — a half-applied commit
+                        }
+                        if done.exists() {
+                            // Drain a few more snapshots after the writer finished.
+                            for _ in 0..100 {
+                                if invariant(&conn)? != 0 {
+                                    return Err(1);
+                                }
+                            }
+                            return Ok(0);
+                        }
+                        if Instant::now() > deadline {
+                            return Ok(0);
+                        }
+                    }
+                }
+                _ => Err(5),
+            }
+        })()
+        .unwrap_or_else(|e| e);
+        std::process::exit(code);
+    }
+
+    // ── Parent ───────────────────────────────────────────────────────────
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("x.db");
+    {
+        let vfs_name = format!("xproc_seed_{}", std::process::id());
+        let vfs = TurboliteVfs::new_local(TurboliteConfig::for_database_path(&db_path))
+            .expect("seed vfs");
+        crate::tiered::register(&vfs_name, vfs).expect("seed register");
+        let uri = format!("file:{}?vfs={}", db_path.display(), vfs_name);
+        let conn = rusqlite::Connection::open(&uri).expect("seed open");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "WAL must engage for cross-process coordination");
+        conn.execute_batch("CREATE TABLE ta (k INTEGER); CREATE TABLE tb (k INTEGER);")
+            .unwrap();
+    }
+
+    let exe = std::env::current_exe().unwrap();
+    let test_name = "tiered::vfs::local_vfs_tests::plugin_vfs_cross_process_wal_isolation";
+    let spawn = |role: &str| {
+        std::process::Command::new(&exe)
+            .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("TURBOLITE_XPROC_ROLE", role)
+            .env("TURBOLITE_XPROC_DIR", dir.path())
+            .spawn()
+            .expect("spawn worker")
+    };
+
+    let writer = spawn("writer");
+    let readers: Vec<_> = (0..3).map(|_| spawn("reader")).collect();
+
+    let writer_code = writer.wait_with_output().unwrap().status.code().unwrap_or(-1);
+    assert_eq!(
+        writer_code, 0,
+        "writer process failed (code {writer_code}: 2=txn 4=setup)"
+    );
+    for (i, r) in readers.into_iter().enumerate() {
+        let code = r.wait_with_output().unwrap().status.code().unwrap_or(-1);
+        assert_eq!(
+            code, 0,
+            "reader {i} failed (code {code}: 1=TORN READ, 3=db error, 4=setup)"
+        );
+    }
+
+    // Cross-process durability + final consistency: a fresh process/cache sees
+    // every committed write and a balanced final state.
+    let vfs_name = format!("xproc_final_{}", std::process::id());
+    let vfs =
+        TurboliteVfs::new_local(TurboliteConfig::for_database_path(&db_path)).expect("final vfs");
+    crate::tiered::register(&vfs_name, vfs).expect("final register");
+    let conn = rusqlite::Connection::open(format!("file:{}?vfs={}", db_path.display(), vfs_name))
+        .expect("final open");
+    let (sum_ta, diff): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COALESCE(SUM(k),0) FROM ta), \
+                    (SELECT COALESCE(SUM(k),0) FROM ta) - (SELECT COALESCE(SUM(k),0) FROM tb)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("final read");
+    assert_eq!(diff, 0, "final state must be balanced");
+    assert_eq!(
+        sum_ta, total_expected,
+        "a fresh process must see all cross-process-committed writes"
+    );
 }

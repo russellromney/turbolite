@@ -46,6 +46,15 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::{Mutex, OnceLock};
 
+/// Register a tiered VFS with SQLite through sqlite-plugin.
+#[inline]
+fn register_turbolite_vfs(
+    name: &str,
+    vfs: turbolite::tiered::TurboliteVfs,
+) -> Result<(), std::io::Error> {
+    turbolite::tiered::register(name, vfs)
+}
+
 // --- Error handling ---
 
 thread_local! {
@@ -220,7 +229,7 @@ pub extern "C" fn turbolite_register_local_file_first(
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -283,7 +292,7 @@ pub extern "C" fn turbolite_register_local(
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -420,7 +429,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
                 return -1;
             }
         };
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("register failed: {}", e));
@@ -512,7 +521,7 @@ pub extern "C" fn turbolite_register_cloud(
         // Leak the runtime for the process lifetime; the VFS captures a handle
         // into it. The FFI boundary owns no cleanup hook.
         std::mem::forget(runtime);
-        match turbolite::tiered::register(name, vfs) {
+        match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("cloud register failed: {}", e));
@@ -659,8 +668,12 @@ pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb 
 ///
 /// # Returns
 /// 0 on success, -1 on error.
+///
+/// # Safety
+/// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
+/// a valid NUL-terminated C string.
 #[no_mangle]
-pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
+pub unsafe extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
     ffi_guard(-1, || {
         clear_last_error();
         if db.is_null() {
@@ -694,8 +707,15 @@ pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_
 /// # Returns
 /// Heap-allocated JSON string on success (caller must free with `turbolite_free_string`),
 /// or NULL on error.
+///
+/// # Safety
+/// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
+/// a valid NUL-terminated C string.
 #[no_mangle]
-pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn turbolite_query_json(
+    db: *mut TurboliteDb,
+    sql: *const c_char,
+) -> *mut c_char {
     ffi_guard(std::ptr::null_mut(), || {
         clear_last_error();
         if db.is_null() {
@@ -764,8 +784,12 @@ pub extern "C" fn turbolite_query_json(db: *mut TurboliteDb, sql: *const c_char)
 }
 
 /// Free a string returned by `turbolite_query_json`.
+///
+/// # Safety
+/// `s` must be NULL or a pointer returned by `turbolite_query_json` that has
+/// not already been freed.
 #[no_mangle]
-pub extern "C" fn turbolite_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn turbolite_free_string(s: *mut c_char) {
     ffi_guard((), || {
         if !s.is_null() {
             unsafe {
@@ -776,8 +800,12 @@ pub extern "C" fn turbolite_free_string(s: *mut c_char) {
 }
 
 /// Close a database connection opened with `turbolite_open`.
+///
+/// # Safety
+/// `db` must be NULL or a handle from `turbolite_open`. A double close is safe
+/// (the handle is freed exactly once).
 #[no_mangle]
-pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
+pub unsafe extern "C" fn turbolite_close(db: *mut TurboliteDb) {
     ffi_guard((), || {
         if db.is_null() {
             return;

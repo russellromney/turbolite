@@ -13,8 +13,8 @@ repository = "https://github.com/russellromney/turbolite"
 crate-type = ["lib", "cdylib"]
 
 [features]
-# Default mirrors the old turbolite default: standalone cdylib linking a
-# bundled SQLite through turbolite's rusqlite. `make lib-bundled` path.
+# Standalone cdylib linking a bundled SQLite through turbolite's rusqlite.
+# sqlite-plugin is turbolite's VFS backend unconditionally.
 default = ["zstd", "bundled-sqlite"]
 # Bundles sqlite3 for consumers that don't already have one linked.
 # Required by the `turbolite_open` / `turbolite_exec` rusqlite wrappers.

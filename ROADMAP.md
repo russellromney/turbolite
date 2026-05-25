@@ -3,41 +3,45 @@
 ## Soyuz: Migrate from sqlite-vfs to sqlite-plugin
 > After: Mercury (CHANGELOG) · Before: Valkyrie
 
-Replace `sqlite-vfs` (rkusa, unmaintained since 2022, self-described prototype) with
+**Shipped (a, b, d-tests): `sqlite-vfs` is removed; `sqlite-plugin` is the sole VFS
+backend.** The WAL-index now hands SQLite a live pointer into the mmap'd `-shm`
+region, so the copy-based torn-read corruption is gone by design. Zero-copy page
+reads (c) remain as a future enhancement.
+
+Replaced `sqlite-vfs` (rkusa, unmaintained since 2022, self-described prototype) with
 `sqlite-plugin` (orbitinghail/Carl Sverre, active, used by Graft).
 
 **Why:** sqlite-vfs has a copy-based WAL-index model where each connection gets a local
-32KB buffer synced via push/pull. This caused a 40% concurrent corruption rate (Phase
-Pelican stress test) because `shm_barrier` failed to push when the writer held an
-exclusive WAL-index lock. We patched it (russellromney/sqlite-vfs#fix/shm-barrier-wal-push)
-but the crate has deeper limitations: no mmap page reads (xFetch/xUnfetch), no extension
-loading (xDl*), no custom device characteristics, hardcoded 1024 sector size.
+32KB buffer synced via push/pull. This caused a high concurrent corruption rate under
+stress because `shm_barrier` failed to push when the writer held an exclusive WAL-index
+lock. We patched the fork, but the crate has deeper limitations: no mmap page reads
+(xFetch/xUnfetch), no extension loading (xDl*), no custom device characteristics,
+hardcoded 1024 sector size.
 
 sqlite-plugin returns `NonNull<u8>` from `shm_map` (direct pointer, no copy layer).
-SQLite reads/writes the mmap directly. No push/pull, no barrier bugs by design. Also
-supports xFetch/xUnfetch for memory-mapped page reads.
+SQLite reads/writes the mmap directly. No push/pull, no barrier bugs by design.
 
-### a. Trait migration
-- [ ] Replace `sqlite_vfs::Vfs` with `sqlite_plugin::Vfs` (6 methods on TurboliteVfs, 8 on SharedTurboliteVfs)
-- [ ] Replace `sqlite_vfs::DatabaseHandle` with sqlite-plugin equivalent (11 methods on TurboliteHandle)
-- [ ] Move FileWalIndex (mmap + in-process locks) into shm_map/shm_lock/shm_barrier/shm_unmap on Vfs
-- [ ] Map type differences: OpenKind, OpenOptions, LockKind, WalIndexLock
-- [ ] Update registration calls (2 sites in mod.rs)
+### a. Trait migration — done
+- [x] Turbolite owns `Vfs`/`DatabaseHandle` via sqlite-plugin (file ops delegate to the handle)
+- [x] FileWalIndex drives `shm_map`/`shm_lock`/`shm_barrier`/`shm_unmap`
+- [x] Internal `LockKind` / `WalIndexLock` types (OpenKind/OpenOptions no longer needed)
+- [x] Registration goes through `register_static` (tiered, local, shared)
 
-### b. Direct pointer WAL-index
-- [ ] shm_map returns NonNull<u8> pointing to mmap'd region (delete copy layer)
-- [ ] shm_barrier becomes a memory fence (no push/pull)
-- [ ] Delete FileWalIndex struct, push/pull/map methods (~260 lines)
-- [ ] Preserve in-process lock coordination (lib.rs:55-141, required for thread-level mutual exclusion)
+### b. Direct pointer WAL-index — done
+- [x] shm_map returns the live mmap pointer (copy layer deleted)
+- [x] shm_barrier is a memory fence (no push/pull)
+- [x] Dropped the copy-based push/pull/map; FileWalIndex remains as the mmap + lock state holder
+- [x] In-process lock coordination preserved
 
-### c. Memory-mapped page reads (xFetch/xUnfetch)
+### c. Memory-mapped page reads (xFetch/xUnfetch) — future
 - [ ] Implement xFetch: return mmap pointer to cache file page (zero-copy read)
 - [ ] Implement xUnfetch: release mmap reference
 - [ ] Expected: warm point-lookup latency from ~5us (pread) to <1us (pointer dereference)
 
 ### d. Tests
-- [ ] Port 25 WAL-index/lock tests to new API
-- [ ] Concurrent stress test: 1 writer + 4 readers, 30x runs, 0 failures
+- [x] WAL-index/lock tests ported to the live-pointer API
+- [x] Concurrent + cross-process WAL-isolation tests (writer vs readers, 0 torn reads)
+- [x] DELETE-journal (on-disk rollback) verified through the plugin VFS
 - [ ] Benchmark: compare pread vs mmap page reads on warm cache
 
 ---

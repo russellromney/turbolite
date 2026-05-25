@@ -1,7 +1,7 @@
 use super::*;
 use arc_swap::ArcSwap;
 use hadb_storage_mem::MemStorage;
-use sqlite_vfs::DatabaseHandle;
+use crate::DatabaseHandle;
 use std::collections::HashSet;
 #[cfg(feature = "encryption")]
 use std::fs::OpenOptions as FsOpenOptions;
