@@ -106,9 +106,8 @@ rmp-serde = "1.3.1"
 # Canonical encoding for the Turbolite manifest wire format. ciborium
 # produces RFC 8949 §4.2 deterministically-encoded CBOR when used with
 # `ciborium::ser::into_writer` on a serde-derived value whose field
-# order is fixed and whose integers use smallest-length encoding — the
-# property phase 004 relies on for BLAKE3-hash stability across
-# implementations.
+# order is fixed and whose integers use smallest-length encoding — needed
+# for BLAKE3 hash stability across implementations.
 ciborium = "0.2"
 # Cryptographic hash for the chain link primitive. BLAKE3 chosen for
 # canonical-byte hashing of manifest and delta objects (replay cursor

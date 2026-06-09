@@ -26,6 +26,20 @@ FFI_DIR := turbolite-ffi
 # Features forwarded to cargo.
 FEATURES ?= zstd
 
+QUINT ?= npx -y @informalsystems/quint@0.32.0
+OPENJDK_PREFIX ?= $(shell brew --prefix openjdk 2>/dev/null)
+JAVA_PATH_PREFIX := $(if $(OPENJDK_PREFIX),$(OPENJDK_PREFIX)/bin:)
+SPEC_NEGATIVE_STEPS := \
+	badWrongEpochStep \
+	badWrongWriterStep \
+	badSkippedSeqStep \
+	badPrevChecksumStep \
+	badEquivocationStep \
+	badChecksumCollisionStep \
+	badStaleWriterAfterPromotionStep \
+	badPromotionCursorStep \
+	badPromotionPageCountStep
+
 # ── FFI build passthrough ─────────────────────────────────────────
 
 .PHONY: lib lib-bundled ext ext-local header
@@ -56,6 +70,83 @@ test: ## Run all tests (Rust unit + FFI)
 .PHONY: test-all
 test-all: ## Run all tests including tiered/S3
 	cargo test --features zstd,tiered,bundled-sqlite
+
+.PHONY: specs-typecheck
+specs-typecheck: ## Typecheck Quint substrate specs
+	$(QUINT) typecheck specs/cursor_chain.qnt
+	$(QUINT) typecheck specs/cursor_chain_liveness.qnt
+
+.PHONY: specs
+specs: specs-typecheck ## Run Quint substrate specs (typecheck + simulator invariants)
+	$(QUINT) run specs/cursor_chain.qnt \
+		--max-samples=200 --max-steps=8 --invariants=safety
+
+.PHONY: specs-progress
+specs-progress: specs-typecheck ## Run deterministic Quint progress scenario
+	$(QUINT) run specs/cursor_chain.qnt \
+		--step=progressStep --max-samples=1 --max-steps=4 \
+		--invariants=safety boundedProgress
+
+.PHONY: specs-negative
+specs-negative: specs-typecheck ## Run Quint specs that are expected to violate safety
+	@for step in $(SPEC_NEGATIVE_STEPS); do \
+		out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-$$step.XXXXXX") || exit 1; \
+		echo "expecting safety violation: $$step"; \
+		if $(QUINT) run specs/cursor_chain.qnt \
+			--max-samples=20 --max-steps=2 --step=$$step \
+			--invariants=safety --verbosity=0 \
+			>"$$out" 2>&1; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to violate safety"; \
+			exit 1; \
+		elif ! grep -q "Invariant violated" "$$out"; then \
+			cat "$$out"; \
+			rm -f "$$out"; \
+			echo "expected $$step to fail by violating safety"; \
+			exit 1; \
+		fi; \
+		rm -f "$$out"; \
+	done
+
+.PHONY: specs-all
+specs-all: specs specs-progress specs-negative specs-rust specs-verify specs-liveness specs-liveness-negative ## Run all local spec checks
+
+.PHONY: specs-verify
+specs-verify: specs-typecheck ## Run Quint bounded model checker (requires Java)
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/cursor_chain.qnt \
+		--max-steps=8 --invariants=safety
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/cursor_chain.qnt \
+		--step=progressStep --max-steps=4 --invariants=safety boundedProgress
+
+.PHONY: specs-rust
+specs-rust: ## Run Rust tests that bridge the Quint substrate contract
+	cargo test --features zstd,bundled-sqlite replay_cursor_contract
+
+.PHONY: specs-liveness
+specs-liveness: specs-typecheck ## Run TLC temporal liveness check under explicit fairness
+	PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/cursor_chain_liveness.qnt \
+		--backend=tlc --max-steps=8 --invariants=safety \
+		--temporal=fairStablePrefixProgress
+
+.PHONY: specs-liveness-negative
+specs-liveness-negative: specs-typecheck ## Run temporal property expected to fail without fairness
+	@out=$$(mktemp "$${TMPDIR:-/tmp}/turbolite-quint-badUnfairPollingProgress.XXXXXX") || exit 1; \
+	if PATH="$(JAVA_PATH_PREFIX)$$PATH" $(QUINT) verify specs/cursor_chain_liveness.qnt \
+		--backend=tlc --max-steps=8 --invariants=safety \
+		--temporal=badUnfairPollingProgress \
+		>"$$out" 2>&1; then \
+		cat "$$out"; \
+		rm -f "$$out"; \
+		echo "expected badUnfairPollingProgress to violate temporal progress"; \
+		exit 1; \
+	elif ! grep -q "Temporal properties were violated" "$$out"; then \
+		cat "$$out"; \
+		rm -f "$$out"; \
+		echo "expected badUnfairPollingProgress to fail by violating temporal progress"; \
+		exit 1; \
+	fi; \
+	rm -f "$$out"
 
 .PHONY: test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node
 test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node: ## FFI / loadable-ext tests live in turbolite-ffi now

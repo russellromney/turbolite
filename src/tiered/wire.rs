@@ -1,4 +1,4 @@
-//! Turbolite manifest wire format — phase 004 canonical CBOR envelope.
+//! Turbolite manifest wire format — canonical CBOR envelope.
 //!
 //! The bytes produced by [`encode`] are what turbolite publishes through a
 //! `ManifestStore` (the envelope's opaque payload) and what
@@ -36,13 +36,12 @@
 //!
 //! ### Legacy payload rejection
 //!
-//! Pre-phase-004 wire payloads led with a one-byte tag (`0x01` = pure
+//! Legacy wire payloads led with a one-byte tag (`0x01` = pure
 //! msgpack, `0x02` = hybrid). Both are detected before the magic check
 //! and surfaced as distinct [`PayloadVersionError`] variants so a
 //! follower hitting old bytes gets an actionable error instead of a
-//! generic decode failure. The plan accepts no silent fallback; a
-//! separate migration phase can add one if real on-disk data needs
-//! converting.
+//! generic decode failure. There is no silent fallback; a migration
+//! reader can add one if real on-disk data needs converting.
 
 use std::io;
 
@@ -58,10 +57,10 @@ const MAGIC: [u8; 4] = *b"TLM1";
 /// Current canonical-CBOR envelope version.
 const VERSION_V1: u16 = 0x0001;
 
-/// Pre-phase-004 leading-tag byte: pure msgpack manifest payload.
+/// Legacy leading-tag byte: pure msgpack manifest payload.
 const TAG_LEGACY_PURE: u8 = 0x01;
 
-/// Pre-phase-004 leading-tag byte: hybrid (manifest + walrust delta cursor) payload.
+/// Legacy leading-tag byte: hybrid (manifest + walrust delta cursor) payload.
 const TAG_LEGACY_HYBRID: u8 = 0x02;
 
 /// Error surface for canonical-envelope decode.
@@ -72,20 +71,20 @@ const TAG_LEGACY_HYBRID: u8 = 0x02;
 /// version we don't support".
 #[derive(Debug, thiserror::Error)]
 pub enum PayloadVersionError {
-    /// Pre-phase-004 hybrid payload (leading byte `0x02`). The hybrid
+    /// Legacy hybrid payload (leading byte `0x02`). The hybrid
     /// payload embedded walrust delta cursor/prefix fields beside the
-    /// page manifest. Phase 004 removed it; delta discovery lives at the
+    /// page manifest. The canonical envelope keeps delta discovery at the
     /// integration layer now.
     #[error(
-        "legacy hybrid manifest payload (leading byte 0x02); no longer supported after phase 004"
+        "legacy hybrid manifest payload (leading byte 0x02); canonical envelope required"
     )]
     HybridDeprecated,
 
-    /// Pre-phase-004 pure msgpack payload (leading byte `0x01`). Decode
-    /// it with msgpack from a pre-phase-004 build if you need the
-    /// contents; phase 004 only accepts the `TLM1` canonical envelope.
+    /// Legacy pure msgpack payload (leading byte `0x01`). Decode it with
+    /// msgpack from an older build if you need the contents; current
+    /// readers accept the `TLM1` canonical envelope.
     #[error(
-        "legacy pure-msgpack manifest payload (leading byte 0x01); no longer supported after phase 004"
+        "legacy pure-msgpack manifest payload (leading byte 0x01); canonical envelope required"
     )]
     PureMsgpackDeprecated,
 
@@ -189,11 +188,10 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, PayloadVersionError> {
 /// `ReplayCursor::base_object_checksum` after publishing a base, and
 /// what every following delta's `prev_checksum` must match.
 ///
-/// Production callers come online in phase 004 step 2 (delta stamping);
-/// for step 1 this is exercised by `checksum_returns_blake3_of_envelope`
-/// so the API surface is covered even before the chain verifier
-/// consumes it. `#[allow(dead_code)]` suppresses the no-lib-callers
-/// warning until step 2 wires the publish path through.
+/// Delta stamping uses the same helper for envelope hashes. The unit test
+/// keeps the API covered even before every chain verifier path consumes it.
+/// `#[allow(dead_code)]` suppresses the no-lib-callers warning until those
+/// callers are wired through.
 #[allow(dead_code)]
 pub fn checksum(envelope_bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(envelope_bytes).as_bytes()
@@ -203,7 +201,7 @@ pub fn checksum(envelope_bytes: &[u8]) -> [u8; 32] {
 /// into `cursor.base_object_checksum` and that the first delta after
 /// the base carries as its `prev_checksum`.
 ///
-/// Resolves the circular definition in the plan ("base_object_checksum
+/// Resolves the circular definition ("base_object_checksum
 /// = hash(this_manifest)"): the manifest contains the field, so it
 /// cannot hash itself directly. We compute the BLAKE3 of the TLM1
 /// envelope encoded with `cursor.base_object_checksum` **cleared**.
@@ -433,10 +431,10 @@ mod tests {
         }
     }
 
-    /// Round-trip preserves every load-bearing field, including the new
-    /// phase 004 ones (cursor, writer_id, discontinuity_stamp).
+    /// Round-trip preserves every load-bearing field, including cursor,
+    /// writer identity, and discontinuity stamp.
     #[test]
-    fn round_trip_preserves_phase_004_fields() {
+    fn round_trip_preserves_replay_cursor_fields() {
         let m = golden_fixture();
         let bytes = encode(&m).expect("encode");
         // Envelope sanity: magic + version + non-empty body.
@@ -493,8 +491,8 @@ mod tests {
         assert_eq!(b1, b1_again);
     }
 
-    /// BLAKE3 golden hash. The whole point of phase 004 is that this
-    /// number stays nailed down across releases. If this test fires,
+    /// BLAKE3 golden hash. This pins the canonical envelope hash across
+    /// releases. If this test fires,
     /// some serialization detail has shifted: either the canonical
     /// encoder changed (ciborium upgrade?), the field set on
     /// `CanonicalManifestV1` changed, or a sort key changed. Fix the
@@ -559,6 +557,37 @@ mod tests {
     }
 
     #[test]
+    fn replay_cursor_contract_base_anchor_binds_cursor_epoch_and_writer() {
+        let mut base = golden_fixture();
+        base.cursor.base_object_checksum = Vec::new();
+        let anchor = base_anchor_checksum(&base).expect("base anchor");
+
+        let mut different_epoch = base.clone();
+        different_epoch.cursor.epoch += 1;
+        assert_ne!(
+            anchor,
+            base_anchor_checksum(&different_epoch).expect("epoch anchor"),
+            "lease epoch must be in the base anchor hash domain"
+        );
+
+        let mut different_writer = base.clone();
+        different_writer.writer_id = "node-leader-B".into();
+        assert_ne!(
+            anchor,
+            base_anchor_checksum(&different_writer).expect("writer anchor"),
+            "writer id must be in the base anchor hash domain"
+        );
+
+        let mut different_seq = base;
+        different_seq.cursor.last_applied_seq += 1;
+        assert_ne!(
+            anchor,
+            base_anchor_checksum(&different_seq).expect("seq anchor"),
+            "last applied seq must be in the base anchor hash domain"
+        );
+    }
+
+    #[test]
     fn legacy_hybrid_returns_hybrid_deprecated() {
         let bytes = vec![TAG_LEGACY_HYBRID, 0xff, 0xff];
         let err = decode(&bytes).expect_err("must reject");
@@ -613,8 +642,8 @@ mod tests {
         }
     }
 
-    /// A pre-phase-004 manifest payload that *didn't* go through the
-    /// envelope (raw rmp_serde bytes from older builds) will fail with
+    /// A legacy manifest payload that *didn't* go through the envelope
+    /// (raw rmp_serde bytes from older builds) will fail with
     /// either PureMsgpackDeprecated (if leading byte is 0x81/etc. that
     /// happens to be 0x01 — unlikely) or MagicMismatch. Either way:
     /// not a silent fallback, not a generic CBOR decode error.
@@ -676,11 +705,9 @@ mod tests {
         );
     }
 
-    /// The `checksum()` helper is what step 2+ delta stamping will use
-    /// to compute `ReplayCursor::base_object_checksum`. Smoke-test it
-    /// here so we know the function is callable and BLAKE3 produces the
-    /// expected 32-byte output before chain-verification code depends
-    /// on it.
+    /// Delta stamping uses `checksum()` to compute chain anchors. This test
+    /// keeps the helper callable and pins the expected 32-byte BLAKE3 output
+    /// before chain-verification code depends on it.
     #[test]
     fn checksum_returns_blake3_of_envelope() {
         let bytes = encode(&golden_fixture()).expect("encode");

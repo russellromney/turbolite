@@ -75,3 +75,6 @@ packages/python/turbolite/turbolite
 
 # Proptest regression minimization files (generated during failing runs)
 *.proptest-regressions
+
+# Quint / Apalache model-checker output
+_apalache-out/

@@ -13,19 +13,19 @@ pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
     /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
     pub version: u64,
-    /// Pre-phase-004 replay floor (the SQLite change-counter-based cutoff).
+    /// Legacy replay floor (the SQLite change-counter-based cutoff).
     ///
     /// Checkpoint/import paths initialize this from SQLite's file change counter
     /// (page 0, offset 24). Direct page replay may advance it to the latest
     /// committed changeset sequence even when the SQLite header counter is lower.
     ///
-    /// **Phase 004 supersedes this field as the replay floor.** Followers
+    /// **Replay cursor supersedes this field as the replay floor.** Followers
     /// must use `cursor.last_applied_seq` (see [`ReplayCursor`]) — the
     /// SQLite header change counter is explicitly not load-bearing for
-    /// phase-004 replay. `change_counter` is kept here for the step 1→4
-    /// transition so existing flush / handle paths continue to set it
-    /// alongside `cursor`; the field will be removed once every consumer
-    /// reads from the cursor instead.
+    /// cursor-chain replay. `change_counter` is kept for compatibility while
+    /// existing flush / handle paths continue to set it alongside `cursor`;
+    /// the field will be removed once every consumer reads from the cursor
+    /// instead.
     ///
     /// Default 0 for backward compat (delta replay starts from the beginning).
     #[serde(default)]
@@ -106,7 +106,7 @@ pub struct Manifest {
     /// without fetching from S3 or reopening the connection.
     /// None for manifests created before this field was added.
     ///
-    /// Phase Strata note: this field intentionally has no `skip_serializing_if`.
+    /// Serialization note: this field intentionally has no `skip_serializing_if`.
     /// Under rmp_serde's positional encoding, a conditionally-skipped field in
     /// the middle of the struct shifts every subsequent field's array index,
     /// which breaks deserialization whenever a new field is added after it.
@@ -121,17 +121,17 @@ pub struct Manifest {
     /// `discontinuity_stamp` differs from their cached manifest's stamp
     /// treat their local cache as stale and cold-start from the remote.
     ///
-    /// Renamed from `epoch` in phase 004 to disambiguate from
-    /// `ReplayCursor.epoch` (the lease-holder epoch).
+    /// Renamed from `epoch` to disambiguate from `ReplayCursor.epoch` (the
+    /// lease-holder epoch).
     ///
-    /// Placed before the cursor/writer_id additions so pre-phase-004
-    /// manifest bytes still decode this slot cleanly (missing trailing
-    /// elements → serde default fills `discontinuity_stamp = 0`).
+    /// Placed before the cursor/writer_id additions so legacy manifest bytes
+    /// still decode this slot cleanly (missing trailing elements → serde
+    /// default fills `discontinuity_stamp = 0`).
     #[serde(default, alias = "epoch")]
     pub discontinuity_stamp: u64,
 
     /// Durable replay cursor — the authoritative replay floor for
-    /// followers in phase 004 substrate replay.
+    /// cursor-chain substrate replay.
     ///
     /// `cursor.last_applied_seq` is the seq up to which deltas have been
     /// folded into this base. Followers replay delta objects with
@@ -155,13 +155,13 @@ pub struct Manifest {
     /// Identifier of the lease holder that published this base manifest.
     /// Followers filter delta candidates against this writer_id; deltas
     /// stamped with a different writer_id are dropped before chain
-    /// verification. Empty string for pre-phase-004 / bootstrap manifests
+    /// verification. Empty string for legacy / bootstrap manifests
     /// where fencing is not yet established.
     #[serde(default)]
     pub writer_id: String,
 }
 
-/// Durable replay cursor for phase 004 substrate replay.
+/// Durable replay cursor for cursor-chain substrate replay.
 ///
 /// Followers persist this after each successful atomic apply. The cursor
 /// is the only authoritative replay floor — the SQLite header change

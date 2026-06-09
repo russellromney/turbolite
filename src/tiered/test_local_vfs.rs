@@ -279,6 +279,233 @@ fn exact_replay_cursor_can_replace_sqlite_header_counter() {
     );
 }
 
+#[test]
+fn replay_cursor_contract_manifest_bytes_stamps_cursor_writer_and_anchor() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 7;
+    base.change_counter = 99;
+    base.page_count = 4;
+    vfs.set_manifest(base);
+
+    let (bytes, anchor) = vfs
+        .manifest_bytes_with_replay_cursor_anchor(3, 11, "writer-a")
+        .expect("anchored replay cursor manifest bytes");
+    let decoded = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode replay cursor bytes");
+
+    assert_eq!(decoded.cursor.last_applied_seq, 3);
+    assert_eq!(
+        decoded.change_counter, 3,
+        "legacy replay floor must track the exact anchored cursor until every consumer is cursor-native"
+    );
+    assert_eq!(decoded.cursor.epoch, 11);
+    assert_eq!(decoded.writer_id, "writer-a");
+    assert_eq!(decoded.cursor.base_object_checksum, anchor);
+    assert_eq!(
+        super::wire::base_anchor_checksum(&decoded)
+            .expect("recompute base anchor")
+            .to_vec(),
+        anchor,
+        "publisher and follower must agree on the first-delta chain anchor"
+    );
+    assert_eq!(
+        vfs.manifest().cursor,
+        decoded.cursor,
+        "anchored replay cursor publication must update the installed manifest"
+    );
+    assert_eq!(
+        vfs.manifest().change_counter,
+        3,
+        "installed compatibility cursor must match the published anchored cursor"
+    );
+}
+
+#[test]
+fn replay_cursor_contract_begin_replay_uses_installed_cursor_floor() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 7;
+    base.page_size = 4096;
+    base.page_count = 4;
+    vfs.set_manifest(base);
+    vfs.manifest_bytes_with_replay_cursor_anchor(3, 11, "writer-a")
+        .expect("seed anchored cursor");
+
+    let mut replay = vfs.begin_replay().expect("begin replay after cursor");
+    let err = replay
+        .commit_changeset(3)
+        .expect_err("begin_replay must not accept an already-folded sequence");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    replay
+        .commit_changeset(4)
+        .expect("begin_replay should resume after the installed replay cursor");
+    replay.abort().expect("abort test replay");
+}
+
+#[test]
+fn replay_cursor_contract_manifest_bytes_rejects_invalid_cursor_inputs() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 7;
+    base.page_count = 4;
+    vfs.set_manifest(base);
+
+    let err = vfs
+        .manifest_bytes_with_replay_cursor_anchor(3, 0, "writer-a")
+        .expect_err("zero cursor publish epoch must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = vfs
+        .manifest_bytes_with_replay_cursor_anchor(3, 11, "   ")
+        .expect_err("blank cursor writer must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    vfs.manifest_bytes_with_replay_cursor_anchor(3, 11, "writer-a")
+        .expect("seed valid anchored cursor");
+
+    let err = vfs
+        .manifest_bytes_with_replay_cursor_anchor(2, 12, "writer-b")
+        .expect_err("published cursor must not move backward");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn replay_cursor_contract_update_replay_cursor_preserves_base_shape_and_writer() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 9;
+    base.page_count = 6;
+    vfs.set_manifest(base);
+    vfs.manifest_bytes_with_replay_cursor_anchor(3, 11, "writer-a")
+        .expect("seed anchored cursor");
+
+    let before = vfs.manifest();
+    let next_cursor = ReplayCursor {
+        last_applied_seq: 4,
+        base_object_checksum: vec![0xAB; 32],
+        epoch: 11,
+    };
+    vfs.update_replay_cursor(next_cursor.clone())
+        .expect("advance replay cursor");
+    let after = vfs.manifest();
+
+    assert_eq!(after.cursor, next_cursor);
+    assert_eq!(after.writer_id, "writer-a");
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.page_count, before.page_count);
+    assert_eq!(after.page_group_keys, before.page_group_keys);
+}
+
+#[test]
+fn replay_cursor_contract_update_replay_cursor_rejects_malformed_or_backward_cursor() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 9;
+    base.page_count = 6;
+    vfs.set_manifest(base);
+
+    let err = vfs
+        .update_replay_cursor(ReplayCursor {
+            last_applied_seq: 1,
+            base_object_checksum: vec![0xAB; 32],
+            epoch: 11,
+        })
+        .expect_err("advanced cursor requires installed writer id");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    vfs.manifest_bytes_with_replay_cursor_anchor(3, 11, "writer-a")
+        .expect("seed anchored cursor");
+
+    let err = vfs
+        .update_replay_cursor(ReplayCursor {
+            last_applied_seq: 4,
+            base_object_checksum: vec![0xAB; 31],
+            epoch: 11,
+        })
+        .expect_err("advanced cursor requires a 32-byte anchor");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = vfs
+        .update_replay_cursor(ReplayCursor {
+            last_applied_seq: 2,
+            base_object_checksum: vec![0xAB; 32],
+            epoch: 11,
+        })
+        .expect_err("follower cursor must not move backward");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn replay_cursor_contract_publish_replayed_base_stamps_final_cursor_anchor() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    let mut base = Manifest::empty();
+    base.version = 13;
+    base.page_count = 8;
+    base.page_group_keys = vec!["base-group-0".to_string(), "base-group-1".to_string()];
+    vfs.set_manifest(base);
+
+    vfs.manifest_bytes_with_replay_cursor_anchor(4, 10, "writer-a")
+        .expect("seed working replay cursor");
+
+    let before_publish = vfs.manifest();
+    let (bytes, anchor) = vfs
+        .publish_replayed_base_with_replay_cursor_anchor(5, 12, "writer-b")
+        .expect("anchored replayed base");
+    let decoded = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode promoted base");
+
+    assert_eq!(decoded.cursor.last_applied_seq, 5);
+    assert_eq!(decoded.cursor.epoch, 12);
+    assert_eq!(decoded.writer_id, "writer-b");
+    assert_eq!(decoded.cursor.base_object_checksum, anchor);
+    assert_eq!(
+        super::wire::base_anchor_checksum(&decoded)
+            .expect("recompute promoted base anchor")
+            .to_vec(),
+        anchor,
+        "promotion must anchor the final published base, not the stale working cursor"
+    );
+    assert_eq!(decoded.version, before_publish.version);
+    assert_eq!(decoded.page_count, before_publish.page_count);
+    assert_eq!(decoded.page_group_keys, before_publish.page_group_keys);
+    assert_eq!(vfs.manifest().cursor, decoded.cursor);
+}
+
 /// Local VFS with compression enabled: write + checkpoint + reopen.
 #[test]
 #[cfg(feature = "zstd")]
