@@ -815,6 +815,79 @@ mod tests {
     }
 
     #[test]
+    fn replay_cursor_contract_recovery_plan_applies_contiguous_prefix_and_page_counts() {
+        let checkpoint = checkpoint_fixture();
+        let delta1 = delta_fixture();
+
+        let mut delta2 = delta_fixture();
+        delta2.sequence = 2;
+        delta2.base_database_version = delta1.end_database_version;
+        delta2.end_database_version = 3;
+        delta2.base_database_page_count = delta1.end_database_page_count;
+        delta2.end_database_page_count = 4;
+        delta2.changed_pages[0].page_number = 3;
+        delta2.replay_idempotency_key = "replay-0002".to_string();
+        delta2.checksum = delta2.fixture_checksum();
+
+        let mut delta3 = delta_fixture();
+        delta3.sequence = 3;
+        delta3.base_database_version = delta2.end_database_version;
+        delta3.end_database_version = 4;
+        delta3.base_database_page_count = delta2.end_database_page_count;
+        delta3.end_database_page_count = 2;
+        delta3.changed_pages[0].page_number = 1;
+        delta3.changed_pages[1].page_number = 0;
+        delta3.replay_idempotency_key = "replay-0003".to_string();
+        delta3.checksum = delta3.fixture_checksum();
+
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 3;
+        root.latest_database_version = 4;
+
+        let plan = select_recovery_plan(
+            &root,
+            &[checkpoint.clone()],
+            &[delta1.clone(), delta2.clone(), delta3.clone()],
+            128,
+        )
+        .expect("contiguous three-delta prefix should plan");
+
+        assert_eq!(plan.checkpoint.checkpoint_delta_sequence, 0);
+        assert_eq!(
+            plan.checkpoint.database_page_count,
+            checkpoint.database_page_count
+        );
+        assert_eq!(
+            plan.deltas
+                .iter()
+                .map(|delta| (
+                    delta.sequence,
+                    delta.base_database_page_count,
+                    delta.end_database_page_count,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 2, 3), (2, 3, 4), (3, 4, 2)]
+        );
+    }
+
+    #[test]
+    fn replay_cursor_contract_recovery_plan_rejects_stale_epoch_candidate() {
+        let mut root = root_fixture();
+        root.latest_delta_sequence = 1;
+        root.latest_database_version = 2;
+
+        let checkpoint = checkpoint_fixture();
+        let mut stale = delta_fixture();
+        stale.lease_epoch -= 1;
+        stale.checksum = stale.fixture_checksum();
+
+        let err = select_recovery_plan(&root, &[checkpoint], &[stale], 128)
+            .expect_err("stale epoch candidate must not satisfy the root fence");
+
+        assert_eq!(err, ContractError::MissingDelta(1));
+    }
+
+    #[test]
     fn root_update_rejects_rollback() {
         let previous = root_fixture();
         let mut next = previous.clone();

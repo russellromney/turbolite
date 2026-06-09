@@ -168,7 +168,7 @@ fn run_crash_incremental(mode: TestMode) {
         &endpoint,
         mode,
         100,
-        &format!("[{}] phase4", mode.name()),
+        &format!("[{}] replay cursor", mode.name()),
     );
 }
 

@@ -1048,11 +1048,15 @@ mod tests {
 
         assert_eq!(vfs.manifest().change_counter, seq);
 
-        let bytes = vfs
-            .publish_replayed_base()
-            .expect("publish replayed base after cursor promotion");
+        let (bytes, anchor) = vfs
+            .publish_replayed_base_with_replay_cursor_anchor(seq, 1, "cursor-writer")
+            .expect("publish anchored replayed base after cursor promotion");
         let published = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
         assert_eq!(published.change_counter, seq);
+        assert_eq!(published.cursor.last_applied_seq, seq);
+        assert_eq!(published.cursor.epoch, 1);
+        assert_eq!(published.writer_id, "cursor-writer");
+        assert_eq!(published.cursor.base_object_checksum, anchor);
     }
 
     /// Two replay cycles back-to-back without an intervening publish
@@ -2562,6 +2566,7 @@ mod tests {
 
     /// `publish_replayed_base` returns pure page/base manifest bytes.
     #[test]
+    #[allow(deprecated)]
     fn publish_replayed_base_round_trips_pure_manifest_when_no_pending_state() {
         let tmp = TempDir::new().unwrap();
         let (vfs, _page_size) = fresh_vfs_with_pages(&tmp, 4);
@@ -2576,25 +2581,27 @@ mod tests {
         );
     }
 
-    /// `publish_replayed_base` after a successful replay returns a
-    /// manifest whose page_group_keys reflect the flushed groups.
+    /// Anchored replay cursor publish after a successful replay returns a manifest
+    /// whose page_group_keys reflect the flushed groups and whose cursor
+    /// anchors the final post-replay base.
     /// The check that the keys differ from the pre-replay manifest
     /// for every replayed group is encoded by the flush primitive,
     /// not by this test directly; here we assert the simpler shape
     /// invariant: the published manifest version >= the post-finalize
     /// manifest version, and page_count covers the replayed pages.
     #[test]
-    fn publish_replayed_base_after_replay_carries_post_replay_state() {
+    fn replay_cursor_contract_publish_replayed_base_after_replay_carries_post_replay_state() {
         let tmp = TempDir::new().unwrap();
         let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
         let cache = vfs_cache(&vfs);
         let pre_replay = vec![0xAAu8; page_size as usize];
         cache.write_page(0, &pre_replay).unwrap();
+        let replay_seq = vfs.manifest().change_counter + 1;
 
         let new_bytes = vec![0xBBu8; page_size as usize];
-        let mut handle = vfs.begin_replay_after(6).unwrap();
+        let mut handle = vfs.begin_replay_after(replay_seq - 1).unwrap();
         handle.apply_page(1, &new_bytes).unwrap();
-        handle.commit_changeset(7).unwrap();
+        handle.commit_changeset(replay_seq).unwrap();
         handle.finalize().unwrap();
 
         let post_finalize_version = vfs.manifest().version;
@@ -2602,14 +2609,29 @@ mod tests {
         // The local-mode VFS keeps no remote storage, so flush is a
         // no-op upload-wise but still bumps the manifest. Tests for
         // remote-mode flush behaviour live in flush.rs's own suite.
-        let bytes = vfs
-            .publish_replayed_base()
-            .expect("publish_replayed_base after replay");
+        let (bytes, anchor) = vfs
+            .publish_replayed_base_with_replay_cursor_anchor(replay_seq, 12, "writer-after-replay")
+            .expect("anchored publish_replayed_base after replay");
         let m = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
         assert!(
             m.version >= post_finalize_version,
             "published manifest version must be >= post-finalize version (post={post_finalize_version}, published={})",
             m.version
+        );
+        assert!(
+            m.change_counter >= replay_seq,
+            "legacy change_counter must not move behind the replay sequence"
+        );
+        assert_eq!(m.cursor.last_applied_seq, replay_seq);
+        assert_eq!(m.cursor.epoch, 12);
+        assert_eq!(m.writer_id, "writer-after-replay");
+        assert_eq!(m.cursor.base_object_checksum, anchor);
+        assert_eq!(
+            crate::tiered::wire::base_anchor_checksum(&m)
+                .expect("recompute post-replay anchor")
+                .to_vec(),
+            anchor,
+            "anchored publish must bind the manifest after replay finalize and flush"
         );
     }
 }

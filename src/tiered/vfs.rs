@@ -85,6 +85,78 @@ pub struct TurboliteVfs {
     wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
 }
 
+fn invalid_replay_cursor_anchor(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_replay_cursor_anchor(field: &str, anchor: &[u8]) -> io::Result<()> {
+    if !anchor.is_empty() && anchor.len() != 32 {
+        return Err(invalid_replay_cursor_anchor(format!(
+            "{field} must be empty for bootstrap or exactly 32 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_replay_cursor_update(
+    manifest: &Manifest,
+    cursor: &super::manifest::ReplayCursor,
+) -> io::Result<()> {
+    if cursor.last_applied_seq < manifest.cursor.last_applied_seq {
+        return Err(invalid_replay_cursor_anchor(format!(
+            "replay cursor cannot move backward from {} to {}",
+            manifest.cursor.last_applied_seq, cursor.last_applied_seq
+        )));
+    }
+    validate_replay_cursor_anchor(
+        "replay cursor base_object_checksum",
+        &cursor.base_object_checksum,
+    )?;
+    if cursor.last_applied_seq > 0 {
+        if cursor.base_object_checksum.len() != 32 {
+            return Err(invalid_replay_cursor_anchor(
+                "advanced replay cursor requires a 32-byte base_object_checksum",
+            ));
+        }
+        if cursor.epoch == 0 {
+            return Err(invalid_replay_cursor_anchor(
+                "advanced replay cursor requires nonzero lease epoch",
+            ));
+        }
+        if manifest.writer_id.trim().is_empty() {
+            return Err(invalid_replay_cursor_anchor(
+                "advanced replay cursor requires an installed writer_id",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_replay_cursor_publish(
+    manifest: &Manifest,
+    last_applied_seq: u64,
+    epoch: u64,
+    writer_id: &str,
+) -> io::Result<()> {
+    if last_applied_seq < manifest.cursor.last_applied_seq {
+        return Err(invalid_replay_cursor_anchor(format!(
+            "published replay cursor cannot move backward from {} to {}",
+            manifest.cursor.last_applied_seq, last_applied_seq
+        )));
+    }
+    if epoch == 0 {
+        return Err(invalid_replay_cursor_anchor(
+            "anchored replay cursor publish requires nonzero lease epoch",
+        ));
+    }
+    if writer_id.trim().is_empty() {
+        return Err(invalid_replay_cursor_anchor(
+            "anchored replay cursor publish requires nonempty writer_id",
+        ));
+    }
+    Ok(())
+}
+
 impl TurboliteVfs {
     /// Local mode. Wraps `hadb_storage_local::LocalStorage` rooted at
     /// `config.cache_dir` and spins up a dedicated 2-thread tokio runtime.
@@ -945,13 +1017,12 @@ impl TurboliteVfs {
         super::wire::encode(&m).map_err(io::Error::from)
     }
 
-    /// Phase 004: persist the follower's advancing **working** replay
-    /// cursor.
+    /// Persist the follower's advancing working replay cursor.
     ///
     /// After a follower applies a verified prefix of delta envelopes, it
     /// records its new replay position here: `last_applied_seq` and the
     /// `base_object_checksum` anchor advance to the last applied delta's
-    /// envelope checksum (see `phase4_chain::FollowerCursor`). This is
+    /// envelope checksum. This is
     /// stored in the local manifest's `cursor` field so the next poll —
     /// and a process restart — resume from the right anchor instead of
     /// re-applying from the base.
@@ -961,37 +1032,25 @@ impl TurboliteVfs {
     /// the local cache, not new groups) is left intact.
     pub fn update_replay_cursor(&self, cursor: super::manifest::ReplayCursor) -> io::Result<()> {
         let mut m = self.manifest();
+        validate_replay_cursor_update(&m, &cursor)?;
         m.cursor = cursor;
         manifest::persist_manifest_local(&self.cache.cache_dir, &m)?;
         self.shared_manifest.store(Arc::new(m));
         Ok(())
     }
 
-    /// Phase 004 base publish: stamp the manifest with a populated
-    /// replay cursor and writer identity, then encode it.
-    ///
-    /// Sets `cursor.last_applied_seq`, `cursor.epoch`, and `writer_id`,
-    /// computes the chain anchor via [`super::wire::base_anchor_checksum`]
-    /// (BLAKE3 of the manifest with the anchor field cleared), writes
-    /// that anchor into `cursor.base_object_checksum`, persists locally,
-    /// installs the shared manifest, and returns `(payload, anchor)`.
-    ///
-    /// The caller publishes `payload` through the ManifestStore and uses
-    /// `anchor` as the `prev_checksum` of the first delta after this
-    /// base. A follower decoding the payload reads the same anchor from
-    /// `cursor.base_object_checksum` and verifies the first delta
-    /// chains to it. This is the writer half of the phase-004 contract;
-    /// `update_replay_cursor` is the follower half.
-    pub fn manifest_bytes_with_phase4_cursor(
+    fn manifest_bytes_with_installed_replay_cursor_anchor(
         &self,
         last_applied_seq: u64,
         epoch: u64,
         writer_id: &str,
     ) -> io::Result<(Vec<u8>, Vec<u8>)> {
         let mut m = self.manifest();
+        validate_replay_cursor_publish(&m, last_applied_seq, epoch, writer_id)?;
         m.cursor.last_applied_seq = last_applied_seq;
         m.cursor.epoch = epoch;
         m.writer_id = writer_id.to_string();
+        m.change_counter = last_applied_seq;
         // Anchor is hashed with the field cleared (base_anchor_checksum
         // does the clearing); then we store it back so the follower
         // reads it directly.
@@ -1001,6 +1060,32 @@ impl TurboliteVfs {
         self.shared_manifest.store(Arc::new(m.clone()));
         let payload = super::wire::encode(&m).map_err(io::Error::from)?;
         Ok((payload, anchor.to_vec()))
+    }
+
+    /// Anchored replay cursor base publish: stamp the manifest with a populated
+    /// replay cursor and writer identity, then encode it.
+    ///
+    /// Sets `cursor.last_applied_seq`, `cursor.epoch`, and `writer_id`,
+    /// sets the legacy `change_counter` compatibility field to the same
+    /// exact replay floor,
+    /// computes the chain anchor via [`super::wire::base_anchor_checksum`]
+    /// (BLAKE3 of the manifest with the anchor field cleared), writes
+    /// that anchor into `cursor.base_object_checksum`, persists locally,
+    /// installs the shared manifest, and returns `(payload, anchor)`.
+    ///
+    /// The caller publishes `payload` through the ManifestStore and uses
+    /// `anchor` as the `prev_checksum` of the first delta after this
+    /// base. A follower decoding the payload reads the same anchor from
+    /// `cursor.base_object_checksum` and verifies the first delta
+    /// chains to it. This is the writer half of the replay cursor contract;
+    /// `update_replay_cursor` is the follower half.
+    pub fn manifest_bytes_with_replay_cursor_anchor(
+        &self,
+        last_applied_seq: u64,
+        epoch: u64,
+        writer_id: &str,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        self.manifest_bytes_with_installed_replay_cursor_anchor(last_applied_seq, epoch, writer_id)
     }
 
     /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
@@ -1293,7 +1378,13 @@ impl TurboliteVfs {
     ///
     /// See `crate::tiered::replay` for the full lifecycle contract.
     pub fn begin_replay(&self) -> io::Result<crate::tiered::replay::ReplayHandle> {
-        self.begin_replay_after(self.manifest().change_counter)
+        let manifest = self.manifest();
+        self.begin_replay_after(
+            manifest
+                .cursor
+                .last_applied_seq
+                .max(manifest.change_counter),
+        )
     }
 
     /// Begin a direct page replay cycle after a known durable replay cursor.
@@ -1350,6 +1441,11 @@ impl TurboliteVfs {
     /// manifest key. If no replay state is pending, the call still
     /// returns the current pure manifest payload — that covers the
     /// "follower already caught up before promotion" case.
+    ///
+    /// Anchored replay cursor promotion callers should use
+    /// [`Self::publish_replayed_base_with_replay_cursor_anchor`] so the published
+    /// base carries the authoritative replay cursor and chain anchor.
+    #[deprecated(note = "anchored replay cursor promotion must use publish_replayed_base_with_replay_cursor_anchor")]
     pub fn publish_replayed_base(&self) -> io::Result<Vec<u8>> {
         // Drive a flush over any pending replay state. flush_to_storage
         // drains pending_flushes + shared_dirty_groups together and
@@ -1363,6 +1459,24 @@ impl TurboliteVfs {
         // discoverable from the integration layer's configured delta
         // storage, not encoded into the page/base manifest.
         self.manifest_bytes()
+    }
+
+    /// Promote accumulated replayed state to an anchored replay cursor remote
+    /// manifest payload.
+    ///
+    /// This is the composed promotion path: first drain pending replay state
+    /// into the base manifest, then stamp the final manifest with the replay
+    /// cursor, lease epoch, writer id, and freshly-computed base chain anchor.
+    /// The returned anchor is the `prev_checksum` expected on the first delta
+    /// after this promoted base.
+    pub fn publish_replayed_base_with_replay_cursor_anchor(
+        &self,
+        last_applied_seq: u64,
+        epoch: u64,
+        writer_id: &str,
+    ) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        self.flush_to_storage()?;
+        self.manifest_bytes_with_installed_replay_cursor_anchor(last_applied_seq, epoch, writer_id)
     }
 
     /// Handle setup for the sqlite-plugin `Vfs::open`. `is_main_db` picks the
