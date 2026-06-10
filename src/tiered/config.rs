@@ -3,8 +3,7 @@ use super::*;
 // ===== Manifest source =====
 
 /// Where to load the manifest on connection open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ManifestSource {
     /// Use local manifest if present, fall back to remote. Correct for single-writer.
     /// Checkpoints keep the local cache fresh; no remote fetch on warm reconnect.
@@ -17,12 +16,10 @@ pub enum ManifestSource {
     S3,
 }
 
-
 // ===== Checkpoint mode =====
 
 /// How checkpoints interact with the configured storage backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CheckpointMode {
     /// A SQLite checkpoint uploads dirty page groups to the backend before
     /// returning. This is the default durability mode.
@@ -33,7 +30,6 @@ pub enum CheckpointMode {
     /// checkpointed image to the backend later.
     LocalThenFlush,
 }
-
 
 // ===== Legacy sync mode =====
 
@@ -46,8 +42,7 @@ pub enum CheckpointMode {
     since = "0.2.0",
     note = "use TurboliteConfig.cache.checkpoint_mode instead"
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 // S3Primary is the deprecated default; the derived Default references it on
 // purpose for back-compat with existing serialized configs.
 #[allow(deprecated)]
@@ -61,8 +56,7 @@ pub enum SyncMode {
 
 /// Grouping strategy marker. Only BTreeAware is supported.
 /// Kept as an enum for serde backward compatibility with existing manifests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GroupingStrategy {
     /// Legacy positional mapping. No longer used for new databases.
     /// Existing Positional manifests are read-only compatible.
@@ -71,7 +65,6 @@ pub enum GroupingStrategy {
     #[default]
     BTreeAware,
 }
-
 
 // ===== Group state for prefetch coordination =====
 
@@ -150,6 +143,19 @@ pub struct PrefetchConfig {
     pub lookup: Vec<f32>,
     /// Number of prefetch worker threads.
     pub threads: u32,
+    /// Optional prefetch queue capacity. This is intentionally independent
+    /// from worker count and cloud I/O permits.
+    pub queue_capacity: u32,
+    /// Total remote I/O requests Turbolite may run concurrently. Defaults to
+    /// worker count + 1 so prefetch can saturate all workers while one permit
+    /// stays reserved for foreground range gets and orchestration.
+    pub io_permits: u32,
+    /// Remote I/O permits reserved for foreground demand reads.
+    pub foreground_reserved_permits: u32,
+    /// Maximum groups each planned SCAN may keep queued/in-flight.
+    pub scan_window_groups: u32,
+    /// Maximum uncompressed bytes each planned SCAN may keep queued/in-flight.
+    pub scan_window_bytes: u64,
     /// Enable query-plan-aware prefetch.
     pub query_plan: bool,
     /// Enable predictive cross-tree prefetch.
@@ -261,13 +267,15 @@ impl CompressionConfig {
 
 impl Default for PrefetchConfig {
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(2);
         Self {
             search: vec![0.3, 0.3, 0.4],
             lookup: vec![0.0, 0.0, 0.0],
-            threads: cpus + 1,
+            threads: Self::default_threads(),
+            queue_capacity: 8,
+            io_permits: Self::default_threads() + 1,
+            foreground_reserved_permits: 1,
+            scan_window_groups: 4,
+            scan_window_bytes: 32 * 1024 * 1024,
             query_plan: true,
             prediction: false,
             manifest_source: ManifestSource::Auto,
@@ -276,6 +284,13 @@ impl Default for PrefetchConfig {
 }
 
 impl PrefetchConfig {
+    /// Default download pool size: leave one core for SQLite/foreground work.
+    pub fn default_threads() -> u32 {
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1) as u32)
+            .unwrap_or(1)
+    }
+
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -291,6 +306,26 @@ impl PrefetchConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.threads),
+            queue_capacity: std::env::var("TURBOLITE_PREFETCH_QUEUE_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.queue_capacity),
+            io_permits: std::env::var("TURBOLITE_CLOUD_IO_PERMITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.io_permits),
+            foreground_reserved_permits: std::env::var("TURBOLITE_FOREGROUND_IO_RESERVED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.foreground_reserved_permits),
+            scan_window_groups: std::env::var("TURBOLITE_SCAN_WINDOW_GROUPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.scan_window_groups),
+            scan_window_bytes: std::env::var("TURBOLITE_SCAN_WINDOW_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.scan_window_bytes),
             query_plan: std::env::var("TURBOLITE_PLAN_AWARE")
                 .map(|v| !matches!(v.as_str(), "false" | "0"))
                 .unwrap_or(d.query_plan),

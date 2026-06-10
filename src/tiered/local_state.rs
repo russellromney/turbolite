@@ -79,11 +79,8 @@ pub(crate) fn persist(cache_dir: &Path, state: &LocalState) -> io::Result<()> {
     ));
     let mut state = state.clone().normalized();
     state.format_version = 1;
-    let data = rmp_serde::to_vec(&state).map_err(|e| {
-        io::Error::other(
-            format!("serialize local_state.msgpack: {e}"),
-        )
-    })?;
+    let data = rmp_serde::to_vec(&state)
+        .map_err(|e| io::Error::other(format!("serialize local_state.msgpack: {e}")))?;
     {
         let mut file = FsOpenOptions::new()
             .create(true)

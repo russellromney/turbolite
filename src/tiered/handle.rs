@@ -8,6 +8,13 @@ use super::storage as storage_helpers;
 
 // ===== TurboliteHandle =====
 
+#[derive(Debug, Clone)]
+struct ActiveScanPrefetch {
+    group_ids: Vec<u64>,
+    cursor: usize,
+    submitted: HashSet<u64>,
+}
+
 /// Database handle for tiered turbolite storage.
 ///
 /// MainDb files are backed by a pluggable `StorageBackend` with a local
@@ -96,6 +103,10 @@ pub struct TurboliteHandle {
     // Query-plan-aware prefetch
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
+    scan_window_groups: u32,
+    scan_window_bytes: u64,
+    active_scan_prefetch: HashMap<String, ActiveScanPrefetch>,
+    last_scan_refill_gid: Option<u64>,
 
     // VACUUM detection
     /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
@@ -395,6 +406,8 @@ impl TurboliteHandle {
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
         query_plan_prefetch: bool,
+        scan_window_groups: u32,
+        scan_window_bytes: u64,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
         override_threshold: u32,
@@ -434,116 +447,109 @@ impl TurboliteHandle {
             // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
             if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
                 if let Some(key) = manifest.page_group_keys.first() {
-                    if !key.is_empty()
-                        && cache.try_claim_group(0) {
-                            // Capture replay epoch BEFORE the fetch so a
-                            // finalize racing between this point and the
-                            // cache write is detected.
-                            let captured_epoch =
-                                replay_epoch.load(std::sync::atomic::Ordering::Acquire);
-                            if let Ok(Some(pg_data)) = storage_helpers::get_page_group(
-                                storage_ref.as_ref(),
-                                runtime_ref,
-                                key,
-                            ) {
-                                // Pre-fetch the override bytes outside the
-                                // read-gate critical section so the section
-                                // only contains the actual cache writes —
-                                // I/O remains parallel with concurrent
-                                // readers.
-                                let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> = Vec::new();
-                                let gp0 = manifest.group_page_nums(0).into_owned();
-                                if let Some(overrides) = manifest.subframe_overrides.first() {
-                                    if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
-                                        let spf = manifest.sub_pages_per_frame as usize;
-                                        for (&frame_idx, ovr) in overrides {
-                                            if let Ok(Some(ovr_data)) =
-                                                storage_helpers::get_page_group(
-                                                    storage_ref.as_ref(),
-                                                    runtime_ref,
-                                                    &ovr.key,
-                                                )
-                                            {
-                                                if let Ok(decompressed) = decode_seekable_subchunk(
-                                                    &ovr_data,
-                                                    #[cfg(feature = "zstd")]
-                                                    dictionary
-                                                        .map(|d| {
-                                                            zstd::dict::DecoderDictionary::copy(d)
-                                                        })
-                                                        .as_ref(),
-                                                    &keys::aad_override_frame(0, frame_idx),
-                                                    encryption_key.as_ref(),
-                                                ) {
-                                                    let frame_start = frame_idx * spf;
-                                                    let frame_end =
-                                                        std::cmp::min(frame_start + spf, gp0.len());
-                                                    if frame_end > frame_start {
-                                                        let frame_page_nums =
-                                                            gp0[frame_start..frame_end].to_vec();
-                                                        let data_len = frame_page_nums.len()
-                                                            * manifest.page_size as usize;
-                                                        if data_len <= decompressed.len() {
-                                                            override_writes.push((
-                                                                frame_page_nums,
-                                                                decompressed[..data_len].to_vec(),
-                                                                frame_start as u32,
-                                                            ));
-                                                        }
+                    if !key.is_empty() && cache.try_claim_group(0) {
+                        // Capture replay epoch BEFORE the fetch so a
+                        // finalize racing between this point and the
+                        // cache write is detected.
+                        let captured_epoch =
+                            replay_epoch.load(std::sync::atomic::Ordering::Acquire);
+                        if let Ok(Some(pg_data)) =
+                            storage_helpers::get_page_group(storage_ref.as_ref(), runtime_ref, key)
+                        {
+                            // Pre-fetch the override bytes outside the
+                            // read-gate critical section so the section
+                            // only contains the actual cache writes —
+                            // I/O remains parallel with concurrent
+                            // readers.
+                            let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> = Vec::new();
+                            let gp0 = manifest.group_page_nums(0).into_owned();
+                            if let Some(overrides) = manifest.subframe_overrides.first() {
+                                if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
+                                    let spf = manifest.sub_pages_per_frame as usize;
+                                    for (&frame_idx, ovr) in overrides {
+                                        if let Ok(Some(ovr_data)) = storage_helpers::get_page_group(
+                                            storage_ref.as_ref(),
+                                            runtime_ref,
+                                            &ovr.key,
+                                        ) {
+                                            if let Ok(decompressed) = decode_seekable_subchunk(
+                                                &ovr_data,
+                                                #[cfg(feature = "zstd")]
+                                                dictionary
+                                                    .map(zstd::dict::DecoderDictionary::copy)
+                                                    .as_ref(),
+                                                &keys::aad_override_frame(0, frame_idx),
+                                                encryption_key.as_ref(),
+                                            ) {
+                                                let frame_start = frame_idx * spf;
+                                                let frame_end =
+                                                    std::cmp::min(frame_start + spf, gp0.len());
+                                                if frame_end > frame_start {
+                                                    let frame_page_nums =
+                                                        gp0[frame_start..frame_end].to_vec();
+                                                    let data_len = frame_page_nums.len()
+                                                        * manifest.page_size as usize;
+                                                    if data_len <= decompressed.len() {
+                                                        override_writes.push((
+                                                            frame_page_nums,
+                                                            decompressed[..data_len].to_vec(),
+                                                            frame_start as u32,
+                                                        ));
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-
-                                let ft = manifest.frame_tables.first().cloned().unwrap_or_default();
-                                let page_size = manifest.page_size;
-                                let page_count_local = manifest.page_count;
-                                #[cfg(feature = "zstd")]
-                                let dict_for_install = dictionary;
-
-                                Self::install_pages_under_replay_gate(
-                                    &cache,
-                                    0,
-                                    &replay_gate,
-                                    &replay_epoch,
-                                    captured_epoch,
-                                    || {
-                                        let _ = Self::decode_and_cache_group_static(
-                                            &cache,
-                                            &pg_data,
-                                            &gp0,
-                                            0,
-                                            page_size,
-                                            page_count_local,
-                                            if ft.is_empty() {
-                                                None
-                                            } else {
-                                                Some(ft.as_slice())
-                                            },
-                                            #[cfg(feature = "zstd")]
-                                            dict_for_install,
-                                            encryption_key.as_ref(),
-                                        );
-                                        for (page_nums, bytes, frame_start) in &override_writes {
-                                            let _ = cache.write_pages_scattered(
-                                                page_nums,
-                                                bytes,
-                                                0,
-                                                *frame_start,
-                                            );
-                                        }
-                                        cache.mark_group_present(0);
-                                        cache.touch_group(0);
-                                    },
-                                );
-                            } else {
-                                // Fetch failed or returned None. Release
-                                // the claim so a future open can retry.
-                                cache.unclaim_if_fetching(0);
                             }
+
+                            let ft = manifest.frame_tables.first().cloned().unwrap_or_default();
+                            let page_size = manifest.page_size;
+                            let page_count_local = manifest.page_count;
+                            #[cfg(feature = "zstd")]
+                            let dict_for_install = dictionary;
+
+                            Self::install_pages_under_replay_gate(
+                                &cache,
+                                0,
+                                &replay_gate,
+                                &replay_epoch,
+                                captured_epoch,
+                                || {
+                                    let _ = Self::decode_and_cache_group_static(
+                                        &cache,
+                                        &pg_data,
+                                        &gp0,
+                                        0,
+                                        page_size,
+                                        page_count_local,
+                                        if ft.is_empty() {
+                                            None
+                                        } else {
+                                            Some(ft.as_slice())
+                                        },
+                                        #[cfg(feature = "zstd")]
+                                        dict_for_install,
+                                        encryption_key.as_ref(),
+                                    );
+                                    for (page_nums, bytes, frame_start) in &override_writes {
+                                        let _ = cache.write_pages_scattered(
+                                            page_nums,
+                                            bytes,
+                                            0,
+                                            *frame_start,
+                                        );
+                                    }
+                                    cache.mark_group_present(0);
+                                    cache.touch_group(0);
+                                },
+                            );
+                        } else {
+                            // Fetch failed or returned None. Release
+                            // the claim so a future open can retry.
+                            cache.unclaim_if_fetching(0);
                         }
+                    }
                 }
             }
         } // end non-local eager fetch block (group 0 only)
@@ -611,6 +617,10 @@ impl TurboliteHandle {
             #[cfg(feature = "zstd")]
             dictionary_bytes: dictionary.map(|d| d.to_vec()),
             query_plan_prefetch,
+            scan_window_groups,
+            scan_window_bytes,
+            active_scan_prefetch: HashMap::new(),
+            last_scan_refill_gid: None,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
@@ -675,6 +685,10 @@ impl TurboliteHandle {
             #[cfg(feature = "zstd")]
             dictionary_bytes: None,
             query_plan_prefetch: false,
+            scan_window_groups: 4,
+            scan_window_bytes: 32 * 1024 * 1024,
+            active_scan_prefetch: HashMap::new(),
+            last_scan_refill_gid: None,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
             cache_limit: None,
@@ -726,6 +740,123 @@ impl TurboliteHandle {
         if let Some(name) = tree_name {
             self.tree_miss_counts.remove(name);
         }
+    }
+
+    fn try_submit_optional_prefetch(
+        pool: &PrefetchPool,
+        cache: &DiskCache,
+        manifest: &Manifest,
+        tree_name: Option<String>,
+        gid: u64,
+    ) -> PrefetchSubmitOutcome {
+        let Some(key) = manifest.page_group_keys.get(gid as usize) else {
+            return PrefetchSubmitOutcome::SkippedState;
+        };
+        if key.is_empty() {
+            return PrefetchSubmitOutcome::SkippedState;
+        }
+        let ft = manifest
+            .frame_tables
+            .get(gid as usize)
+            .cloned()
+            .unwrap_or_default();
+        let gp = manifest.group_page_nums(gid).into_owned();
+        let ovrs = manifest
+            .subframe_overrides
+            .get(gid as usize)
+            .cloned()
+            .unwrap_or_default();
+        pool.submit_optional(
+            tree_name,
+            gid,
+            key.clone(),
+            ft,
+            manifest.page_size,
+            manifest.sub_pages_per_frame,
+            gp,
+            ovrs,
+            manifest.version,
+            cache,
+        )
+    }
+
+    fn refill_active_scan_prefetch(
+        &mut self,
+        manifest: &Manifest,
+        cache: &DiskCache,
+        current_gid: Option<u64>,
+    ) {
+        let Some(pool) = self.prefetch_pool.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let window_groups = self.scan_window_groups.max(1) as usize;
+        let window_bytes = self.scan_window_bytes;
+        let page_size = manifest.page_size as u64;
+
+        for (tree_name, scan) in self.active_scan_prefetch.iter_mut() {
+            scan.submitted.retain(|gid| {
+                cache.group_state(*gid) == GroupState::Fetching || pool.is_optional_pending(*gid)
+            });
+
+            let mut active_groups = scan.submitted.len();
+            let mut active_bytes: u64 = scan
+                .submitted
+                .iter()
+                .map(|gid| manifest.group_size(*gid) as u64 * page_size)
+                .sum();
+
+            while active_groups < window_groups && scan.cursor < scan.group_ids.len() {
+                let gid = scan.group_ids[scan.cursor];
+                scan.cursor += 1;
+                if Some(gid) == current_gid {
+                    continue;
+                }
+                if cache.group_state(gid) != GroupState::None || pool.is_optional_pending(gid) {
+                    continue;
+                }
+                let group_bytes = manifest.group_size(gid) as u64 * page_size;
+                if active_groups > 0 && active_bytes.saturating_add(group_bytes) > window_bytes {
+                    break;
+                }
+                if matches!(
+                    Self::try_submit_optional_prefetch(
+                        pool.as_ref(),
+                        cache,
+                        manifest,
+                        Some(tree_name.clone()),
+                        gid,
+                    ),
+                    PrefetchSubmitOutcome::Accepted
+                ) {
+                    scan.submitted.insert(gid);
+                    active_groups += 1;
+                    active_bytes = active_bytes.saturating_add(group_bytes);
+                }
+            }
+        }
+    }
+
+    fn clear_timed_out_fetching(&self, cache: &DiskCache, gid: u64) -> bool {
+        if let Some(pool) = &self.prefetch_pool {
+            if pool.is_optional_fetching(gid) {
+                // Inside a SQLite read transaction this thread already holds
+                // replay_gate.read() (taken at Shared lock), so gate.write()
+                // would self-deadlock. The read guard already excludes replay
+                // finalize, and a worker racing past its cancelled-check
+                // installs bytes from the same manifest version we are about
+                // to fetch — identical content, so the claim CAS in
+                // unclaim_if_fetching is enough ordering on this path.
+                let _cancel_guard = if self.replay_read_guard.is_none() {
+                    self.replay_gate.as_ref().map(|gate| gate.write())
+                } else {
+                    None
+                };
+                if pool.cancel_optional_fetching(gid) {
+                    return cache.unclaim_if_fetching(gid);
+                }
+            }
+        }
+        cache.unclaim_if_fetching(gid)
     }
 
     #[allow(dead_code)]
@@ -1026,50 +1157,6 @@ impl TurboliteHandle {
             None => return,
         };
 
-        let ps = manifest.page_size;
-        let sub_ppf = manifest.sub_pages_per_frame;
-
-        // Helper: try to claim and submit a group for prefetch.
-        let try_submit = |gid: u64, submitted: &mut usize| -> bool {
-            if cache.group_state(gid) != GroupState::None {
-                return false;
-            }
-            if !cache.try_claim_group(gid) {
-                return false;
-            }
-            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                if !key.is_empty() {
-                    let ft = manifest
-                        .frame_tables
-                        .get(gid as usize)
-                        .cloned()
-                        .unwrap_or_default();
-                    let gp = manifest.group_page_nums(gid).into_owned();
-                    let ovrs = manifest
-                        .subframe_overrides
-                        .get(gid as usize)
-                        .cloned()
-                        .unwrap_or_default();
-                    if pool.submit(
-                        None,
-                        gid,
-                        key.clone(),
-                        ft,
-                        ps,
-                        sub_ppf,
-                        gp,
-                        ovrs,
-                        manifest.version,
-                    ) {
-                        *submitted += 1;
-                        return true;
-                    }
-                }
-            }
-            cache.unclaim_if_fetching(gid);
-            false
-        };
-
         // Manifest-based sibling prefetch (hop schedule)
         let siblings = manifest.prefetch_siblings(current_gid);
         let eligible: Vec<u64> = siblings
@@ -1108,7 +1195,14 @@ impl TurboliteHandle {
             if submitted >= max_submit {
                 break;
             }
-            try_submit(gid, &mut submitted);
+            // The pool owns queue admission and the worker owns the
+            // Fetching claim lifecycle.
+            if matches!(
+                Self::try_submit_optional_prefetch(pool, cache, manifest, tree_name.cloned(), gid),
+                PrefetchSubmitOutcome::Accepted
+            ) {
+                submitted += 1;
+            }
         }
     }
 
@@ -1363,18 +1457,11 @@ impl DatabaseHandle for TurboliteHandle {
 
         // 3e. query-plan-aware prefetch.
         //
-        // Drain the global plan queue and submit ALL planned groups to the
-        // prefetch pool in EQP order: all groups for tree 1, then all groups
-        // for tree 2, etc. The pool's FIFO channel preserves this order, so
-        // worker threads fetch what SQLite needs first.
-        //
-        // Runs on every read (before cache hit check) so the first read after
-        // step() triggers submission. First reads are always interior page
-        // hits (pinned, ~microseconds), giving the pool a head start before
-        // SQLite needs leaf pages.
-        //
-        // The drain is a no-op (empty Vec, one mutex check) when no plan is
-        // queued, which is the common case for cached reads within a query.
+        // Planned SCAN prefetch is a fixed sliding window per tree. The
+        // global plan queue is drained once, but each tree only keeps a small
+        // number of optional groups queued/in-flight. Refill happens on group
+        // transitions below, not by re-submitting the whole manifest on every
+        // page hit.
         if self.query_plan_prefetch {
             let planned = query_plan::drain_planned_accesses();
             if !planned.is_empty() {
@@ -1388,7 +1475,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
 
                 if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
-                    let manifest_snap = self.manifest.load();
+                    let manifest_snap = (**self.manifest.load()).clone();
                     let tree_names: Vec<&String> =
                         manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> =
@@ -1402,10 +1489,13 @@ impl DatabaseHandle for TurboliteHandle {
                     );
                     drop(manifest_snap);
                 }
-                if let Some(pool) = &self.prefetch_pool {
+                if self.prefetch_pool.is_some() {
                     let manifest_snap = self.manifest.load();
-                    let sub_ppf = manifest_snap.sub_pages_per_frame;
-                    let cache_ref = self.cache.as_ref().expect("disk cache required");
+                    let cache_for_plan =
+                        Arc::clone(self.cache.as_ref().expect("disk cache required"));
+                    let cache_ref = cache_for_plan.as_ref();
+                    self.active_scan_prefetch.clear();
+                    self.last_scan_refill_gid = None;
                     for access in &planned {
                         // Only bulk prefetch for SCAN. SEARCH uses prefetch_search
                         // via trigger_prefetch (per-tree miss counters).
@@ -1415,50 +1505,17 @@ impl DatabaseHandle for TurboliteHandle {
                         if let Some(group_ids) =
                             manifest_snap.tree_name_to_groups.get(&access.tree_name)
                         {
-                            for &plan_gid in group_ids {
-                                if cache_ref.group_state(plan_gid) == GroupState::None
-                                    && cache_ref.try_claim_group(plan_gid)
-                                {
-                                    if let Some(key) =
-                                        manifest_snap.page_group_keys.get(plan_gid as usize)
-                                    {
-                                        if !key.is_empty() {
-                                            let ft = manifest_snap
-                                                .frame_tables
-                                                .get(plan_gid as usize)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            let gp = manifest_snap
-                                                .group_page_nums(plan_gid)
-                                                .into_owned();
-                                            let ovrs = manifest_snap
-                                                .subframe_overrides
-                                                .get(plan_gid as usize)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if !pool.submit(
-                                                Some(access.tree_name.clone()),
-                                                plan_gid,
-                                                key.clone(),
-                                                ft,
-                                                manifest_snap.page_size,
-                                                sub_ppf,
-                                                gp,
-                                                ovrs,
-                                                manifest_snap.version,
-                                            ) {
-                                                cache_ref.unclaim_if_fetching(plan_gid);
-                                            }
-                                        } else {
-                                            cache_ref.unclaim_if_fetching(plan_gid);
-                                        }
-                                    } else {
-                                        cache_ref.unclaim_if_fetching(plan_gid);
-                                    }
-                                }
-                            }
+                            self.active_scan_prefetch.insert(
+                                access.tree_name.clone(),
+                                ActiveScanPrefetch {
+                                    group_ids: group_ids.clone(),
+                                    cursor: 0,
+                                    submitted: HashSet::new(),
+                                },
+                            );
                         }
                     }
+                    self.refill_active_scan_prefetch(&manifest_snap, cache_ref, Some(gid));
                 }
             }
         }
@@ -1466,6 +1523,14 @@ impl DatabaseHandle for TurboliteHandle {
         // 4. Check page bitmap (cache hit = direct pread, no decompression)
         let cache_arc = Arc::clone(self.cache.as_ref().expect("disk cache required"));
         let cache = cache_arc.as_ref();
+        if self.query_plan_prefetch
+            && !self.active_scan_prefetch.is_empty()
+            && self.last_scan_refill_gid != Some(gid)
+        {
+            let manifest_snap = (**self.manifest.load()).clone();
+            self.refill_active_scan_prefetch(&manifest_snap, cache, Some(gid));
+            self.last_scan_refill_gid = Some(gid);
+        }
         if cache.is_present(page_num) {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
@@ -1659,8 +1724,12 @@ impl DatabaseHandle for TurboliteHandle {
             let frame_table = manifest.frame_tables.get(gid as usize);
             let has_frames = manifest.sub_pages_per_frame > 0
                 && frame_table.map(|ft| !ft.is_empty()).unwrap_or(false);
+            let planned_scan_group = self
+                .active_scan_prefetch
+                .values()
+                .any(|scan| scan.group_ids.contains(&gid));
 
-            if has_frames {
+            if has_frames && !planned_scan_group {
                 // ── SEEKABLE PATH: range GET just the sub-chunk containing the needed page ──
                 let sub_ppg = manifest.sub_pages_per_frame;
                 let page_in_group = page_in_group_idx;
@@ -1680,39 +1749,45 @@ impl DatabaseHandle for TurboliteHandle {
                         .get(gid as usize)
                         .and_then(|ovs| ovs.get(&frame_idx));
 
-                    // Submit the CURRENT group to prefetch pool (full group fetch in background).
-                    self.increment_misses(current_tree_name.as_ref());
                     if let Some(pool) = &self.prefetch_pool {
-                        if cache.group_state(gid) == GroupState::None && cache.try_claim_group(gid)
+                        if cache.group_state(gid) == GroupState::Fetching
+                            && pool.is_optional_fetching(gid)
                         {
-                            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
-                                if !key.is_empty() {
-                                    let gp_owned = manifest.group_page_nums(gid).into_owned();
-                                    let ovrs = manifest
-                                        .subframe_overrides
-                                        .get(gid as usize)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    if !pool.submit(
-                                        None,
-                                        gid,
-                                        key.clone(),
-                                        ft.to_vec(),
-                                        manifest.page_size,
-                                        sub_ppg,
-                                        gp_owned,
-                                        ovrs,
-                                        manifest.version,
-                                    ) {
-                                        cache.unclaim_if_fetching(gid);
-                                    }
-                                } else {
-                                    cache.unclaim_if_fetching(gid);
-                                }
-                            } else {
-                                cache.unclaim_if_fetching(gid);
+                            let wait_start = Instant::now();
+                            if cache.wait_for_group(gid) == GroupState::Fetching {
+                                self.clear_timed_out_fetching(cache, gid);
+                            }
+                            pool.record_foreground_wait(wait_start.elapsed());
+                            if cache.is_present(page_num) {
+                                self.reset_misses(current_tree_name.as_ref());
+                                cache.read_page(page_num, buf)?;
+                                self.detect_interior_page(buf, page_num, cache);
+                                cache.touch_group(gid);
+                                return Ok(());
                             }
                         }
+                    }
+
+                    // Warm the rest of the current group in the background
+                    // while the foreground range GET fetches just the frame
+                    // it needs. Point/search access is range-first, and later
+                    // pages from the same group become cache hits instead of
+                    // more serial round trips. Planned cold-scan groups never
+                    // reach this path (`planned_scan_group` routes them to
+                    // full-group demand), so scans still never pay range
+                    // demand plus full-object optional prefetch for the same
+                    // group. Admission is nonblocking and the worker claims
+                    // `Fetching` only after it holds an I/O permit, so the
+                    // foreground below cannot wait behind unstarted work.
+                    self.increment_misses(current_tree_name.as_ref());
+                    if let Some(pool) = &self.prefetch_pool {
+                        let _ = Self::try_submit_optional_prefetch(
+                            pool,
+                            &cache_arc,
+                            &manifest,
+                            current_tree_name.clone(),
+                            gid,
+                        );
                     }
                     self.trigger_prefetch(
                         page_num,
@@ -1725,15 +1800,29 @@ impl DatabaseHandle for TurboliteHandle {
 
                     let s3_start = Instant::now();
                     let fetch_result = if let Some(ovr) = override_entry {
-                        storage_helpers::get_page_group(storage_ref, runtime_ref, &ovr.key)
+                        if let Some(pool) = &self.prefetch_pool {
+                            pool.get_foreground(storage_ref, runtime_ref, &ovr.key)
+                        } else {
+                            storage_helpers::get_page_group(storage_ref, runtime_ref, &ovr.key)
+                        }
                     } else {
-                        storage_helpers::range_get(
-                            storage_ref,
-                            runtime_ref,
-                            base_key,
-                            entry.offset,
-                            entry.len,
-                        )
+                        if let Some(pool) = &self.prefetch_pool {
+                            pool.range_get_foreground(
+                                storage_ref,
+                                runtime_ref,
+                                base_key,
+                                entry.offset,
+                                entry.len,
+                            )
+                        } else {
+                            storage_helpers::range_get(
+                                storage_ref,
+                                runtime_ref,
+                                base_key,
+                                entry.offset,
+                                entry.len,
+                            )
+                        }
                     };
                     match fetch_result {
                         Ok(Some(compressed_frame)) => {
@@ -1838,18 +1927,33 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                             return Ok(());
                         }
-                        Ok(None) | Err(_) => {
-                            // Fall through to legacy path
+                        Ok(None) if override_entry.is_some() => {
+                            let object = override_entry
+                                .map(|ovr| ovr.key.as_str())
+                                .unwrap_or(base_key.as_str());
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "seekable frame object missing for page={page_num} gid={gid} frame={frame_idx}: {object}"
+                                ),
+                            ));
+                        }
+                        Ok(None) => {
                             if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                                 eprintln!(
-                                "  [range-get] page={} gid={} frame={} failed, falling through to legacy path",
-                                page_num, gid, frame_idx,
-                            );
+                                    "  [range-get] page={} gid={} frame={} missing, falling through to legacy path",
+                                    page_num, gid, frame_idx,
+                                );
                             }
+                        }
+                        Err(e) => {
+                            return Err(e);
                         }
                     }
                 }
-                // Fall through to legacy path if sub-chunk fetch failed
+                // Fall through to legacy path only when the manifest lacks the
+                // requested seekable frame entry. Storage/protocol failures above
+                // are authoritative and must not become hidden full-group I/O.
             }
 
             // ── LEGACY PATH: full group download ──
@@ -1857,7 +1961,10 @@ impl DatabaseHandle for TurboliteHandle {
             if state == GroupState::Fetching {
                 let wait_start = Instant::now();
                 if cache.wait_for_group(gid) == GroupState::Fetching {
-                    cache.unclaim_if_fetching(gid);
+                    self.clear_timed_out_fetching(cache, gid);
+                }
+                if let Some(pool) = &self.prefetch_pool {
+                    pool.record_foreground_wait(wait_start.elapsed());
                 }
                 if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     turbolite_debug!(
@@ -1885,7 +1992,12 @@ impl DatabaseHandle for TurboliteHandle {
                     if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                         if !key.is_empty() {
                             let s3_start = Instant::now();
-                            match storage_helpers::get_page_group(storage_ref, runtime_ref, key) {
+                            let fetch_result = if let Some(pool) = &self.prefetch_pool {
+                                pool.get_foreground(storage_ref, runtime_ref, key)
+                            } else {
+                                storage_helpers::get_page_group(storage_ref, runtime_ref, key)
+                            };
+                            match fetch_result {
                                 Ok(Some(pg_data)) => {
                                     let s3_ms = s3_start.elapsed().as_millis();
                                     let decode_start = Instant::now();
@@ -1979,9 +2091,10 @@ impl DatabaseHandle for TurboliteHandle {
                                 }
                                 Err(e) => {
                                     cache.unclaim_if_fetching(gid);
-                                    return Err(io::Error::other(
-                                        format!("S3 GET failed for gid={}: {}", gid, e),
-                                    ));
+                                    return Err(io::Error::other(format!(
+                                        "S3 GET failed for gid={}: {}",
+                                        gid, e
+                                    )));
                                 }
                             }
                         }
@@ -1991,7 +2104,12 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 } else {
                     let wait_start = Instant::now();
-                    cache.wait_for_group(gid);
+                    if cache.wait_for_group(gid) == GroupState::Fetching {
+                        self.clear_timed_out_fetching(cache, gid);
+                    }
+                    if let Some(pool) = &self.prefetch_pool {
+                        pool.record_foreground_wait(wait_start.elapsed());
+                    }
                     if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                         turbolite_debug!(
                             "  [inline] page={} gid={} WAITED (race) {}ms",
@@ -2306,9 +2424,7 @@ impl DatabaseHandle for TurboliteHandle {
                 // in their own sibling file, see persist_dirty_groups).
                 let m = (**self.manifest.load()).clone();
                 let manifest_bytes = rmp_serde::to_vec(&m).map_err(|e| {
-                    io::Error::other(
-                        format!("serialize manifest for staging: {e}"),
-                    )
+                    io::Error::other(format!("serialize manifest for staging: {e}"))
                 })?;
                 writer.append_manifest(&manifest_bytes)?;
 
@@ -2827,12 +2943,10 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                         }
                         Err(e) => {
-                            return Err(io::Error::other(
-                                format!(
-                                    "cache.read_page({}) failed during interior collection: {}",
-                                    pnum, e
-                                ),
-                            ));
+                            return Err(io::Error::other(format!(
+                                "cache.read_page({}) failed during interior collection: {}",
+                                pnum, e
+                            )));
                         }
                     }
                 }
@@ -2956,12 +3070,10 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                         }
                         Err(e) => {
-                            return Err(io::Error::other(
-                                format!(
-                                    "cache.read_page({}) failed during index leaf collection: {}",
-                                    pnum, e
-                                ),
-                            ));
+                            return Err(io::Error::other(format!(
+                                "cache.read_page({}) failed during index leaf collection: {}",
+                                pnum, e
+                            )));
                         }
                     }
                 }
@@ -3241,9 +3353,10 @@ impl DatabaseHandle for TurboliteHandle {
             if let Some(cache) = &self.cache {
                 let m = (**self.manifest.load()).clone();
                 manifest::persist_manifest_local(&cache.cache_dir, &m).map_err(|e| {
-                    io::Error::other(
-                        format!("local manifest persist failed after remote sync: {}", e),
-                    )
+                    io::Error::other(format!(
+                        "local manifest persist failed after remote sync: {}",
+                        e
+                    ))
                 })?;
                 manifest::persist_dirty_groups(&cache.cache_dir, &[])?;
             }
@@ -3503,9 +3616,10 @@ impl DatabaseHandle for TurboliteHandle {
                                     .insert("shared".to_string(), Box::new(guard));
                             }
                             Err(restore_err) => {
-                                return Err(io::Error::other(
-                                    format!("Lock restore failed: {}", restore_err),
-                                ));
+                                return Err(io::Error::other(format!(
+                                    "Lock restore failed: {}",
+                                    restore_err
+                                )));
                             }
                         }
                         return Ok(false);
@@ -3526,7 +3640,6 @@ impl DatabaseHandle for TurboliteHandle {
             LockKind::Reserved | LockKind::Pending | LockKind::Exclusive
         ))
     }
-
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 | Indexed filter | covered index scan | 74ms | 173ms |
 | Full scan + filter | full table scan | 586ms | 984ms |
 
-1M rows, 1.5GB at with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 8 prefetch threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
+1M rows, 1.5GB at with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 7 prefetch threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
 
 Benchmarks are organized by **cache level** (what's already on local disk when the query runs):
 
@@ -201,7 +201,7 @@ If encryption is enabled, turbolite encrypts everything: S3 objects, local cache
 
 **Scans on small machines.** With 1 prefetch thread, a scan over 1.46GB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect startup to be painful.
 
-**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need more CPUs.
+**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and foreground SQLite work starts contending with downloads. The default (`max(num_cpus - 1, 1)`) leaves one core for foreground work, but scan-heavy workloads on large databases still need enough CPUs.
 
 **First query penalty.** The first query at cache level `none` pays ~50-200ms for interior page loading plus at least one data fetch. If the query needs an index page before background prefetch finishes, it falls back to an inline range GET.
 
@@ -219,7 +219,7 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 
 | Parameter | What it controls | Default |
 |-----------|-----------------|---------|
-| `prefetch.threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
+| `prefetch.threads` | Worker threads for parallel S3 fetches | max(num_cpus - 1, 1) |
 | `cache.pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
 | `cache.gc_enabled` | Delete old page group versions after checkpoint | true |
 | `sync_mode` | Checkpoint durability: `Durable` (S3 upload in checkpoint) or `LocalThenFlush` (defer upload) | Durable |

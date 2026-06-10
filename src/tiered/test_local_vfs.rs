@@ -2936,7 +2936,10 @@ fn plugin_vfs_crud_delete_journal() {
     let mode: String = conn
         .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(mode, "delete", "DELETE journal mode engaged via the plugin VFS");
+    assert_eq!(
+        mode, "delete",
+        "DELETE journal mode engaged via the plugin VFS"
+    );
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", [])
         .unwrap();
@@ -2952,8 +2955,10 @@ fn plugin_vfs_crud_delete_journal() {
 
     // A rolled-back transaction must restore the prior image from the on-disk
     // rollback journal — the companion-file open/write/read/delete path.
-    conn.execute_batch("BEGIN; UPDATE t SET val='changed' WHERE id=1; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;")
-        .unwrap();
+    conn.execute_batch(
+        "BEGIN; UPDATE t SET val='changed' WHERE id=1; INSERT INTO t VALUES (3, 'gone'); ROLLBACK;",
+    )
+    .unwrap();
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
         .unwrap();
@@ -2961,7 +2966,10 @@ fn plugin_vfs_crud_delete_journal() {
     let v: String = conn
         .query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, "hello", "rolled-back update is reverted from the journal");
+    assert_eq!(
+        v, "hello",
+        "rolled-back update is reverted from the journal"
+    );
 
     // Committed data survives reopening the connection.
     drop(conn);
@@ -3008,7 +3016,8 @@ fn plugin_vfs_crud_wal() {
 
     // Force a checkpoint: drains the WAL back into the main db, exercising the
     // exclusive WAL-index locks + shared-memory reads.
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     let v: String = conn
         .query_row("SELECT val FROM t WHERE id = 50", [], |r| r.get(0))
@@ -3044,7 +3053,8 @@ fn plugin_vfs_concurrent_wal_isolation() {
     // Seed: WAL mode + the two tables.
     {
         let conn = rusqlite::Connection::open(&db_uri).expect("seed open");
-        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .unwrap();
@@ -3068,7 +3078,8 @@ fn plugin_vfs_concurrent_wal_isolation() {
         let done = Arc::clone(&reads_done);
         handles.push(std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(&uri).expect("reader open");
-            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             while !stop.load(Ordering::Relaxed) {
                 let diff: i64 = conn
                     .query_row(
@@ -3091,7 +3102,8 @@ fn plugin_vfs_concurrent_wal_isolation() {
         let uri = db_uri.clone();
         std::thread::spawn(move || {
             let conn = rusqlite::Connection::open(&uri).expect("writer open");
-            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             for k in 1..=WRITES {
                 conn.execute_batch(&format!(
                     "BEGIN; INSERT INTO ta(k) VALUES({k}); INSERT INTO tb(k) VALUES({k}); COMMIT;"
@@ -3230,7 +3242,10 @@ fn plugin_vfs_cross_process_wal_isolation() {
         let mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(mode, "wal", "WAL must engage for cross-process coordination");
+        assert_eq!(
+            mode, "wal",
+            "WAL must engage for cross-process coordination"
+        );
         conn.execute_batch("CREATE TABLE ta (k INTEGER); CREATE TABLE tb (k INTEGER);")
             .unwrap();
     }
@@ -3249,7 +3264,12 @@ fn plugin_vfs_cross_process_wal_isolation() {
     let writer = spawn("writer");
     let readers: Vec<_> = (0..3).map(|_| spawn("reader")).collect();
 
-    let writer_code = writer.wait_with_output().unwrap().status.code().unwrap_or(-1);
+    let writer_code = writer
+        .wait_with_output()
+        .unwrap()
+        .status
+        .code()
+        .unwrap_or(-1);
     assert_eq!(
         writer_code, 0,
         "writer process failed (code {writer_code}: 2=txn 4=setup)"

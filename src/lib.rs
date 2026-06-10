@@ -522,11 +522,7 @@ impl FileWalIndex {
     /// Acquire or release WAL-index byte-range locks (in-process table + fcntl
     /// file locks for cross-process). `WalIndexLock::None` releases the range;
     /// returns `Ok(false)` on contention.
-    pub(crate) fn lock(
-        &mut self,
-        locks: Range<u8>,
-        lock: WalIndexLock,
-    ) -> Result<bool, io::Error> {
+    pub(crate) fn lock(&mut self, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, io::Error> {
         let conn_id = self.conn_id;
         let lock_file = self.ensure_lock_file()?;
 

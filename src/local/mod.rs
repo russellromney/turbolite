@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use fs2::FileExt;
 use crate::{DatabaseHandle, LockKind};
+use fs2::FileExt;
 
 use file_format::{
     decode_directory, decode_page, encode_directory, encode_page, Header, PageCodec,
@@ -212,7 +212,9 @@ fn register_or_reuse_vfs(path: &Path, options: &LocalOptions) -> Result<String, 
     sqlite_plugin::vfs::register_static(
         cname,
         vfs,
-        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+        sqlite_plugin::vfs::RegisterOpts {
+            make_default: false,
+        },
     )
     .map_err(|code| LocalError::Io(io::Error::other(format!("sqlite code {code}"))))?;
     map.insert(key, vfs_name.clone());
@@ -588,9 +590,7 @@ fn decode_file(bytes: &[u8], codec: &PageCodec) -> Result<(Vec<u8>, u32), io::Er
         ));
     }
     // Exact-tail invariant: the directory occupies the remainder of the file.
-    if dir_off
-        .checked_add(page_count * DIR_ENTRY_LEN) != Some(bytes.len())
-    {
+    if dir_off.checked_add(page_count * DIR_ENTRY_LEN) != Some(bytes.len()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "directory length inconsistent with file size",

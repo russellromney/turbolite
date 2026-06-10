@@ -429,9 +429,13 @@ impl TurboliteVfs {
         // Prefetch pool: backend-agnostic, runs for every non-local setup
         // (local has no remote I/O to parallelise, so skip the worker
         // threads entirely).
-        let prefetch_pool = if is_local {
+        let prefetch_pool = if is_local || config.prefetch.threads == 0 {
             None
         } else {
+            let io_budget = RemoteIoBudget::new(
+                config.prefetch.io_permits,
+                config.prefetch.foreground_reserved_permits,
+            );
             Some(Arc::new(PrefetchPool::new(
                 config.prefetch.threads,
                 Arc::clone(&storage),
@@ -445,6 +449,8 @@ impl TurboliteVfs {
                 Arc::clone(&shared_manifest),
                 Arc::clone(&replay_gate),
                 Arc::clone(&replay_epoch),
+                config.prefetch.queue_capacity,
+                io_budget,
             )))
         };
 
@@ -1445,7 +1451,9 @@ impl TurboliteVfs {
     /// Anchored replay cursor promotion callers should use
     /// [`Self::publish_replayed_base_with_replay_cursor_anchor`] so the published
     /// base carries the authoritative replay cursor and chain anchor.
-    #[deprecated(note = "anchored replay cursor promotion must use publish_replayed_base_with_replay_cursor_anchor")]
+    #[deprecated(
+        note = "anchored replay cursor promotion must use publish_replayed_base_with_replay_cursor_anchor"
+    )]
     pub fn publish_replayed_base(&self) -> io::Result<Vec<u8>> {
         // Drive a flush over any pending replay state. flush_to_storage
         // drains pending_flushes + shared_dirty_groups together and
@@ -1661,6 +1669,8 @@ impl TurboliteVfs {
                 self.config.compression.dictionary.as_deref(),
                 self.config.encryption.key,
                 self.config.prefetch.query_plan,
+                self.config.prefetch.scan_window_groups,
+                self.config.prefetch.scan_window_bytes,
                 self.config.cache.max_bytes,
                 self.config.cache.evict_on_checkpoint,
                 self.config.cache.override_threshold,
@@ -1747,11 +1757,11 @@ impl TurboliteVfs {
 /// is signalled by `Err(SQLITE_IOERR_SHORT_READ)`).
 mod plugin_backend {
     use super::{TurboliteHandle, TurboliteVfs};
+    use crate::{DatabaseHandle, LockKind, WalIndexLock};
     use core::ptr::NonNull;
     use sqlite_plugin::flags::{AccessFlags, LockLevel, OpenKind, OpenOpts, ShmLockMode};
     use sqlite_plugin::vars;
     use sqlite_plugin::vfs::{Vfs, VfsResult};
-    use crate::{DatabaseHandle, LockKind, WalIndexLock};
     use std::io::ErrorKind;
 
     /// sqlite-plugin lock level → the `LockKind` the handle speaks. The five

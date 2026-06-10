@@ -75,9 +75,7 @@ pub enum PayloadVersionError {
     /// payload embedded walrust delta cursor/prefix fields beside the
     /// page manifest. The canonical envelope keeps delta discovery at the
     /// integration layer now.
-    #[error(
-        "legacy hybrid manifest payload (leading byte 0x02); canonical envelope required"
-    )]
+    #[error("legacy hybrid manifest payload (leading byte 0x02); canonical envelope required")]
     HybridDeprecated,
 
     /// Legacy pure msgpack payload (leading byte `0x01`). Decode it with

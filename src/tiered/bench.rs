@@ -475,18 +475,23 @@ impl TurboliteSharedState {
                             .get(gid as usize)
                             .cloned()
                             .unwrap_or_default();
-                        pool.submit(
-                            Some(access.tree_name.clone()),
-                            gid,
-                            key.clone(),
-                            ft,
-                            manifest.page_size,
-                            manifest.sub_pages_per_frame,
-                            gp,
-                            ovrs,
-                            manifest.version,
-                        );
-                        groups_submitted += 1;
+                        if matches!(
+                            pool.submit_optional(
+                                Some(access.tree_name.clone()),
+                                gid,
+                                key.clone(),
+                                ft,
+                                manifest.page_size,
+                                manifest.sub_pages_per_frame,
+                                gp,
+                                ovrs,
+                                manifest.version,
+                                self.cache.as_ref(),
+                            ),
+                            super::PrefetchSubmitOutcome::Accepted
+                        ) {
+                            groups_submitted += 1;
+                        }
                     }
                 }
             }

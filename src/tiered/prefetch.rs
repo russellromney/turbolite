@@ -6,7 +6,8 @@
 //! any other `StorageBackend`. Not instantiated in local-filesystem
 //! mode (there's no remote I/O to parallelise).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +19,7 @@ use super::async_rt::block_on;
 use super::manifest::{FrameEntry, Manifest, SubframeOverride};
 use super::{
     decode_page_group_bulk, decode_page_group_seekable_full, decode_seekable_subchunk,
-    is_valid_btree_page, keys, DiskCache, GroupState,
+    is_valid_btree_page, keys, storage as storage_helpers, DiskCache, GroupState,
 };
 
 /// A job for the prefetch thread pool.
@@ -46,6 +47,8 @@ pub(crate) struct PrefetchJob {
     /// version of the bytes is stale. The job is dropped without
     /// writing.
     pub(crate) replay_epoch_at_submit: u64,
+    /// Time this optional job entered the queue.
+    queued_at: Instant,
 }
 
 #[derive(Default, Clone)]
@@ -62,9 +65,150 @@ struct PrefetchTreeCounters {
     bytes_fetched: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefetchSubmitOutcome {
+    Accepted,
+    Full,
+    Closed,
+    SkippedState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefetchTrafficClass {
+    ForegroundRange,
+    ForegroundGroup,
+    PrefetchGroup,
+    PrefetchOverride,
+}
+
+impl PrefetchTrafficClass {
+    fn index(self) -> usize {
+        match self {
+            Self::ForegroundRange => 0,
+            Self::ForegroundGroup => 1,
+            Self::PrefetchGroup => 2,
+            Self::PrefetchOverride => 3,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ForegroundRange => "foreground_range",
+            Self::ForegroundGroup => "foreground_group",
+            Self::PrefetchGroup => "prefetch_group",
+            Self::PrefetchOverride => "prefetch_override",
+        }
+    }
+
+    const ALL: [Self; 4] = [
+        Self::ForegroundRange,
+        Self::ForegroundGroup,
+        Self::PrefetchGroup,
+        Self::PrefetchOverride,
+    ];
+}
+
+const LATENCY_BUCKETS: usize = 40;
+
+/// Lock-free log2-bucketed latency histogram in microseconds. Bucket `i`
+/// counts samples in `[2^(i-1), 2^i)`, so reported quantiles are bucket
+/// upper bounds — at most 2x the true value, which is enough resolution to
+/// tell a 1ms GET from a 100ms one.
+struct LatencyHistogram {
+    buckets: [AtomicU64; LATENCY_BUCKETS],
+    count: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LatencyHistogram {
+    fn record(&self, elapsed: std::time::Duration) {
+        let us = elapsed.as_micros() as u64;
+        let idx = (64 - us.leading_zeros() as usize).min(LATENCY_BUCKETS - 1);
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// Upper bound (us) of the bucket holding the q-th quantile sample.
+    fn quantile_us(&self, q: f64) -> u64 {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 {
+            return 0;
+        }
+        let target = ((q * count as f64).ceil() as u64).clamp(1, count);
+        let mut seen = 0u64;
+        for (idx, bucket) in self.buckets.iter().enumerate() {
+            seen += bucket.load(Ordering::Relaxed);
+            if seen >= target {
+                return 1u64 << idx;
+            }
+        }
+        self.max_us.load(Ordering::Relaxed)
+    }
+
+    fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count": self.count.load(Ordering::Relaxed),
+            "p50_us": self.quantile_us(0.50),
+            "p95_us": self.quantile_us(0.95),
+            "p99_us": self.quantile_us(0.99),
+            "p999_us": self.quantile_us(0.999),
+            "max_us": self.max_us.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Default)]
+struct TrafficCounters {
+    ops: AtomicU64,
+    bytes: AtomicU64,
+    errors: AtomicU64,
+    latency_us: AtomicU64,
+    latency: LatencyHistogram,
+}
+
+impl TrafficCounters {
+    fn record(&self, bytes: u64, elapsed: std::time::Duration) {
+        self.ops.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.latency_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.latency.record(elapsed);
+    }
+
+    fn error(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ops": self.ops.load(Ordering::Relaxed),
+            "bytes": self.bytes.load(Ordering::Relaxed),
+            "errors": self.errors.load(Ordering::Relaxed),
+            "latency_us": self.latency_us.load(Ordering::Relaxed),
+            "latency": self.latency.snapshot_json(),
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PrefetchMetrics {
     submitted: AtomicU64,
+    accepted: AtomicU64,
+    full: AtomicU64,
+    closed: AtomicU64,
+    cancelled: AtomicU64,
+    permit_unavailable: AtomicU64,
     completed: AtomicU64,
     skipped_state: AtomicU64,
     missing_objects: AtomicU64,
@@ -74,6 +218,12 @@ pub(crate) struct PrefetchMetrics {
     stale_manifest: AtomicU64,
     stale_replay: AtomicU64,
     bytes_fetched: AtomicU64,
+    wait_before_fetch_us: AtomicU64,
+    wait_before_fetch: LatencyHistogram,
+    foreground_waits: AtomicU64,
+    foreground_wait_us: AtomicU64,
+    foreground_wait: LatencyHistogram,
+    traffic: [TrafficCounters; 4],
     trees: parking_lot::Mutex<HashMap<String, PrefetchTreeCounters>>,
 }
 
@@ -88,6 +238,28 @@ impl PrefetchMetrics {
     fn submitted(&self, tree_name: &Option<String>) {
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.with_tree(tree_name, |tree| tree.submitted += 1);
+    }
+
+    fn accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn full(&self) {
+        self.full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn closed(&self) {
+        self.closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancelled(&self, tree_name: &Option<String>) {
+        self.cancelled.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.skipped_state += 1);
+    }
+
+    fn permit_unavailable(&self, tree_name: &Option<String>) {
+        self.permit_unavailable.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.skipped_state += 1);
     }
 
     fn completed(&self, tree_name: &Option<String>, bytes: u64) {
@@ -134,7 +306,39 @@ impl PrefetchMetrics {
         self.with_tree(tree_name, |tree| tree.stale_replay += 1);
     }
 
-    fn snapshot_json(&self, in_flight: u64) -> serde_json::Value {
+    fn wait_before_fetch(&self, elapsed: std::time::Duration) {
+        self.wait_before_fetch_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.wait_before_fetch.record(elapsed);
+    }
+
+    fn foreground_wait(&self, elapsed: std::time::Duration) {
+        self.foreground_waits.fetch_add(1, Ordering::Relaxed);
+        self.foreground_wait_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+        self.foreground_wait.record(elapsed);
+    }
+
+    fn traffic_success(
+        &self,
+        class: PrefetchTrafficClass,
+        bytes: u64,
+        elapsed: std::time::Duration,
+    ) {
+        self.traffic[class.index()].record(bytes, elapsed);
+    }
+
+    fn traffic_error(&self, class: PrefetchTrafficClass) {
+        self.traffic[class.index()].error();
+    }
+
+    fn snapshot_json(
+        &self,
+        in_flight: u64,
+        queued: u64,
+        max_queued: u64,
+        max_remote: u64,
+    ) -> serde_json::Value {
         let trees = self.trees.lock();
         let tree_json = trees
             .iter()
@@ -156,10 +360,27 @@ impl PrefetchMetrics {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
+        let traffic_json = PrefetchTrafficClass::ALL
+            .iter()
+            .map(|class| {
+                (
+                    class.as_str().to_string(),
+                    self.traffic[class.index()].snapshot_json(),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
 
         serde_json::json!({
             "in_flight": in_flight,
+            "queued": queued,
+            "max_queued": max_queued,
+            "max_remote_in_flight": max_remote,
             "submitted": self.submitted.load(Ordering::Relaxed),
+            "accepted": self.accepted.load(Ordering::Relaxed),
+            "full": self.full.load(Ordering::Relaxed),
+            "closed": self.closed.load(Ordering::Relaxed),
+            "cancelled": self.cancelled.load(Ordering::Relaxed),
+            "permit_unavailable": self.permit_unavailable.load(Ordering::Relaxed),
             "completed": self.completed.load(Ordering::Relaxed),
             "skipped_state": self.skipped_state.load(Ordering::Relaxed),
             "missing_objects": self.missing_objects.load(Ordering::Relaxed),
@@ -169,8 +390,129 @@ impl PrefetchMetrics {
             "stale_manifest": self.stale_manifest.load(Ordering::Relaxed),
             "stale_replay": self.stale_replay.load(Ordering::Relaxed),
             "bytes_fetched": self.bytes_fetched.load(Ordering::Relaxed),
+            "wait_before_fetch_us": self.wait_before_fetch_us.load(Ordering::Relaxed),
+            "wait_before_fetch": self.wait_before_fetch.snapshot_json(),
+            "foreground_waits": self.foreground_waits.load(Ordering::Relaxed),
+            "foreground_wait_us": self.foreground_wait_us.load(Ordering::Relaxed),
+            "foreground_wait": self.foreground_wait.snapshot_json(),
+            "traffic": traffic_json,
             "trees": tree_json,
         })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteIoBudget {
+    total: u64,
+    foreground_reserved: u64,
+    in_flight: AtomicU64,
+    prefetch_in_flight: AtomicU64,
+    max_in_flight: AtomicU64,
+    condvar: parking_lot::Condvar,
+    mutex: parking_lot::Mutex<()>,
+}
+
+pub(crate) struct RemoteIoPermit {
+    budget: Arc<RemoteIoBudget>,
+    prefetch: bool,
+}
+
+impl RemoteIoBudget {
+    pub(crate) fn new(total: u32, foreground_reserved: u32) -> Arc<Self> {
+        let total = u64::from(total.max(1));
+        let foreground_reserved = u64::from(foreground_reserved).min(total);
+        Arc::new(Self {
+            total,
+            foreground_reserved,
+            in_flight: AtomicU64::new(0),
+            prefetch_in_flight: AtomicU64::new(0),
+            max_in_flight: AtomicU64::new(0),
+            condvar: parking_lot::Condvar::new(),
+            mutex: parking_lot::Mutex::new(()),
+        })
+    }
+
+    fn note_max(&self, value: u64) {
+        self.max_in_flight.fetch_max(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn try_acquire_prefetch(self: &Arc<Self>) -> Option<RemoteIoPermit> {
+        let prefetch_limit = self.total.saturating_sub(self.foreground_reserved);
+        if prefetch_limit == 0 {
+            return None;
+        }
+        loop {
+            let current_prefetch = self.prefetch_in_flight.load(Ordering::Acquire);
+            if current_prefetch >= prefetch_limit {
+                return None;
+            }
+            if self
+                .prefetch_in_flight
+                .compare_exchange(
+                    current_prefetch,
+                    current_prefetch + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            loop {
+                let current = self.in_flight.load(Ordering::Acquire);
+                if current >= self.total {
+                    self.prefetch_in_flight.fetch_sub(1, Ordering::Release);
+                    return None;
+                }
+                if self
+                    .in_flight
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.note_max(current + 1);
+                    return Some(RemoteIoPermit {
+                        budget: Arc::clone(self),
+                        prefetch: true,
+                    });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn acquire_foreground(self: &Arc<Self>) -> RemoteIoPermit {
+        let mut guard = self.mutex.lock();
+        loop {
+            let current = self.in_flight.load(Ordering::Acquire);
+            if current < self.total
+                && self
+                    .in_flight
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.note_max(current + 1);
+                return RemoteIoPermit {
+                    budget: Arc::clone(self),
+                    prefetch: false,
+                };
+            }
+            self.condvar.wait(&mut guard);
+        }
+    }
+
+    pub(crate) fn max_in_flight(&self) -> u64 {
+        self.max_in_flight.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for RemoteIoPermit {
+    fn drop(&mut self) {
+        self.budget.in_flight.fetch_sub(1, Ordering::Release);
+        if self.prefetch {
+            self.budget
+                .prefetch_in_flight
+                .fetch_sub(1, Ordering::Release);
+        }
+        self.budget.condvar.notify_one();
     }
 }
 
@@ -192,6 +534,11 @@ pub(crate) struct PrefetchPool {
     /// shared atomic under `replay_gate.read()` later.
     replay_epoch_at_pool: Arc<AtomicU64>,
     metrics: Arc<PrefetchMetrics>,
+    queued_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    active_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    cancelled_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    max_queued: Arc<AtomicU64>,
+    io_budget: Arc<RemoteIoBudget>,
 }
 
 impl PrefetchPool {
@@ -207,8 +554,10 @@ impl PrefetchPool {
         shared_manifest: Arc<ArcSwap<Manifest>>,
         replay_gate: Arc<parking_lot::RwLock<()>>,
         replay_epoch: Arc<AtomicU64>,
+        queue_capacity: u32,
+        io_budget: Arc<RemoteIoBudget>,
     ) -> Self {
-        let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
+        let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(queue_capacity.max(1) as usize);
         // Bounded so the completion signal can't grow without limit if no one
         // is calling `wait_idle`. Sized to comfortably absorb a wake-up backlog
         // (`num_workers * 4`); workers `try_send` and drop on full because
@@ -218,6 +567,10 @@ impl PrefetchPool {
         let mut workers = Vec::with_capacity(num_workers as usize);
         let shutdown = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(PrefetchMetrics::default());
+        let queued_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let active_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let cancelled_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let max_queued = Arc::new(AtomicU64::new(0));
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
@@ -240,6 +593,10 @@ impl PrefetchPool {
             let replay_gate = Arc::clone(&replay_gate);
             let replay_epoch = Arc::clone(&replay_epoch);
             let metrics = Arc::clone(&metrics);
+            let queued_gids = Arc::clone(&queued_gids);
+            let active_gids = Arc::clone(&active_gids);
+            let cancelled_gids = Arc::clone(&cancelled_gids);
+            let io_budget = Arc::clone(&io_budget);
 
             workers.push(std::thread::spawn(move || {
                 // Mark a job as finished: drop the in-flight counter (so
@@ -247,6 +604,9 @@ impl PrefetchPool {
                 // waiter via the bounded done channel. Dropped wake-ups are
                 // fine — the next call to wait_idle reads the atomic directly.
                 let finish = |gid: u64| {
+                    queued_gids.lock().remove(&gid);
+                    active_gids.lock().remove(&gid);
+                    cancelled_gids.lock().remove(&gid);
                     in_flight.fetch_sub(1, Ordering::Release);
                     let _ = done_tx.try_send(gid);
                 };
@@ -264,15 +624,10 @@ impl PrefetchPool {
                 // pre-replay bytes over the freshly-replayed ones.
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
+                    metrics.wait_before_fetch(job.queued_at.elapsed());
 
                     let current = cache.group_state(gid);
-                    if current == GroupState::None {
-                        if !cache.try_claim_group(gid) {
-                            metrics.skipped_state(&job.tree_name);
-                            finish(gid);
-                            continue;
-                        }
-                    } else if current != GroupState::Fetching {
+                    if current != GroupState::None {
                         if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
@@ -280,6 +635,17 @@ impl PrefetchPool {
                         finish(gid);
                         continue;
                     }
+                    let Some(_io_permit) = io_budget.try_acquire_prefetch() else {
+                        metrics.permit_unavailable(&job.tree_name);
+                        finish(gid);
+                        continue;
+                    };
+                    if !cache.try_claim_group(gid) {
+                        metrics.skipped_state(&job.tree_name);
+                        finish(gid);
+                        continue;
+                    }
+                    active_gids.lock().insert(gid);
 
                     let worker_start = Instant::now();
 
@@ -292,18 +658,31 @@ impl PrefetchPool {
                             }
                             cache.unclaim_if_fetching(gid);
                             metrics.fetch_error(&job.tree_name);
+                            metrics.traffic_error(PrefetchTrafficClass::PrefetchGroup);
                             finish(gid);
                             continue;
                         }
                     };
+                    drop(_io_permit);
                     let fetch_ms = fetch_start.elapsed().as_millis();
 
                     let Some(pg_data) = pg_data else {
                         cache.unclaim_if_fetching(gid);
                         metrics.missing_object(&job.tree_name);
+                        metrics.traffic_error(PrefetchTrafficClass::PrefetchGroup);
                         finish(gid);
                         continue;
                     };
+                    if cancelled_gids.lock().contains(&gid) {
+                        metrics.cancelled(&job.tree_name);
+                        finish(gid);
+                        continue;
+                    };
+                    metrics.traffic_success(
+                        PrefetchTrafficClass::PrefetchGroup,
+                        pg_data.len() as u64,
+                        fetch_start.elapsed(),
+                    );
 
                     #[cfg(feature = "zstd")]
                     let decoder_dict = dictionary
@@ -360,31 +739,18 @@ impl PrefetchPool {
                         continue;
                     }
 
-                    // Hold the replay-gate read lock across both the
-                    // epoch re-check and the cache write. This blocks
-                    // concurrent finalize, which takes the write
-                    // guard, and means we cannot race between
-                    // "epoch matches" and "we wrote bytes". If
-                    // finalize ran between submit and here, the
-                    // captured epoch will not match the current value
-                    // and we drop without writing.
-                    let _replay_read_guard = replay_gate.read();
-                    let current_epoch = replay_epoch.load(Ordering::Acquire);
-                    if current_epoch != job.replay_epoch_at_submit {
-                        turbolite_debug!(
-                            "[prefetch] gid={} replay epoch advanced ({} -> {}), discarding stale fetch",
-                            gid, job.replay_epoch_at_submit, current_epoch,
-                        );
-                        cache.unclaim_if_fetching(gid);
-                        metrics.stale_replay(&job.tree_name);
-                        finish(gid);
-                        continue;
-                    }
-
                     if !job.overrides.is_empty() && job.sub_pages_per_frame > 0 {
                         let spf = job.sub_pages_per_frame as usize;
                         let mut override_failed = false;
                         for (&frame_idx, ovr) in &job.overrides {
+                            let override_fetch_start = Instant::now();
+                            let Some(override_permit) = io_budget.try_acquire_prefetch() else {
+                                cache.unclaim_if_fetching(gid);
+                                metrics.permit_unavailable(&job.tree_name);
+                                metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
+                                override_failed = true;
+                                break;
+                            };
                             let ovr_data = match block_on(&runtime, storage.get(&ovr.key)) {
                                 Ok(Some(data)) => data,
                                 Ok(None) => {
@@ -394,6 +760,7 @@ impl PrefetchPool {
                                     );
                                     cache.unclaim_if_fetching(gid);
                                     metrics.missing_object(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
                                     override_failed = true;
                                     break;
                                 }
@@ -406,10 +773,22 @@ impl PrefetchPool {
                                     }
                                     cache.unclaim_if_fetching(gid);
                                     metrics.fetch_error(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
                                     override_failed = true;
                                     break;
                                 }
                             };
+                            drop(override_permit);
+                            if cancelled_gids.lock().contains(&gid) {
+                                metrics.cancelled(&job.tree_name);
+                                override_failed = true;
+                                break;
+                            }
+                            metrics.traffic_success(
+                                PrefetchTrafficClass::PrefetchOverride,
+                                ovr_data.len() as u64,
+                                override_fetch_start.elapsed(),
+                            );
                             #[cfg(feature = "zstd")]
                             let ovr_decoder = dictionary
                                 .as_deref()
@@ -431,6 +810,7 @@ impl PrefetchPool {
                                     }
                                     cache.unclaim_if_fetching(gid);
                                     metrics.decode_error(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
                                     override_failed = true;
                                     break;
                                 }
@@ -444,6 +824,7 @@ impl PrefetchPool {
                             if data_len > decompressed.len() || dest_end > page_data.len() {
                                 cache.unclaim_if_fetching(gid);
                                 metrics.decode_error(&job.tree_name);
+                                metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
                                 override_failed = true;
                                 break;
                             }
@@ -454,6 +835,42 @@ impl PrefetchPool {
                             finish(gid);
                             continue;
                         }
+                    }
+
+                    // Hold the replay-gate read lock across both the final
+                    // epoch/cancel re-check and the cache write. Foreground
+                    // cancellation takes the write side before clearing the
+                    // claim, so a late optional worker cannot install bytes
+                    // after foreground has taken over ownership.
+                    let _replay_read_guard = replay_gate.read();
+                    if cancelled_gids.lock().contains(&gid) {
+                        metrics.cancelled(&job.tree_name);
+                        finish(gid);
+                        continue;
+                    }
+                    let current_version = shared_manifest.load().version;
+                    if current_version != job.manifest_version {
+                        turbolite_debug!(
+                            "[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
+                            gid,
+                            job.manifest_version,
+                            current_version,
+                        );
+                        cache.unclaim_if_fetching(gid);
+                        metrics.stale_manifest(&job.tree_name);
+                        finish(gid);
+                        continue;
+                    }
+                    let current_epoch = replay_epoch.load(Ordering::Acquire);
+                    if current_epoch != job.replay_epoch_at_submit {
+                        turbolite_debug!(
+                            "[prefetch] gid={} replay epoch advanced ({} -> {}), discarding stale fetch",
+                            gid, job.replay_epoch_at_submit, current_epoch,
+                        );
+                        cache.unclaim_if_fetching(gid);
+                        metrics.stale_replay(&job.tree_name);
+                        finish(gid);
+                        continue;
                     }
 
                     turbolite_debug!(
@@ -529,11 +946,21 @@ impl PrefetchPool {
             shutdown,
             replay_epoch_at_pool: replay_epoch,
             metrics,
+            queued_gids,
+            active_gids,
+            cancelled_gids,
+            max_queued,
+            io_budget,
         }
     }
 
-    /// Submit a prefetch job. Returns false if channel is closed.
-    pub(crate) fn submit(
+    /// Submit optional prefetch work without blocking or claiming a group.
+    ///
+    /// Group state remains `None` while work is merely queued. A worker must
+    /// acquire a prefetch I/O permit and then claim `Fetching` immediately
+    /// before starting remote I/O. This keeps foreground reads from waiting
+    /// behind optional work that has not started.
+    pub(crate) fn submit_optional(
         &self,
         tree_name: Option<String>,
         gid: u64,
@@ -544,15 +971,33 @@ impl PrefetchPool {
         group_page_nums: Vec<u64>,
         overrides: HashMap<usize, SubframeOverride>,
         manifest_version: u64,
-    ) -> bool {
-        self.in_flight.fetch_add(1, Ordering::Acquire);
+        cache: &DiskCache,
+    ) -> PrefetchSubmitOutcome {
+        if self.workers.lock().is_empty() {
+            self.metrics.closed();
+            return PrefetchSubmitOutcome::Closed;
+        }
+        if cache.group_state(gid) != GroupState::None {
+            self.metrics.skipped_state(&tree_name);
+            return PrefetchSubmitOutcome::SkippedState;
+        }
+        {
+            let mut queued = self.queued_gids.lock();
+            if !queued.insert(gid) {
+                self.metrics.skipped_state(&tree_name);
+                return PrefetchSubmitOutcome::SkippedState;
+            }
+            self.max_queued
+                .fetch_max(queued.len() as u64, Ordering::Relaxed);
+        }
         // Snapshot the replay epoch at submission. The worker re-reads
         // it under the replay_gate read lock before its final cache
         // write; if it has advanced, replay finalize ran in between
         // and the prefetch's bytes are stale.
         let replay_epoch_at_submit = self.replay_epoch_at_pool.load(Ordering::Acquire);
-        self.metrics.submitted(&tree_name);
-        match self.job_tx.send(PrefetchJob {
+        let submit_tree_name = tree_name.clone();
+        self.in_flight.fetch_add(1, Ordering::Release);
+        let job = PrefetchJob {
             tree_name,
             gid,
             key,
@@ -563,18 +1008,114 @@ impl PrefetchPool {
             group_page_nums,
             overrides,
             replay_epoch_at_submit,
-        }) {
-            Ok(()) => true,
-            Err(_) => {
+            queued_at: Instant::now(),
+        };
+        match self.job_tx.try_send(job) {
+            Ok(()) => {
+                self.metrics.accepted();
+                self.metrics.submitted(&submit_tree_name);
+                PrefetchSubmitOutcome::Accepted
+            }
+            Err(flume::TrySendError::Full(job)) => {
                 self.in_flight.fetch_sub(1, Ordering::Release);
-                false
+                self.queued_gids.lock().remove(&job.gid);
+                self.metrics.full();
+                PrefetchSubmitOutcome::Full
+            }
+            Err(flume::TrySendError::Disconnected(job)) => {
+                self.in_flight.fetch_sub(1, Ordering::Release);
+                self.queued_gids.lock().remove(&job.gid);
+                self.metrics.closed();
+                PrefetchSubmitOutcome::Closed
+            }
+        }
+    }
+
+    pub(crate) fn is_optional_pending(&self, gid: u64) -> bool {
+        self.queued_gids.lock().contains(&gid)
+    }
+
+    pub(crate) fn is_optional_fetching(&self, gid: u64) -> bool {
+        self.active_gids.lock().contains(&gid)
+    }
+
+    pub(crate) fn cancel_optional_fetching(&self, gid: u64) -> bool {
+        let active = self.active_gids.lock();
+        if active.contains(&gid) {
+            self.cancelled_gids.lock().insert(gid);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_foreground_wait(&self, elapsed: std::time::Duration) {
+        self.metrics.foreground_wait(elapsed);
+    }
+
+    pub(crate) fn get_foreground(
+        &self,
+        storage: &dyn StorageBackend,
+        runtime: &tokio::runtime::Handle,
+        key: &str,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let _permit = self.io_budget.acquire_foreground();
+        let start = Instant::now();
+        match storage_helpers::get_page_group(storage, runtime, key) {
+            Ok(result) => {
+                if let Some(bytes) = &result {
+                    self.metrics.traffic_success(
+                        PrefetchTrafficClass::ForegroundGroup,
+                        bytes.len() as u64,
+                        start.elapsed(),
+                    );
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                self.metrics
+                    .traffic_error(PrefetchTrafficClass::ForegroundGroup);
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn range_get_foreground(
+        &self,
+        storage: &dyn StorageBackend,
+        runtime: &tokio::runtime::Handle,
+        key: &str,
+        start_byte: u64,
+        len: u32,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let _permit = self.io_budget.acquire_foreground();
+        let start = Instant::now();
+        match storage_helpers::range_get(storage, runtime, key, start_byte, len) {
+            Ok(result) => {
+                if let Some(bytes) = &result {
+                    self.metrics.traffic_success(
+                        PrefetchTrafficClass::ForegroundRange,
+                        bytes.len() as u64,
+                        start.elapsed(),
+                    );
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                self.metrics
+                    .traffic_error(PrefetchTrafficClass::ForegroundRange);
+                Err(e)
             }
         }
     }
 
     pub(crate) fn stats_json(&self) -> serde_json::Value {
-        self.metrics
-            .snapshot_json(self.in_flight.load(Ordering::Relaxed))
+        self.metrics.snapshot_json(
+            self.in_flight.load(Ordering::Relaxed),
+            self.queued_gids.lock().len() as u64,
+            self.max_queued.load(Ordering::Relaxed),
+            self.io_budget.max_in_flight(),
+        )
     }
 
     /// Wait until all in-flight prefetch jobs complete.
@@ -634,7 +1175,7 @@ mod metrics_tests {
         metrics.completed(&tree, 4096);
         metrics.fetch_error(&tree);
 
-        let stats = metrics.snapshot_json(1);
+        let stats = metrics.snapshot_json(1, 0, 0, 1);
         assert_eq!(stats["in_flight"], 1);
         assert_eq!(stats["submitted"], 1);
         assert_eq!(stats["completed"], 1);
@@ -644,6 +1185,52 @@ mod metrics_tests {
         assert_eq!(stats["trees"]["users"]["completed"], 1);
         assert_eq!(stats["trees"]["users"]["fetch_errors"], 1);
         assert_eq!(stats["trees"]["users"]["bytes_fetched"], 4096);
+    }
+
+    #[test]
+    fn latency_histogram_quantiles_are_bucket_upper_bounds() {
+        use super::LatencyHistogram;
+        use std::time::Duration;
+
+        let hist = LatencyHistogram::default();
+        assert_eq!(hist.quantile_us(0.99), 0, "empty histogram reports 0");
+
+        // 99 fast samples (~100us) and 1 slow one (~50ms).
+        for _ in 0..99 {
+            hist.record(Duration::from_micros(100));
+        }
+        hist.record(Duration::from_millis(50));
+
+        // 100us lands in [64, 128); 50_000us lands in [32768, 65536).
+        assert_eq!(hist.quantile_us(0.50), 128);
+        assert_eq!(hist.quantile_us(0.99), 128);
+        assert_eq!(hist.quantile_us(0.999), 65536);
+
+        let snap = hist.snapshot_json();
+        assert_eq!(snap["count"], 100);
+        assert_eq!(snap["p50_us"], 128);
+        assert_eq!(snap["p999_us"], 65536);
+        assert_eq!(snap["max_us"], 50_000);
+    }
+
+    #[test]
+    fn traffic_counters_expose_latency_histogram() {
+        let metrics = PrefetchMetrics::default();
+        metrics.traffic_success(
+            super::PrefetchTrafficClass::ForegroundRange,
+            512,
+            std::time::Duration::from_millis(3),
+        );
+        metrics.foreground_wait(std::time::Duration::from_millis(7));
+
+        let stats = metrics.snapshot_json(0, 0, 0, 0);
+        let range = &stats["traffic"]["foreground_range"];
+        assert_eq!(range["latency"]["count"], 1);
+        // 3000us lands in [2048, 4096).
+        assert_eq!(range["latency"]["p99_us"], 4096);
+        assert_eq!(stats["foreground_wait"]["count"], 1);
+        // 7000us lands in [4096, 8192).
+        assert_eq!(stats["foreground_wait"]["p99_us"], 8192);
     }
 }
 

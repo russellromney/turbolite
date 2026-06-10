@@ -45,11 +45,8 @@ use zstd::dict::{from_samples, EncoderDictionary};
 pub fn train_dictionary(samples: &[Vec<u8>], dict_size: usize) -> io::Result<Vec<u8>> {
     let sample_refs: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
 
-    from_samples(&sample_refs, dict_size).map_err(|e| {
-        io::Error::other(
-            format!("Dictionary training failed: {}", e),
-        )
-    })
+    from_samples(&sample_refs, dict_size)
+        .map_err(|e| io::Error::other(format!("Dictionary training failed: {}", e)))
 }
 
 /// Train a dictionary from an existing SQLite database.
@@ -102,9 +99,7 @@ pub fn compress_with_dict(data: &[u8], dict: &[u8], level: i32) -> io::Result<Ve
     let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), &encoder_dict)
         .map_err(io::Error::other)?;
     encoder.write_all(data)?;
-    encoder
-        .finish()
-        .map_err(io::Error::other)
+    encoder.finish().map_err(io::Error::other)
 }
 
 /// Decompress data using a dictionary.

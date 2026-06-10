@@ -43,11 +43,20 @@ pub(crate) fn range_get(
     start: u64,
     len: u32,
 ) -> io::Result<Option<Vec<u8>>> {
-    block_on(runtime, backend.range_get(key, start, len)).map_err(|e| {
-        io::Error::other(
-            format!("storage range_get {key}: {e}"),
-        )
-    })
+    let result = block_on(runtime, backend.range_get(key, start, len))
+        .map_err(|e| io::Error::other(format!("storage range_get {key}: {e}")))?;
+    if let Some(bytes) = &result {
+        if bytes.len() != len as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "storage range_get {key} returned {} bytes for requested exact range {start}+{len}",
+                    bytes.len()
+                ),
+            ));
+        }
+    }
+    Ok(result)
 }
 
 /// Upload a batch of `(key, bytes)`. Uses the backend's native `put_many`
@@ -126,9 +135,7 @@ pub(crate) fn list_all_keys_with_prefix(
             // Guard against pathological backends that always return at
             // least one key.
             if out.len() > 10_000_000 {
-                return Err(io::Error::other(
-                    "list overran 10M keys",
-                ));
+                return Err(io::Error::other("list overran 10M keys"));
             }
             // One-shot backends (like LocalStorage's single-pass walk) will
             // return the full list in one call; the second `list` with the
@@ -183,9 +190,7 @@ pub(crate) fn get_page_groups_by_key(
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    return Err(io::Error::other(
-                        format!("storage get {k}: {e}"),
-                    ));
+                    return Err(io::Error::other(format!("storage get {k}: {e}")));
                 }
             }
         }
@@ -202,4 +207,65 @@ pub(crate) fn manifest_exists(
 ) -> io::Result<bool> {
     block_on(runtime, backend.exists(keys::MANIFEST_KEY))
         .map_err(|e| io::Error::other(format!("storage exists: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct RangeIgnoringBackend;
+
+    #[async_trait]
+    impl StorageBackend for RangeIgnoringBackend {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(Some(vec![1, 2, 3, 4, 5, 6]))
+        }
+
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+            Ok(hadb_storage::CasResult {
+                success: true,
+                etag: None,
+            })
+        }
+
+        async fn put_if_match(
+            &self,
+            _key: &str,
+            _data: &[u8],
+            _etag: &str,
+        ) -> Result<hadb_storage::CasResult> {
+            Ok(hadb_storage::CasResult {
+                success: true,
+                etag: None,
+            })
+        }
+
+        async fn range_get(&self, _key: &str, _start: u64, _len: u32) -> Result<Option<Vec<u8>>> {
+            Ok(Some(vec![1, 2, 3, 4, 5, 6]))
+        }
+    }
+
+    #[test]
+    fn range_get_rejects_overlong_backend_response() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(RangeIgnoringBackend);
+        let err = range_get(backend.as_ref(), rt.handle(), "g0", 1, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exact range"));
+    }
 }

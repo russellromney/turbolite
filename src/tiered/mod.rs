@@ -208,9 +208,8 @@ pub fn get_manifest(
     backend: &dyn hadb_storage::StorageBackend,
     runtime: &tokio::runtime::Handle,
 ) -> std::io::Result<Option<Manifest>> {
-    let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY)).map_err(|e| {
-        std::io::Error::other(format!("fetch manifest: {e}"))
-    })?;
+    let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY))
+        .map_err(|e| std::io::Error::other(format!("fetch manifest: {e}")))?;
     match bytes {
         None => Ok(None),
         Some(bytes) => {
@@ -373,12 +372,14 @@ pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
 /// Register a TurboliteVfs with SQLite through sqlite-plugin under the given
 /// name, as a non-default VFS.
 pub fn register_plugin(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
-    let cname = std::ffi::CString::new(name)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let cname =
+        std::ffi::CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     sqlite_plugin::vfs::register_static(
         cname,
         vfs,
-        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+        sqlite_plugin::vfs::RegisterOpts {
+            make_default: false,
+        },
     )
     .map_err(|code| io::Error::other(format!("sqlite code {code}")))?;
     REGISTERED_VFS_NAMES.lock().insert(name.to_string());
@@ -497,12 +498,14 @@ mod shared_plugin_backend {
 /// so you can call `manifest()` and `set_manifest()` on it after registration.
 /// This is required for haqlite's shared-mode turbolite integration.
 pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
-    let cname = std::ffi::CString::new(name)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let cname =
+        std::ffi::CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     sqlite_plugin::vfs::register_static(
         cname,
         vfs,
-        sqlite_plugin::vfs::RegisterOpts { make_default: false },
+        sqlite_plugin::vfs::RegisterOpts {
+            make_default: false,
+        },
     )
     .map_err(|code| io::Error::other(format!("sqlite code {code}")))?;
     REGISTERED_VFS_NAMES.lock().insert(name.to_string());
@@ -526,11 +529,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     // Check current journal_mode
     let current_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .map_err(|e| {
-            io::Error::other(
-                format!("failed to read journal_mode: {}", e),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("failed to read journal_mode: {}", e)))?;
 
     if current_mode == "off" || current_mode == "memory" {
         return Ok(());
@@ -539,9 +538,7 @@ pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<()
     if current_mode == "wal" {
         // Checkpoint to flush WAL contents into the main database file
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(|e| {
-                io::Error::other(format!("checkpoint failed: {}", e))
-            })?;
+            .map_err(|e| io::Error::other(format!("checkpoint failed: {}", e)))?;
     }
 
     // Try the normal PRAGMA path (works when not in WAL mode)

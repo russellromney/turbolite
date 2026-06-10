@@ -1,9 +1,172 @@
 use super::*;
 use crate::tiered::*;
+use anyhow::Result;
+use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+#[derive(Default)]
+struct DeterministicPressureBackend {
+    base_sleep_ms: u64,
+    started: AtomicU64,
+    active: AtomicU64,
+    max_active: AtomicU64,
+}
+
+struct BlockingPayloadBackend {
+    release: AtomicBool,
+    started: AtomicU64,
+    payload: Vec<u8>,
+}
+
+#[async_trait]
+impl StorageBackend for DeterministicPressureBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        self.started.fetch_add(1, Ordering::Release);
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.max_active.fetch_max(active, Ordering::Relaxed);
+        if self.base_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.base_sleep_ms * active)).await;
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        Ok(None)
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for BlockingPayloadBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        self.started.fetch_add(1, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(Some(self.payload.clone()))
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+}
+
+fn test_pool(
+    cache: Arc<DiskCache>,
+    backend: Arc<dyn StorageBackend>,
+    queue_capacity: u32,
+    io_permits: u32,
+    foreground_reserved: u32,
+) -> PrefetchPool {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let handle = rt.handle().clone();
+    std::mem::forget(rt);
+    PrefetchPool::new(
+        1,
+        backend,
+        handle,
+        cache,
+        4,
+        Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::new(ArcSwap::from_pointee(Manifest::empty())),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        queue_capacity,
+        RemoteIoBudget::new(io_permits, foreground_reserved),
+    )
+}
+
+fn submit_test_job(pool: &PrefetchPool, cache: &DiskCache, gid: u64) -> PrefetchSubmitOutcome {
+    pool.submit_optional(
+        Some("scan".to_string()),
+        gid,
+        format!("g{gid}"),
+        Vec::new(),
+        64,
+        0,
+        Vec::new(),
+        HashMap::new(),
+        0,
+        cache,
+    )
+}
+
+fn test_encode_group(page_size: u32, pages_per_group: usize, fill: u8) -> Vec<u8> {
+    let pages: Vec<Option<Vec<u8>>> = (0..pages_per_group)
+        .map(|_| Some(vec![fill; page_size as usize]))
+        .collect();
+    encode_page_group(
+        &pages,
+        page_size,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap()
+}
 
 // =========================================================================
 // Demand-Driven Prefetch: btree_groups data structure tests
@@ -412,7 +575,255 @@ fn test_read_path_range_get_before_prefetch() {
         "group state should remain None until prefetch is submitted"
     );
 
-    // Now the read path would claim and submit to pool
+    assert_eq!(
+        cache.group_state(0),
+        GroupState::None,
+        "seekable range demand must not also claim current group for full prefetch"
+    );
+}
+
+#[test]
+fn optional_prefetch_queue_full_is_nonblocking_and_does_not_claim_rejected_group() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend = Arc::new(DeterministicPressureBackend {
+        base_sleep_ms: 200,
+        ..Default::default()
+    });
+    let pool = test_pool(Arc::clone(&cache), backend.clone(), 1, 2, 1);
+
+    assert_eq!(
+        submit_test_job(&pool, cache.as_ref(), 0),
+        PrefetchSubmitOutcome::Accepted
+    );
+    while backend.started.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        submit_test_job(&pool, cache.as_ref(), 1),
+        PrefetchSubmitOutcome::Accepted
+    );
+
+    let start = Instant::now();
+    let outcome = submit_test_job(&pool, cache.as_ref(), 2);
+    assert_eq!(outcome, PrefetchSubmitOutcome::Full);
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "queue pressure must be reported without blocking foreground callers"
+    );
+    assert_eq!(cache.group_state(2), GroupState::None);
+    assert_eq!(
+        cache.group_state(1),
+        GroupState::None,
+        "queued optional work is not Fetching"
+    );
+
+    pool.wait_idle();
+    let stats = pool.stats_json();
+    assert_eq!(stats["full"], 1);
+    assert_eq!(stats["accepted"], 2);
+}
+
+#[test]
+fn optional_prefetch_permit_unavailable_never_sets_fetching() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend = Arc::new(DeterministicPressureBackend::default());
+    let pool = test_pool(Arc::clone(&cache), backend, 1, 1, 1);
+
+    assert_eq!(
+        submit_test_job(&pool, cache.as_ref(), 0),
+        PrefetchSubmitOutcome::Accepted
+    );
+    pool.wait_idle();
+
+    assert_eq!(cache.group_state(0), GroupState::None);
+    assert_eq!(pool.stats_json()["permit_unavailable"], 1);
+}
+
+#[test]
+fn optional_prefetch_workers_drop_busy_permit_without_claiming_or_hanging() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend = Arc::new(BlockingPayloadBackend {
+        release: AtomicBool::new(false),
+        started: AtomicU64::new(0),
+        payload: test_encode_group(64, 4, 9),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = PrefetchPool::new(
+        2,
+        backend.clone(),
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(8)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::new(ArcSwap::from_pointee(Manifest::empty())),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        4,
+        RemoteIoBudget::new(2, 1),
+    );
+
+    for gid in 0..2 {
+        assert_eq!(
+            pool.submit_optional(
+                Some("scan".to_string()),
+                gid,
+                format!("g{gid}"),
+                Vec::new(),
+                64,
+                0,
+                vec![gid * 4, gid * 4 + 1, gid * 4 + 2, gid * 4 + 3],
+                HashMap::new(),
+                0,
+                cache.as_ref(),
+            ),
+            PrefetchSubmitOutcome::Accepted
+        );
+    }
+
+    while backend.started.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(25));
+
+    assert_eq!(backend.started.load(Ordering::Acquire), 1);
+    assert_eq!(cache.group_state(1), GroupState::None);
+    assert_eq!(pool.stats_json()["permit_unavailable"], 1);
+
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+
+    assert_eq!(backend.started.load(Ordering::Acquire), 1);
+    assert_eq!(pool.stats_json()["completed"], 1);
+    assert_eq!(pool.stats_json()["permit_unavailable"], 1);
+    assert_eq!(cache.group_state(0), GroupState::Present);
+    assert_eq!(cache.group_state(1), GroupState::None);
+    assert_eq!(pool.stats_json()["in_flight"], 0);
+}
+
+#[test]
+fn zero_worker_prefetch_pool_rejects_without_hanging() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend = Arc::new(DeterministicPressureBackend::default());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = PrefetchPool::new(
+        0,
+        backend,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::new(ArcSwap::from_pointee(Manifest::empty())),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        1,
+        RemoteIoBudget::new(1, 0),
+    );
+
+    assert_eq!(
+        submit_test_job(&pool, cache.as_ref(), 0),
+        PrefetchSubmitOutcome::Closed
+    );
+    pool.wait_idle();
+    assert_eq!(pool.stats_json()["in_flight"], 0);
+}
+
+#[test]
+fn cancelled_active_prefetch_does_not_install_late_bytes() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let payload = test_encode_group(64, 4, 7);
+    let backend = Arc::new(BlockingPayloadBackend {
+        release: AtomicBool::new(false),
+        started: AtomicU64::new(0),
+        payload,
+    });
+    let pool = test_pool(Arc::clone(&cache), backend.clone(), 2, 1, 0);
+
+    let outcome = pool.submit_optional(
+        Some("scan".to_string()),
+        0,
+        "g0".to_string(),
+        Vec::new(),
+        64,
+        0,
+        vec![0, 1, 2, 3],
+        HashMap::new(),
+        0,
+        cache.as_ref(),
+    );
+    assert_eq!(outcome, PrefetchSubmitOutcome::Accepted);
+    while backend.started.load(Ordering::Acquire) == 0 || !pool.is_optional_fetching(0) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(pool.cancel_optional_fetching(0));
+    assert!(cache.unclaim_if_fetching(0));
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+
+    assert!(!cache.is_present(0));
+    assert_eq!(cache.group_state(0), GroupState::None);
+    assert_eq!(pool.stats_json()["cancelled"], 1);
+}
+
+#[test]
+fn foreground_permit_survives_exhausted_prefetch_capacity() {
+    let budget = RemoteIoBudget::new(2, 1);
+    let _prefetch = budget
+        .try_acquire_prefetch()
+        .expect("one spare prefetch permit");
+    let start = Instant::now();
+    let _foreground = budget.acquire_foreground();
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "reserved foreground permit must remain available"
+    );
+}
+
+#[test]
+fn legacy_claim_before_queue_rejection_would_make_foreground_wait() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    let (tx, _rx) = flume::bounded::<u64>(0);
+
     assert!(cache.try_claim_group(0));
-    assert_eq!(cache.group_state(0), GroupState::Fetching);
+    assert!(
+        tx.try_send(0).is_err(),
+        "legacy full queue rejects after claim"
+    );
+
+    let start = Instant::now();
+    let observed = cache.wait_for_group(0);
+    assert_eq!(observed, GroupState::Fetching);
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "legacy claim-before-admission makes foreground wait for the lost Fetching claim"
+    );
+    cache.unclaim_if_fetching(0);
+}
+
+#[test]
+fn legacy_blocking_submit_would_park_foreground_when_queue_full() {
+    let (tx, _rx) = flume::bounded::<u64>(1);
+    tx.send(0).unwrap();
+
+    let start = Instant::now();
+    let err = tx
+        .send_timeout(1, Duration::from_millis(150))
+        .expect_err("legacy blocking send would wait on a full optional queue");
+    assert!(matches!(err, flume::SendTimeoutError::Timeout(_)));
+    assert!(
+        start.elapsed() >= Duration::from_millis(125),
+        "old blocking optional admission parks the caller under queue pressure"
+    );
 }

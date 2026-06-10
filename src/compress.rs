@@ -22,9 +22,7 @@ pub fn compress(
         let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
             .map_err(io::Error::other)?;
         encoder.write_all(data)?;
-        encoder
-            .finish()
-            .map_err(io::Error::other)
+        encoder.finish().map_err(io::Error::other)
     } else {
         encode_all(data, level).map_err(io::Error::other)
     }
@@ -73,8 +71,7 @@ pub fn decompress_capped(
             .map_err(io::Error::other)?;
         decoder.take(cap as u64).read_to_end(&mut output)?
     } else {
-        let decoder = zstd::stream::Decoder::new(data)
-            .map_err(io::Error::other)?;
+        let decoder = zstd::stream::Decoder::new(data).map_err(io::Error::other)?;
         decoder.take(cap as u64).read_to_end(&mut output)?
     };
     if n > max_len {

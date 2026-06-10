@@ -20,7 +20,7 @@
 //! | `TURBOLITE_CACHE_DIR` | no | `"/tmp/turbolite"` | Local cache directory |
 //! | `TURBOLITE_ENDPOINT_URL` | no | — | Custom S3 endpoint (Tigris, MinIO) |
 //! | `TURBOLITE_REGION` | no | — | AWS region |
-//! | `TURBOLITE_PREFETCH_THREADS` | no | `num_cpus + 1` | Prefetch worker threads |
+//! | `TURBOLITE_PREFETCH_THREADS` | no | `max(num_cpus - 1, 1)` | Prefetch worker threads |
 //! | `TURBOLITE_COMPRESSION_LEVEL` | no | `3` | Zstd level 1-22 |
 //! | `TURBOLITE_READ_ONLY` | no | `false` | Open in read-only mode |
 //!

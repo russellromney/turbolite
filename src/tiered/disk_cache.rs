@@ -123,11 +123,7 @@ impl CacheIndex {
             entries: &self.entries,
             next_offset: self.next_offset,
         })
-        .map_err(|e| {
-            io::Error::other(
-                format!("serialize cache index: {}", e),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("serialize cache index: {}", e)))?;
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, &data)?;
         fs::rename(&tmp, &self.path)?;
@@ -649,7 +645,9 @@ impl DiskCache {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
                         unsafe {
-                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(new_ptr, ps)));
+                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                                new_ptr, ps,
+                            )));
                         }
                     }
                 }
@@ -699,7 +697,9 @@ impl DiskCache {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
                         unsafe {
-                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(new_ptr, ps)));
+                            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                                new_ptr, ps,
+                            )));
                         }
                     }
                 }
@@ -900,12 +900,10 @@ impl DiskCache {
         {
             let remaining = self.fail_no_visibility_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
-                return Err(io::Error::other(
-                    format!(
-                        "test-injected forward write_page_no_visibility failure on page {}",
-                        page_num
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "test-injected forward write_page_no_visibility failure on page {}",
+                    page_num
+                )));
             }
         }
         self.write_page_no_visibility_inner(page_num, data)
@@ -925,12 +923,10 @@ impl DiskCache {
         {
             let remaining = self.fail_rollback_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
-                return Err(io::Error::other(
-                    format!(
-                        "test-injected rollback write_page_no_visibility failure on page {}",
-                        page_num
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "test-injected rollback write_page_no_visibility failure on page {}",
+                    page_num
+                )));
             }
         }
         self.write_page_no_visibility_inner(page_num, data)

@@ -718,11 +718,7 @@ impl ReplayHandle {
         self.ctx
             .pending_flushes
             .lock()
-            .map_err(|e| {
-                io::Error::other(
-                    format!("pending_flushes poisoned: {e}"),
-                )
-            })?
+            .map_err(|e| io::Error::other(format!("pending_flushes poisoned: {e}")))?
             .push(PendingFlush {
                 staging_path: staging_log_path,
                 version: staging_version,
@@ -835,9 +831,9 @@ impl ReplayHandle {
 
     fn check_not_consumed(&self, method: &str) -> io::Result<()> {
         if self.consumed {
-            return Err(io::Error::other(
-                format!("ReplayHandle::{method} called after finalize/abort"),
-            ));
+            return Err(io::Error::other(format!(
+                "ReplayHandle::{method} called after finalize/abort"
+            )));
         }
         Ok(())
     }

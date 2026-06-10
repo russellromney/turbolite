@@ -10,11 +10,15 @@ fn test_tiered_config_default() {
     assert_eq!(c.cache.ttl_secs, 0);
     assert_eq!(c.prefetch.search, vec![0.3, 0.3, 0.4]);
     assert_eq!(c.prefetch.lookup, vec![0.0, 0.0, 0.0]);
-    let expected_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(2)
-        + 1;
-    assert_eq!(c.prefetch.threads, expected_threads);
+    assert_eq!(c.prefetch.threads, PrefetchConfig::default_threads());
+    assert!(c.prefetch.threads >= 1);
+    assert_eq!(c.prefetch.queue_capacity, 8);
+    // Workers + 1: prefetch can saturate every worker while one permit
+    // stays reserved for foreground range gets.
+    assert_eq!(c.prefetch.io_permits, PrefetchConfig::default_threads() + 1);
+    assert_eq!(c.prefetch.foreground_reserved_permits, 1);
+    assert_eq!(c.prefetch.scan_window_groups, 4);
+    assert_eq!(c.prefetch.scan_window_bytes, 32 * 1024 * 1024);
 }
 
 #[test]

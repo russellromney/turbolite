@@ -646,11 +646,8 @@ impl SubChunkTracker {
                 (*id, tier, count)
             })
             .collect();
-        let data = serde_json::to_vec(&entries).map_err(|e| {
-            io::Error::other(
-                format!("serialize sub-chunk tracker: {}", e),
-            )
-        })?;
+        let data = serde_json::to_vec(&entries)
+            .map_err(|e| io::Error::other(format!("serialize sub-chunk tracker: {}", e)))?;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
             use rand::RngCore;

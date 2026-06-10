@@ -141,14 +141,15 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
 
         // For SCAN: always emit the table (we need all data groups)
         if access_type == AccessType::Scan
-            && seen.insert((table_name.to_string(), AccessType::Scan)) {
-                accesses.push(PlannedAccess {
-                    tree_name: table_name.to_string(),
-                    access_type: AccessType::Scan,
-                    table_name: Some(table_name.to_string()),
-                    constraint_columns: constraint_columns.clone(),
-                });
-            }
+            && seen.insert((table_name.to_string(), AccessType::Scan))
+        {
+            accesses.push(PlannedAccess {
+                tree_name: table_name.to_string(),
+                access_type: AccessType::Scan,
+                table_name: Some(table_name.to_string()),
+                constraint_columns: constraint_columns.clone(),
+            });
+        }
 
         // Check for USING [COVERING] INDEX <index_name>
         if let Some(idx_pos) = rest
