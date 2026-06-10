@@ -1,0 +1,37 @@
+[bench] main() starting
+[bench] CLI parsed
+=== Tiered VFS Benchmark (Page Group Model) ===
+Bucket:       sqlces-test
+Endpoint:     https://t3.storage.dev
+Page size:    65536 bytes
+Pages/group:  256 (16.0 MB uncompressed per group)
+Iterations:   1 measured + 0 warmup per cold query, 1 per warm query
+Queries:      post detail, profile, who-liked, mutual friends
+Plan-aware:   ENABLED (Phase Marne query-plan prefetch)
+
+--- 1,000,000 posts, 100,000 users (~812.5 MB, ~13001 pages, ~51 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(1000000) starting
+  Reusing S3 prefix: social_1000000_btree
+[bench] creating reader VFS...
+[bench] calling TurboliteVfs::with_backend()...
+[bench] TurboliteVfs::with_backend() returned OK
+[bench] registering VFS 'bench_reader_0'
+[bench] VFS registered, opening connection...
+[bench] connection opened, skipping COUNT(*) verification
+  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+  scan-filter  schedule: off / off
+
+=== CACHE LEVEL: NONE (everything from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [cache-info] level=none label=scan-filter iter=0 json={"bytes_evicted":0,"evictions":0,"groups_cached":70,"groups_total":97,"hit_rate":0.9982351266723598,"hits":17534,"last_eviction_count":0,"misses":31,"peak_bytes":1151336448,"prefetch":{"accepted":39,"bytes_fetched":47993393,"cancelled":0,"closed":0,"completed":39,"decode_errors":0,"fetch_errors":0,"foreground_wait_us":0,"foreground_waits":0,"full":0,"in_flight":0,"max_queued":2,"max_remote_in_flight":3,"missing_objects":0,"permit_unavailable":0,"queued":0,"skipped_state":0,"stale_manifest":0,"stale_replay":0,"submitted":39,"traffic":{"foreground_group":{"bytes":36721514,"errors":0,"latency_us":7591820,"ops":30},"foreground_range":{"bytes":46202,"errors":0,"latency_us":60718,"ops":1},"prefetch_group":{"bytes":47993393,"errors":0,"latency_us":7894641,"ops":39},"prefetch_override":{"bytes":0,"errors":0,"latency_us":0,"ops":0}},"trees":{"posts":{"bytes_fetched":47993393,"completed":39,"decode_errors":0,"fetch_errors":0,"missing_objects":0,"skipped_state":0,"stale_manifest":0,"stale_replay":0,"submitted":39,"write_errors":0}},"wait_before_fetch_us":814,"write_errors":0},"size_bytes":1151336448,"tiers":{"data":{"bytes":1150025728,"chunks":4387},"index":{"bytes":262144,"chunks":1},"pinned":{"bytes":1048576,"chunks":4}}}
+  [none] scan-filter             9.3s       9.3s       9.3s       70.0       80.8MB
+
+
+Reference: Neon cold start ~500ms (us-east-2, compute pool)
+Done.
+real 12.39
+user 1.09
+sys 2.46

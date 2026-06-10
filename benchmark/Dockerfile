@@ -1,6 +1,6 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake libclang-dev && rm -rf /var/lib/apt/lists/*
 
 # Stub out path dependencies that aren't needed for the benchmark.
 # walrust-core and hadb-io are behind the "wal" feature flag which

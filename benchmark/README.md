@@ -100,7 +100,7 @@ SEARCH queries scan unknown portions of indexes/tables and need aggressive warmu
                    Options: none, interior, index, data
 --queries          Queries to run, comma-separated (default: all)
                    Options: post, profile, who-liked, mutual, idx-filter, scan-filter
---prefetch-threads Worker threads for parallel S3 fetches (default: 8)
+--prefetch-threads Worker threads for parallel S3 fetches (default: max(num_cpus - 1, 1))
 --prefetch-search  SEARCH prefetch schedule (default: 0.3,0.3,0.4)
 --prefetch-lookup  Lookup prefetch schedule (default: 0,0,0)
 --prefetch-hops    Radial prefetch schedule for Positional strategy (default: 0.33,0.33)

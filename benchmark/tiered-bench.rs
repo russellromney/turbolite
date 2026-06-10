@@ -106,6 +106,10 @@ impl<'a> BenchCtx<'a> {
             .saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
         (fc, fb)
     }
+
+    fn cache_info(&self) -> String {
+        self.state.cache_info()
+    }
 }
 
 // =========================================================================
@@ -297,9 +301,10 @@ struct Cli {
     #[arg(long, default_value = "10000", env = "BENCH_BATCH_SIZE")]
     batch_size: usize,
 
-    /// Number of worker threads for parallel S3 fetches. Default 8.
-    #[arg(long, default_value = "8", env = "BENCH_PREFETCH_THREADS")]
-    prefetch_threads: u32,
+    /// Number of worker threads for parallel S3 fetches.
+    /// Defaults to max(num_cpus - 1, 1).
+    #[arg(long, env = "BENCH_PREFETCH_THREADS")]
+    prefetch_threads: Option<u32>,
 
     /// Prefetch schedule for SEARCH queries (aggressive warmup).
     /// Comma-separated fractions. Default "0.3,0.3,0.4".
@@ -514,6 +519,60 @@ fn parse_query_prefetch(s: &str) -> Option<Vec<f32>> {
     }
 }
 
+const DEFAULT_MODE_ORDER: [&str; 4] = ["data", "index", "interior", "none"];
+
+fn selected_mode_order(modes: Option<&str>) -> Vec<&'static str> {
+    let Some(modes) = modes else {
+        return DEFAULT_MODE_ORDER.to_vec();
+    };
+
+    let mut selected = Vec::new();
+    for mode in modes.split(',') {
+        let mode = match mode.trim().to_lowercase().as_str() {
+            "data" => "data",
+            "index" => "index",
+            "interior" => "interior",
+            "none" => "none",
+            _ => continue,
+        };
+        if !selected.contains(&mode) {
+            selected.push(mode);
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+mod mode_order_tests {
+    use super::*;
+
+    #[test]
+    fn selected_mode_order_preserves_explicit_order() {
+        assert_eq!(
+            selected_mode_order(Some("none,interior,index,data")),
+            vec!["none", "interior", "index", "data"]
+        );
+    }
+
+    #[test]
+    fn selected_mode_order_keeps_default_order_when_absent() {
+        assert_eq!(selected_mode_order(None), DEFAULT_MODE_ORDER.to_vec());
+    }
+
+    #[test]
+    fn effective_prefetch_threads_leaves_one_core_by_default() {
+        assert_eq!(
+            effective_prefetch_threads_from(None, None),
+            PrefetchConfig::default_threads()
+        );
+    }
+
+    #[test]
+    fn effective_prefetch_threads_keeps_turbolite_env_precedence() {
+        assert_eq!(effective_prefetch_threads_from(Some(5), Some("7")), 7);
+    }
+}
+
 fn format_ms(us: f64) -> String {
     if us >= 1_000_000.0 {
         format!("{:.1}s", us / 1_000_000.0)
@@ -538,14 +597,28 @@ fn parse_prefetch_hops(s: &str) -> Vec<f32> {
         .collect()
 }
 
+fn effective_prefetch_threads_from(cli_threads: Option<u32>, turbolite_env: Option<&str>) -> u32 {
+    turbolite_env
+        .and_then(|v| v.parse().ok())
+        .or(cli_threads)
+        .unwrap_or_else(PrefetchConfig::default_threads)
+}
+
+fn effective_prefetch_threads(cli_threads: Option<u32>) -> u32 {
+    let turbolite_env = std::env::var("TURBOLITE_PREFETCH_THREADS").ok();
+    effective_prefetch_threads_from(cli_threads, turbolite_env.as_deref())
+}
+
 fn make_config(
     _prefix: &str,
     cache_dir: &std::path::Path,
     ppg: u32,
-    prefetch_threads: u32,
+    prefetch_threads: Option<u32>,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
 ) -> TurboliteConfig {
+    let env_prefetch = PrefetchConfig::from_env();
+    let prefetch_threads = effective_prefetch_threads(prefetch_threads);
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
         compression: CompressionConfig {
@@ -560,7 +633,7 @@ fn make_config(
             threads: prefetch_threads,
             search: prefetch_search,
             lookup: prefetch_lookup,
-            ..Default::default()
+            ..env_prefetch
         },
         ..Default::default()
     }
@@ -570,10 +643,12 @@ fn make_reader_config(
     _prefix: &str,
     cache_dir: &std::path::Path,
     ppg: u32,
-    prefetch_threads: u32,
+    prefetch_threads: Option<u32>,
     prefetch_search: Vec<f32>,
     prefetch_lookup: Vec<f32>,
 ) -> TurboliteConfig {
+    let env_prefetch = PrefetchConfig::from_env();
+    let prefetch_threads = effective_prefetch_threads(prefetch_threads);
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
         compression: CompressionConfig {
@@ -589,7 +664,7 @@ fn make_reader_config(
             threads: prefetch_threads,
             search: prefetch_search,
             lookup: prefetch_lookup,
-            ..Default::default()
+            ..env_prefetch
         },
         ..Default::default()
     }
@@ -1091,7 +1166,7 @@ fn bench_data(
     // Prime: run query once to populate cache, then reuse same params
     // to measure true cache-hit latency (no S3 fetches)
     let params = param_fn(0);
-    let _ = run_query_pair(conn, sql, &params, false, schedule);
+    let _ = run_query_pair(conn, sql, &params, plan_aware, schedule);
     handle.reset_s3_counters();
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -1259,6 +1334,14 @@ fn bench_none(
                 let (fc, fb) = handle.s3_counters();
                 s3_fetches.push(fc);
                 s3_bytes.push(fb);
+                if std::env::var("BENCH_CACHE_INFO").is_ok() {
+                    eprintln!(
+                        "  [cache-info] level=none label={} iter={} json={}",
+                        label,
+                        i,
+                        handle.cache_info(),
+                    );
+                }
             }
             Err(e) => eprintln!("    [none] {} iter {} error: {}", label, i, e),
         }
@@ -1361,6 +1444,62 @@ fn print_result(r: &BenchResult) {
         format_ms(r.p99()),
         format!("{:.1}", r.avg_fetches()),
         format_kb(r.avg_bytes_kb()),
+    );
+}
+
+/// Print per-class remote GET latency tails plus foreground wait, from the
+/// pool histograms in cache_info. Separates "GETs are slow" from "foreground
+/// is stuck waiting on an in-flight prefetch" — different bottlenecks.
+fn print_remote_tails(ctx: &BenchCtx) {
+    let info: serde_json::Value = match serde_json::from_str(&ctx.cache_info()) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let prefetch = &info["prefetch"];
+
+    let fmt_us = |v: &serde_json::Value| -> String {
+        match v.as_u64() {
+            Some(us) if us >= 1000 => format!("{:.1}ms", us as f64 / 1000.0),
+            Some(us) => format!("{}us", us),
+            None => "-".to_string(),
+        }
+    };
+    let print_hist = |label: &str, hist: &serde_json::Value| {
+        let count = hist["count"].as_u64().unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        println!(
+            "  {:<22} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            label,
+            count,
+            fmt_us(&hist["p50_us"]),
+            fmt_us(&hist["p95_us"]),
+            fmt_us(&hist["p99_us"]),
+            fmt_us(&hist["p999_us"]),
+            fmt_us(&hist["max_us"]),
+        );
+    };
+
+    println!();
+    println!("=== REMOTE I/O TAILS (whole run, all modes) ===");
+    println!(
+        "  {:<22} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "count", "p50", "p95", "p99", "p999", "max"
+    );
+    for class in [
+        "foreground_range",
+        "foreground_group",
+        "prefetch_group",
+        "prefetch_override",
+    ] {
+        print_hist(class, &prefetch["traffic"][class]["latency"]);
+    }
+    print_hist("foreground_wait", &prefetch["foreground_wait"]);
+    print_hist("queue_wait", &prefetch["wait_before_fetch"]);
+    println!(
+        "  max remote in-flight: {}",
+        prefetch["max_remote_in_flight"].as_u64().unwrap_or(0)
     );
 }
 
@@ -1640,19 +1779,11 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         .queries
         .as_ref()
         .map(|q| q.split(',').map(|s| s.trim().to_lowercase()).collect());
-    let mode_filter: Option<Vec<String>> = cli
-        .modes
-        .as_ref()
-        .map(|m| m.split(',').map(|s| s.trim().to_lowercase()).collect());
+    let mode_order = selected_mode_order(cli.modes.as_deref());
     let should_run_query = |label: &str| -> bool {
         query_filter
             .as_ref()
             .map_or(true, |f| f.iter().any(|q| label.contains(q.as_str())))
-    };
-    let should_run_mode = |mode: &str| -> bool {
-        mode_filter
-            .as_ref()
-            .map_or(true, |f| f.contains(&mode.to_string()))
     };
 
     // --naive overrides: disable all prefetch and plan-aware
@@ -1750,78 +1881,80 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("  {:12} schedule: {}", q.label, q.schedule.label());
     }
 
-    if should_run_mode("data") {
-        println!();
-        println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
-        print_header();
-        for q in &queries {
-            print_result(&bench_data(
-                &warm_conn,
-                &ctx,
-                q.label,
-                q.sql,
-                &q.param_fn,
-                cli.iterations,
-                plan_aware,
-                &q.schedule,
-            ));
-        }
-    }
-
-    if should_run_mode("index") {
-        println!();
-        println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
-        print_header();
-        for q in &queries {
-            print_result(&bench_index(
-                &warm_conn,
-                &ctx,
-                q.label,
-                q.sql,
-                &q.param_fn,
-                cli.warmup,
-                cli.iterations,
-                plan_aware,
-                &q.schedule,
-            ));
-        }
-    }
-
-    if should_run_mode("interior") {
-        println!();
-        println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
-        print_header();
-        for q in &queries {
-            print_result(&bench_interior(
-                &warm_conn,
-                &ctx,
-                q.label,
-                q.sql,
-                &q.param_fn,
-                cli.warmup,
-                cli.iterations,
-                plan_aware,
-                &q.schedule,
-            ));
-        }
-    }
-
-    if should_run_mode("none") {
-        println!();
-        println!("=== CACHE LEVEL: NONE (everything from S3) ===");
-        print_header();
-        for q in &queries {
-            print_result(&bench_none(
-                &warm_conn,
-                &ctx,
-                q.label,
-                q.sql,
-                &q.param_fn,
-                cli.warmup,
-                cli.iterations,
-                plan_aware,
-                &q.schedule,
-            ));
+    for mode in mode_order {
+        match mode {
+            "data" => {
+                println!();
+                println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
+                print_header();
+                for q in &queries {
+                    print_result(&bench_data(
+                        &warm_conn,
+                        &ctx,
+                        q.label,
+                        q.sql,
+                        &q.param_fn,
+                        cli.iterations,
+                        plan_aware,
+                        &q.schedule,
+                    ));
+                }
+            }
+            "index" => {
+                println!();
+                println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
+                print_header();
+                for q in &queries {
+                    print_result(&bench_index(
+                        &warm_conn,
+                        &ctx,
+                        q.label,
+                        q.sql,
+                        &q.param_fn,
+                        cli.warmup,
+                        cli.iterations,
+                        plan_aware,
+                        &q.schedule,
+                    ));
+                }
+            }
+            "interior" => {
+                println!();
+                println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
+                print_header();
+                for q in &queries {
+                    print_result(&bench_interior(
+                        &warm_conn,
+                        &ctx,
+                        q.label,
+                        q.sql,
+                        &q.param_fn,
+                        cli.warmup,
+                        cli.iterations,
+                        plan_aware,
+                        &q.schedule,
+                    ));
+                }
+            }
+            "none" => {
+                println!();
+                println!("=== CACHE LEVEL: NONE (everything from S3) ===");
+                print_header();
+                for q in &queries {
+                    print_result(&bench_none(
+                        &warm_conn,
+                        &ctx,
+                        q.label,
+                        q.sql,
+                        &q.param_fn,
+                        cli.warmup,
+                        cli.iterations,
+                        plan_aware,
+                        &q.schedule,
+                    ));
+                }
+            }
+            _ => unreachable!("selected_mode_order only returns known modes"),
         }
     }
 
@@ -1898,6 +2031,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         }
     }
 
+    print_remote_tails(&ctx);
+
     println!();
 
     // --- Cleanup S3 ---
@@ -1949,6 +2084,10 @@ fn main() {
     println!(
         "Iterations:   {} measured + {} warmup per cold query, {} per warm query",
         cli.iterations, cli.warmup, cli.iterations
+    );
+    println!(
+        "Prefetch:     {} worker threads",
+        effective_prefetch_threads(cli.prefetch_threads)
     );
     println!("Queries:      post detail, profile, who-liked, mutual friends");
     if cli.plan_aware {
