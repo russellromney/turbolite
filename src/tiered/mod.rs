@@ -58,6 +58,7 @@ use crate::compress;
 // --- Extracted submodules ---
 mod async_rt;
 mod bench;
+mod btree_peek;
 mod cache_tracking;
 mod compact;
 mod config;
@@ -69,6 +70,7 @@ mod import;
 mod instrumented_storage;
 mod keys;
 mod local_state;
+mod lookahead;
 mod manifest;
 mod prediction;
 mod prefetch;

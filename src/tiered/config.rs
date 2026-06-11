@@ -158,6 +158,8 @@ pub struct PrefetchConfig {
     pub scan_window_bytes: u64,
     /// Enable query-plan-aware prefetch.
     pub query_plan: bool,
+    /// Enable advisory index-leaf lookahead for SEARCH -> table rowid chasing.
+    pub lookahead: bool,
     /// Enable predictive cross-tree prefetch.
     pub prediction: bool,
     /// Manifest source — Auto (local fallback) vs Remote (always backend).
@@ -277,6 +279,7 @@ impl Default for PrefetchConfig {
             scan_window_groups: 4,
             scan_window_bytes: 32 * 1024 * 1024,
             query_plan: true,
+            lookahead: false,
             prediction: false,
             manifest_source: ManifestSource::Auto,
         }
@@ -329,6 +332,9 @@ impl PrefetchConfig {
             query_plan: std::env::var("TURBOLITE_PLAN_AWARE")
                 .map(|v| !matches!(v.as_str(), "false" | "0"))
                 .unwrap_or(d.query_plan),
+            lookahead: std::env::var("TURBOLITE_LOOKAHEAD")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(d.lookahead),
             prediction: std::env::var("TURBOLITE_PREDICTION")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(d.prediction),

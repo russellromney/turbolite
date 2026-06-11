@@ -22,6 +22,33 @@ struct BlockingPayloadBackend {
     payload: Vec<u8>,
 }
 
+struct RangePayloadBackend {
+    payload: Vec<u8>,
+    full_gets: AtomicU64,
+    range_gets: AtomicU64,
+}
+
+struct FrameOverridePayloadBackend {
+    base_payload: Vec<u8>,
+    override_payload: Vec<u8>,
+    full_gets: AtomicU64,
+    range_gets: AtomicU64,
+}
+
+struct BlockingGetRangePayloadBackend {
+    release_get: AtomicBool,
+    get_started: AtomicU64,
+    range_gets: AtomicU64,
+    get_payload: Vec<u8>,
+    range_payload: Vec<u8>,
+}
+
+struct BlockingRangePayloadBackend {
+    release_range: AtomicBool,
+    range_started: AtomicU64,
+    range_payload: Vec<u8>,
+}
+
 #[async_trait]
 impl StorageBackend for DeterministicPressureBackend {
     async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
@@ -109,18 +136,213 @@ impl StorageBackend for BlockingPayloadBackend {
     }
 }
 
-fn test_pool(
+#[async_trait]
+impl StorageBackend for RangePayloadBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        self.full_gets.fetch_add(1, Ordering::Release);
+        Ok(Some(self.payload.clone()))
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, _key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.range_gets.fetch_add(1, Ordering::Release);
+        let start = start as usize;
+        let end = start + len as usize;
+        Ok(Some(self.payload[start..end].to_vec()))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FrameOverridePayloadBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.full_gets.fetch_add(1, Ordering::Release);
+        if key == "override-1" {
+            Ok(Some(self.override_payload.clone()))
+        } else {
+            Ok(Some(self.base_payload.clone()))
+        }
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, _key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.range_gets.fetch_add(1, Ordering::Release);
+        let start = start as usize;
+        let end = start + len as usize;
+        Ok(Some(self.base_payload[start..end].to_vec()))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for BlockingGetRangePayloadBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        self.get_started.fetch_add(1, Ordering::Release);
+        while !self.release_get.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(Some(self.get_payload.clone()))
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, _key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.range_gets.fetch_add(1, Ordering::Release);
+        let start = start as usize;
+        let end = start + len as usize;
+        Ok(Some(self.range_payload[start..end].to_vec()))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for BlockingRangePayloadBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, _key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.range_started.fetch_add(1, Ordering::Release);
+        while !self.release_range.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let start = start as usize;
+        let end = start + len as usize;
+        Ok(Some(self.range_payload[start..end].to_vec()))
+    }
+}
+
+fn test_pool_with_workers(
+    workers: u32,
     cache: Arc<DiskCache>,
     backend: Arc<dyn StorageBackend>,
     queue_capacity: u32,
     io_permits: u32,
     foreground_reserved: u32,
+    replay_epoch: Arc<AtomicU64>,
 ) -> PrefetchPool {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let handle = rt.handle().clone();
     std::mem::forget(rt);
     PrefetchPool::new(
-        1,
+        workers,
         backend,
         handle,
         cache,
@@ -131,9 +353,27 @@ fn test_pool(
         None,
         Arc::new(ArcSwap::from_pointee(Manifest::empty())),
         Arc::new(parking_lot::RwLock::new(())),
-        Arc::new(AtomicU64::new(0)),
+        replay_epoch,
         queue_capacity,
         RemoteIoBudget::new(io_permits, foreground_reserved),
+    )
+}
+
+fn test_pool(
+    cache: Arc<DiskCache>,
+    backend: Arc<dyn StorageBackend>,
+    queue_capacity: u32,
+    io_permits: u32,
+    foreground_reserved: u32,
+) -> PrefetchPool {
+    test_pool_with_workers(
+        1,
+        cache,
+        backend,
+        queue_capacity,
+        io_permits,
+        foreground_reserved,
+        Arc::new(AtomicU64::new(0)),
     )
 }
 
@@ -159,6 +399,26 @@ fn test_encode_group(page_size: u32, pages_per_group: usize, fill: u8) -> Vec<u8
     encode_page_group(
         &pages,
         page_size,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap()
+}
+
+fn test_encode_seekable_group(
+    page_size: u32,
+    pages_per_group: usize,
+) -> (Vec<u8>, Vec<FrameEntry>) {
+    let pages: Vec<Option<Vec<u8>>> = (0..pages_per_group)
+        .map(|idx| Some(vec![idx as u8 + 1; page_size as usize]))
+        .collect();
+    encode_page_group_seekable(
+        &pages,
+        page_size,
+        1,
         3,
         #[cfg(feature = "zstd")]
         None,
@@ -639,6 +899,521 @@ fn optional_prefetch_permit_unavailable_never_sets_fetching() {
 
     assert_eq!(cache.group_state(0), GroupState::None);
     assert_eq!(pool.stats_json()["permit_unavailable"], 1);
+}
+
+#[test]
+fn frame_batch_prefetch_coalesces_adjacent_ranges_without_group_claim() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(RangePayloadBackend {
+        payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = PrefetchPool::new(
+        2,
+        backend.clone(),
+        rt.handle().clone(),
+        cache.clone(),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::new(ArcSwap::from_pointee(Manifest::empty())),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(2, 0),
+    );
+
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![1, 2],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    assert_eq!(outcome.accepted_frames, 2);
+    assert_eq!(
+        cache.group_state(0),
+        GroupState::None,
+        "frame jobs must not take a group-level Fetching claim"
+    );
+
+    pool.wait_idle();
+    assert_eq!(backend.full_gets.load(Ordering::Acquire), 0);
+    assert_eq!(
+        backend.range_gets.load(Ordering::Acquire),
+        1,
+        "adjacent frame table ranges should coalesce into one range GET"
+    );
+    assert!(cache.is_present(1));
+    assert!(cache.is_present(2));
+    assert!(!cache.is_present(0));
+    assert!(!cache.is_present(3));
+    assert_eq!(
+        cache.group_state(0),
+        GroupState::None,
+        "partial frame install must not mark the whole group present"
+    );
+    let stats = pool.stats_json();
+    assert_eq!(stats["traffic"]["prefetch_frame"]["ops"], 1);
+}
+
+#[test]
+fn frame_batch_prefetch_dedupes_queued_frames() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(RangePayloadBackend {
+        payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = test_pool(cache.clone(), backend, 8, 1, 0);
+
+    let first = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table.clone(),
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![1, 2],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    let second = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![2],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+
+    assert_eq!(first.outcome, PrefetchSubmitOutcome::Accepted);
+    assert_eq!(first.accepted_frames, 2);
+    assert_eq!(second.outcome, PrefetchSubmitOutcome::SkippedState);
+    assert_eq!(second.accepted_frames, 0);
+    pool.wait_idle();
+}
+
+#[test]
+fn frame_batch_finish_does_not_unregister_active_group_prefetch() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (range_payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(BlockingGetRangePayloadBackend {
+        release_get: AtomicBool::new(false),
+        get_started: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+        get_payload: test_encode_group(64, 4, 7),
+        range_payload,
+    });
+    let pool = test_pool_with_workers(
+        2,
+        cache.clone(),
+        backend.clone(),
+        8,
+        2,
+        0,
+        Arc::new(AtomicU64::new(0)),
+    );
+
+    let optional_outcome = pool.submit_optional(
+        Some("scan".to_string()),
+        0,
+        "g0".to_string(),
+        Vec::new(),
+        64,
+        0,
+        vec![0, 1, 2, 3],
+        HashMap::new(),
+        0,
+        cache.as_ref(),
+    );
+    if optional_outcome != PrefetchSubmitOutcome::Accepted {
+        backend.release_get.store(true, Ordering::Release);
+        pool.wait_idle();
+        assert_eq!(optional_outcome, PrefetchSubmitOutcome::Accepted);
+    }
+    let wait_started = Instant::now();
+    while backend.get_started.load(Ordering::Acquire) == 0
+        && wait_started.elapsed() < Duration::from_secs(1)
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if backend.get_started.load(Ordering::Acquire) == 0 || !pool.is_optional_fetching(0) {
+        backend.release_get.store(true, Ordering::Release);
+        pool.wait_idle();
+        assert!(
+            backend.get_started.load(Ordering::Acquire) > 0 && pool.is_optional_fetching(0),
+            "optional group prefetch should be active before frame job"
+        );
+    }
+
+    let frame_outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![2],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    if frame_outcome.outcome != PrefetchSubmitOutcome::Accepted {
+        backend.release_get.store(true, Ordering::Release);
+        pool.wait_idle();
+        assert_eq!(frame_outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    }
+    let wait_frame = Instant::now();
+    while !cache.is_present(2) && wait_frame.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let still_fetching = pool.is_optional_fetching(0);
+    assert!(
+        cache.is_present(2),
+        "frame job should install page 2 before the blocked group get is released"
+    );
+    assert_eq!(
+        backend.get_started.load(Ordering::Acquire),
+        1,
+        "the group prefetch must still be the blocked full GET"
+    );
+
+    backend.release_get.store(true, Ordering::Release);
+    pool.wait_idle();
+    assert!(
+        still_fetching,
+        "finishing a frame job must not clear group-level active bookkeeping"
+    );
+}
+
+#[test]
+fn frame_batch_does_not_overwrite_present_pages_inside_partial_frame() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 2, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let pages: Vec<Option<Vec<u8>>> = (0..4).map(|idx| Some(vec![idx as u8 + 1; 64])).collect();
+    let (payload, frame_table) = encode_page_group_seekable(
+        &pages,
+        64,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(RangePayloadBackend {
+        payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = test_pool(cache.clone(), backend, 8, 2, 0);
+
+    cache.write_page(0, &vec![77u8; 64]).unwrap();
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        2,
+        vec![0, 1, 2, 3],
+        vec![0],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    assert_eq!(outcome.accepted_frames, 1);
+    pool.wait_idle();
+
+    let mut page0 = vec![0u8; 64];
+    cache.read_page(0, &mut page0).unwrap();
+    assert_eq!(
+        page0,
+        vec![77u8; 64],
+        "advisory frame prefetch must not rewrite already-present dirty/local bytes"
+    );
+    let mut page1 = vec![0u8; 64];
+    cache.read_page(1, &mut page1).unwrap();
+    assert_eq!(page1, vec![2u8; 64]);
+}
+
+#[test]
+fn frame_batch_drops_stale_replay_epoch_before_install() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (range_payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(BlockingRangePayloadBackend {
+        release_range: AtomicBool::new(false),
+        range_started: AtomicU64::new(0),
+        range_payload,
+    });
+    let replay_epoch = Arc::new(AtomicU64::new(0));
+    let pool = test_pool_with_workers(
+        1,
+        cache.clone(),
+        backend.clone(),
+        8,
+        1,
+        0,
+        replay_epoch.clone(),
+    );
+
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![1],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    while backend.range_started.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    replay_epoch.fetch_add(1, Ordering::AcqRel);
+    backend.release_range.store(true, Ordering::Release);
+    pool.wait_idle();
+
+    assert!(!cache.is_present(1));
+    assert_eq!(pool.stats_json()["stale_replay"], 1);
+}
+
+#[test]
+fn frame_batch_hits_are_one_shot_and_require_present_frame() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(RangePayloadBackend {
+        payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = test_pool(cache.clone(), backend, 8, 2, 0);
+
+    let hit_outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![1],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(hit_outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    assert_eq!(hit_outcome.accepted_frames, 1);
+    pool.wait_idle();
+
+    pool.record_lookahead_hit_if_present(&cache, 0, 1);
+    pool.record_lookahead_hit_if_present(&cache, 0, 1);
+    assert_eq!(pool.stats_json()["lookahead"]["hits"], 1);
+
+    pool.clear_lookahead_frame(0, 2);
+    pool.record_lookahead_hit_if_present(&cache, 0, 2);
+    assert_eq!(
+        pool.stats_json()["lookahead"]["hits"],
+        1,
+        "non-lookahead frames must not be counted as lookahead hits"
+    );
+}
+
+#[test]
+fn stats_include_queued_frame_jobs() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (range_payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(BlockingGetRangePayloadBackend {
+        release_get: AtomicBool::new(false),
+        get_started: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+        get_payload: test_encode_group(64, 4, 7),
+        range_payload,
+    });
+    let pool = test_pool(cache.clone(), backend.clone(), 8, 1, 0);
+
+    assert_eq!(
+        pool.submit_optional(
+            Some("scan".to_string()),
+            0,
+            "g0".to_string(),
+            Vec::new(),
+            64,
+            0,
+            vec![0, 1, 2, 3],
+            HashMap::new(),
+            0,
+            cache.as_ref(),
+        ),
+        PrefetchSubmitOutcome::Accepted
+    );
+    while backend.get_started.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let queued_frame_outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![2],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(
+        queued_frame_outcome.outcome,
+        PrefetchSubmitOutcome::Accepted
+    );
+    assert_eq!(queued_frame_outcome.accepted_frames, 1);
+
+    assert_eq!(pool.stats_json()["queued"], 2);
+
+    backend.release_get.store(true, Ordering::Release);
+    pool.wait_idle();
+}
+
+#[test]
+fn frame_batch_rejects_sub_chunk_ids_that_would_truncate() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (payload, frame_table) = test_encode_seekable_group(64, 4);
+    let backend = Arc::new(RangePayloadBackend {
+        payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = test_pool(cache.clone(), backend, 8, 2, 0);
+
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        u64::from(u32::MAX) + 1,
+        "g-too-large".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![0],
+        HashMap::new(),
+        0,
+        &cache,
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::SkippedState);
+    assert_eq!(outcome.accepted_frames, 0);
+}
+
+#[test]
+fn frame_batch_prefetch_fetches_override_frame_object() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 1, 64, 4, None, vec![vec![0, 1, 2, 3]]).unwrap(),
+    );
+    let (base_payload, frame_table) = test_encode_seekable_group(64, 4);
+    let override_payload = super::encode_override_frame(
+        &[(1, vec![99u8; 64])],
+        64,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &keys::aad_override_frame(0, 1),
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(FrameOverridePayloadBackend {
+        base_payload,
+        override_payload,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = test_pool(cache.clone(), backend.clone(), 8, 2, 0);
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        1,
+        SubframeOverride {
+            key: "override-1".to_string(),
+            entry: FrameEntry {
+                offset: 0,
+                len: backend.override_payload.len() as u32,
+            },
+        },
+    );
+
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        64,
+        1,
+        vec![0, 1, 2, 3],
+        vec![1],
+        overrides,
+        0,
+        &cache,
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    assert_eq!(outcome.accepted_frames, 1);
+
+    pool.wait_idle();
+    assert_eq!(backend.full_gets.load(Ordering::Acquire), 1);
+    assert_eq!(backend.range_gets.load(Ordering::Acquire), 0);
+    let mut page = vec![0u8; 64];
+    cache.read_page(1, &mut page).unwrap();
+    assert_eq!(page, vec![99u8; 64]);
+    assert!(!cache.is_present(0));
+    assert!(!cache.is_present(2));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Query-plan-aware prefetch.
 //!
-//! A global queue of planned B-tree accesses populated by the trace callback
-//! (in ext_entry.c) and drained by the VFS on first cache miss.
+//! A per-thread queue of planned B-tree accesses populated by the trace
+//! callback (in ext_entry.c) and drained by the VFS on first cache miss.
 //!
 //! The trace callback runs EXPLAIN QUERY PLAN on each SQL statement at the
 //! start of sqlite3_step(), extracts SCAN/SEARCH + table/index names, and
@@ -11,8 +11,11 @@
 //! When the queue is empty (extension not loaded, or DDL/PRAGMA), the VFS
 //! falls back to the hop schedule.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
 
 /// Access type from EXPLAIN QUERY PLAN output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,31 +41,80 @@ pub struct PlannedAccess {
     pub constraint_columns: Vec<String>,
 }
 
-/// Global queue of planned accesses. The trace callback pushes, VFS drains.
-///
-/// Using a simple Mutex<Vec> because:
-/// - Push path (trace callback): runs once per step(), ~10us EQP cost dominates
-/// - Drain path (VFS read): one drain per query on first cache miss
-/// - No contention in practice: push completes before drain starts (synchronous trace)
-static PLAN_QUEUE: Mutex<Vec<PlannedAccess>> = Mutex::new(Vec::new());
+#[derive(Debug, Clone)]
+struct PlannedAccessBatch {
+    id: u64,
+    accesses: Vec<PlannedAccess>,
+}
+
+static NEXT_PLAN_BATCH_ID: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_PLAN_QUEUE: OnceLock<Mutex<Vec<PlannedAccessBatch>>> = OnceLock::new();
+
+fn global_plan_queue() -> &'static Mutex<Vec<PlannedAccessBatch>> {
+    GLOBAL_PLAN_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// Same-thread queue of planned accesses. SQLite normally invokes the trace
+// callback and VFS reads on the connection's thread; keeping this queue
+// thread-local prevents unrelated connections/tests from stealing another
+// query's plan before that first cache miss. Each push is also mirrored into a
+// process-global fallback queue so a cross-thread VFS read can still consume
+// the advisory plan instead of silently disabling plan-aware prefetch.
+thread_local! {
+    static PLAN_QUEUE: RefCell<Vec<PlannedAccessBatch>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Push planned accesses to the global queue (called from trace callback).
 pub fn push_planned_accesses(accesses: Vec<PlannedAccess>) {
     if accesses.is_empty() {
         return;
     }
-    let mut queue = PLAN_QUEUE.lock().expect("plan queue poisoned");
-    queue.extend(accesses);
+    let batch = PlannedAccessBatch {
+        id: NEXT_PLAN_BATCH_ID.fetch_add(1, AtomicOrdering::Relaxed),
+        accesses,
+    };
+    PLAN_QUEUE.with(|queue| queue.borrow_mut().push(batch.clone()));
+    global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(batch);
 }
 
 /// Drain all planned accesses from the queue (called from VFS on first cache miss).
 /// Returns an empty Vec if nothing is queued.
 pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
-    let mut queue = PLAN_QUEUE.lock().expect("plan queue poisoned");
-    if queue.is_empty() {
-        return Vec::new();
+    let local = PLAN_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *queue))
+        }
+    });
+
+    if let Some(batches) = local {
+        let drained_ids: HashSet<u64> = batches.iter().map(|batch| batch.id).collect();
+        global_plan_queue()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|batch| !drained_ids.contains(&batch.id));
+        return batches
+            .into_iter()
+            .flat_map(|batch| batch.accesses)
+            .collect();
     }
-    std::mem::take(&mut *queue)
+
+    let mut global = global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if global.is_empty() {
+        Vec::new()
+    } else {
+        std::mem::take(&mut *global)
+            .into_iter()
+            .flat_map(|batch| batch.accesses)
+            .collect()
+    }
 }
 
 /// End-of-query signal. Set by the SQLITE_TRACE_PROFILE callback when a

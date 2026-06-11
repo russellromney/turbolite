@@ -16,6 +16,9 @@ use arc_swap::ArcSwap;
 use hadb_storage::StorageBackend;
 
 use super::async_rt::block_on;
+use super::cache_tracking::SubChunkId;
+#[cfg(test)]
+use super::encode_override_frame;
 use super::manifest::{FrameEntry, Manifest, SubframeOverride};
 use super::{
     decode_page_group_bulk, decode_page_group_seekable_full, decode_seekable_subchunk,
@@ -38,6 +41,9 @@ pub(crate) struct PrefetchJob {
     pub(crate) group_page_nums: Vec<u64>,
     /// Override frames for this group.
     pub(crate) overrides: HashMap<usize, SubframeOverride>,
+    /// Specific seekable frame indices to fetch. None means the legacy
+    /// full-group optional prefetch job.
+    pub(crate) frame_indices: Option<Vec<usize>>,
     /// Manifest version when this job was submitted.
     pub(crate) manifest_version: u64,
     /// Replay epoch captured at submission. The worker re-reads the
@@ -74,11 +80,27 @@ pub(crate) enum PrefetchSubmitOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefetchFrameSubmitOutcome {
+    pub(crate) outcome: PrefetchSubmitOutcome,
+    pub(crate) accepted_frames: usize,
+}
+
+impl PrefetchFrameSubmitOutcome {
+    fn new(outcome: PrefetchSubmitOutcome, accepted_frames: usize) -> Self {
+        Self {
+            outcome,
+            accepted_frames,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefetchTrafficClass {
     ForegroundRange,
     ForegroundGroup,
     PrefetchGroup,
     PrefetchOverride,
+    PrefetchFrame,
 }
 
 impl PrefetchTrafficClass {
@@ -88,6 +110,7 @@ impl PrefetchTrafficClass {
             Self::ForegroundGroup => 1,
             Self::PrefetchGroup => 2,
             Self::PrefetchOverride => 3,
+            Self::PrefetchFrame => 4,
         }
     }
 
@@ -97,15 +120,94 @@ impl PrefetchTrafficClass {
             Self::ForegroundGroup => "foreground_group",
             Self::PrefetchGroup => "prefetch_group",
             Self::PrefetchOverride => "prefetch_override",
+            Self::PrefetchFrame => "prefetch_frame",
         }
     }
 
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ForegroundRange,
         Self::ForegroundGroup,
         Self::PrefetchGroup,
         Self::PrefetchOverride,
+        Self::PrefetchFrame,
     ];
+}
+
+fn sub_chunk_id_for_frame(gid: u64, frame_idx: usize) -> Option<SubChunkId> {
+    if gid > u64::from(u32::MAX) || frame_idx > usize::from(u16::MAX) {
+        return None;
+    }
+    Some(SubChunkId {
+        group_id: gid as u32,
+        frame_index: frame_idx as u16,
+    })
+}
+
+fn frame_ids_for(gid: u64, frames: &[usize]) -> Vec<SubChunkId> {
+    frames
+        .iter()
+        .filter_map(|&frame_idx| sub_chunk_id_for_frame(gid, frame_idx))
+        .collect()
+}
+
+fn clear_lookahead_group(lookahead_frame_ids: &parking_lot::Mutex<HashSet<SubChunkId>>, gid: u64) {
+    if gid > u64::from(u32::MAX) {
+        return;
+    }
+    let group_id = gid as u32;
+    lookahead_frame_ids
+        .lock()
+        .retain(|id| id.group_id != group_id);
+}
+
+fn coalesced_frame_runs(frames: &[usize], frame_table: &[FrameEntry]) -> Vec<Vec<usize>> {
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for &frame_idx in frames {
+        let Some(entry) = frame_table.get(frame_idx) else {
+            continue;
+        };
+        if let Some(last_run) = runs.last_mut() {
+            if let Some(&prev_idx) = last_run.last() {
+                if let Some(prev) = frame_table.get(prev_idx) {
+                    if prev_idx + 1 == frame_idx
+                        && prev.offset.saturating_add(u64::from(prev.len)) == entry.offset
+                    {
+                        last_run.push(frame_idx);
+                        continue;
+                    }
+                }
+            }
+        }
+        runs.push(vec![frame_idx]);
+    }
+    runs
+}
+
+fn mark_decoded_page_types(
+    cache: &DiskCache,
+    gid: u64,
+    page_nums: &[u64],
+    data: &[u8],
+    page_size: usize,
+    start_index_in_group: u32,
+) {
+    for (i, &pnum) in page_nums.iter().enumerate() {
+        let hdr_off = if pnum == 0 { 100 } else { 0 };
+        let page_start = i * page_size;
+        let idx_in_group = start_index_in_group + i as u32;
+        let type_byte = data.get(page_start + hdr_off).copied();
+        if let Some(b) = type_byte {
+            if b == 0x05 || b == 0x02 {
+                cache.mark_interior_group(gid, pnum, idx_in_group);
+            } else if b == 0x0a {
+                if let Some(page_slice) = data.get(page_start..page_start + page_size) {
+                    if is_valid_btree_page(page_slice, hdr_off) {
+                        cache.mark_index_page(pnum, gid, idx_in_group);
+                    }
+                }
+            }
+        }
+    }
 }
 
 const LATENCY_BUCKETS: usize = 40;
@@ -223,7 +325,16 @@ pub(crate) struct PrefetchMetrics {
     foreground_waits: AtomicU64,
     foreground_wait_us: AtomicU64,
     foreground_wait: LatencyHistogram,
-    traffic: [TrafficCounters; 4],
+    lookahead_retained: AtomicU64,
+    lookahead_fired: AtomicU64,
+    lookahead_frames_submitted: AtomicU64,
+    lookahead_hits: AtomicU64,
+    lookahead_dup_bytes: AtomicU64,
+    lookahead_bailout_no_anchor: AtomicU64,
+    lookahead_bailout_uncached: AtomicU64,
+    lookahead_bailout_parse: AtomicU64,
+    lookahead_bailout_no_frames: AtomicU64,
+    traffic: [TrafficCounters; 5],
     trees: parking_lot::Mutex<HashMap<String, PrefetchTreeCounters>>,
 }
 
@@ -319,6 +430,43 @@ impl PrefetchMetrics {
         self.foreground_wait.record(elapsed);
     }
 
+    fn lookahead_retained(&self, rows: u64) {
+        self.lookahead_retained.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    fn lookahead_fired(&self, frames: u64) {
+        self.lookahead_fired.fetch_add(1, Ordering::Relaxed);
+        self.lookahead_frames_submitted
+            .fetch_add(frames, Ordering::Relaxed);
+    }
+
+    fn lookahead_hit(&self) {
+        self.lookahead_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookahead_dup_bytes(&self, bytes: u64) {
+        self.lookahead_dup_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn lookahead_bailout_no_anchor(&self) {
+        self.lookahead_bailout_no_anchor
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookahead_bailout_uncached(&self) {
+        self.lookahead_bailout_uncached
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookahead_bailout_parse(&self) {
+        self.lookahead_bailout_parse.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookahead_bailout_no_frames(&self) {
+        self.lookahead_bailout_no_frames
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn traffic_success(
         &self,
         class: PrefetchTrafficClass,
@@ -395,6 +543,19 @@ impl PrefetchMetrics {
             "foreground_waits": self.foreground_waits.load(Ordering::Relaxed),
             "foreground_wait_us": self.foreground_wait_us.load(Ordering::Relaxed),
             "foreground_wait": self.foreground_wait.snapshot_json(),
+            "lookahead": {
+                "retained": self.lookahead_retained.load(Ordering::Relaxed),
+                "fired": self.lookahead_fired.load(Ordering::Relaxed),
+                "frames_submitted": self.lookahead_frames_submitted.load(Ordering::Relaxed),
+                "hits": self.lookahead_hits.load(Ordering::Relaxed),
+                "dup_bytes": self.lookahead_dup_bytes.load(Ordering::Relaxed),
+                "bailouts": {
+                    "no_anchor": self.lookahead_bailout_no_anchor.load(Ordering::Relaxed),
+                    "uncached": self.lookahead_bailout_uncached.load(Ordering::Relaxed),
+                    "parse": self.lookahead_bailout_parse.load(Ordering::Relaxed),
+                    "no_frames": self.lookahead_bailout_no_frames.load(Ordering::Relaxed),
+                },
+            },
             "traffic": traffic_json,
             "trees": tree_json,
         })
@@ -537,6 +698,9 @@ pub(crate) struct PrefetchPool {
     queued_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
     active_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
     cancelled_gids: Arc<parking_lot::Mutex<HashSet<u64>>>,
+    queued_frame_ids: Arc<parking_lot::Mutex<HashSet<SubChunkId>>>,
+    active_frame_ids: Arc<parking_lot::Mutex<HashSet<SubChunkId>>>,
+    lookahead_frame_ids: Arc<parking_lot::Mutex<HashSet<SubChunkId>>>,
     max_queued: Arc<AtomicU64>,
     io_budget: Arc<RemoteIoBudget>,
 }
@@ -570,6 +734,9 @@ impl PrefetchPool {
         let queued_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let active_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let cancelled_gids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let queued_frame_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let active_frame_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let lookahead_frame_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let max_queued = Arc::new(AtomicU64::new(0));
 
         #[cfg(feature = "zstd")]
@@ -596,6 +763,9 @@ impl PrefetchPool {
             let queued_gids = Arc::clone(&queued_gids);
             let active_gids = Arc::clone(&active_gids);
             let cancelled_gids = Arc::clone(&cancelled_gids);
+            let queued_frame_ids = Arc::clone(&queued_frame_ids);
+            let active_frame_ids = Arc::clone(&active_frame_ids);
+            let lookahead_frame_ids = Arc::clone(&lookahead_frame_ids);
             let io_budget = Arc::clone(&io_budget);
 
             workers.push(std::thread::spawn(move || {
@@ -603,12 +773,26 @@ impl PrefetchPool {
                 // wait_idle can observe completion) and best-effort wake any
                 // waiter via the bounded done channel. Dropped wake-ups are
                 // fine — the next call to wait_idle reads the atomic directly.
+                let finish_common = |gid: u64| {
+                    in_flight.fetch_sub(1, Ordering::Release);
+                    let _ = done_tx.try_send(gid);
+                };
+                let finish_frame = |gid: u64, frame_ids: &[SubChunkId]| {
+                    if !frame_ids.is_empty() {
+                        let mut queued = queued_frame_ids.lock();
+                        let mut active = active_frame_ids.lock();
+                        for id in frame_ids {
+                            queued.remove(id);
+                            active.remove(id);
+                        }
+                    }
+                    finish_common(gid);
+                };
                 let finish = |gid: u64| {
                     queued_gids.lock().remove(&gid);
                     active_gids.lock().remove(&gid);
                     cancelled_gids.lock().remove(&gid);
-                    in_flight.fetch_sub(1, Ordering::Release);
-                    let _ = done_tx.try_send(gid);
+                    finish_common(gid);
                 };
 
                 // Worker error / stale paths use `unclaim_if_fetching`
@@ -625,6 +809,297 @@ impl PrefetchPool {
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
                     metrics.wait_before_fetch(job.queued_at.elapsed());
+
+                    if let Some(frame_indices) = job.frame_indices.as_ref() {
+                        let frame_ids = frame_ids_for(gid, frame_indices);
+                        {
+                            let mut active = active_frame_ids.lock();
+                            for id in &frame_ids {
+                                active.insert(*id);
+                            }
+                        }
+                        let Some(_io_permit) = io_budget.try_acquire_prefetch() else {
+                            metrics.permit_unavailable(&job.tree_name);
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        };
+
+                        let present = cache.tracker.lock().present.clone();
+                        let frames_to_fetch: Vec<usize> = frame_indices
+                            .iter()
+                            .copied()
+                            .filter(|idx| {
+                                sub_chunk_id_for_frame(gid, *idx)
+                                    .map(|id| !present.contains(&id))
+                                    .unwrap_or(false)
+                            })
+                            .filter(|idx| *idx < job.frame_table.len())
+                            .collect();
+                        drop(present);
+                        if frames_to_fetch.is_empty() {
+                            metrics.skipped_state(&job.tree_name);
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+
+                        #[cfg(feature = "zstd")]
+                        let decoder_dict = dictionary
+                            .as_deref()
+                            .map(|d| zstd::dict::DecoderDictionary::copy(d));
+
+                        let mut fetched_bytes = 0u64;
+                        let mut failed = false;
+                        let mut decoded_frames: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+
+                        for &frame_idx in frames_to_fetch
+                            .iter()
+                            .filter(|idx| job.overrides.contains_key(idx))
+                        {
+                            let ovr = job
+                                .overrides
+                                .get(&frame_idx)
+                                .expect("filtered to override frames");
+                            let fetch_start = Instant::now();
+                            let compressed_frame = match storage_helpers::get_page_group(
+                                storage.as_ref(),
+                                &runtime,
+                                &ovr.key,
+                            ) {
+                                Ok(Some(bytes)) => bytes,
+                                Ok(None) => {
+                                    metrics.missing_object(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                    failed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch-frame] gid={} override frame={} fetch error: {}",
+                                            gid, frame_idx, e
+                                        );
+                                    }
+                                    metrics.fetch_error(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                    failed = true;
+                                    break;
+                                }
+                            };
+                            fetched_bytes += compressed_frame.len() as u64;
+                            metrics.traffic_success(
+                                PrefetchTrafficClass::PrefetchFrame,
+                                compressed_frame.len() as u64,
+                                fetch_start.elapsed(),
+                            );
+                            let decompressed = match decode_seekable_subchunk(
+                                &compressed_frame,
+                                #[cfg(feature = "zstd")]
+                                decoder_dict.as_ref(),
+                                &keys::aad_override_frame(gid, frame_idx),
+                                encryption_key.as_ref().as_ref(),
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch-frame] gid={} override frame={} decode error: {}",
+                                            gid, frame_idx, e
+                                        );
+                                    }
+                                    metrics.decode_error(&job.tree_name);
+                                    failed = true;
+                                    break;
+                                }
+                            };
+                            decoded_frames.push((
+                                frame_idx,
+                                decompressed,
+                                compressed_frame.len() as u64,
+                            ));
+                        }
+                        if failed {
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+
+                        let base_frames_to_fetch: Vec<usize> = frames_to_fetch
+                            .iter()
+                            .copied()
+                            .filter(|idx| !job.overrides.contains_key(idx))
+                            .collect();
+                        for run in coalesced_frame_runs(&base_frames_to_fetch, &job.frame_table) {
+                            let first_idx = run[0];
+                            let last_idx = *run.last().expect("run is non-empty");
+                            let first = &job.frame_table[first_idx];
+                            let last = &job.frame_table[last_idx];
+                            let total_len =
+                                (last.offset + u64::from(last.len) - first.offset) as u32;
+                            let fetch_start = Instant::now();
+                            let range_bytes = match storage_helpers::range_get(
+                                storage.as_ref(),
+                                &runtime,
+                                &job.key,
+                                first.offset,
+                                total_len,
+                            ) {
+                                Ok(Some(bytes)) => bytes,
+                                Ok(None) => {
+                                    metrics.missing_object(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                    failed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch-frame] gid={} frames={:?} fetch error: {}",
+                                            gid, run, e
+                                        );
+                                    }
+                                    metrics.fetch_error(&job.tree_name);
+                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                    failed = true;
+                                    break;
+                                }
+                            };
+                            fetched_bytes += range_bytes.len() as u64;
+                            metrics.traffic_success(
+                                PrefetchTrafficClass::PrefetchFrame,
+                                range_bytes.len() as u64,
+                                fetch_start.elapsed(),
+                            );
+
+                            for frame_idx in run {
+                                let entry = &job.frame_table[frame_idx];
+                                let start = (entry.offset - first.offset) as usize;
+                                let end = start + entry.len as usize;
+                                let Some(compressed_frame) = range_bytes.get(start..end) else {
+                                    metrics.decode_error(&job.tree_name);
+                                    failed = true;
+                                    break;
+                                };
+                                let decompressed = match decode_seekable_subchunk(
+                                    compressed_frame,
+                                    #[cfg(feature = "zstd")]
+                                    decoder_dict.as_ref(),
+                                    &keys::aad_page_group(gid),
+                                    encryption_key.as_ref().as_ref(),
+                                ) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        if !shutdown.load(Ordering::Acquire) {
+                                            eprintln!(
+                                                "[prefetch-frame] gid={} frame={} decode error: {}",
+                                                gid, frame_idx, e
+                                            );
+                                        }
+                                        metrics.decode_error(&job.tree_name);
+                                        failed = true;
+                                        break;
+                                    }
+                                };
+                                decoded_frames.push((
+                                    frame_idx,
+                                    decompressed,
+                                    compressed_frame.len() as u64,
+                                ));
+                            }
+                            if failed {
+                                break;
+                            }
+                        }
+                        drop(_io_permit);
+                        if failed {
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+
+                        let _replay_read_guard = replay_gate.read();
+                        let current_version = shared_manifest.load().version;
+                        if current_version != job.manifest_version {
+                            metrics.stale_manifest(&job.tree_name);
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+                        let current_epoch = replay_epoch.load(Ordering::Acquire);
+                        if current_epoch != job.replay_epoch_at_submit {
+                            metrics.stale_replay(&job.tree_name);
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+
+                        let ps = job.page_size as usize;
+                        let spf = job.sub_pages_per_frame as usize;
+                        for (frame_idx, decompressed, compressed_len) in decoded_frames {
+                            let frame_start = frame_idx * spf;
+                            let frame_end =
+                                std::cmp::min(frame_start + spf, job.group_page_nums.len());
+                            if frame_start >= frame_end {
+                                continue;
+                            }
+                            let frame_pages = &job.group_page_nums[frame_start..frame_end];
+                            let data_len = frame_pages.len() * ps;
+                            if data_len > decompressed.len() {
+                                metrics.decode_error(&job.tree_name);
+                                failed = true;
+                                break;
+                            }
+                            let frame_data = &decompressed[..data_len];
+                            let cold_pages: Vec<(usize, u64)> = frame_pages
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .filter(|(_, pnum)| !cache.is_present(*pnum))
+                                .collect();
+                            if cold_pages.is_empty() {
+                                metrics.lookahead_dup_bytes(compressed_len);
+                                continue;
+                            }
+                            for (offset_in_frame, pnum) in cold_pages {
+                                let page_start = offset_in_frame * ps;
+                                let page_end = page_start + ps;
+                                let page_data = &frame_data[page_start..page_end];
+                                if let Err(e) = cache.write_pages_scattered(
+                                    &[pnum],
+                                    page_data,
+                                    gid,
+                                    frame_start as u32 + offset_in_frame as u32,
+                                ) {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch-frame] gid={} frame={} write error: {}",
+                                            gid, frame_idx, e
+                                        );
+                                    }
+                                    metrics.write_error(&job.tree_name);
+                                    failed = true;
+                                    break;
+                                }
+                                mark_decoded_page_types(
+                                    cache.as_ref(),
+                                    gid,
+                                    &[pnum],
+                                    page_data,
+                                    ps,
+                                    frame_start as u32 + offset_in_frame as u32,
+                                );
+                            }
+                            if failed {
+                                break;
+                            }
+                            if let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) {
+                                lookahead_frame_ids.lock().insert(id);
+                            }
+                        }
+                        if failed {
+                            finish_frame(gid, &frame_ids);
+                            continue;
+                        }
+                        cache.touch_group(gid);
+                        metrics.completed(&job.tree_name, fetched_bytes);
+                        finish_frame(gid, &frame_ids);
+                        continue;
+                    }
 
                     let current = cache.group_state(gid);
                     if current != GroupState::None {
@@ -921,6 +1396,7 @@ impl PrefetchPool {
                         }
                     }
 
+                    clear_lookahead_group(&lookahead_frame_ids, gid);
                     cache.mark_group_present(gid);
                     cache.touch_group(gid);
                     metrics.completed(&job.tree_name, pg_data.len() as u64);
@@ -949,6 +1425,9 @@ impl PrefetchPool {
             queued_gids,
             active_gids,
             cancelled_gids,
+            queued_frame_ids,
+            active_frame_ids,
+            lookahead_frame_ids,
             max_queued,
             io_budget,
         }
@@ -987,9 +1466,8 @@ impl PrefetchPool {
                 self.metrics.skipped_state(&tree_name);
                 return PrefetchSubmitOutcome::SkippedState;
             }
-            self.max_queued
-                .fetch_max(queued.len() as u64, Ordering::Relaxed);
         }
+        self.note_max_queued();
         // Snapshot the replay epoch at submission. The worker re-reads
         // it under the replay_gate read lock before its final cache
         // write; if it has advanced, replay finalize ran in between
@@ -1007,6 +1485,7 @@ impl PrefetchPool {
             sub_pages_per_frame: sub_ppf,
             group_page_nums,
             overrides,
+            frame_indices: None,
             replay_epoch_at_submit,
             queued_at: Instant::now(),
         };
@@ -1031,6 +1510,122 @@ impl PrefetchPool {
         }
     }
 
+    pub(crate) fn submit_frame_batch(
+        &self,
+        tree_name: Option<String>,
+        gid: u64,
+        key: String,
+        frame_table: Vec<FrameEntry>,
+        page_size: u32,
+        sub_ppf: u32,
+        group_page_nums: Vec<u64>,
+        frame_indices: Vec<usize>,
+        overrides: HashMap<usize, SubframeOverride>,
+        manifest_version: u64,
+        cache: &DiskCache,
+    ) -> PrefetchFrameSubmitOutcome {
+        if self.workers.lock().is_empty() {
+            self.metrics.closed();
+            return PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::Closed, 0);
+        }
+        if frame_table.is_empty() || sub_ppf == 0 {
+            self.metrics.skipped_state(&tree_name);
+            return PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::SkippedState, 0);
+        }
+
+        let mut frames = frame_indices;
+        frames.sort_unstable();
+        frames.dedup();
+        frames.retain(|idx| *idx < frame_table.len());
+        if frames.is_empty() {
+            self.metrics.skipped_state(&tree_name);
+            return PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::SkippedState, 0);
+        }
+
+        let present = cache.tracker.lock().present.clone();
+        let active = self.active_frame_ids.lock();
+        let mut queued = self.queued_frame_ids.lock();
+        let mut accepted_frames = Vec::new();
+        for frame_idx in frames {
+            let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
+                continue;
+            };
+            if present.contains(&id) || queued.contains(&id) || active.contains(&id) {
+                continue;
+            }
+            let frame_start = frame_idx.saturating_mul(sub_ppf as usize);
+            let frame_end = std::cmp::min(frame_start + sub_ppf as usize, group_page_nums.len());
+            if frame_start >= frame_end
+                || group_page_nums[frame_start..frame_end]
+                    .iter()
+                    .all(|pnum| cache.is_present(*pnum))
+            {
+                continue;
+            }
+            queued.insert(id);
+            accepted_frames.push(frame_idx);
+        }
+        drop(active);
+        drop(queued);
+        self.note_max_queued();
+
+        if accepted_frames.is_empty() {
+            self.metrics.skipped_state(&tree_name);
+            return PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::SkippedState, 0);
+        }
+        let accepted_frame_count = accepted_frames.len();
+
+        let replay_epoch_at_submit = self.replay_epoch_at_pool.load(Ordering::Acquire);
+        let submit_tree_name = tree_name.clone();
+        self.in_flight.fetch_add(1, Ordering::Release);
+        let job = PrefetchJob {
+            tree_name,
+            gid,
+            key,
+            frame_table,
+            manifest_version,
+            page_size,
+            sub_pages_per_frame: sub_ppf,
+            group_page_nums,
+            overrides,
+            frame_indices: Some(accepted_frames),
+            replay_epoch_at_submit,
+            queued_at: Instant::now(),
+        };
+        match self.job_tx.try_send(job) {
+            Ok(()) => {
+                self.metrics.accepted();
+                self.metrics.submitted(&submit_tree_name);
+                PrefetchFrameSubmitOutcome::new(
+                    PrefetchSubmitOutcome::Accepted,
+                    accepted_frame_count,
+                )
+            }
+            Err(flume::TrySendError::Full(job)) => {
+                self.in_flight.fetch_sub(1, Ordering::Release);
+                if let Some(frames) = job.frame_indices {
+                    let mut queued = self.queued_frame_ids.lock();
+                    for id in frame_ids_for(job.gid, &frames) {
+                        queued.remove(&id);
+                    }
+                }
+                self.metrics.full();
+                PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::Full, 0)
+            }
+            Err(flume::TrySendError::Disconnected(job)) => {
+                self.in_flight.fetch_sub(1, Ordering::Release);
+                if let Some(frames) = job.frame_indices {
+                    let mut queued = self.queued_frame_ids.lock();
+                    for id in frame_ids_for(job.gid, &frames) {
+                        queued.remove(&id);
+                    }
+                }
+                self.metrics.closed();
+                PrefetchFrameSubmitOutcome::new(PrefetchSubmitOutcome::Closed, 0)
+            }
+        }
+    }
+
     pub(crate) fn is_optional_pending(&self, gid: u64) -> bool {
         self.queued_gids.lock().contains(&gid)
     }
@@ -1051,6 +1646,63 @@ impl PrefetchPool {
 
     pub(crate) fn record_foreground_wait(&self, elapsed: std::time::Duration) {
         self.metrics.foreground_wait(elapsed);
+    }
+
+    pub(crate) fn record_lookahead_retained(&self, rows: u64) {
+        self.metrics.lookahead_retained(rows);
+    }
+
+    pub(crate) fn record_lookahead_fired(&self, frames: u64) {
+        self.metrics.lookahead_fired(frames);
+    }
+
+    pub(crate) fn record_lookahead_hit_if_present(
+        &self,
+        cache: &DiskCache,
+        gid: u64,
+        frame_idx: usize,
+    ) {
+        let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
+            return;
+        };
+        if !cache.tracker.lock().is_sub_chunk_present(&id) {
+            self.lookahead_frame_ids.lock().remove(&id);
+            return;
+        }
+        if self.lookahead_frame_ids.lock().remove(&id) {
+            self.metrics.lookahead_hit();
+        }
+    }
+
+    pub(crate) fn clear_lookahead_frame(&self, gid: u64, frame_idx: usize) {
+        let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
+            return;
+        };
+        self.lookahead_frame_ids.lock().remove(&id);
+    }
+
+    pub(crate) fn clear_lookahead_group(&self, gid: u64) {
+        clear_lookahead_group(&self.lookahead_frame_ids, gid);
+    }
+
+    pub(crate) fn clear_lookahead_provenance(&self) {
+        self.lookahead_frame_ids.lock().clear();
+    }
+
+    pub(crate) fn record_lookahead_bailout_no_anchor(&self) {
+        self.metrics.lookahead_bailout_no_anchor();
+    }
+
+    pub(crate) fn record_lookahead_bailout_uncached(&self) {
+        self.metrics.lookahead_bailout_uncached();
+    }
+
+    pub(crate) fn record_lookahead_bailout_parse(&self) {
+        self.metrics.lookahead_bailout_parse();
+    }
+
+    pub(crate) fn record_lookahead_bailout_no_frames(&self) {
+        self.metrics.lookahead_bailout_no_frames();
     }
 
     pub(crate) fn get_foreground(
@@ -1112,10 +1764,15 @@ impl PrefetchPool {
     pub(crate) fn stats_json(&self) -> serde_json::Value {
         self.metrics.snapshot_json(
             self.in_flight.load(Ordering::Relaxed),
-            self.queued_gids.lock().len() as u64,
+            self.queued_gids.lock().len() as u64 + self.queued_frame_ids.lock().len() as u64,
             self.max_queued.load(Ordering::Relaxed),
             self.io_budget.max_in_flight(),
         )
+    }
+
+    fn note_max_queued(&self) {
+        let queued = self.queued_gids.lock().len() + self.queued_frame_ids.lock().len();
+        self.max_queued.fetch_max(queued as u64, Ordering::Relaxed);
     }
 
     /// Wait until all in-flight prefetch jobs complete.

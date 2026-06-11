@@ -664,6 +664,7 @@ fn flush_inner(
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            tree_name_to_root_page: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: old_manifest.db_header.clone(),
         };

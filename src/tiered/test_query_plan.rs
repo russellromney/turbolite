@@ -7,6 +7,7 @@ use super::*;
 // Serialize them on this lock. `unwrap_or_else(into_inner)` keeps one test's
 // panic from poisoning the rest.
 static END_QUERY_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PLAN_QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn test_parse_search_with_index() {
@@ -15,6 +16,8 @@ fn test_parse_search_with_index() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].tree_name, "idx_users_email");
     assert_eq!(result[0].access_type, AccessType::Search);
+    assert_eq!(result[0].table_name.as_deref(), Some("users"));
+    assert_eq!(result[0].constraint_columns, vec!["email".to_string()]);
 }
 
 #[test]
@@ -57,8 +60,23 @@ SCAN likes";
     assert_eq!(result[0].access_type, AccessType::Search);
     assert_eq!(result[1].tree_name, "idx_posts_user_id");
     assert_eq!(result[1].access_type, AccessType::Search);
+    assert_eq!(result[1].table_name.as_deref(), Some("posts"));
+    assert_eq!(result[1].constraint_columns, vec!["user_id".to_string()]);
     assert_eq!(result[2].tree_name, "likes");
     assert_eq!(result[2].access_type, AccessType::Scan);
+}
+
+#[test]
+fn test_parse_profile_lookahead_shape_keeps_table_mapping() {
+    let eqp = "\
+SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
+SEARCH posts USING INDEX idx_posts_user_created (user_id=?)";
+    let result = parse_eqp_output(eqp);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].tree_name, "idx_posts_user_created");
+    assert_eq!(result[0].access_type, AccessType::Search);
+    assert_eq!(result[0].table_name.as_deref(), Some("posts"));
+    assert_eq!(result[0].constraint_columns, vec!["user_id".to_string()]);
 }
 
 #[test]
@@ -90,6 +108,9 @@ COMPOUND SUBQUERY 1";
 
 #[test]
 fn test_queue_push_drain() {
+    let _guard = PLAN_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // Drain any leftover from other tests
     drain_planned_accesses();
 
@@ -120,34 +141,61 @@ fn test_queue_push_drain() {
 
 #[test]
 fn test_queue_accumulates_multiple_pushes() {
-    // Lock the queue for the duration to prevent other tests from draining
-    let mut queue = super::PLAN_QUEUE.lock().expect("plan queue poisoned");
-    queue.clear();
-
-    // Simulate two pushes by extending directly
-    queue.push(PlannedAccess {
+    let _guard = PLAN_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    drain_planned_accesses();
+    push_planned_accesses(vec![PlannedAccess {
         tree_name: "users".into(),
         access_type: AccessType::Scan,
         table_name: None,
         constraint_columns: vec![],
-    });
-    queue.push(PlannedAccess {
+    }]);
+    push_planned_accesses(vec![PlannedAccess {
         tree_name: "posts".into(),
         access_type: AccessType::Search,
         table_name: None,
         constraint_columns: vec![],
-    });
+    }]);
 
-    assert_eq!(queue.len(), 2);
-    queue.clear();
+    let drained = drain_planned_accesses();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].tree_name, "users");
+    assert_eq!(drained[1].tree_name, "posts");
 }
 
 #[test]
 fn test_empty_push_is_noop() {
+    let _guard = PLAN_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     drain_planned_accesses();
     push_planned_accesses(vec![]);
     let drained = drain_planned_accesses();
     assert!(drained.is_empty());
+}
+
+#[test]
+fn test_queue_cross_thread_fallback_drains_mirrored_plan() {
+    let _guard = PLAN_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    drain_planned_accesses();
+
+    let producer = std::thread::spawn(|| {
+        push_planned_accesses(vec![PlannedAccess {
+            tree_name: "cross_thread".into(),
+            access_type: AccessType::Search,
+            table_name: None,
+            constraint_columns: vec![],
+        }]);
+    });
+    producer.join().unwrap();
+
+    let drained = drain_planned_accesses();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].tree_name, "cross_thread");
+    assert!(drain_planned_accesses().is_empty());
 }
 
 #[test]
@@ -270,6 +318,9 @@ fn test_end_query_signal_multiple_signals_collapse() {
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {
     let _guard = END_QUERY_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _plan_guard = PLAN_QUEUE_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     check_and_clear_end_query();

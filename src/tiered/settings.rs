@@ -24,6 +24,7 @@
 //!   - `prefetch_lookup` — index lookup / point query schedule (conservative)
 //!   - `prefetch_reset`  — reset both to defaults (value ignored)
 //!   - `plan_aware`      — "true"/"false"/"1"/"0"
+//!   - `lookahead`       — "true"/"false"/"1"/"0"
 //!   - `cache_limit`     — byte-size string ("512MB", "2GB", "0" = unlimited)
 //!   - `evict_on_checkpoint` — "true"/"false"/"1"/"0"
 //!
@@ -205,7 +206,7 @@ pub fn validate(key: &str, value: &str) -> Result<(), &'static str> {
         "prefetch_reset" => {
             // Value ignored, any value accepted.
         }
-        "plan_aware" | "evict_on_checkpoint" => {
+        "plan_aware" | "lookahead" | "evict_on_checkpoint" => {
             if !matches!(value, "true" | "false" | "1" | "0") {
                 return Err("expected true/false/1/0");
             }
@@ -257,6 +258,7 @@ mod tests {
     #[test]
     fn validate_bool_and_bytes() {
         assert!(validate("plan_aware", "true").is_ok());
+        assert!(validate("lookahead", "1").is_ok());
         assert!(validate("plan_aware", "maybe").is_err());
         assert!(validate("evict_on_checkpoint", "0").is_ok());
         assert!(validate("cache_limit", "512MB").is_ok());

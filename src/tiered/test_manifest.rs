@@ -485,6 +485,8 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         m2.tree_name_to_groups.get("idx_users_name").unwrap(),
         &vec![1u64]
     );
+    assert_eq!(m2.tree_name_to_root_page.get("users"), Some(&0u64));
+    assert_eq!(m2.tree_name_to_root_page.get("idx_users_name"), Some(&5u64));
 }
 
 // =========================================================================

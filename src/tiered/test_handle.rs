@@ -27,6 +27,24 @@ fn wrong_key() -> [u8; 32] {
     [0xFFu8; 32]
 }
 
+#[test]
+fn lookahead_anchor_window_aims_contiguous_run_around_served_leaf() {
+    assert_eq!(anchored_lookahead_window(100, &[40], 32), Some(25..57));
+    assert_eq!(anchored_lookahead_window(100, &[2], 32), Some(0..32));
+    assert_eq!(anchored_lookahead_window(100, &[96], 32), Some(68..100));
+    assert_eq!(
+        anchored_lookahead_window(100, &[40, 41, 42], 32),
+        Some(26..58)
+    );
+    assert_eq!(
+        anchored_lookahead_window(100, &[10, 60], 32),
+        Some(0..32),
+        "an anchor span wider than the cap must aim from the first anchored row"
+    );
+    assert_eq!(anchored_lookahead_window(10, &[4], 32), Some(0..10));
+    assert_eq!(anchored_lookahead_window(10, &[], 32), None);
+}
+
 fn handle_with_manifest(
     dir: &TempDir,
     page_group_keys: Vec<String>,
@@ -74,6 +92,7 @@ fn handle_with_manifest(
         #[cfg(feature = "zstd")]
         None,
         None,
+        false,
         false,
         4,
         32 * 1024 * 1024,
@@ -283,7 +302,55 @@ fn planned_scan_read_path_does_not_submit_current_group_to_optional_window() {
 
     let stats = pool.stats_json();
     assert!(stats["max_queued"].as_u64().unwrap() <= 2);
+    assert!(handle.planned_lookahead_searches.is_empty());
+    assert_eq!(stats["lookahead"]["fired"], 0);
     assert!(handle.active_scan_prefetch["users"].submitted.len() <= 2);
+}
+
+#[test]
+fn retained_lookahead_missing_table_root_bails_without_firing() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemStorage::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        0,
+        storage,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&handle.manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(1, 0),
+    ));
+    handle.prefetch_pool = Some(Arc::clone(&pool));
+    handle.retained_lookahead.insert(
+        "posts".to_string(),
+        RetainedLookahead {
+            index_tree_name: "idx_posts_user_created".to_string(),
+            table_name: "posts".to_string(),
+            rowids: vec![1, 2, 3],
+        },
+    );
+
+    let mut manifest = (**handle.manifest.load()).clone();
+    manifest.sub_pages_per_frame = 2;
+    manifest.frame_tables = vec![vec![FrameEntry { offset: 0, len: 1 }]];
+    handle.manifest.store(Arc::new(manifest.clone()));
+    assert!(!manifest.tree_name_to_root_page.contains_key("posts"));
+    handle.fire_retained_lookahead("posts", 0, cache.as_ref(), &manifest);
+
+    let stats = pool.stats_json();
+    assert_eq!(stats["lookahead"]["fired"], 0);
+    assert_eq!(stats["lookahead"]["frames_submitted"], 0);
+    assert_eq!(stats["lookahead"]["bailouts"]["no_anchor"], 1);
+    assert!(!handle.retained_lookahead.contains_key("posts"));
 }
 
 #[test]
@@ -371,6 +438,7 @@ fn seekable_read_waits_for_active_optional_full_prefetch_without_range_duplicate
         #[cfg(feature = "zstd")]
         None,
         None,
+        false,
         false,
         4,
         32 * 1024 * 1024,
@@ -490,6 +558,7 @@ fn planned_scan_seekable_current_group_uses_foreground_full_get_not_ranges() {
         None,
         None,
         false,
+        false,
         4,
         32 * 1024 * 1024,
         None,
@@ -589,6 +658,7 @@ fn planned_scan_seekable_group_uses_full_get_even_without_current_tree_name() {
         None,
         None,
         false,
+        false,
         4,
         32 * 1024 * 1024,
         None,
@@ -686,6 +756,7 @@ fn seekable_read_rejects_range_ignoring_backend_without_full_get_fallback() {
         #[cfg(feature = "zstd")]
         None,
         None,
+        false,
         false,
         4,
         32 * 1024 * 1024,
@@ -1115,6 +1186,7 @@ fn seekable_miss_warms_current_group_via_optional_prefetch() {
         #[cfg(feature = "zstd")]
         None,
         None,
+        false,
         false,
         4,
         32 * 1024 * 1024,

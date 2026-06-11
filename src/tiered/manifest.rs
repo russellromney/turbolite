@@ -95,6 +95,11 @@ pub struct Manifest {
     #[serde(skip)]
     pub tree_name_to_groups: HashMap<String, Vec<u64>>,
 
+    /// Reverse index tree_name -> root page (0-based).
+    /// Built on load from `btrees`, not serialized.
+    #[serde(skip)]
+    pub tree_name_to_root_page: HashMap<String, u64>,
+
     /// Reverse index: group_id -> B-tree name. Built on load, not serialized.
     /// Used by per-query prefetch schedule selection (SEARCH vs default hops).
     #[serde(skip)]
@@ -296,6 +301,7 @@ impl Manifest {
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            tree_name_to_root_page: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
             discontinuity_stamp: 0,
@@ -322,6 +328,7 @@ impl Manifest {
         self.btree_groups.clear();
         self.page_to_tree_name.clear();
         self.tree_name_to_groups.clear();
+        self.tree_name_to_root_page.clear();
         self.group_to_tree_name.clear();
         // Auto-detect: if group_pages is populated, this is BTreeAware
         if !self.group_pages.is_empty() && self.strategy == GroupingStrategy::Positional {
@@ -344,7 +351,7 @@ impl Manifest {
             }
         }
         // Build btree_groups + page_to_tree_name + tree_name_to_groups from B-tree manifest entries
-        for entry in self.btrees.values() {
+        for (&root_page, entry) in &self.btrees {
             for &gid in &entry.group_ids {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
                 self.group_to_tree_name.insert(gid, entry.name.clone());
@@ -360,6 +367,8 @@ impl Manifest {
             // Tree name -> group IDs
             self.tree_name_to_groups
                 .insert(entry.name.clone(), entry.group_ids.clone());
+            self.tree_name_to_root_page
+                .insert(entry.name.clone(), root_page);
         }
     }
 
