@@ -1,0 +1,157 @@
+[2m2026-06-10T23:19:59Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.4 KiB/2.4 KiB (13.0 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:20:02Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] profile          641.5ms    839.3ms    839.3ms       25.1       23.0MB
+[2m2026-06-10T23:20:11Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.5 KiB/2.5 KiB (9.3 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:20:23Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.5 KiB/2.5 KiB (2.7 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:20:32Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] who-liked        564.3ms       5.1s       5.1s        8.5       31.4MB
+[2m2026-06-10T23:20:34Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.5 KiB/2.5 KiB (11.3 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:20:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.5 KiB/2.5 KiB (11.6 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:20:48Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] mutual           118.7ms       1.2s       1.2s        1.6        1.4MB
+[2m2026-06-10T23:20:57Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.6 KiB/2.6 KiB (10.3 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:21:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] idx-filter       181.1ms    298.9ms    298.9ms        1.0        147KB
+[2m2026-06-10T23:21:09Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.7 KiB/2.7 KiB (5.5 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:21:20Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] scan-filter      656.8ms       1.7s       1.7s       69.0       80.8MB
+[2m2026-06-10T23:21:20Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===
+[2m2026-06-10T23:21:20Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-10T23:21:20Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-10T23:21:20Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.7 KiB/2.7 KiB (9.3 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:21:32Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 3.0 KiB/3.0 KiB (8.3 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:21:33Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] post+user           342.2ms    753.2ms    753.2ms        2.0        1.3MB
+[2m2026-06-10T23:21:43Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 3.1 KiB/3.1 KiB (14.4 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:21:45Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] profile             921.9ms       1.5s       1.5s       23.0       16.0MB
+[2m2026-06-10T23:21:53Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] who-liked           358.1ms    855.3ms    855.3ms        5.5       19.4MB
+[2m2026-06-10T23:21:55Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] mutual                119us      247us      247us        0.0          0KB
+[2m2026-06-10T23:21:55Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] idx-filter             72us      119us      119us        0.0          0KB
+[2m2026-06-10T23:21:55Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 3.3 KiB/3.3 KiB (14.8 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] scan-filter         624.3ms       1.0s       1.0s       69.0       80.8MB
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: DATA (everything cached, reuse connection) ===
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] post+user               64us      192us      192us        0.0          0KB
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] profile                266us      402us      402us        0.0          0KB
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] who-liked              136us      349us      349us        0.0          0KB
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] mutual                  96us      165us      165us        0.0          0KB
+[2m2026-06-10T23:22:03Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] idx-filter              54us       71us       71us        0.0          0KB
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] scan-filter          204.9ms    210.1ms    210.1ms        0.0          0KB
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== REMOTE I/O TAILS (whole run, all modes) ===
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                            count        p50        p95        p99       p999        max
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_range            842     65.5ms    262.1ms    524.3ms   1048.6ms    983.6ms
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_group             61    131.1ms    524.3ms   1048.6ms   1048.6ms    596.4ms
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  prefetch_group             3326    131.1ms    524.3ms   1048.6ms   4194.3ms   4253.8ms
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_wait             231    131.1ms   1048.6ms   1048.6ms   1048.6ms   1000.2ms
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  queue_wait                 3347      1.0ms    524.3ms    524.3ms   1048.6ms    551.6ms
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  max remote in-flight: 33
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Reference: Neon cold start ~500ms (us-east-2, compute pool)
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Done.
+[2m2026-06-10T23:22:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 4.9 KiB/4.9 KiB (24.7 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:22:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 4.9 KiB/4.9 KiB (33.7 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260610_231913_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260610_231913_7815691b351228.log
+[2m2026-06-10T23:22:08Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Main child exited normally with code: 0
+[2m2026-06-10T23:22:08Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Starting clean up.
+[2m2026-06-10T23:22:08Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Umounting /dev/vdc from /data
+[2m2026-06-10T23:22:08Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][  176.453740] reboot: Restarting system
+[2m2026-06-10T23:22:11Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]machine exited with exit code 0, not restarting
+[2m2026-06-11T05:35:24Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Pulling container image registry.fly.io/turbolite-tiered-bench@sha256:7ae12100fa0b29bfb0d552621f83cbff4cac76777d1004cd6986213ea27c0e45
+[2m2026-06-11T05:35:39Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Successfully prepared image registry.fly.io/turbolite-tiered-bench@sha256:7ae12100fa0b29bfb0d552621f83cbff4cac76777d1004cd6986213ea27c0e45 (15.206131115s)
+[2m2026-06-11T05:35:39Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Setting up volume 'bench_data'
+[2m2026-06-11T05:35:39Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Opening encrypted volume
+[2m2026-06-11T05:35:40Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Configuring firecracker
+[2m2026-06-11T05:36:05Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]2026-06-11T05:36:05.789179172 [01KTTJV5R4WQVSEXKGTQRGV3RG:main] Running Firecracker v1.14.4
+[2m2026-06-11T05:36:05Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]2026-06-11T05:36:05.789399756 [01KTTJV5R4WQVSEXKGTQRGV3RG:main] Listening on API socket ("/fc.sock").
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Starting init (commit: ea887ee)...
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Checking filesystem on /data
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]/dev/vdc: clean, 72/2621440 files, 1502335/10481664 blocks
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Mounting /dev/vdc at /data w/ uid: 0, gid: 0 and chmod 0755
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Resized /data to 42932895744 bytes
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Preparing to run: `/usr/local/bin/entrypoint.sh --sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none,interior,index,data --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0,0 --plan-aware --skip-verify` as root
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m [fly api proxy] listening at /.fly/api
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] main() starting
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] CLI parsed
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== Tiered VFS Benchmark (Page Group Model) ===
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Bucket:       sqlces-test
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Endpoint:     https://t3.storage.dev
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Page size:    65536 bytes
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Pages/group:  256 (16.0 MB uncompressed per group)
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Iterations:   10 measured + 2 warmup per cold query, 10 per warm query
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Prefetch:     7 worker threads
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Queries:      post detail, profile, who-liked, mutual friends
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Plan-aware:   ENABLED (Phase Marne query-plan prefetch)
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]--- 1,000,000 posts, 100,000 users (~812.5 MB, ~13001 pages, ~51 page groups) ---
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]    prefetch_search: [0.3, 0.3, 0.4]
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]    prefetch_lookup: [0.0, 0.0, 0.0]
+[2m2026-06-11T05:36:06Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] run_benchmark(1000000) starting
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]2026/06/11 05:36:07 INFO SSH listening listen_address=[fdaa:1:220a:a7b:305:d0b3:9d47:2]:22
+[2m2026-06-11T05:36:07Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]Machine started in 1.431s
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] S3 data already exists at prefix 'social_1000000_btree' (23294 pages, 97 groups), skipping generation
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] creating reader VFS...
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] calling TurboliteVfs::with_backend()...
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] TurboliteVfs::with_backend() returned OK
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] registering VFS 'bench_reader_0'
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] VFS registered, opening connection...
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][bench] connection opened, skipping COUNT(*) verification
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  post+user    schedule: off / off
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  profile      schedule: 0.20,0.30,0.50 / 0.00,0.10,0.20
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  who-liked    schedule: 0.30,0.30,0.40 / 0.00,0.00,0.00,0.00
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  mutual       schedule: 0.40,0.30,0.30 / 0.10,0.20,0.30
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  idx-filter   schedule: 0.30,0.30,0.40 / 0.10,0.20,0.30
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  scan-filter  schedule: off / off
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: NONE (everything from S3) ===
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-11T05:36:07Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-11T05:36:13Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] post+user            229.8ms    556.8ms    556.8ms        9.6        4.4MB
+[2m2026-06-11T05:36:18Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 1.7 KiB/1.7 KiB (12.0 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:36:30Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 1.7 KiB/1.7 KiB (15.1 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:36:30Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] profile                 1.4s       1.9s       1.9s       35.0       27.1MB
+[2m2026-06-11T05:36:39Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] who-liked            384.3ms    699.3ms    699.3ms       14.4       33.8MB
+[2m2026-06-11T05:36:41Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 1.8 KiB/1.8 KiB (14.0 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:36:42Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] mutual               171.5ms    236.5ms    236.5ms        5.5       10.4MB
+[2m2026-06-11T05:36:45Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] idx-filter           120.5ms    182.6ms    182.6ms        4.1        1.4MB
+[2m2026-06-11T05:36:52Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.0 KiB/2.0 KiB (11.7 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:36:54Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [none] scan-filter          753.8ms    804.3ms    804.3ms       71.0       81.2MB
+[2m2026-06-11T05:36:54Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===
+[2m2026-06-11T05:36:54Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-11T05:36:54Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-11T05:36:56Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] post+user        118.9ms    141.5ms    141.5ms        2.1        1.6MB
+[2m2026-06-11T05:37:04Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.4 KiB/2.4 KiB (9.1 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:05Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] profile          660.8ms       1.0s       1.0s       25.7       23.0MB
+[2m2026-06-11T05:37:09Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] who-liked        271.0ms    532.1ms    532.1ms        9.2       31.6MB
+[2m2026-06-11T05:37:12Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] mutual            77.4ms    287.8ms    287.8ms        1.9        4.1MB
+[2m2026-06-11T05:37:13Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] idx-filter        41.3ms     82.7ms     82.7ms        1.0        147KB
+[2m2026-06-11T05:37:15Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 2.7 KiB/2.7 KiB (12.4 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:23Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [interior] scan-filter      754.5ms    795.7ms    795.7ms       69.0       80.8MB
+[2m2026-06-11T05:37:23Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===
+[2m2026-06-11T05:37:23Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-11T05:37:23Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-11T05:37:25Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] post+user           100.7ms    211.4ms    211.4ms        2.1        1.6MB
+[2m2026-06-11T05:37:27Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 3.1 KiB/3.1 KiB (13.7 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:30Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] profile             386.6ms    447.6ms    447.6ms       23.3       15.8MB
+[2m2026-06-11T05:37:34Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] who-liked           221.9ms    556.8ms    556.8ms        6.6       14.7MB
+[2m2026-06-11T05:37:35Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] mutual                122us      258us      258us        0.0          0KB
+[2m2026-06-11T05:37:35Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] idx-filter             88us      266us      266us        0.0          0KB
+[2m2026-06-11T05:37:38Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 3.4 KiB/3.4 KiB (19.8 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [index] scan-filter         846.7ms       1.2s       1.2s       69.0       80.8MB
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== CACHE LEVEL: DATA (everything cached, reuse connection) ===
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                                  p50        p90        p99    s3 GETs     s3 bytes
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  ------------------------ ---------- ---------- ---------- ---------- ------------
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] post+user               68us      190us      190us        0.0          0KB
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] profile                201us      404us      404us        0.0          0KB
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] who-liked              172us      518us      518us        0.0          0KB
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] mutual                 102us      123us      123us        0.0          0KB
+[2m2026-06-11T05:37:46Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] idx-filter              44us       78us       78us        0.0          0KB
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  [data] scan-filter          203.8ms    218.1ms    218.1ms        0.1        1.4MB
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]=== REMOTE I/O TAILS (whole run, all modes) ===
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]                            count        p50        p95        p99       p999        max
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_range           1000     65.5ms    262.1ms    262.1ms    524.3ms    495.7ms
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_group             80     65.5ms    131.1ms    262.1ms    262.1ms    156.0ms
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  prefetch_group             3326     65.5ms    262.1ms    524.3ms   1048.6ms    781.8ms
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  foreground_wait             328     32.8ms    262.1ms    524.3ms    524.3ms    454.0ms
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  queue_wait                 3358    262.1ms   1048.6ms   1048.6ms   2097.2ms   1118.3ms
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]  max remote in-flight: 8
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Reference: Neon cold start ~500ms (us-east-2, compute pool)
+[2m2026-06-11T05:37:49Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Done.
+[2m2026-06-11T05:37:50Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 4.9 KiB/4.9 KiB (15.0 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:50Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m]Completed 4.9 KiB/4.9 KiB (43.2 KiB/s) with 1 file(s) remainingupload: tmp/bench_20260611_053606_7815691b351228.log to s3://sqlces-test/bench/logs/bench_20260611_053606_7815691b351228.log
+[2m2026-06-11T05:37:51Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Main child exited normally with code: 0
+[2m2026-06-11T05:37:51Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Starting clean up.
+[2m2026-06-11T05:37:51Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][32m INFO[0m Umounting /dev/vdc from /data
+[2m2026-06-11T05:37:51Z[0m app[7815691b351228] [32miad[0m [[34minfo[0m][  105.145926] reboot: Restarting system
+[2m2026-06-11T05:38:01Z[0m runner[7815691b351228] [32miad[0m [[34minfo[0m]machine exited with exit code 0, not restarting

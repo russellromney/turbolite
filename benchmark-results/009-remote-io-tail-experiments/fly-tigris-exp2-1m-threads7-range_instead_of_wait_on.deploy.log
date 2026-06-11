@@ -1,0 +1,14 @@
+==> Verifying app config
+Validating benchmark/fly-full.toml
+[32m✓[0m Configuration is valid
+--> Verified app config
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-009/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-009/benchmark/Dockerfile (from benchmark/fly-full.toml)
+[33mWARN[0m failed to create build in graphql: Post "https://api.fly.io/api/v1/builds": dial tcp: lookup api.fly.io: no such host
+
+Waiting for depot builder...
+
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-009/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-009/benchmark/Dockerfile (from benchmark/fly-full.toml)
+Warning: Metrics send issue: failed to send metrics: Post "https://flyctl-metrics.fly.dev/metrics_post": dial tcp: lookup flyctl-metrics.fly.dev: no such host
+Error: failed to fetch an image or build from source: Get "https://api.fly.io/api/v1/organizations/russell-romney": dial tcp: lookup api.fly.io: no such host

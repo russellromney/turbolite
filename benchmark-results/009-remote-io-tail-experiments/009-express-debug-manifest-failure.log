@@ -1,0 +1,25 @@
+[bench] main() starting
+[bench] CLI parsed
+=== Tiered VFS Benchmark (Page Group Model) ===
+Bucket:       turbolite-bench--use2-az1--x-s3
+Endpoint:     (default S3)
+Page size:    65536 bytes
+Pages/group:  256 (16.0 MB uncompressed per group)
+Iterations:   1 measured + 0 warmup per cold query, 1 per warm query
+Prefetch:     7 worker threads
+Queries:      post detail, profile, who-liked, mutual friends
+
+--- 1,000,000 posts, 100,000 users (~812.5 MB, ~13001 pages, ~51 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(1000000) starting
+
+thread 'main' (38306) panicked at benchmark/tiered-bench.rs:1565:14:
+failed to check S3 manifest: Custom { kind: Other, error: "fetch manifest: S3 GET social_1000000_btree/manifest.msgpack failed after 3 attempts: dispatch failure" }
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::result::unwrap_failed
+   3: tiered_bench::run_benchmark
+   4: tiered_bench::main
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.

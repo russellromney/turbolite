@@ -1,0 +1,17 @@
+==> Verifying app config
+Validating benchmark/fly-full.toml
+[32m✓[0m Configuration is valid
+--> Verified app config
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-009/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-009/benchmark/Dockerfile (from benchmark/fly-full.toml)
+Waiting for depot builder...
+
+[33mWARN[0m failed to finish build in graphql: ensure depot builder failed, please try again (status 401): {"error":"401 Unauthorized"}
+
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-009/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-009/benchmark/Dockerfile (from benchmark/fly-full.toml)
+[33mWARN[0m failed to create build in graphql: ensure depot builder failed, please try again (status 401): {"error":"401 Unauthorized"}
+
+Waiting for depot builder...
+
+error reporting health: unauthenticated: Invalid tokenError: failed to fetch an image or build from source: error building: ensure depot builder failed, please try again (status 401): {"error":"401 Unauthorized"}

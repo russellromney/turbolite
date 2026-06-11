@@ -1,0 +1,83 @@
+[bench] main() starting
+[bench] CLI parsed
+=== Tiered VFS Benchmark (Page Group Model) ===
+Bucket:       cinch-bench--use2-az1--x-s3
+Endpoint:     (default S3)
+Page size:    65536 bytes
+Pages/group:  256 (16.0 MB uncompressed per group)
+Iterations:   10 measured + 2 warmup per cold query, 10 per warm query
+Prefetch:     8 worker threads
+Queries:      post detail, profile, who-liked, mutual friends
+Plan-aware:   ENABLED (Phase Marne query-plan prefetch)
+
+--- 1,000,000 posts, 100,000 users (~812.5 MB, ~13001 pages, ~51 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(1000000) starting
+[bench] S3 data already exists at prefix 'social_1000000_btree' (23294 pages, 97 groups), skipping generation
+[bench] creating reader VFS...
+[bench] calling TurboliteVfs::with_backend()...
+[bench] TurboliteVfs::with_backend() returned OK
+[bench] registering VFS 'bench_reader_0'
+[bench] VFS registered, opening connection...
+[bench] connection opened, skipping COUNT(*) verification
+  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+  post+user    schedule: off / off
+  profile      schedule: 0.20,0.30,0.50 / 0.00,0.10,0.20
+  who-liked    schedule: 0.30,0.30,0.40 / 0.00,0.00,0.00,0.00
+  mutual       schedule: 0.40,0.30,0.30 / 0.10,0.20,0.30
+  idx-filter   schedule: 0.30,0.30,0.40 / 0.10,0.20,0.30
+  scan-filter  schedule: off / off
+
+=== CACHE LEVEL: NONE (everything from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [none] post+user             85.7ms    105.1ms    105.1ms        9.8        8.0MB
+  [none] profile              277.7ms    323.2ms    323.2ms       32.2       26.8MB
+  [none] who-liked            336.9ms    608.9ms    608.9ms       11.1       42.1MB
+  [none] mutual                25.4ms    126.3ms    126.3ms        4.6        7.8MB
+  [none] idx-filter            86.8ms     95.6ms     95.6ms        4.0        7.4MB
+  [none] scan-filter          484.4ms    502.3ms    502.3ms       71.0       81.2MB
+
+=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [interior] post+user         41.6ms     46.2ms     46.2ms        2.0        1.3MB
+  [interior] profile          142.6ms    170.2ms    170.2ms       25.0       22.9MB
+  [interior] who-liked        168.4ms    428.0ms    428.0ms        7.6       30.0MB
+  [interior] mutual            10.2ms    114.4ms    114.4ms        1.6        3.7MB
+  [interior] idx-filter         8.9ms     10.3ms     10.3ms        1.0        147KB
+  [interior] scan-filter      466.7ms    475.8ms    475.8ms       69.0       80.8MB
+
+=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [index] post+user            43.1ms     47.0ms     47.0ms        2.0        1.3MB
+  [index] profile             117.0ms    159.9ms    159.9ms       23.0       16.0MB
+  [index] who-liked           129.0ms    422.6ms    422.6ms        5.2       16.3MB
+  [index] mutual                 84us      190us      190us        0.0          0KB
+  [index] idx-filter             52us       56us       56us        0.0          0KB
+  [index] scan-filter         458.4ms    483.8ms    483.8ms       69.0       80.8MB
+
+=== CACHE LEVEL: DATA (everything cached, reuse connection) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [data] post+user               77us      153us      153us        0.0          0KB
+  [data] profile                240us      414us      414us        0.0          0KB
+  [data] who-liked              185us      427us      427us        0.0          0KB
+  [data] mutual                 108us      140us      140us        0.0          0KB
+  [data] idx-filter              58us       70us       70us        0.0          0KB
+  [data] scan-filter          227.2ms    231.2ms    231.2ms        0.0          0KB
+
+=== REMOTE I/O TAILS (whole run, all modes) ===
+                            count        p50        p95        p99       p999        max
+  foreground_range            830      8.2ms      8.2ms      8.2ms     16.4ms     11.6ms
+  foreground_group             74     16.4ms     32.8ms     65.5ms     65.5ms     39.6ms
+  prefetch_group             3316     16.4ms    131.1ms    131.1ms    131.1ms    125.0ms
+  foreground_wait             214     65.5ms    131.1ms    262.1ms    262.1ms    141.0ms
+  queue_wait                 3342    131.1ms    524.3ms    524.3ms    524.3ms    459.4ms
+  max remote in-flight: 9
+
+
+Reference: Neon cold start ~500ms (us-east-2, compute pool)
+Done.

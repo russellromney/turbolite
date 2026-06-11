@@ -1,0 +1,123 @@
+==> Verifying app config
+Validating benchmark/fly-full.toml
+[32m✓[0m Configuration is valid
+--> Verified app config
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-009/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-009/benchmark/Dockerfile (from benchmark/fly-full.toml)
+Waiting for depot builder...
+
+==> Building image with Depot
+--> build:  (​)
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 30B 0.1s
+#1 transferring dockerfile: 1.93kB 0.3s done
+#1 DONE 0.3s
+
+#2 [internal] load metadata for docker.io/library/rust:1-bookworm
+#2 DONE 0.4s
+
+#3 [internal] load metadata for docker.io/library/debian:bookworm-slim
+#3 DONE 0.5s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 33B 0.1s
+#4 transferring context: 481B 0.3s done
+#4 DONE 0.3s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [stage-1 1/6] FROM docker.io/library/debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb
+#6 resolve docker.io/library/debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb done
+#6 DONE 0.0s
+
+#7 [builder  1/10] FROM docker.io/library/rust:1-bookworm@sha256:13c186980fa33cc12759b429662a1322939dbe697484b7c33b47dd2698d28460
+#7 resolve docker.io/library/rust:1-bookworm@sha256:13c186980fa33cc12759b429662a1322939dbe697484b7c33b47dd2698d28460 done
+#7 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 4.01kB 0.2s done
+#5 DONE 0.2s
+
+#8 [builder  7/10] COPY bin/ bin/
+#8 CACHED
+
+#9 [stage-1 4/6] COPY --from=builder /app/target/release/tiered-tune /usr/local/bin/tiered-tune
+#9 CACHED
+
+#10 [builder  4/10] RUN mkdir -p /walrust/crates/walrust-core/src &&     echo '[package]\nname = "walrust"\nversion = "0.3.0"\nedition = "2021"' > /walrust/crates/walrust-core/Cargo.toml &&     echo '' > /walrust/crates/walrust-core/src/lib.rs &&     mkdir -p /hadb/hadb-io/src &&     echo '[package]\nname = "hadb-io"\nversion = "0.2.0"\nedition = "2021"' > /hadb/hadb-io/Cargo.toml &&     echo '' > /hadb/hadb-io/src/lib.rs
+#10 CACHED
+
+#11 [stage-1 3/6] COPY --from=builder /app/target/release/tiered-bench /usr/local/bin/tiered-bench
+#11 CACHED
+
+#12 [builder  6/10] COPY src/ src/
+#12 CACHED
+
+#13 [stage-1 2/6] RUN apt-get update && apt-get install -y ca-certificates curl unzip &&     curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" &&     unzip awscliv2.zip &&     ./aws/install &&     rm -rf aws awscliv2.zip &&     apt-get remove -y curl unzip &&     apt-get autoremove -y &&     rm -rf /var/lib/apt/lists/*
+#13 CACHED
+
+#14 [stage-1 5/6] COPY benchmark/entrypoint.sh /usr/local/bin/entrypoint.sh
+#14 CACHED
+
+#15 [builder  3/10] RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake libclang-dev && rm -rf /var/lib/apt/lists/*
+#15 CACHED
+
+#16 [builder  2/10] WORKDIR /app
+#16 CACHED
+
+#17 [builder  9/10] COPY turbolite-ffi/ turbolite-ffi/
+#17 CACHED
+
+#18 [builder  5/10] COPY Cargo.toml Cargo.lock* ./
+#18 CACHED
+
+#19 [builder  8/10] COPY benchmark/ benchmark/
+#19 CACHED
+
+#20 [builder 10/10] RUN cargo build --release --features bench-s3,zstd,bundled-sqlite --bin tiered-bench --bin tiered-tune
+#20 CACHED
+
+#21 [stage-1 6/6] RUN chmod +x /usr/local/bin/entrypoint.sh
+#21 CACHED
+
+#22 exporting to image
+#22 exporting layers 0.0s done
+#22 exporting manifest sha256:15fed75d1b00d0f0c5704a21a9b3a879046a2eccb371c27c745b1d8d951c1edf done
+#22 exporting config sha256:2e1b5931599cf0c6c4de79d1e8fe950bf8bb7c69fd5dd975e4adfd559be6f2fc done
+#22 pushing layers for registry.fly.io/turbolite-tiered-bench:deployment-01KTSX9RAJ0D174EE22VAMMSDT@sha256:15fed75d1b00d0f0c5704a21a9b3a879046a2eccb371c27c745b1d8d951c1edf
+#22 pushing layer sha256:80f76edc52cf4fdda238c20014c711325a9925399c52bb3b9a1977d9fdd2d237
+#22 pushing layer sha256:2e1b5931599cf0c6c4de79d1e8fe950bf8bb7c69fd5dd975e4adfd559be6f2fc
+#22 pushing layer sha256:ef3fe092339ba112b23dd9a2d0e6df2400649e3e309b924503b2410b79e55e7c
+#22 pushing layer sha256:f544660fd5008848419a812ed6515285df0e64edc6c2927e5a189633d3a3cdc0
+#22 pushing layer sha256:6661c2789aaf3e465ae63b016245624fa0279b14ec6f32d7f6549b7ebf81838a
+#22 pushing layer sha256:f0e0f667a33aad0ce975aa432e22cf4518e1618ec7846e2cd2fdc085f33846ff
+#22 pushing layer sha256:d99a2f4faf8f9311ec8350703eb0dd78394dac102a17d5ad83cd7dea10726c62
+#22 pushing layer sha256:f544660fd5008848419a812ed6515285df0e64edc6c2927e5a189633d3a3cdc0 0.1s done
+#22 pushing layer sha256:80f76edc52cf4fdda238c20014c711325a9925399c52bb3b9a1977d9fdd2d237 0.3s done
+#22 pushing layer sha256:6661c2789aaf3e465ae63b016245624fa0279b14ec6f32d7f6549b7ebf81838a 0.2s done
+#22 pushing layer sha256:ef3fe092339ba112b23dd9a2d0e6df2400649e3e309b924503b2410b79e55e7c 0.4s done
+#22 pushing layer sha256:f0e0f667a33aad0ce975aa432e22cf4518e1618ec7846e2cd2fdc085f33846ff 0.5s done
+#22 pushing layer sha256:d99a2f4faf8f9311ec8350703eb0dd78394dac102a17d5ad83cd7dea10726c62 0.7s done
+#22 pushing layers for registry.fly.io/turbolite-tiered-bench:deployment-01KTSX9RAJ0D174EE22VAMMSDT@sha256:15fed75d1b00d0f0c5704a21a9b3a879046a2eccb371c27c745b1d8d951c1edf 0.7s done
+#22 pushing layer sha256:2e1b5931599cf0c6c4de79d1e8fe950bf8bb7c69fd5dd975e4adfd559be6f2fc 0.7s done
+#22 pushing manifest for registry.fly.io/turbolite-tiered-bench:deployment-01KTSX9RAJ0D174EE22VAMMSDT@sha256:15fed75d1b00d0f0c5704a21a9b3a879046a2eccb371c27c745b1d8d951c1edf 0.1s done
+#22 DONE 0.8s
+--> Build Summary:  (​)
+[38;5;252m--> Building image done[0m
+image: registry.fly.io/turbolite-tiered-bench:deployment-01KTSX9RAJ0D174EE22VAMMSDT
+image size: 103 MB
+
+Watch your deployment at https://fly.io/apps/turbolite-tiered-bench/monitoring
+
+Updating existing machines in 'turbolite-tiered-bench' with rolling strategy
+> Acquiring lease for 7815691b351228
+> Acquired lease for 7815691b351228
+> Updating machine config for 7815691b351228
+> Updating 7815691b351228 [app]
+> Updated machine config for 7815691b351228
+> Waiting for machine 7815691b351228 to reach a good state
+> Machine 7815691b351228 reached stopped state
+✔ Machine 7815691b351228 is now in a good state
+> Clearing lease for 7815691b351228
+✔ Cleared lease for 7815691b351228
