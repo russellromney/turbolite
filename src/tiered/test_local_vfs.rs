@@ -108,13 +108,15 @@ fn lookahead_profile_plan(reader: &rusqlite::Connection) -> Vec<query_plan::Plan
     accesses
 }
 
+type LookaheadProfileReaderResult = (Vec<(i64, String, i64)>, u64, u64, u64, serde_json::Value);
+
 fn run_lookahead_profile_reader(
     backend: Arc<CountingStorageBackend>,
     runtime: &tokio::runtime::Runtime,
     cache_dir: &std::path::Path,
     lookahead: bool,
     name_suffix: &str,
-) -> (Vec<(i64, String, i64)>, u64, u64, u64, serde_json::Value) {
+) -> LookaheadProfileReaderResult {
     query_plan::drain_planned_accesses();
     let mut reader_config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),

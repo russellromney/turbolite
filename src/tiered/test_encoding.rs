@@ -81,8 +81,8 @@ fn test_encode_all_pages_filled() {
     let (pg_count, _ps, decoded) = test_decode(&encoded);
 
     assert_eq!(pg_count, 4);
-    for i in 0..4 {
-        assert_eq!(decoded[i], vec![i as u8; page_size as usize]);
+    for (i, page) in decoded.iter().enumerate().take(4) {
+        assert_eq!(*page, vec![i as u8; page_size as usize]);
     }
 }
 

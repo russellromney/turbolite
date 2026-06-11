@@ -1,4 +1,5 @@
 use super::*;
+use crate::tiered::btree_peek::parse_index_leaf_rowids;
 use crate::DatabaseHandle;
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -211,6 +212,120 @@ impl StorageBackend for BlockingSeekableBackend {
     }
 }
 
+struct BlockingRangeSeekableBackend {
+    blob: Vec<u8>,
+    release: AtomicBool,
+    range_gets: AtomicU64,
+}
+
+#[async_trait]
+impl StorageBackend for BlockingRangeSeekableBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, _key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.range_gets.fetch_add(1, Ordering::AcqRel);
+        while !self.release.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let start = start as usize;
+        let end = start + len as usize;
+        Ok(Some(self.blob[start..end].to_vec()))
+    }
+}
+
+fn sqlite_page(db: &[u8], page_size: usize, page_num: u64) -> &[u8] {
+    let start = page_num as usize * page_size;
+    &db[start..start + page_size]
+}
+
+fn sqlite_page_type(page: &[u8], page_num: u64) -> Option<u8> {
+    let hdr_off = if page_num == 0 { 100 } else { 0 };
+    page.get(hdr_off).copied()
+}
+
+fn read_sqlite_varint(buf: &[u8], off: usize) -> Option<(u64, usize)> {
+    let tail = buf.get(off..)?;
+    let mut val = 0u64;
+    for i in 0..8 {
+        let b = *tail.get(i)?;
+        val = (val << 7) | u64::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            return Some((val, i + 1));
+        }
+    }
+    let b = *tail.get(8)?;
+    val = (val << 8) | u64::from(b);
+    Some((val, 9))
+}
+
+fn table_leaf_rowids_for_test(page: &[u8], page_num: u64) -> Vec<i64> {
+    let hdr = if page_num == 0 { 100 } else { 0 };
+    if page.get(hdr).copied() != Some(0x0d) || page.len() < hdr + 8 {
+        return Vec::new();
+    }
+    let cell_count = u16::from_be_bytes([page[hdr + 3], page[hdr + 4]]) as usize;
+    let mut rowids = Vec::new();
+    for i in 0..cell_count {
+        let ptr = hdr + 8 + i * 2;
+        if ptr + 2 > page.len() {
+            break;
+        }
+        let cell = u16::from_be_bytes([page[ptr], page[ptr + 1]]) as usize;
+        let Some((_, payload_varint_len)) = read_sqlite_varint(page, cell) else {
+            continue;
+        };
+        let Some((rowid, _)) = read_sqlite_varint(page, cell + payload_varint_len) else {
+            continue;
+        };
+        if let Ok(rowid) = i64::try_from(rowid) {
+            rowids.push(rowid);
+        }
+    }
+    rowids
+}
+
+fn page_size_from_sqlite_header(db: &[u8]) -> usize {
+    let raw = u16::from_be_bytes([db[16], db[17]]);
+    if raw == 1 {
+        65_536
+    } else {
+        raw as usize
+    }
+}
+
 #[test]
 fn scan_prefetch_refill_admits_only_fixed_window() {
     let dir = TempDir::new().unwrap();
@@ -351,6 +466,589 @@ fn retained_lookahead_missing_table_root_bails_without_firing() {
     assert_eq!(stats["lookahead"]["frames_submitted"], 0);
     assert_eq!(stats["lookahead"]["bailouts"]["no_anchor"], 1);
     assert!(!handle.retained_lookahead.contains_key("posts"));
+}
+
+#[test]
+fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_frames() {
+    query_plan::drain_planned_accesses();
+    let sqlite_dir = TempDir::new().unwrap();
+    let db_path = sqlite_dir.path().join("real_index.db");
+    let writer = rusqlite::Connection::open(&db_path).expect("open sqlite fixture");
+    writer
+        .execute_batch(
+            "PRAGMA page_size=4096;
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY,
+               category TEXT NOT NULL,
+               bucket INTEGER NOT NULL,
+               payload TEXT NOT NULL
+             );
+             CREATE INDEX idx_items_category_bucket
+               ON items(category, bucket);",
+        )
+        .expect("schema");
+    {
+        let tx = writer.unchecked_transaction().expect("fixture tx");
+        let payload = "x".repeat(180);
+        for n in 0..420i64 {
+            let id = 10_000 + n;
+            tx.execute(
+                "INSERT INTO items (id, category, bucket, payload)
+                 VALUES (?1, 'target', ?2, ?3)",
+                rusqlite::params![id, n, payload],
+            )
+            .expect("insert fixture row");
+        }
+        tx.commit().expect("commit fixture");
+    }
+    let table_root_page_1based: u64 = writer
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'items'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("items rootpage") as u64;
+    drop(writer);
+
+    let db = std::fs::read(&db_path).expect("read sqlite fixture");
+    let page_size = page_size_from_sqlite_header(&db);
+    assert_eq!(page_size, 4096);
+    let page_count = db.len() / page_size;
+    let mut rowid_to_leaf = HashMap::new();
+    let mut index_leaf_candidates = Vec::new();
+    let mut interior_pages = Vec::new();
+    for page_num in 0..page_count as u64 {
+        let page = sqlite_page(&db, page_size, page_num);
+        match sqlite_page_type(page, page_num) {
+            Some(0x05) => interior_pages.push(page_num),
+            Some(0x0d) => {
+                for rowid in table_leaf_rowids_for_test(page, page_num) {
+                    if rowid >= 10_000 {
+                        rowid_to_leaf.insert(rowid, page_num);
+                    }
+                }
+            }
+            Some(0x0a) => {
+                let parsed = parse_index_leaf_rowids(page, page_num == 0, 256, Some(page_size));
+                if parsed.rowids.len() > 32 {
+                    index_leaf_candidates.push((page_num, parsed.rowids));
+                }
+            }
+            _ => {}
+        }
+    }
+    let (index_leaf_page_num, index_rowids) = index_leaf_candidates
+        .into_iter()
+        .max_by_key(|(_, rowids)| rowids.len())
+        .expect("fixture should have a populated index leaf");
+    assert!(
+        index_rowids.len() > 32,
+        "fixture index leaf must be larger than the lookahead cap"
+    );
+    let anchor_rowid = index_rowids[index_rowids.len() / 2];
+    let anchor_page_num = *rowid_to_leaf
+        .get(&anchor_rowid)
+        .expect("anchor rowid should resolve to a table leaf");
+    let anchor_matches: Vec<usize> = index_rowids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, rowid)| {
+            (rowid_to_leaf.get(rowid) == Some(&anchor_page_num)).then_some(idx)
+        })
+        .collect();
+    let window = anchored_lookahead_window(index_rowids.len(), &anchor_matches, 32)
+        .expect("real anchor should produce a lookahead window");
+    let mut all_leaf_frames: Vec<usize> = index_rowids
+        .iter()
+        .filter_map(|rowid| rowid_to_leaf.get(rowid).map(|page| *page as usize))
+        .collect();
+    all_leaf_frames.sort_unstable();
+    all_leaf_frames.dedup();
+    let mut expected_frames: Vec<usize> = index_rowids[window]
+        .iter()
+        .filter_map(|rowid| rowid_to_leaf.get(rowid).map(|page| *page as usize))
+        .collect();
+    expected_frames.sort_unstable();
+    expected_frames.dedup();
+    assert!(
+        expected_frames.len() < all_leaf_frames.len(),
+        "anchored run should be smaller than the whole parsed leaf; expected={expected_frames:?}, all={all_leaf_frames:?}"
+    );
+
+    let support_leaf = rowid_to_leaf
+        .values()
+        .copied()
+        .find(|page| !expected_frames.contains(&(*page as usize)))
+        .expect("fixture should have a table leaf outside the anchored run");
+    let pages: Vec<Option<Vec<u8>>> = (0..page_count as u64)
+        .map(|page_num| Some(sqlite_page(&db, page_size, page_num).to_vec()))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size as u32,
+        1,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .expect("encode seekable fixture");
+
+    let cache_dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(
+            cache_dir.path(),
+            3600,
+            page_count as u32,
+            1,
+            page_size as u32,
+            page_count as u64,
+            None,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut manifest = Manifest {
+        page_count: page_count as u64,
+        page_size: page_size as u32,
+        pages_per_group: page_count as u32,
+        sub_pages_per_frame: 1,
+        page_group_keys: vec!["g0".to_string()],
+        group_pages: vec![(0..page_count as u64).collect()],
+        frame_tables: vec![frame_table.clone()],
+        tree_name_to_root_page: HashMap::from([("items".to_string(), table_root_page_1based - 1)]),
+        page_to_tree_name: HashMap::from([
+            (index_leaf_page_num, "idx_items_category_bucket".to_string()),
+            (anchor_page_num, "items".to_string()),
+        ]),
+        ..Manifest::empty()
+    };
+    manifest.tree_name_to_groups = HashMap::from([
+        ("items".to_string(), vec![0]),
+        ("idx_items_category_bucket".to_string(), vec![0]),
+    ]);
+    for page_num in interior_pages
+        .into_iter()
+        .chain(std::iter::once(support_leaf))
+    {
+        cache
+            .write_pages_scattered(
+                &[page_num],
+                sqlite_page(&db, page_size, page_num),
+                0,
+                page_num as u32,
+            )
+            .unwrap();
+    }
+
+    let backend = Arc::new(BlockingRangeSeekableBackend {
+        blob,
+        release: AtomicBool::new(false),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest.clone()));
+    let storage: Arc<dyn StorageBackend> = backend.clone();
+    let mut handle = TurboliteHandle::new_tiered(
+        Some(storage.clone()),
+        Some(rt.handle().clone()),
+        Arc::clone(&cache),
+        Arc::clone(&shared_manifest),
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        cache_dir.path().join("real-index.lock"),
+        page_count as u32,
+        0,
+        true,
+        vec![0.3, 0.3, 0.4],
+        vec![0.0, 0.0, 0.0],
+        None,
+        false,
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        false,
+        false,
+        4,
+        32 * 1024 * 1024,
+        None,
+        false,
+        0,
+        0,
+        false,
+        true,
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        storage,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        page_count as u32,
+        Arc::new(AtomicU64::new(page_count as u64)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&shared_manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        64,
+        RemoteIoBudget::new(1, 0),
+    ));
+    handle.prefetch_pool = Some(Arc::clone(&pool));
+    handle.query_plan_prefetch = true;
+    handle.lookahead_enabled = true;
+    handle
+        .planned_lookahead_searches
+        .insert("idx_items_category_bucket".to_string(), "items".to_string());
+
+    let manifest_arc = shared_manifest.load_full();
+    let index_page = sqlite_page(&db, page_size, index_leaf_page_num);
+    handle.note_served_page_for_lookahead(
+        index_leaf_page_num,
+        Some(&"idx_items_category_bucket".to_string()),
+        index_page,
+        cache.as_ref(),
+        &manifest_arc,
+    );
+    assert_eq!(
+        handle
+            .retained_lookahead
+            .get("items")
+            .map(|retained| retained.rowids.len()),
+        Some(index_rowids.len())
+    );
+    handle.fire_retained_lookahead("items", anchor_page_num, cache.as_ref(), &manifest_arc);
+
+    let mut submitted_frames = Vec::new();
+    for _ in 0..1000 {
+        submitted_frames = pool.pending_frame_indices_for_gid(0);
+        if !submitted_frames.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        submitted_frames, expected_frames,
+        "lookahead must submit the anchored contiguous frame run, not every parsed index leaf frame"
+    );
+    assert_eq!(
+        pool.stats_json()["lookahead"]["frames_submitted"],
+        expected_frames.len() as u64
+    );
+
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+}
+
+#[test]
+fn lookahead_frame_respects_dirty_page_written_through_handle() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+    handle.read_only = false;
+    let page_size = 64u32;
+    let pages: Vec<Option<Vec<u8>>> = (0..4)
+        .map(|idx| Some(vec![idx as u8 + 1; page_size as usize]))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(CountingSeekableBackend {
+        blob,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        backend,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&handle.manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(1, 0),
+    ));
+    handle.prefetch_pool = Some(Arc::clone(&pool));
+
+    handle
+        .write_all_at(&vec![77u8; page_size as usize], 0)
+        .unwrap();
+    assert!(handle.dirty_page_nums.read().contains(&0));
+    let manifest = handle.manifest.load();
+    let outcome = pool.submit_frame_batch(
+        Some("lookahead".to_string()),
+        0,
+        "g0".to_string(),
+        frame_table,
+        page_size,
+        2,
+        manifest.group_page_nums(0).into_owned(),
+        vec![0],
+        HashMap::new(),
+        manifest.version,
+        cache.as_ref(),
+    );
+    assert_eq!(outcome.outcome, PrefetchSubmitOutcome::Accepted);
+    drop(manifest);
+    pool.wait_idle();
+
+    let mut page0 = vec![0u8; page_size as usize];
+    cache.read_page(0, &mut page0).unwrap();
+    assert_eq!(page0, vec![77u8; page_size as usize]);
+    let mut page1 = vec![0u8; page_size as usize];
+    cache.read_page(1, &mut page1).unwrap();
+    assert_eq!(page1, vec![2u8; page_size as usize]);
+}
+
+#[test]
+fn clear_timed_out_fetching_does_not_cancel_in_flight_frame_job() {
+    let dir = TempDir::new().unwrap();
+    let (handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+    let page_size = 64u32;
+    let pages: Vec<Option<Vec<u8>>> = (0..4)
+        .map(|idx| Some(vec![idx as u8 + 11; page_size as usize]))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(BlockingRangeSeekableBackend {
+        blob,
+        release: AtomicBool::new(false),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        backend.clone(),
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&handle.manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(1, 0),
+    ));
+    let manifest = handle.manifest.load();
+    assert_eq!(
+        pool.submit_frame_batch(
+            Some("lookahead".to_string()),
+            0,
+            "g0".to_string(),
+            frame_table,
+            page_size,
+            2,
+            manifest.group_page_nums(0).into_owned(),
+            vec![0],
+            HashMap::new(),
+            manifest.version,
+            cache.as_ref(),
+        )
+        .outcome,
+        PrefetchSubmitOutcome::Accepted
+    );
+    drop(manifest);
+    while backend.range_gets.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(cache.try_claim_group(0));
+    assert!(handle.clear_timed_out_fetching(cache.as_ref(), 0));
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+
+    let mut page1 = vec![0u8; page_size as usize];
+    cache.read_page(1, &mut page1).unwrap();
+    assert_eq!(page1, vec![12u8; page_size as usize]);
+    assert_eq!(cache.group_state(0), GroupState::None);
+}
+
+#[test]
+fn demand_cache_hit_after_lookahead_frame_install_counts_hit() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+    let page_size = 64u32;
+    let pages: Vec<Option<Vec<u8>>> = (0..4)
+        .map(|idx| Some(vec![idx as u8 + 21; page_size as usize]))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size,
+        2,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(CountingSeekableBackend {
+        blob,
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        backend,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&handle.manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(1, 0),
+    ));
+    handle.prefetch_pool = Some(Arc::clone(&pool));
+    handle.query_plan_prefetch = true;
+    handle.lookahead_enabled = true;
+    let mut manifest_for_hit = (**handle.manifest.load()).clone();
+    manifest_for_hit.sub_pages_per_frame = 2;
+    manifest_for_hit.frame_tables = vec![frame_table.clone()];
+    handle.manifest.store(Arc::new(manifest_for_hit));
+
+    let manifest = handle.manifest.load();
+    assert_eq!(
+        pool.submit_frame_batch(
+            Some("lookahead".to_string()),
+            0,
+            "g0".to_string(),
+            frame_table,
+            page_size,
+            2,
+            manifest.group_page_nums(0).into_owned(),
+            vec![0],
+            HashMap::new(),
+            manifest.version,
+            cache.as_ref(),
+        )
+        .outcome,
+        PrefetchSubmitOutcome::Accepted
+    );
+    drop(manifest);
+    pool.wait_idle();
+
+    query_plan::check_and_clear_end_query();
+    let mut buf = vec![0u8; page_size as usize];
+    handle.read_exact_at(&mut buf, page_size as u64).unwrap();
+    assert_eq!(buf, vec![22u8; page_size as usize]);
+    assert_eq!(pool.stats_json()["lookahead"]["hits"], 1);
+}
+
+#[test]
+fn frame_job_counts_dup_bytes_when_demand_installs_frame_first() {
+    let dir = TempDir::new().unwrap();
+    let (handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+    let page_size = 64u32;
+    let pages: Vec<Option<Vec<u8>>> = (0..4)
+        .map(|idx| Some(vec![idx as u8 + 31; page_size as usize]))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size,
+        1,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
+    let backend = Arc::new(BlockingRangeSeekableBackend {
+        blob,
+        release: AtomicBool::new(false),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        backend.clone(),
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        4,
+        Arc::new(AtomicU64::new(4)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&handle.manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        8,
+        RemoteIoBudget::new(1, 0),
+    ));
+    let manifest = handle.manifest.load();
+    assert_eq!(
+        pool.submit_frame_batch(
+            Some("lookahead".to_string()),
+            0,
+            "g0".to_string(),
+            frame_table,
+            page_size,
+            1,
+            manifest.group_page_nums(0).into_owned(),
+            vec![1],
+            HashMap::new(),
+            manifest.version,
+            cache.as_ref(),
+        )
+        .outcome,
+        PrefetchSubmitOutcome::Accepted
+    );
+    drop(manifest);
+    while backend.range_gets.load(Ordering::Acquire) == 0 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    cache
+        .write_pages_scattered(&[1], &vec![99u8; page_size as usize], 0, 1)
+        .unwrap();
+
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+    assert!(
+        pool.stats_json()["lookahead"]["dup_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let mut page1 = vec![0u8; page_size as usize];
+    cache.read_page(1, &mut page1).unwrap();
+    assert_eq!(page1, vec![99u8; page_size as usize]);
 }
 
 #[test]

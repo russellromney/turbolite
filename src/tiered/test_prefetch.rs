@@ -588,10 +588,10 @@ fn test_btree_groups_group_not_in_any_btree() {
     };
     m.build_page_index();
 
-    assert!(m.btree_groups.get(&0).is_some());
-    assert!(m.btree_groups.get(&1).is_some());
+    assert!(m.btree_groups.contains_key(&0));
+    assert!(m.btree_groups.contains_key(&1));
     assert!(
-        m.btree_groups.get(&2).is_none(),
+        !m.btree_groups.contains_key(&2),
         "orphan group should not be in btree_groups"
     );
 }
@@ -1142,7 +1142,7 @@ fn frame_batch_does_not_overwrite_present_pages_inside_partial_frame() {
     });
     let pool = test_pool(cache.clone(), backend, 8, 2, 0);
 
-    cache.write_page(0, &vec![77u8; 64]).unwrap();
+    cache.write_page(0, &[77u8; 64]).unwrap();
     let outcome = pool.submit_frame_batch(
         Some("lookahead".to_string()),
         0,

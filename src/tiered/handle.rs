@@ -56,6 +56,16 @@ fn anchored_lookahead_window(
     Some(start..end)
 }
 
+fn manifest_usable_size(manifest: &Manifest) -> usize {
+    let reserved = manifest
+        .db_header
+        .as_deref()
+        .and_then(|header| header.get(20))
+        .copied()
+        .unwrap_or(0) as usize;
+    (manifest.page_size as usize).saturating_sub(reserved)
+}
+
 /// Database handle for tiered turbolite storage.
 ///
 /// MainDb files are backed by a pluggable `StorageBackend` with a local
@@ -930,11 +940,25 @@ impl TurboliteHandle {
         let hdr_off = if page_num == 0 { 100 } else { 0 };
         match page.get(hdr_off).copied() {
             Some(0x0a) => {
+                if self.retained_lookahead.contains_key(tree_name)
+                    && !self.planned_lookahead_searches.contains_key(tree_name)
+                {
+                    self.retained_lookahead.remove(tree_name);
+                    if let Some(pool) = &self.prefetch_pool {
+                        pool.record_lookahead_bailout_parse();
+                    }
+                    return;
+                }
                 let Some(table_name) = self.planned_lookahead_searches.get(tree_name).cloned()
                 else {
                     return;
                 };
-                let parsed = parse_index_leaf_rowids(page, page_num == 0, 256);
+                let parsed = parse_index_leaf_rowids(
+                    page,
+                    page_num == 0,
+                    256,
+                    Some(manifest_usable_size(manifest)),
+                );
                 if parsed.rowids.is_empty() {
                     if parsed.malformed_cells > 0 || parsed.overflow_cells > 0 {
                         if let Some(pool) = &self.prefetch_pool {
@@ -955,10 +979,8 @@ impl TurboliteHandle {
                     },
                 );
             }
-            Some(0x0d) => {
-                if self.retained_lookahead.contains_key(tree_name) {
-                    self.fire_retained_lookahead(tree_name, page_num, cache, manifest);
-                }
+            Some(0x0d) if self.retained_lookahead.contains_key(tree_name) => {
+                self.fire_retained_lookahead(tree_name, page_num, cache, manifest);
             }
             _ => {}
         }
@@ -1574,7 +1596,7 @@ impl DatabaseHandle for TurboliteHandle {
         // and a cached-but-now-out-of-bounds page must NOT short-circuit here —
         // it has to fall through to the slow path's zero-fill. Without the bound
         // a read returned stale pre-truncate bytes.
-        if !self.dirty_since_sync && !(self.query_plan_prefetch && self.lookahead_enabled) {
+        if !(self.dirty_since_sync || self.query_plan_prefetch && self.lookahead_enabled) {
             if let Some(cache) = &self.cache {
                 let current_gen = cache.generation.load(Ordering::Acquire);
                 let page_count = self.manifest.load().page_count;
@@ -1752,7 +1774,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
 
                 if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
-                    let manifest_snap = (**self.manifest.load()).clone();
+                    let manifest_snap = self.manifest.load_full();
                     let tree_names: Vec<&String> =
                         manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> =
@@ -1804,7 +1826,7 @@ impl DatabaseHandle for TurboliteHandle {
             && !self.active_scan_prefetch.is_empty()
             && self.last_scan_refill_gid != Some(gid)
         {
-            let manifest_snap = (**self.manifest.load()).clone();
+            let manifest_snap = self.manifest.load_full();
             self.refill_active_scan_prefetch(&manifest_snap, cache, Some(gid));
             self.last_scan_refill_gid = Some(gid);
         }
@@ -1823,7 +1845,7 @@ impl DatabaseHandle for TurboliteHandle {
                 );
             }
             self.detect_interior_page(buf, page_num, cache);
-            let manifest_snap = (**self.manifest.load()).clone();
+            let manifest_snap = self.manifest.load_full();
             self.record_lookahead_hit_if_present(gid, loc, &manifest_snap);
             self.note_served_page_for_lookahead(
                 page_num,
@@ -1863,7 +1885,7 @@ impl DatabaseHandle for TurboliteHandle {
             if let (Some(ref storage), Some(runtime)) =
                 (self.storage.as_ref(), self.runtime.as_ref())
             {
-                let manifest = (**self.manifest.load()).clone();
+                let manifest = self.manifest.load_full();
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
                         if let Ok(Some(pg_data)) =
@@ -1984,7 +2006,7 @@ impl DatabaseHandle for TurboliteHandle {
             ));
         }
 
-        let manifest = (**self.manifest.load()).clone();
+        let manifest = self.manifest.load_full();
 
         // 5a. Re-check cache: a sibling prefetch may have completed since step 4.
         if cache.is_present(page_num) {

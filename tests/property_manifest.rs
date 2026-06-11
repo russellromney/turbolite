@@ -2,6 +2,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use turbolite::tiered::{FrameEntry, GroupingStrategy, Manifest};
 
+#[allow(clippy::too_many_arguments)]
 fn make_manifest(
     version: u64,
     change_counter: u64,
@@ -32,6 +33,7 @@ fn make_manifest(
         btree_groups: HashMap::new(),
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
+        tree_name_to_root_page: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
         discontinuity_stamp: 0,
@@ -92,9 +94,7 @@ proptest! {
         bytes in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let result: Result<Manifest, _> = rmp_serde::from_slice(&bytes);
-        if let Ok(ref manifest) = result {
-            prop_assert!(manifest.version >= 0);
-        }
+        let _ = result;
     }
 
     #[test]

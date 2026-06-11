@@ -199,6 +199,42 @@ fn test_queue_cross_thread_fallback_drains_mirrored_plan() {
 }
 
 #[test]
+fn test_queue_cross_thread_global_drain_suppresses_owner_local_copy() {
+    let _guard = PLAN_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    drain_planned_accesses();
+
+    let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        push_planned_accesses(vec![PlannedAccess {
+            tree_name: "owner_local".into(),
+            access_type: AccessType::Search,
+            table_name: Some("posts".into()),
+            constraint_columns: vec!["user_id".into()],
+        }]);
+        pushed_tx.send(()).unwrap();
+        drain_rx.recv().unwrap();
+        drain_planned_accesses()
+    });
+
+    pushed_rx.recv().unwrap();
+    let global_drained = drain_planned_accesses();
+    assert_eq!(global_drained.len(), 1);
+    assert_eq!(global_drained[0].tree_name, "owner_local");
+
+    drain_tx.send(()).unwrap();
+    let owner_drained = owner.join().unwrap();
+    assert_eq!(
+        owner_drained.len(),
+        0,
+        "cross-thread fallback must consume the owner's mirrored local batch to avoid processing one plan twice"
+    );
+    assert!(drain_planned_accesses().is_empty());
+}
+
+#[test]
 fn test_parse_subquery() {
     // Subqueries produce nested EQP lines with different indentation
     let eqp = "\

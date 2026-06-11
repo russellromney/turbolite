@@ -1626,6 +1626,23 @@ impl PrefetchPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_frame_indices_for_gid(&self, gid: u64) -> Vec<usize> {
+        let Ok(group_id) = u32::try_from(gid) else {
+            return Vec::new();
+        };
+        let queued = self.queued_frame_ids.lock();
+        let active = self.active_frame_ids.lock();
+        let mut frames: Vec<usize> = queued
+            .iter()
+            .chain(active.iter())
+            .filter_map(|id| (id.group_id == group_id).then_some(id.frame_index as usize))
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        frames
+    }
+
     pub(crate) fn is_optional_pending(&self, gid: u64) -> bool {
         self.queued_gids.lock().contains(&gid)
     }

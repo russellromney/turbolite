@@ -28,7 +28,12 @@ pub(crate) struct TableInteriorCells {
     pub(crate) stopped_early: bool,
 }
 
-pub(crate) fn parse_index_leaf_rowids(page: &[u8], page1: bool, cap: usize) -> IndexLeafRowids {
+pub(crate) fn parse_index_leaf_rowids(
+    page: &[u8],
+    page1: bool,
+    cap: usize,
+    usable_size: Option<usize>,
+) -> IndexLeafRowids {
     let mut out = IndexLeafRowids::default();
     if cap == 0 {
         return out;
@@ -42,7 +47,7 @@ pub(crate) fn parse_index_leaf_rowids(page: &[u8], page1: bool, cap: usize) -> I
 
     let cell_count = read_u16(page, header + 3).unwrap_or(0) as usize;
     let pointer_array = header + 8;
-    let max_local = index_max_local_payload(page.len());
+    let max_local = index_max_local_payload(index_usable_size(page, page1, usable_size));
 
     for i in 0..cell_count {
         if out.rowids.len() >= cap {
@@ -172,6 +177,17 @@ fn index_max_local_payload(usable_size: usize) -> usize {
     ((usable_size - 12) * 64 / 255).saturating_sub(23)
 }
 
+fn index_usable_size(page: &[u8], page1: bool, usable_size: Option<usize>) -> usize {
+    if let Some(usable_size) = usable_size {
+        return usable_size.min(page.len());
+    }
+    if page1 {
+        let reserved = page.get(20).copied().unwrap_or(0) as usize;
+        return page.len().saturating_sub(reserved);
+    }
+    page.len()
+}
+
 fn read_u16(buf: &[u8], off: usize) -> Option<u16> {
     let bytes: [u8; 2] = buf.get(off..off + 2)?.try_into().ok()?;
     Some(u16::from_be_bytes(bytes))
@@ -222,6 +238,10 @@ fn read_record_int(buf: &[u8], off: usize, serial_type: u64) -> Option<i64> {
         4 => 4,
         5 => 6,
         6 => 8,
+        // Serial type 7 is an IEEE-754 REAL. Rowid-bearing index payloads end
+        // with the integer rowid, so a REAL in the final slot is not a rowid;
+        // bail the cell instead of manufacturing an integer.
+        7 => return None,
         8 => return Some(0),
         9 => return Some(1),
         _ => return None,
@@ -243,6 +263,23 @@ mod tests {
     fn read_db_page(file: &[u8], page_size: usize, page_num: u64) -> Option<&[u8]> {
         let start = page_num as usize * page_size;
         file.get(start..start + page_size)
+    }
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        if value <= 0x7f {
+            return vec![value as u8];
+        }
+        let mut bytes = Vec::new();
+        while value > 0 {
+            bytes.push((value & 0x7f) as u8);
+            value >>= 7;
+        }
+        bytes.reverse();
+        let last = bytes.len() - 1;
+        for b in &mut bytes[..last] {
+            *b |= 0x80;
+        }
+        bytes
     }
 
     #[test]
@@ -304,7 +341,7 @@ mod tests {
             let page = read_db_page(&file, page_size, page_num).unwrap();
             let header = if page_num == 0 { 100 } else { 0 };
             if page.get(header).copied() == Some(0x0a) {
-                rowids.extend(parse_index_leaf_rowids(page, page_num == 0, 512).rowids);
+                rowids.extend(parse_index_leaf_rowids(page, page_num == 0, 512, None).rowids);
             }
         }
         rowids.sort_unstable();
@@ -432,10 +469,158 @@ mod tests {
             let page = read_db_page(&file, page_size, page_num).unwrap();
             let header = if page_num == 0 { 100 } else { 0 };
             if page.get(header).copied() == Some(0x0a) {
-                overflow_cells += parse_index_leaf_rowids(page, page_num == 0, 256).overflow_cells;
+                overflow_cells +=
+                    parse_index_leaf_rowids(page, page_num == 0, 256, None).overflow_cells;
             }
         }
         assert!(overflow_cells > 0);
+    }
+
+    #[test]
+    fn reserved_bytes_reduce_index_overflow_threshold() {
+        let mut page = vec![0u8; 4096];
+        page[20] = 255;
+        page[100] = 0x0a;
+        page[103..105].copy_from_slice(&1u16.to_be_bytes());
+        page[108..110].copy_from_slice(&200u16.to_be_bytes());
+        let payload_len = encode_varint(970);
+        page[200..200 + payload_len.len()].copy_from_slice(&payload_len);
+
+        let parsed = parse_index_leaf_rowids(&page, true, 64, None);
+        assert_eq!(parsed.overflow_cells, 1);
+        assert_eq!(parsed.malformed_cells, 0);
+        assert!(parsed.rowids.is_empty());
+    }
+
+    #[test]
+    fn real_serial_type_in_final_index_slot_bails_cell() {
+        let mut page = vec![0u8; 256];
+        page[0] = 0x0a;
+        page[3..5].copy_from_slice(&1u16.to_be_bytes());
+        page[8..10].copy_from_slice(&64u16.to_be_bytes());
+        page[64] = 10; // payload bytes
+        page[65] = 2; // record header bytes: header_len + one serial varint
+        page[66] = 7; // REAL, not an integer rowid
+
+        let parsed = parse_index_leaf_rowids(&page, false, 64, None);
+        assert!(parsed.rowids.is_empty());
+        assert_eq!(parsed.malformed_cells, 1);
+    }
+
+    #[test]
+    fn text_keyed_multi_column_index_yields_rowids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("text_index.db");
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=4096;
+             CREATE TABLE docs (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL);
+             CREATE INDEX idx_docs_a_b ON docs(a, b);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        for id in 1..=120i64 {
+            tx.execute(
+                "INSERT INTO docs (id, a, b) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    id,
+                    format!("key-{id:03}"),
+                    format!("suffix-{:03}", 120 - id)
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+
+        let file = std::fs::read(&db_path).unwrap();
+        let page_size = u16::from_be_bytes([file[16], file[17]]) as usize;
+        let page_count = file.len() / page_size;
+        let walk =
+            crate::btree_walker::walk_all_btrees(page_count as u64, page_size as u32, &|p| {
+                read_db_page(&file, page_size, p).map(ToOwned::to_owned)
+            });
+        let index = walk
+            .btrees
+            .values()
+            .find(|entry| entry.name == "idx_docs_a_b")
+            .expect("text index btree");
+
+        let mut rowids = Vec::new();
+        for &page_num in &index.pages {
+            let page = read_db_page(&file, page_size, page_num).unwrap();
+            let header = if page_num == 0 { 100 } else { 0 };
+            if page.get(header).copied() == Some(0x0a) {
+                rowids.extend(parse_index_leaf_rowids(page, page_num == 0, 256, None).rowids);
+            }
+        }
+        rowids.sort_unstable();
+        assert_eq!(rowids, (1..=120).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn without_rowid_table_leaf_bails_instead_of_inventing_rowids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid.db");
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=4096;
+             CREATE TABLE wr (
+               a TEXT NOT NULL,
+               b TEXT NOT NULL,
+               payload TEXT,
+               PRIMARY KEY (a, b)
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        for id in 1..=120i64 {
+            tx.execute(
+                "INSERT INTO wr (a, b, payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    format!("key-{id:03}"),
+                    format!("suffix-{:03}", 120 - id),
+                    format!("payload-{id}")
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+
+        let file = std::fs::read(&db_path).unwrap();
+        let page_size = u16::from_be_bytes([file[16], file[17]]) as usize;
+        let page_count = file.len() / page_size;
+        let walk =
+            crate::btree_walker::walk_all_btrees(page_count as u64, page_size as u32, &|p| {
+                read_db_page(&file, page_size, p).map(ToOwned::to_owned)
+            });
+        let table = walk
+            .btrees
+            .values()
+            .find(|entry| entry.name == "wr")
+            .expect("without rowid table btree");
+
+        let mut malformed = 0;
+        let mut rowids = Vec::new();
+        for &page_num in &table.pages {
+            let page = read_db_page(&file, page_size, page_num).unwrap();
+            let header = if page_num == 0 { 100 } else { 0 };
+            if page.get(header).copied() == Some(0x0a) {
+                let parsed = parse_index_leaf_rowids(page, page_num == 0, 256, None);
+                malformed += parsed.malformed_cells;
+                rowids.extend(parsed.rowids);
+            }
+        }
+        assert!(rowids.is_empty());
+        assert!(
+            malformed > 0,
+            "WITHOUT ROWID table leaves must bail instead of exposing fake rowids"
+        );
     }
 
     #[test]
@@ -449,8 +634,8 @@ mod tests {
                 x ^= x << 8;
                 *b = x as u8;
             }
-            let _ = parse_index_leaf_rowids(&page, false, 64);
-            let _ = parse_index_leaf_rowids(&page, true, 64);
+            let _ = parse_index_leaf_rowids(&page, false, 64, None);
+            let _ = parse_index_leaf_rowids(&page, true, 64, None);
             let _ = parse_table_interior_cells(&page, false);
             let _ = parse_table_interior_cells(&page, true);
         }

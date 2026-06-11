@@ -1,5 +1,6 @@
 //! Advisory index-leaf lookahead state and rowid resolution helpers.
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::Ordering;
@@ -7,6 +8,7 @@ use std::sync::atomic::Ordering;
 use super::btree_peek::parse_table_interior_cells;
 use super::DiskCache;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RowidResolution {
     pub(crate) rowid: i64,
@@ -20,6 +22,7 @@ pub(crate) struct RowidPathResolution {
     pub(crate) path: Vec<u64>,
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_rowids_to_pages(
     table_root_page: u64,
     rowids: &[i64],
@@ -63,6 +66,7 @@ pub(crate) fn resolve_rowids_to_pages_with_paths(
         .collect()
 }
 
+#[cfg(test)]
 fn resolve_rowid_to_page(
     table_root_page: u64,
     rowid: i64,

@@ -446,7 +446,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert_eq!(m2.btree_groups.get(&0).unwrap(), &vec![0u64]);
     assert_eq!(m2.btree_groups.get(&1).unwrap(), &vec![1u64]);
     // group 2 has no btree entry, so no btree_groups mapping
-    assert!(m2.btree_groups.get(&2).is_none());
+    assert!(!m2.btree_groups.contains_key(&2));
     // Page_to_tree_name reverse index rebuilt from btrees
     // B-tree root=0 ("users") owns group 0 with pages [0, 5, 10, 15]
     assert_eq!(
@@ -475,8 +475,8 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         Some("idx_users_name")
     );
     // Pages in group 2 (no btree entry) should NOT be in page_to_tree_name
-    assert!(m2.page_to_tree_name.get(&6).is_none());
-    assert!(m2.page_to_tree_name.get(&19).is_none());
+    assert!(!m2.page_to_tree_name.contains_key(&6));
+    assert!(!m2.page_to_tree_name.contains_key(&19));
     // page_to_tree_name is skip-serialized (rebuilt, not persisted)
     assert!(!m2.page_to_tree_name.is_empty()); // rebuilt by build_page_index
                                                // tree_name_to_groups also rebuilt

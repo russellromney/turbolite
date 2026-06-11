@@ -49,9 +49,14 @@ struct PlannedAccessBatch {
 
 static NEXT_PLAN_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_PLAN_QUEUE: OnceLock<Mutex<Vec<PlannedAccessBatch>>> = OnceLock::new();
+static GLOBAL_CONSUMED_PLAN_BATCH_IDS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
 
 fn global_plan_queue() -> &'static Mutex<Vec<PlannedAccessBatch>> {
     GLOBAL_PLAN_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn global_consumed_plan_batch_ids() -> &'static Mutex<HashSet<u64>> {
+    GLOBAL_CONSUMED_PLAN_BATCH_IDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 // Same-thread queue of planned accesses. SQLite normally invokes the trace
@@ -93,6 +98,17 @@ pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
     });
 
     if let Some(batches) = local {
+        let mut consumed = global_consumed_plan_batch_ids()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let batches: Vec<PlannedAccessBatch> = batches
+            .into_iter()
+            .filter(|batch| !consumed.remove(&batch.id))
+            .collect();
+        drop(consumed);
+        if batches.is_empty() {
+            return Vec::new();
+        }
         let drained_ids: HashSet<u64> = batches.iter().map(|batch| batch.id).collect();
         global_plan_queue()
             .lock()
@@ -108,13 +124,19 @@ pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if global.is_empty() {
-        Vec::new()
-    } else {
-        std::mem::take(&mut *global)
-            .into_iter()
-            .flat_map(|batch| batch.accesses)
-            .collect()
+        return Vec::new();
     }
+    let batches = std::mem::take(&mut *global);
+    let consumed_ids: HashSet<u64> = batches.iter().map(|batch| batch.id).collect();
+    drop(global);
+    global_consumed_plan_batch_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(consumed_ids);
+    batches
+        .into_iter()
+        .flat_map(|batch| batch.accesses)
+        .collect()
 }
 
 /// End-of-query signal. Set by the SQLITE_TRACE_PROFILE callback when a

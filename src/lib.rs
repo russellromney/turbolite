@@ -875,8 +875,8 @@ mod tests {
             .expect("region present");
         assert_eq!(ptr2, ptr, "same region maps to the same pointer");
         let read = unsafe { std::slice::from_raw_parts(ptr2, WAL_REGION_SIZE) };
-        for i in 0..WAL_REGION_SIZE {
-            assert_eq!(read[i], (i % 256) as u8);
+        for (i, byte) in read.iter().enumerate().take(WAL_REGION_SIZE) {
+            assert_eq!(*byte, (i % 256) as u8);
         }
     }
 

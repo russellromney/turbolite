@@ -616,7 +616,7 @@ fn rename_table_old_patterns_become_dead() {
         table.prune();
     }
     assert!(
-        table.patterns.get(&pattern).is_none(),
+        !table.patterns.contains_key(&pattern),
         "stale pattern should be pruned after enough checkpoints"
     );
 }

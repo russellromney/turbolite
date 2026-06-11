@@ -1775,7 +1775,7 @@ fn test_compressed_index_persistence() {
     {
         let cache = compressed_cache(dir.path(), 64, 16);
         for p in 0..4u64 {
-            let data: Vec<u8> = (0..64).map(|i| (p as u8 + i)).collect();
+            let data: Vec<u8> = (0..64).map(|i| p as u8 + i).collect();
             cache.write_page(p, &data).unwrap();
         }
         cache.persist_bitmap().unwrap();
@@ -1790,7 +1790,7 @@ fn test_compressed_index_persistence() {
                 "page {} should be present after reopen",
                 p
             );
-            let expected: Vec<u8> = (0..64).map(|i| (p as u8 + i)).collect();
+            let expected: Vec<u8> = (0..64).map(|i| p as u8 + i).collect();
             let mut buf = vec![0u8; 64];
             cache.read_page(p, &mut buf).unwrap();
             assert_eq!(buf, expected, "page {} content mismatch after reopen", p);
@@ -2318,9 +2318,9 @@ fn test_mem_cache_eviction_frees_memory() {
 
     // Verify AtomicPtr slots are null
     if let Some(ref mc) = cache.mem_cache {
-        for p in 0..4 {
+        for (p, slot) in mc.iter().enumerate().take(4) {
             assert!(
-                mc[p].load(Ordering::Relaxed).is_null(),
+                slot.load(Ordering::Relaxed).is_null(),
                 "slot {} should be null after eviction",
                 p
             );
