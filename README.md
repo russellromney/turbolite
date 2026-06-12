@@ -258,12 +258,27 @@ let config = TurboliteConfig {
 
 For per-query retuning without reopening the connection, use the
 `turbolite_config_set` SQL function (Phase Cirrus c). Each push is
-scoped to the calling connection's handle:
+scoped to the calling connection's handle and remains in effect until
+you change it again:
 
 ```sql
 SELECT turbolite_config_set('prefetch_search', '0.5,0.5,0.0');
 SELECT turbolite_config_set('prefetch_lookup', '0.0,0.0,0.0');
 SELECT * FROM posts WHERE created_at > ?;   -- runs with the new schedule
+```
+
+Index-leaf lookahead is default-off because it helps targeted
+index-to-table probes but can hurt scans or already-warm queries. It
+requires query-plan prefetch (`plan_aware`, default true). Turn it on
+around the specific query shapes that benefit, then turn it back off:
+
+```sql
+SELECT turbolite_config_set('lookahead', 'true');
+SELECT posts.*
+FROM users
+JOIN posts ON posts.user_id = users.id
+WHERE users.id = ?;
+SELECT turbolite_config_set('lookahead', 'false');
 ```
 
 Rust callers can invoke the same path via `turbolite::tiered::settings::set`.

@@ -115,7 +115,8 @@ fn run_lookahead_profile_reader(
     backend: Arc<CountingStorageBackend>,
     runtime: &tokio::runtime::Runtime,
     cache_dir: &std::path::Path,
-    lookahead: bool,
+    config_lookahead: bool,
+    query_time_lookahead: Option<bool>,
     name_suffix: &str,
 ) -> LookaheadProfileReaderResult {
     query_plan::drain_planned_accesses();
@@ -131,7 +132,7 @@ fn run_lookahead_profile_reader(
     reader_config.prefetch.io_permits = 16;
     reader_config.prefetch.foreground_reserved_permits = 1;
     reader_config.prefetch.query_plan = true;
-    reader_config.prefetch.lookahead = lookahead;
+    reader_config.prefetch.lookahead = config_lookahead;
     reader_config.prefetch.manifest_source = ManifestSource::Remote;
 
     let reader_vfs =
@@ -151,6 +152,10 @@ fn run_lookahead_profile_reader(
     shared.clear_cache_all();
     backend.reset_stats();
     query_plan::push_planned_accesses(accesses);
+    if let Some(enabled) = query_time_lookahead {
+        crate::tiered::settings::set("lookahead", if enabled { "true" } else { "false" })
+            .expect("set lookahead on active reader handle");
+    }
 
     let mut stmt = reader
         .prepare(lookahead_profile_sql())
@@ -343,6 +348,7 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
             &runtime,
             reader_cache_off.path(),
             false,
+            None,
             "lookahead_reader_off",
         );
     let (rows, foreground_ranges, lookahead_fired, lookahead_hits, cache_info) =
@@ -350,8 +356,9 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
             backend.clone(),
             &runtime,
             reader_cache_on.path(),
-            true,
-            "lookahead_reader_on",
+            false,
+            Some(true),
+            "lookahead_reader_query_time_on",
         );
     assert_eq!(
         rows, rows_off,
@@ -365,11 +372,11 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
     );
     assert!(
         lookahead_fired > 0,
-        "lookahead should retain an index leaf and fire at the anchored table leaf; cache_info={cache_info}"
+        "query-time lookahead should retain an index leaf and fire at the anchored table leaf; cache_info={cache_info}"
     );
     assert!(
         lookahead_hits > 0,
-        "lookahead should satisfy at least one retained frame demand; cache_info={cache_info}"
+        "query-time lookahead should satisfy at least one retained frame demand; cache_info={cache_info}"
     );
     assert!(
         lookahead_hits >= rows.len() as u64,
