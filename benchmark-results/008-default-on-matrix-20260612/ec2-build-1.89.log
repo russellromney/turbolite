@@ -1,0 +1,41 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+info: syncing channel updates for 1.89.0-x86_64-unknown-linux-gnu
+info: latest update on 2025-08-07 for version 1.89.0 (29483883e 2025-08-04)
+info: downloading 3 components
+
+  1.89.0-x86_64-unknown-linux-gnu installed - rustc 1.89.0 (29483883e 2025-08-04)
+
+info: checking for self-update (current version: 1.29.0)
+error: rustc 1.89.0 is not supported by the following packages:
+  aws-config@1.8.18 requires rustc 1.91.1
+  aws-credential-types@1.2.14 requires rustc 1.91.1
+  aws-runtime@1.7.4 requires rustc 1.91.1
+  aws-sdk-s3@1.135.0 requires rustc 1.91.1
+  aws-sdk-sso@1.101.0 requires rustc 1.91.1
+  aws-sdk-ssooidc@1.103.0 requires rustc 1.91.1
+  aws-sdk-sts@1.106.0 requires rustc 1.91.1
+  aws-sigv4@1.4.5 requires rustc 1.91.1
+  aws-smithy-async@1.2.14 requires rustc 1.91.1
+  aws-smithy-checksums@0.64.8 requires rustc 1.91.1
+  aws-smithy-eventstream@0.60.21 requires rustc 1.91.1
+  aws-smithy-http@0.63.6 requires rustc 1.91.1
+  aws-smithy-http-client@1.1.13 requires rustc 1.91.1
+  aws-smithy-json@0.62.7 requires rustc 1.91.1
+  aws-smithy-observability@0.2.6 requires rustc 1.91.1
+  aws-smithy-query@0.60.15 requires rustc 1.91.1
+  aws-smithy-runtime@1.11.3 requires rustc 1.91.1
+  aws-smithy-runtime-api@1.12.3 requires rustc 1.91.1
+  aws-smithy-runtime-api-macros@1.0.0 requires rustc 1.91.0
+  aws-smithy-schema@0.1.0 requires rustc 1.91
+  aws-smithy-types@1.5.0 requires rustc 1.91.1
+  aws-smithy-xml@0.60.15 requires rustc 1.91.1
+  aws-types@1.3.16 requires rustc 1.91.1
+  aws-types@1.3.16 requires rustc 1.91.1
+  aws-types@1.3.16 requires rustc 1.91.1
+Either upgrade rustc or select compatible dependency versions with
+`cargo update <name>@<current-ver> --precise <compatible-ver>`
+where `<compatible-ver>` is the latest version supporting rustc 1.89.0
+

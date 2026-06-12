@@ -1,0 +1,34 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+   Compiling aws-runtime v1.7.4
+   Compiling aws-sdk-ssooidc v1.103.0
+   Compiling aws-sdk-sso v1.101.0
+   Compiling aws-sdk-sts v1.106.0
+   Compiling aws-sdk-s3 v1.135.0
+   Compiling aws-config v1.8.18
+   Compiling hadb-storage-s3 v0.4.1
+   Compiling turbolite v0.5.0 (/home/ec2-user/turbolite)
+warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+  --> benchmark/tiered-bench.rs:27:5
+   |
+27 |     set_local_checkpoint_only, CacheConfig, CompressionConfig, PrefetchConfig, TurboliteConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+    --> benchmark/tiered-bench.rs:1670:9
+     |
+1670 |         set_local_checkpoint_only(true);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+    --> benchmark/tiered-bench.rs:1678:9
+     |
+1678 |         set_local_checkpoint_only(false);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `turbolite` (bin "tiered-bench") generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 50.37s

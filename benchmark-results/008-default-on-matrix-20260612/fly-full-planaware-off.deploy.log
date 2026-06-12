@@ -1,0 +1,773 @@
+==> Verifying app config
+Validating benchmark/fly-008-default-on-full.toml
+[32m✓[0m Configuration is valid
+--> Verified app config
+==> Building image
+[33mWARN[0m ignoring /Users/russellromney/.codex/worktrees/turbolite-008-lookahead/Dockerfile, and using /Users/russellromney/.codex/worktrees/turbolite-008-lookahead/benchmark/Dockerfile (from benchmark/fly-008-default-on-full.toml)
+Waiting for depot builder...
+
+==> Building image with Depot
+--> build:  (​)
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.93kB 0.2s done
+#1 DONE 0.2s
+
+#2 [internal] load metadata for docker.io/library/rust:1-bookworm
+#2 DONE 0.2s
+
+#3 [internal] load metadata for docker.io/library/debian:bookworm-slim
+#3 DONE 0.2s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 33B 0.1s
+#4 transferring context: 481B 0.2s done
+#4 DONE 0.3s
+
+#5 [builder  1/27] FROM docker.io/library/rust:1-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9
+#5 resolve docker.io/library/rust:1-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 done
+#5 ...
+
+#6 [internal] load build context
+#6 transferring context: 2.43MB 3.3s done
+#6 DONE 3.5s
+
+#7 [builder  2/10] WORKDIR /app
+#7 CACHED
+
+#8 [builder  3/10] RUN apt-get update && apt-get install -y pkg-config libssl-dev cmake libclang-dev && rm -rf /var/lib/apt/lists/*
+#8 CACHED
+
+#9 [builder  4/10] RUN mkdir -p /walrust/crates/walrust-core/src &&     echo '[package]\nname = "walrust"\nversion = "0.3.0"\nedition = "2021"' > /walrust/crates/walrust-core/Cargo.toml &&     echo '' > /walrust/crates/walrust-core/src/lib.rs &&     mkdir -p /hadb/hadb-io/src &&     echo '[package]\nname = "hadb-io"\nversion = "0.2.0"\nedition = "2021"' > /hadb/hadb-io/Cargo.toml &&     echo '' > /hadb/hadb-io/src/lib.rs
+#9 CACHED
+
+#10 [builder  5/10] COPY Cargo.toml Cargo.lock* ./
+#10 DONE 0.5s
+
+#11 [stage-1  1/13] FROM docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+#11 resolve docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 done
+#11 ...
+
+#12 [builder  6/10] COPY src/ src/
+#12 DONE 0.1s
+
+#13 [builder  7/10] COPY bin/ bin/
+#13 DONE 0.0s
+
+#14 [builder  8/10] COPY benchmark/ benchmark/
+#14 DONE 0.0s
+
+#15 [builder  9/10] COPY turbolite-ffi/ turbolite-ffi/
+#15 DONE 0.0s
+
+#16 [builder 10/10] RUN cargo build --release --features bench-s3,zstd,bundled-sqlite --bin tiered-bench --bin tiered-tune
+#16 0.182     Updating crates.io index
+#16 0.183     Updating git repository `https://github.com/russellromney/walrust.git`
+#16 7.695     Updating git repository `https://github.com/russellromney/hadb.git`
+#16 10.40  Downloading crates ...
+#16 10.55   Downloaded aws-credential-types v1.2.14
+#16 10.58   Downloaded equivalent v1.0.2
+#16 10.60   Downloaded http-body v0.4.6
+#16 10.63   Downloaded powerfmt v0.2.0
+#16 10.66   Downloaded shlex v1.3.0
+#16 10.67   Downloaded socket2 v0.5.10
+#16 10.69   Downloaded slab v0.4.12
+#16 10.70   Downloaded untrusted v0.9.0
+#16 10.71   Downloaded tower-layer v0.3.3
+#16 10.72   Downloaded tracing-core v0.1.36
+#16 10.74   Downloaded spin v0.10.0
+#16 10.76   Downloaded utf8_iter v1.0.4
+#16 10.77   Downloaded urlencoding v2.1.3
+#16 10.77   Downloaded zerotrie v0.2.4
+#16 10.79   Downloaded zerovec-derive v0.11.3
+#16 10.80   Downloaded zstd v0.13.3
+#16 10.81   Downloaded yoke v0.8.3
+#16 10.81   Downloaded zstd-safe v7.2.4
+#16 10.82   Downloaded webpki-roots v0.26.11
+#16 10.82   Downloaded zeroize v1.8.2
+#16 10.83   Downloaded yoke-derive v0.8.2
+#16 10.83   Downloaded zerovec v0.11.6
+#16 10.85   Downloaded rustls v0.21.12
+#16 10.88   Downloaded vcpkg v0.2.15
+#16 11.01   Downloaded unicode-width v0.2.2
+#16 11.02   Downloaded nix v0.29.0
+#16 11.05   Downloaded regex-syntax v0.8.11
+#16 11.06   Downloaded rustls v0.23.40
+#16 11.09   Downloaded rustix v1.1.4
+#16 11.15   Downloaded zerocopy v0.8.52
+#16 11.19   Downloaded webpki-roots v1.0.7
+#16 11.20   Downloaded radix_trie v0.2.1
+#16 11.21   Downloaded rayon v1.12.0
+#16 11.23   Downloaded hyper v0.14.32
+#16 11.24   Downloaded writeable v0.6.3
+#16 11.25   Downloaded rustls-webpki v0.101.7
+#16 11.28   Downloaded rusqlite v0.35.0
+#16 11.30   Downloaded regex v1.12.4
+#16 11.31   Downloaded itertools v0.13.0
+#16 11.33   Downloaded icu_properties_data v2.2.0
+#16 11.35   Downloaded hyper v1.10.1
+#16 11.37   Downloaded hashbrown v0.16.1
+#16 11.38   Downloaded regex-automata v0.4.14
+#16 11.41   Downloaded hashbrown v0.15.5
+#16 11.42   Downloaded zmij v1.0.21
+#16 11.43   Downloaded zerofrom-derive v0.1.7
+#16 11.43   Downloaded zerofrom v0.1.8
+#16 11.43   Downloaded xmlparser v0.13.6
+#16 11.44   Downloaded vsimd v0.8.0
+#16 11.44   Downloaded version_check v0.9.5
+#16 11.45   Downloaded utf8parse v0.2.2
+#16 11.45   Downloaded ureq v2.12.1
+#16 11.46   Downloaded libc v0.2.186
+#16 11.55   Downloaded idna v1.1.0
+#16 11.56   Downloaded zstd-sys v2.0.16+zstd.1.5.7
+#16 11.58   Downloaded zerocopy-derive v0.8.52
+#16 11.60   Downloaded uuid v1.23.3
+#16 11.61   Downloaded url v2.5.8
+#16 11.62   Downloaded tokio v1.52.3
+#16 11.71   Downloaded syn v2.0.117
+#16 11.73   Downloaded nom v7.1.3
+#16 11.74   Downloaded mio v1.2.1
+#16 11.76   Downloaded indexmap v2.14.0
+#16 11.76   Downloaded http v1.4.2
+#16 11.77   Downloaded aws-sdk-s3 v1.135.0
+#16 11.98   Downloaded want v0.3.1
+#16 11.98   Downloaded unicode-segmentation v1.13.3
+#16 11.99   Downloaded typenum v1.20.1
+#16 12.00   Downloaded regex-lite v0.1.9
+#16 12.00   Downloaded minimal-lexical v0.2.1
+#16 12.01   Downloaded memchr v2.8.1
+#16 12.02   Downloaded icu_collections v2.2.0
+#16 12.03   Downloaded hyper-util v0.1.20
+#16 12.05   Downloaded http v0.2.12
+#16 12.05   Downloaded unicode-ident v1.0.24
+#16 12.06   Downloaded tracing-attributes v0.1.31
+#16 12.07   Downloaded tower v0.5.3
+#16 12.09   Downloaded tokio-util v0.7.18
+#16 12.10   Downloaded rustls-webpki v0.103.13
+#16 12.11   Downloaded rand v0.8.6
+#16 12.12   Downloaded icu_normalizer_data v2.2.0
+#16 12.12   Downloaded tracing v0.1.44
+#16 12.16   Downloaded tower-service v0.3.3
+#16 12.17   Downloaded tokio-rustls v0.26.4
+#16 12.17   Downloaded tokio-macros v2.7.0
+#16 12.17   Downloaded tinystr v0.8.3
+#16 12.18   Downloaded time-core v0.1.8
+#16 12.18   Downloaded thiserror-impl v1.0.69
+#16 12.18   Downloaded ring v0.17.14
+#16 12.28   Downloaded tempfile v3.27.0
+#16 12.28   Downloaded stable_deref_trait v1.2.1
+#16 12.29   Downloaded spin v0.9.8
+#16 12.29   Downloaded sha1 v0.11.0
+#16 12.30   Downloaded rayon-core v1.13.0
+#16 12.30   Downloaded proc-macro2 v1.0.106
+#16 12.31   Downloaded p256 v0.13.2
+#16 12.32   Downloaded num-traits v0.2.19
+#16 12.32   Downloaded miniz_oxide v0.8.9
+#16 12.33   Downloaded log v0.4.32
+#16 12.33   Downloaded icu_properties v2.2.0
+#16 12.34   Downloaded icu_normalizer v2.2.0
+#16 12.34   Downloaded icu_locale_core v2.2.0
+#16 12.36   Downloaded socket2 v0.6.4
+#16 12.37   Downloaded rmp-serde v1.3.1
+#16 12.37   Downloaded parking_lot v0.12.5
+#16 12.37   Downloaded once_cell v1.21.4
+#16 12.38   Downloaded hashbrown v0.17.1
+#16 12.39   Downloaded crc-fast v1.10.0
+#16 12.42   Downloaded tokio-rustls v0.24.1
+#16 12.42   Downloaded time v0.3.47
+#16 12.45   Downloaded strsim v0.11.1
+#16 12.46   Downloaded sqlite-plugin v0.10.1
+#16 12.47   Downloaded rustls-pki-types v1.14.1
+#16 12.47   Downloaded rmp v0.8.15
+#16 12.48   Downloaded ppv-lite86 v0.2.21
+#16 12.49   Downloaded litemap v0.8.2
+#16 12.49   Downloaded icu_provider v2.2.0
+#16 12.50   Downloaded hmac v0.13.0
+#16 12.50   Downloaded hmac v0.12.1
+#16 12.51   Downloaded half v2.7.1
+#16 12.51   Downloaded time-macros v0.2.27
+#16 12.52   Downloaded thiserror v1.0.69
+#16 12.53   Downloaded spki v0.7.3
+#16 12.54   Downloaded serde_core v1.0.228
+#16 12.54   Downloaded pem-rfc7468 v0.7.0
+#16 12.55   Downloaded parking_lot_core v0.9.12
+#16 12.55   Downloaded num-integer v0.1.46
+#16 12.56   Downloaded md-5 v0.11.0
+#16 12.56   Downloaded lru v0.16.4
+#16 12.56   Downloaded try-lock v0.2.5
+#16 12.57   Downloaded synstructure v0.13.2
+#16 12.57   Downloaded subtle v2.6.1
+#16 12.57   Downloaded sec1 v0.7.3
+#16 12.57   Downloaded rustls-native-certs v0.8.4
+#16 12.58   Downloaded rand_core v0.6.4
+#16 12.58   Downloaded primeorder v0.13.6
+#16 12.58   Downloaded pkcs8 v0.10.2
+#16 12.59   Downloaded pin-project-lite v0.2.17
+#16 12.60   Downloaded hybrid-array v0.4.12
+#16 12.61   Downloaded httparse v1.10.1
+#16 12.62   Downloaded ff v0.13.1
+#16 12.62   Downloaded shlex v2.0.1
+#16 12.62   Downloaded serde_json v1.0.150
+#16 12.64   Downloaded serde v1.0.228
+#16 12.65   Downloaded scopeguard v1.2.0
+#16 12.65   Downloaded rustyline v15.0.0
+#16 12.66   Downloaded quote v1.0.45
+#16 12.67   Downloaded pkg-config v0.3.33
+#16 12.67   Downloaded nanorand v0.7.0
+#16 12.68   Downloaded lock_api v0.4.14
+#16 12.68   Downloaded jobserver v0.1.34
+#16 12.68   Downloaded http-body-util v0.1.3
+#16 12.69   Downloaded h2 v0.4.14
+#16 12.70   Downloaded h2 v0.3.27
+#16 12.72   Downloaded futures-util v0.3.32
+#16 12.75   Downloaded clap_builder v4.6.0
+#16 12.76   Downloaded bindgen v0.72.1
+#16 12.77   Downloaded aws-sdk-sts v1.106.0
+#16 12.82   Downloaded aws-lc-rs v1.17.0
+#16 12.88   Downloaded smallvec v1.15.1
+#16 12.89   Downloaded simd-adler32 v0.3.9
+#16 12.90   Downloaded signature v2.2.0
+#16 12.90   Downloaded signal-hook-registry v1.4.8
+#16 12.91   Downloaded sha2 v0.11.0
+#16 12.92   Downloaded sha2 v0.10.9
+#16 12.93   Downloaded serde_derive v1.0.228
+#16 12.94   Downloaded semver v1.0.28
+#16 12.95   Downloaded ryu v1.0.23
+#16 12.96   Downloaded rustc-hash v2.1.2
+#16 12.96   Downloaded rand_chacha v0.3.1
+#16 12.96   Downloaded pin-utils v0.1.0
+#16 12.97   Downloaded outref v0.5.2
+#16 12.97   Downloaded getrandom v0.4.2
+#16 12.98   Downloaded fs_extra v1.3.0
+#16 12.98   Downloaded foldhash v0.1.5
+#16 12.99   Downloaded linux-raw-sys v0.12.1
+#16 13.14   Downloaded flume v0.11.1
+#16 13.15   Downloaded der v0.7.10
+#16 13.16   Downloaded crypto-bigint v0.5.5
+#16 13.18   Downloaded cc v1.2.63
+#16 13.18   Downloaded bytes v1.11.1
+#16 13.19   Downloaded blake3 v1.8.5
+#16 13.21   Downloaded base64 v0.22.1
+#16 13.22   Downloaded aws-smithy-types v1.4.9
+#16 13.24   Downloaded aws-smithy-runtime v1.11.3
+#16 13.25   Downloaded aws-smithy-http-client v1.1.13
+#16 13.26   Downloaded aws-sdk-sso v1.101.0
+#16 13.28   Downloaded aws-runtime v1.7.4
+#16 13.28   Downloaded aws-config v1.8.18
+#16 13.30   Downloaded aho-corasick v1.1.4
+#16 13.31   Downloaded sha1 v0.10.6
+#16 13.31   Downloaded serde_bytes v0.11.19
+#16 13.32   Downloaded sct v0.7.1
+#16 13.33   Downloaded rustversion v1.0.22
+#16 13.33   Downloaded rustc_version v0.4.1
+#16 13.33   Downloaded rfc6979 v0.4.0
+#16 13.34   Downloaded potential_utf v0.1.5
+#16 13.34   Downloaded num-conv v0.2.2
+#16 13.34   Downloaded nibble_vec v0.1.0
+#16 13.34   Downloaded itoa v1.0.18
+#16 13.35   Downloaded ipnet v2.12.0
+#16 13.35   Downloaded hyper-rustls v0.27.9
+#16 13.35   Downloaded hyper-rustls v0.24.2
+#16 13.36   Downloaded httpdate v1.0.3
+#16 13.36   Downloaded hex v0.4.3
+#16 13.37   Downloaded hashlink v0.10.0
+#16 13.37   Downloaded group v0.13.0
+#16 13.38   Downloaded getrandom v0.2.17
+#16 13.38   Downloaded futures-task v0.3.32
+#16 13.38   Downloaded futures-channel v0.3.32
+#16 13.39   Downloaded fs2 v0.4.3
+#16 13.39   Downloaded foldhash v0.2.0
+#16 13.39   Downloaded file-guard v0.2.0
+#16 13.40   Downloaded either v1.16.0
+#16 13.40   Downloaded dunce v1.0.5
+#16 13.40   Downloaded digest v0.11.3
+#16 13.41   Downloaded deranged v0.5.8
+#16 13.41   Downloaded ctutils v0.4.2
+#16 13.42   Downloaded crossbeam-utils v0.8.21
+#16 13.42   Downloaded crossbeam-deque v0.8.6
+#16 13.43   Downloaded const-oid v0.10.2
+#16 13.43   Downloaded cmake v0.1.58
+#16 13.44   Downloaded clap_derive v4.6.1
+#16 13.44   Downloaded clap v4.6.1
+#16 13.47   Downloaded clang-sys v1.8.1
+#16 13.47   Downloaded cexpr v0.6.0
+#16 13.48   Downloaded bitflags v2.13.0
+#16 13.49   Downloaded aws-types v1.3.16
+#16 13.49   Downloaded aws-sdk-ssooidc v1.103.0
+#16 13.52   Downloaded arc-swap v1.9.1
+#16 13.53   Downloaded percent-encoding v2.3.2
+#16 13.53   Downloaded openssl-probe v0.2.1
+#16 13.53   Downloaded is_terminal_polyfill v1.70.2
+#16 13.54   Downloaded idna_adapter v1.2.2
+#16 13.54   Downloaded http-body v1.0.1
+#16 13.54   Downloaded hadb-storage-s3 v0.4.1
+#16 13.54   Downloaded hadb-storage-local v0.4.0
+#16 13.55   Downloaded hadb-storage v0.4.1
+#16 13.55   Downloaded glob v0.3.3
+#16 13.55   Downloaded generic-array v0.14.7
+#16 13.56   Downloaded futures-sink v0.3.32
+#16 13.56   Downloaded futures-core v0.3.32
+#16 13.56   Downloaded form_urlencoded v1.2.2
+#16 13.56   Downloaded fd-lock v4.0.4
+#16 13.57   Downloaded fallible-streaming-iterator v0.1.9
+#16 13.57   Downloaded errno v0.3.14
+#16 13.57   Downloaded endian-type v0.1.2
+#16 13.58   Downloaded elliptic-curve v0.13.8
+#16 13.58   Downloaded crypto-common v0.1.7
+#16 13.59   Downloaded crc32fast v1.5.0
+#16 13.59   Downloaded cpufeatures v0.2.17
+#16 13.59   Downloaded colorchoice v1.0.5
+#16 13.60   Downloaded clap_complete v4.6.5
+#16 13.60   Downloaded ciborium v0.2.2
+#16 13.61   Downloaded block-buffer v0.10.4
+#16 13.61   Downloaded base64ct v1.8.3
+#16 13.62   Downloaded aws-smithy-runtime-api v1.12.3
+#16 13.63   Downloaded aws-smithy-eventstream v0.60.20
+#16 13.63   Downloaded aws-sigv4 v1.4.5
+#16 13.76   Downloaded home v0.5.12
+#16 13.76   Downloaded heck v0.5.0
+#16 13.76   Downloaded fnv v1.0.7
+#16 13.77   Downloaded flate2 v1.1.9
+#16 13.78   Downloaded find-msvc-tools v0.1.9
+#16 13.78   Downloaded fastrand v2.4.1
+#16 13.78   Downloaded fallible-iterator v0.3.0
+#16 13.79   Downloaded displaydoc v0.2.6
+#16 13.79   Downloaded digest v0.10.7
+#16 13.80   Downloaded crossbeam-epoch v0.9.18
+#16 13.80   Downloaded const-oid v0.9.6
+#16 13.81   Downloaded ciborium-io v0.2.2
+#16 13.81   Downloaded cfg_aliases v0.2.1
+#16 13.81   Downloaded block-buffer v0.12.0
+#16 13.82   Downloaded aws-smithy-xml v0.60.15
+#16 13.82   Downloaded aws-smithy-schema v0.1.0
+#16 13.83   Downloaded aws-smithy-runtime-api-macros v1.0.0
+#16 13.83   Downloaded aws-smithy-observability v0.2.6
+#16 13.83   Downloaded aws-smithy-json v0.62.7
+#16 13.84   Downloaded aws-smithy-async v1.2.14
+#16 13.84   Downloaded async-trait v0.1.89
+#16 13.85   Downloaded arrayvec v0.7.6
+#16 13.86   Downloaded arrayref v0.3.9
+#16 13.86   Downloaded anyhow v1.0.102
+#16 13.87   Downloaded anstyle-parse v1.0.0
+#16 13.88   Downloaded anstream v1.0.0
+#16 13.88   Downloaded allocator-api2 v0.2.21
+#16 13.89   Downloaded ecdsa v0.16.9
+#16 13.89   Downloaded libsqlite3-sys v0.33.0
+#16 14.01   Downloaded crypto-common v0.2.2
+#16 14.01   Downloaded cpufeatures v0.3.0
+#16 14.01   Downloaded constant_time_eq v0.4.2
+#16 14.02   Downloaded cmov v0.5.4
+#16 14.02   Downloaded clap_lex v1.1.0
+#16 14.02   Downloaded ciborium-ll v0.2.2
+#16 14.03   Downloaded cfg-if v1.0.4
+#16 14.03   Downloaded bytes-utils v0.1.4
+#16 14.03   Downloaded base64-simd v0.8.0
+#16 14.04   Downloaded base16ct v0.2.0
+#16 14.04   Downloaded aws-smithy-query v0.60.15
+#16 14.04   Downloaded aws-smithy-http v0.63.6
+#16 14.05   Downloaded aws-smithy-checksums v0.64.8
+#16 14.05   Downloaded autocfg v1.5.1
+#16 14.05   Downloaded atty v0.2.14
+#16 14.06   Downloaded atomic-waker v1.1.2
+#16 14.06   Downloaded anstyle-query v1.1.5
+#16 14.06   Downloaded anstyle v1.0.14
+#16 14.06   Downloaded adler2 v2.0.1
+#16 14.08   Downloaded aws-lc-sys v0.41.0
+#16 14.91    Compiling proc-macro2 v1.0.106
+#16 14.91    Compiling unicode-ident v1.0.24
+#16 14.91    Compiling quote v1.0.45
+#16 14.92    Compiling cfg-if v1.0.4
+#16 14.93    Compiling libc v0.2.186
+#16 14.94    Compiling zeroize v1.8.2
+#16 14.94    Compiling smallvec v1.15.1
+#16 15.09    Compiling find-msvc-tools v0.1.9
+#16 15.14    Compiling shlex v2.0.1
+#16 15.30    Compiling bytes v1.11.1
+#16 15.33    Compiling pin-project-lite v0.2.17
+#16 15.35    Compiling scopeguard v1.2.0
+#16 15.45    Compiling lock_api v0.4.14
+#16 15.47    Compiling parking_lot_core v0.9.12
+#16 15.50    Compiling futures-core v0.3.32
+#16 15.51    Compiling itoa v1.0.18
+#16 15.71    Compiling typenum v1.20.1
+#16 15.86    Compiling once_cell v1.21.4
+#16 16.14    Compiling futures-sink v0.3.32
+#16 16.31    Compiling fnv v1.0.7
+#16 16.33    Compiling subtle v2.6.1
+#16 16.47    Compiling autocfg v1.5.1
+#16 16.47    Compiling version_check v0.9.5
+#16 16.64    Compiling tracing-core v0.1.36
+#16 17.18    Compiling jobserver v0.1.34
+#16 17.33    Compiling http v1.4.2
+#16 17.35    Compiling num-traits v0.2.19
+#16 17.54    Compiling syn v2.0.117
+#16 17.58    Compiling generic-array v0.14.7
+#16 17.74    Compiling cc v1.2.63
+#16 17.84    Compiling http v0.2.12
+#16 17.87    Compiling futures-task v0.3.32
+#16 18.02    Compiling futures-util v0.3.32
+#16 19.23    Compiling http-body v1.0.1
+#16 19.47    Compiling const-oid v0.9.6
+#16 20.00    Compiling getrandom v0.2.17
+#16 20.43    Compiling errno v0.3.14
+#16 20.68    Compiling signal-hook-registry v1.4.8
+#16 20.77    Compiling parking_lot v0.12.5
+#16 20.80    Compiling mio v1.2.1
+#16 20.82    Compiling socket2 v0.6.4
+#16 20.85    Compiling ring v0.17.14
+#16 20.92    Compiling http-body v0.4.6
+#16 21.19    Compiling powerfmt v0.2.0
+#16 21.41    Compiling either v1.16.0
+#16 21.52    Compiling deranged v0.5.8
+#16 21.69    Compiling outref v0.5.2
+#16 21.79    Compiling vsimd v0.8.0
+#16 21.81    Compiling num-conv v0.2.2
+#16 21.91    Compiling time-core v0.1.8
+#16 21.96    Compiling bytes-utils v0.1.4
+#16 22.13    Compiling num-integer v0.1.46
+#16 22.19    Compiling http-body-util v0.1.3
+#16 22.31    Compiling pin-utils v0.1.0
+#16 22.41    Compiling ryu v1.0.23
+#16 22.44    Compiling cmake v0.1.58
+#16 22.57    Compiling synstructure v0.13.2
+#16 22.75    Compiling base64-simd v0.8.0
+#16 22.84    Compiling crypto-common v0.1.7
+#16 22.90    Compiling block-buffer v0.10.4
+#16 22.96    Compiling untrusted v0.9.0
+#16 22.98    Compiling fs_extra v1.3.0
+#16 23.05    Compiling dunce v1.0.5
+#16 23.10    Compiling time v0.3.47
+#16 23.16    Compiling digest v0.10.7
+#16 23.17    Compiling rand_core v0.6.4
+#16 23.25    Compiling aws-lc-sys v0.41.0
+#16 23.26    Compiling equivalent v1.0.2
+#16 23.34    Compiling rustls-pki-types v1.14.1
+#16 23.40    Compiling hashbrown v0.17.1
+#16 23.46    Compiling log v0.4.32
+#16 23.48    Compiling aws-lc-rs v1.17.0
+#16 23.72    Compiling stable_deref_trait v1.2.1
+#16 23.75    Compiling percent-encoding v2.3.2
+#16 23.83    Compiling base64ct v1.8.3
+#16 24.10    Compiling hybrid-array v0.4.12
+#16 24.50    Compiling indexmap v2.14.0
+#16 24.55    Compiling pem-rfc7468 v0.7.0
+#16 24.81    Compiling tokio-macros v2.7.0
+#16 25.08    Compiling tracing-attributes v0.1.31
+#16 25.25    Compiling zerofrom-derive v0.1.7
+#16 25.67    Compiling aws-smithy-runtime-api-macros v1.0.0
+#16 25.82    Compiling tokio v1.52.3
+#16 25.84    Compiling yoke-derive v0.8.2
+#16 26.30    Compiling httparse v1.10.1
+#16 26.85    Compiling slab v0.4.12
+#16 27.04    Compiling crc32fast v1.5.0
+#16 27.27    Compiling tracing v0.1.44
+#16 27.31    Compiling zerofrom v0.1.8
+#16 27.40    Compiling zerovec-derive v0.11.3
+#16 27.44    Compiling der v0.7.10
+#16 27.46    Compiling yoke v0.8.3
+#16 27.64    Compiling try-lock v0.2.5
+#16 27.68    Compiling cmov v0.5.4
+#16 27.73    Compiling want v0.3.1
+#16 27.90    Compiling ctutils v0.4.2
+#16 28.13    Compiling block-buffer v0.12.0
+#16 28.26    Compiling crypto-common v0.2.2
+#16 28.33    Compiling displaydoc v0.2.6
+#16 28.35    Compiling futures-channel v0.3.32
+#16 28.61    Compiling rustls v0.23.40
+#16 28.62    Compiling zerovec v0.11.6
+#16 28.76    Compiling spki v0.7.3
+#16 29.06    Compiling tower-service v0.3.3
+#16 29.07    Compiling const-oid v0.10.2
+#16 29.17    Compiling pkcs8 v0.10.2
+#16 29.30    Compiling digest v0.11.3
+#16 29.40    Compiling ff v0.13.1
+#16 29.50    Compiling socket2 v0.5.10
+#16 29.54    Compiling base16ct v0.2.0
+#16 29.71    Compiling rustls v0.21.12
+#16 29.75    Compiling atomic-waker v1.1.2
+#16 29.84    Compiling sec1 v0.7.3
+#16 29.88    Compiling group v0.13.0
+#16 30.07    Compiling crypto-bigint v0.5.5
+#16 30.11    Compiling base64 v0.22.1
+#16 30.58    Compiling cpufeatures v0.3.0
+#16 30.63    Compiling tinystr v0.8.3
+#16 30.64    Compiling hmac v0.12.1
+#16 30.77    Compiling openssl-probe v0.2.1
+#16 30.80    Compiling cpufeatures v0.2.17
+#16 30.81    Compiling ipnet v2.12.0
+#16 30.86    Compiling litemap v0.8.2
+#16 31.04    Compiling httpdate v1.0.3
+#16 31.08    Compiling writeable v0.6.3
+#16 31.12    Compiling semver v1.0.28
+#16 31.31    Compiling elliptic-curve v0.13.8
+#16 31.46    Compiling rustc_version v0.4.1
+#16 31.47    Compiling icu_locale_core v2.2.0
+#16 31.78    Compiling rustls-native-certs v0.8.4
+#16 31.81    Compiling rfc6979 v0.4.0
+#16 32.03    Compiling tokio-util v0.7.18
+#16 32.42    Compiling aws-smithy-async v1.2.14
+#16 32.47    Compiling potential_utf v0.1.5
+#16 32.63    Compiling zerotrie v0.2.4
+#16 32.73    Compiling aws-smithy-types v1.4.9
+#16 32.76    Compiling h2 v0.4.14
+#16 33.22    Compiling h2 v0.3.27
+#16 33.47    Compiling form_urlencoded v1.2.2
+#16 33.76    Compiling aws-smithy-runtime-api v1.12.3
+#16 35.42    Compiling aws-smithy-eventstream v0.60.20
+#16 36.99    Compiling hyper v1.10.1
+#16 37.12    Compiling hyper v0.14.32
+#16 38.51    Compiling rustls-webpki v0.101.7
+#16 40.04    Compiling sct v0.7.1
+#16 40.22    Compiling hyper-util v0.1.20
+#16 40.44    Compiling aws-smithy-http v0.63.6
+#16 40.47    Compiling aws-smithy-schema v0.1.0
+#16 41.18    Compiling signature v2.2.0
+#16 41.35    Compiling pkg-config v0.3.33
+#16 41.44    Compiling utf8_iter v1.0.4
+#16 41.60    Compiling tower-layer v0.3.3
+#16 41.80    Compiling icu_properties_data v2.2.0
+#16 41.87    Compiling icu_normalizer_data v2.2.0
+#16 41.88    Compiling serde_core v1.0.228
+#16 41.97    Compiling tower v0.5.3
+#16 42.01    Compiling icu_collections v2.2.0
+#16 42.05    Compiling ecdsa v0.16.9
+#16 42.17    Compiling aws-credential-types v1.2.14
+#16 42.35    Compiling icu_provider v2.2.0
+#16 42.68    Compiling tokio-rustls v0.24.1
+#16 42.80    Compiling aws-types v1.3.16
+#16 42.92    Compiling hyper-rustls v0.24.2
+#16 42.95    Compiling primeorder v0.13.6
+#16 43.06    Compiling sha2 v0.10.9
+#16 43.07    Compiling sha2 v0.11.0
+#16 43.21    Compiling hex v0.4.3
+#16 43.21    Compiling zerocopy v0.8.52
+#16 43.25    Compiling fastrand v2.4.1
+#16 43.50    Compiling rustversion v1.0.22
+#16 43.51    Compiling p256 v0.13.2
+#16 44.03    Compiling aws-smithy-observability v0.2.6
+#16 44.56    Compiling hmac v0.13.0
+#16 44.68    Compiling zerocopy-derive v0.8.52
+#16 44.79    Compiling glob v0.3.3
+#16 44.84    Compiling aws-sigv4 v1.4.5
+#16 45.16    Compiling icu_properties v2.2.0
+#16 45.48    Compiling clang-sys v1.8.1
+#16 45.80    Compiling icu_normalizer v2.2.0
+#16 46.80    Compiling serde v1.0.228
+#16 47.06    Compiling uuid v1.23.3
+#16 47.24    Compiling arc-swap v1.9.1
+#16 47.26    Compiling idna_adapter v1.2.2
+#16 47.57    Compiling aws-smithy-json v0.62.7
+#16 47.64    Compiling serde_derive v1.0.228
+#16 47.65    Compiling memchr v2.8.1
+#16 47.88    Compiling regex-syntax v0.8.11
+#16 48.47    Compiling utf8parse v0.2.2
+#16 48.56    Compiling bitflags v2.13.0
+#16 49.02    Compiling regex-lite v0.1.9
+#16 49.44    Compiling minimal-lexical v0.2.1
+#16 49.64    Compiling crossbeam-utils v0.8.21
+#16 49.85    Compiling nom v7.1.3
+#16 49.90    Compiling regex-automata v0.4.14
+#16 51.13    Compiling idna v1.1.0
+#16 51.27    Compiling zstd-sys v2.0.16+zstd.1.5.7
+#16 51.33    Compiling rustix v1.1.4
+#16 51.35    Compiling bindgen v0.72.1
+#16 51.58    Compiling anyhow v1.0.102
+#16 51.60    Compiling xmlparser v0.13.6
+#16 51.78    Compiling itertools v0.13.0
+#16 51.91    Compiling aws-smithy-xml v0.60.15
+#16 52.11    Compiling url v2.5.8
+#16 52.18    Compiling regex v1.12.4
+#16 52.55    Compiling cexpr v0.6.0
+#16 52.75    Compiling anstyle-parse v1.0.0
+#16 53.14    Compiling colorchoice v1.0.5
+#16 53.22    Compiling spin v0.10.0
+#16 53.26    Compiling is_terminal_polyfill v1.70.2
+#16 53.30    Compiling allocator-api2 v0.2.21
+#16 53.31    Compiling cfg_aliases v0.2.1
+#16 53.32    Compiling anstyle v1.0.14
+#16 53.36    Compiling shlex v1.3.0
+#16 53.36    Compiling anstyle-query v1.1.5
+#16 53.47    Compiling rustc-hash v2.1.2
+#16 53.53    Compiling linux-raw-sys v0.12.1
+#16 53.59    Compiling foldhash v0.2.0
+#16 53.60    Compiling urlencoding v2.1.3
+#16 53.69    Compiling vcpkg v0.2.15
+#16 53.78    Compiling aws-smithy-query v0.60.15
+#16 53.79    Compiling hashbrown v0.16.1
+#16 53.94    Compiling anstream v1.0.0
+#16 54.41    Compiling libsqlite3-sys v0.33.0
+#16 54.52    Compiling crc-fast v1.10.0
+#16 54.60    Compiling nix v0.29.0
+#16 54.68    Compiling crossbeam-epoch v0.9.18
+#16 55.17    Compiling ppv-lite86 v0.2.21
+#16 55.19    Compiling sha1 v0.11.0
+#16 55.55    Compiling md-5 v0.11.0
+#16 55.68    Compiling async-trait v0.1.89
+#16 55.77    Compiling rayon-core v1.13.0
+#16 55.79    Compiling strsim v0.11.1
+#16 55.91    Compiling heck v0.5.0
+#16 56.12    Compiling zstd-safe v7.2.4
+#16 56.28    Compiling foldhash v0.1.5
+#16 56.53    Compiling zmij v1.0.21
+#16 56.69    Compiling getrandom v0.4.2
+#16 56.70    Compiling simd-adler32 v0.3.9
+#16 56.73    Compiling clap_lex v1.1.0
+#16 56.87    Compiling adler2 v2.0.1
+#16 57.05    Compiling miniz_oxide v0.8.9
+#16 57.06    Compiling clap_builder v4.6.0
+#16 57.35    Compiling hadb-storage v0.4.1
+#16 57.51    Compiling hashbrown v0.15.5
+#16 57.56    Compiling clap_derive v4.6.1
+#16 58.23    Compiling rand_chacha v0.3.1
+#16 58.87    Compiling crossbeam-deque v0.8.6
+#16 59.06    Compiling lru v0.16.4
+#16 59.22    Compiling half v2.7.1
+#16 59.38    Compiling sha1 v0.10.6
+#16 59.58    Compiling webpki-roots v1.0.7
+#16 59.68    Compiling blake3 v1.8.5
+#16 59.82    Compiling nibble_vec v0.1.0
+#16 59.94    Compiling ciborium-io v0.2.2
+#16 59.96    Compiling serde_json v1.0.150
+#16 60.02    Compiling thiserror v1.0.69
+#16 60.10    Compiling endian-type v0.1.2
+#16 60.14    Compiling sqlite-plugin v0.10.1
+#16 60.36    Compiling radix_trie v0.2.1
+#16 60.45    Compiling aws-smithy-checksums v0.64.8
+#16 60.80    Compiling ciborium-ll v0.2.2
+#16 61.50    Compiling clap v4.6.1
+#16 61.59    Compiling webpki-roots v0.26.11
+#16 63.89    Compiling rand v0.8.6
+#16 64.91    Compiling hashlink v0.10.0
+#16 65.00    Compiling flate2 v1.1.9
+#16 66.25    Compiling fd-lock v4.0.4
+#16 66.41    Compiling thiserror-impl v1.0.69
+#16 66.46    Compiling rmp v0.8.15
+#16 66.55    Compiling nanorand v0.7.0
+#16 67.08    Compiling spin v0.9.8
+#16 67.26    Compiling unicode-segmentation v1.13.3
+#16 67.42    Compiling home v0.5.12
+#16 67.68    Compiling arrayvec v0.7.6
+#16 68.21    Compiling unicode-width v0.2.2
+#16 68.39    Compiling fallible-streaming-iterator v0.1.9
+#16 68.59    Compiling constant_time_eq v0.4.2
+#16 68.75    Compiling fallible-iterator v0.3.0
+#16 68.82    Compiling arrayref v0.3.9
+#16 68.84    Compiling rustyline v15.0.0
+#16 69.10    Compiling flume v0.11.1
+#16 69.50    Compiling rmp-serde v1.3.1
+#16 69.90    Compiling tempfile v3.27.0
+#16 70.83    Compiling hadb-storage-local v0.4.0
+#16 72.21    Compiling rayon v1.12.0
+#16 74.73    Compiling clap_complete v4.6.5
+#16 75.09    Compiling ciborium v0.2.2
+#16 75.82    Compiling serde_bytes v0.11.19
+#16 76.09    Compiling file-guard v0.2.0
+#16 76.11    Compiling fs2 v0.4.3
+#16 76.15    Compiling atty v0.2.14
+#16 100.8    Compiling zstd v0.13.3
+#16 105.7    Compiling rustls-webpki v0.103.13
+#16 111.4    Compiling tokio-rustls v0.26.4
+#16 111.4    Compiling ureq v2.12.1
+#16 112.0    Compiling hyper-rustls v0.27.9
+#16 113.4    Compiling aws-smithy-http-client v1.1.13
+#16 118.2    Compiling aws-smithy-runtime v1.11.3
+#16 122.8    Compiling aws-runtime v1.7.4
+#16 127.7    Compiling aws-sdk-sts v1.106.0
+#16 127.9    Compiling aws-sdk-ssooidc v1.103.0
+#16 128.0    Compiling aws-sdk-sso v1.101.0
+#16 128.2    Compiling aws-sdk-s3 v1.135.0
+#16 134.9    Compiling aws-config v1.8.18
+#16 153.2    Compiling rusqlite v0.35.0
+#16 161.9    Compiling hadb-storage-s3 v0.4.1
+#16 168.6    Compiling turbolite v0.5.0 (/app)
+#16 184.3 warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+#16 184.3   --> benchmark/tiered-bench.rs:27:5
+#16 184.3    |
+#16 184.3 27 |     set_local_checkpoint_only, CacheConfig, CompressionConfig, PrefetchConfig, TurboliteConfig,
+#16 184.3    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+#16 184.3    |
+#16 184.3    = note: `#[warn(deprecated)]` on by default
+#16 184.3 
+#16 184.3 warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+#16 184.3     --> benchmark/tiered-bench.rs:1670:9
+#16 184.3      |
+#16 184.3 1670 |         set_local_checkpoint_only(true);
+#16 184.3      |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+#16 184.3 
+#16 184.3 warning: use of deprecated function `turbolite::tiered::set_local_checkpoint_only`: use TurboliteConfig.cache.checkpoint_mode instead
+#16 184.3     --> benchmark/tiered-bench.rs:1678:9
+#16 184.3      |
+#16 184.3 1678 |         set_local_checkpoint_only(false);
+#16 184.3      |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+#16 184.3 
+#16 188.1 warning: `turbolite` (bin "tiered-bench") generated 3 warnings
+#16 188.1     Finished `release` profile [optimized] target(s) in 3m 07s
+#16 DONE 189.0s
+
+#11 [stage-1  1/13] FROM docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+#11 ...
+
+#17 [stage-1 2/6] RUN apt-get update && apt-get install -y ca-certificates curl unzip &&     curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" &&     unzip awscliv2.zip &&     ./aws/install &&     rm -rf aws awscliv2.zip &&     apt-get remove -y curl unzip &&     apt-get autoremove -y &&     rm -rf /var/lib/apt/lists/*
+#17 CACHED
+
+#18 [stage-1 3/6] COPY --from=builder /app/target/release/tiered-bench /usr/local/bin/tiered-bench
+#18 DONE 0.3s
+
+#11 [stage-1  1/13] FROM docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+#11 ...
+
+#19 [stage-1 4/6] COPY --from=builder /app/target/release/tiered-tune /usr/local/bin/tiered-tune
+#19 DONE 0.3s
+
+#11 [stage-1  1/13] FROM docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+#11 ...
+
+#20 [stage-1 5/6] COPY benchmark/entrypoint.sh /usr/local/bin/entrypoint.sh
+#20 DONE 0.1s
+
+#11 [stage-1  1/13] FROM docker.io/library/debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+#11 ...
+
+#21 [stage-1 6/6] RUN chmod +x /usr/local/bin/entrypoint.sh
+#21 DONE 0.1s
+
+#22 exporting to image
+#22 exporting layers
+#22 exporting layers 1.1s done
+#22 exporting manifest sha256:33699ea99ba7f0e1030576d6d9cbbf19e0a597fe83a93caf79687ff8feebe209 done
+#22 exporting config sha256:dba4fa93c867885ba875d18c9da5b90e562ee57893e156864c3947b520e9ba6c done
+#22 pushing layers for registry.fly.io/turbolite-tiered-bench:deployment-01KTYMQHQBKKD9TSS2GD1VCP0P@sha256:33699ea99ba7f0e1030576d6d9cbbf19e0a597fe83a93caf79687ff8feebe209
+#22 pushing layer sha256:c7ba4bf835c66c25d148b780ac29d8bedf7c978264009b37786cd7778ba402b1
+#22 pushing layer sha256:dba4fa93c867885ba875d18c9da5b90e562ee57893e156864c3947b520e9ba6c
+#22 pushing layer sha256:ae96f0336245157ff4c818daae33eb3b1fb6b8f6519f510e33c2b01542245d2d 0.1s done
+#22 pushing layer sha256:8fab94330d7b5a5d2e0d164f4d7b70bd0a5aa3b9d7b4594731e83d7033129797
+#22 pushing layer sha256:7b920bbb46dfc4897047cf229158011aa776b7cd5426bc9a8d41edd5be18c1d3
+#22 pushing layer sha256:2f7273bdd73cd3090b15a1d5bfaf9564382e2f6f46d27e6f145093d226688017
+#22 pushing layer sha256:7284161ee1752fad223a8cdac7e8ab48061cf0913507043e1bc23beb3e2bf956
+#22 pushing layer sha256:8fab94330d7b5a5d2e0d164f4d7b70bd0a5aa3b9d7b4594731e83d7033129797 0.6s done
+#22 pushing layer sha256:c7ba4bf835c66c25d148b780ac29d8bedf7c978264009b37786cd7778ba402b1 0.9s done
+#22 pushing layer sha256:dba4fa93c867885ba875d18c9da5b90e562ee57893e156864c3947b520e9ba6c 0.9s done
+#22 pushing layer sha256:7284161ee1752fad223a8cdac7e8ab48061cf0913507043e1bc23beb3e2bf956 0.9s done
+#22 pushing layer sha256:2f7273bdd73cd3090b15a1d5bfaf9564382e2f6f46d27e6f145093d226688017 1.1s done
+#22 pushing layers for registry.fly.io/turbolite-tiered-bench:deployment-01KTYMQHQBKKD9TSS2GD1VCP0P@sha256:33699ea99ba7f0e1030576d6d9cbbf19e0a597fe83a93caf79687ff8feebe209 1.1s done
+#22 pushing layer sha256:7b920bbb46dfc4897047cf229158011aa776b7cd5426bc9a8d41edd5be18c1d3 1.1s done
+#22 pushing manifest for registry.fly.io/turbolite-tiered-bench:deployment-01KTYMQHQBKKD9TSS2GD1VCP0P@sha256:33699ea99ba7f0e1030576d6d9cbbf19e0a597fe83a93caf79687ff8feebe209
+#22 pushing manifest for registry.fly.io/turbolite-tiered-bench:deployment-01KTYMQHQBKKD9TSS2GD1VCP0P@sha256:33699ea99ba7f0e1030576d6d9cbbf19e0a597fe83a93caf79687ff8feebe209 0.1s done
+#22 DONE 2.4s
+
+#5 [builder  1/27] FROM docker.io/library/rust:1-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9
+--> Build Summary:  (​)
+[38;5;252m--> Building image done[0m
+image: registry.fly.io/turbolite-tiered-bench:deployment-01KTYMQHQBKKD9TSS2GD1VCP0P
+image size: 105 MB
+
+Watch your deployment at https://fly.io/apps/turbolite-tiered-bench/monitoring
+
+Updating existing machines in 'turbolite-tiered-bench' with rolling strategy
+> Acquiring lease for 7815691b351228
+> Acquired lease for 7815691b351228
+> Updating machine config for 7815691b351228
+> Updating 7815691b351228 [app]
+> Updated machine config for 7815691b351228
+✔ Machine 7815691b351228 is now in a good state
+> Clearing lease for 7815691b351228
+✔ Cleared lease for 7815691b351228

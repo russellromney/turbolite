@@ -1,0 +1,39 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+   Compiling aws-smithy-types v1.5.0
+   Compiling ring v0.17.14
+   Compiling aws-lc-rs v1.17.0
+   Compiling aws-lc-sys v0.41.0
+   Compiling rustls v0.21.12
+   Compiling rustls v0.23.40
+   Compiling hyper v1.10.1
+   Compiling h2 v0.3.27
+   Compiling hex v0.4.3
+   Compiling fastrand v2.4.1
+   Compiling zerocopy v0.8.52
+   Compiling rustversion v1.0.22
+   Compiling p256 v0.13.2
+   Compiling aws-types v1.3.16
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_properties_data v2.2.0
+   Compiling serde_core v1.0.228
+   Compiling hmac v0.13.0
+   Compiling zerocopy-derive v0.8.52
+   Compiling aws-smithy-runtime-api v1.12.3
+error[E0119]: conflicting implementations of trait `From<time::format_description::parse::format_item::HourBase>` for type `<time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type`
+   --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-runtime-api-1.12.3/src/client/auth.rs:509:1
+    |
+509 | / impl<T> From<T> for AuthSchemePreference
+510 | | where
+511 | |     T: AsRef<[AuthSchemeId]>,
+    | |_____________________________^
+    |
+    = note: conflicting implementation in crate `time`:
+            - impl From<time::format_description::parse::format_item::HourBase> for <time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type;
+    = note: upstream crates may add a new impl of trait `std::convert::AsRef<[client::auth::AuthSchemeId]>` for type `time::format_description::parse::format_item::HourBase` in future versions
+
+For more information about this error, try `rustc --explain E0119`.
+error: could not compile `aws-smithy-runtime-api` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

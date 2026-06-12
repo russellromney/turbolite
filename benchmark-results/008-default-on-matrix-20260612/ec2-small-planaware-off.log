@@ -1,0 +1,606 @@
+[bench] main() starting
+[bench] CLI parsed
+=== Tiered VFS Benchmark (Page Group Model) ===
+Bucket:       turbolite-bench--use2-az1--x-s3
+Endpoint:     (default S3)
+Page size:    65536 bytes
+Pages/group:  256 (16.0 MB uncompressed per group)
+Iterations:   20 measured + 2 warmup per cold query, 20 per warm query
+Prefetch:     7 worker threads
+Queries:      post detail, profile, who-liked, mutual friends
+Plan-aware:   ENABLED (Phase Marne query-plan prefetch)
+
+--- 10,000 posts, 1,000 users (~8.1 MB, ~131 pages, ~1 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(10000) starting
+  Reusing S3 prefix: social_10000_btree
+[bench] creating reader VFS...
+[bench] calling TurboliteVfs::with_backend()...
+[bench] TurboliteVfs::with_backend() returned OK
+[bench] registering VFS 'bench_reader_0'
+[bench] VFS registered, opening connection...
+[bench] connection opened, skipping COUNT(*) verification
+  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+  post+user    schedule: off / off
+  profile      schedule: 0.10,0.20,0.30 / 0.00,0.00,0.00,0.00
+  who-liked    schedule: 0.30,0.30,0.40 / 0.00,0.00,0.00
+  mutual       schedule: 0.40,0.30,0.30 / 0.00,0.00,0.00
+  idx-filter   schedule: 0.20,0.30,0.50 / 0.00,0.00,0.00
+  scan-filter  schedule: off / off
+
+=== CACHE LEVEL: NONE (everything from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+    [none] post+user warmup 0 error: no such table: posts
+    [none] post+user warmup 1 error: no such table: posts
+    [none] post+user iter 0 error: no such table: posts
+    [none] post+user iter 1 error: no such table: posts
+    [none] post+user iter 2 error: no such table: posts
+    [none] post+user iter 3 error: no such table: posts
+    [none] post+user iter 4 error: no such table: posts
+    [none] post+user iter 5 error: no such table: posts
+    [none] post+user iter 6 error: no such table: posts
+    [none] post+user iter 7 error: no such table: posts
+    [none] post+user iter 8 error: no such table: posts
+    [none] post+user iter 9 error: no such table: posts
+    [none] post+user iter 10 error: no such table: posts
+    [none] post+user iter 11 error: no such table: posts
+    [none] post+user iter 12 error: no such table: posts
+    [none] post+user iter 13 error: no such table: posts
+    [none] post+user iter 14 error: no such table: posts
+    [none] post+user iter 15 error: no such table: posts
+    [none] post+user iter 16 error: no such table: posts
+    [none] post+user iter 17 error: no such table: posts
+    [none] post+user iter 18 error: no such table: posts
+    [none] post+user iter 19 error: no such table: posts
+  [none] post+user                0us        0us        0us        0.0          0KB
+    [none] profile warmup 0 error: no such table: users
+    [none] profile warmup 1 error: no such table: users
+    [none] profile iter 0 error: no such table: users
+    [none] profile iter 1 error: no such table: users
+    [none] profile iter 2 error: no such table: users
+    [none] profile iter 3 error: no such table: users
+    [none] profile iter 4 error: no such table: users
+    [none] profile iter 5 error: no such table: users
+    [none] profile iter 6 error: no such table: users
+    [none] profile iter 7 error: no such table: users
+    [none] profile iter 8 error: no such table: users
+    [none] profile iter 9 error: no such table: users
+    [none] profile iter 10 error: no such table: users
+    [none] profile iter 11 error: no such table: users
+    [none] profile iter 12 error: no such table: users
+    [none] profile iter 13 error: no such table: users
+    [none] profile iter 14 error: no such table: users
+    [none] profile iter 15 error: no such table: users
+    [none] profile iter 16 error: no such table: users
+    [none] profile iter 17 error: no such table: users
+    [none] profile iter 18 error: no such table: users
+    [none] profile iter 19 error: no such table: users
+  [none] profile                  0us        0us        0us        0.0          0KB
+    [none] who-liked warmup 0 error: no such table: likes
+    [none] who-liked warmup 1 error: no such table: likes
+    [none] who-liked iter 0 error: no such table: likes
+    [none] who-liked iter 1 error: no such table: likes
+    [none] who-liked iter 2 error: no such table: likes
+    [none] who-liked iter 3 error: no such table: likes
+    [none] who-liked iter 4 error: no such table: likes
+    [none] who-liked iter 5 error: no such table: likes
+    [none] who-liked iter 6 error: no such table: likes
+    [none] who-liked iter 7 error: no such table: likes
+    [none] who-liked iter 8 error: no such table: likes
+    [none] who-liked iter 9 error: no such table: likes
+    [none] who-liked iter 10 error: no such table: likes
+    [none] who-liked iter 11 error: no such table: likes
+    [none] who-liked iter 12 error: no such table: likes
+    [none] who-liked iter 13 error: no such table: likes
+    [none] who-liked iter 14 error: no such table: likes
+    [none] who-liked iter 15 error: no such table: likes
+    [none] who-liked iter 16 error: no such table: likes
+    [none] who-liked iter 17 error: no such table: likes
+    [none] who-liked iter 18 error: no such table: likes
+    [none] who-liked iter 19 error: no such table: likes
+  [none] who-liked                0us        0us        0us        0.0          0KB
+    [none] mutual warmup 0 error: no such table: friendships
+    [none] mutual warmup 1 error: no such table: friendships
+    [none] mutual iter 0 error: no such table: friendships
+    [none] mutual iter 1 error: no such table: friendships
+    [none] mutual iter 2 error: no such table: friendships
+    [none] mutual iter 3 error: no such table: friendships
+    [none] mutual iter 4 error: no such table: friendships
+    [none] mutual iter 5 error: no such table: friendships
+    [none] mutual iter 6 error: no such table: friendships
+    [none] mutual iter 7 error: no such table: friendships
+    [none] mutual iter 8 error: no such table: friendships
+    [none] mutual iter 9 error: no such table: friendships
+    [none] mutual iter 10 error: no such table: friendships
+    [none] mutual iter 11 error: no such table: friendships
+    [none] mutual iter 12 error: no such table: friendships
+    [none] mutual iter 13 error: no such table: friendships
+    [none] mutual iter 14 error: no such table: friendships
+    [none] mutual iter 15 error: no such table: friendships
+    [none] mutual iter 16 error: no such table: friendships
+    [none] mutual iter 17 error: no such table: friendships
+    [none] mutual iter 18 error: no such table: friendships
+    [none] mutual iter 19 error: no such table: friendships
+  [none] mutual                   0us        0us        0us        0.0          0KB
+    [none] idx-filter warmup 0 error: no such table: posts
+    [none] idx-filter warmup 1 error: no such table: posts
+    [none] idx-filter iter 0 error: no such table: posts
+    [none] idx-filter iter 1 error: no such table: posts
+    [none] idx-filter iter 2 error: no such table: posts
+    [none] idx-filter iter 3 error: no such table: posts
+    [none] idx-filter iter 4 error: no such table: posts
+    [none] idx-filter iter 5 error: no such table: posts
+    [none] idx-filter iter 6 error: no such table: posts
+    [none] idx-filter iter 7 error: no such table: posts
+    [none] idx-filter iter 8 error: no such table: posts
+    [none] idx-filter iter 9 error: no such table: posts
+    [none] idx-filter iter 10 error: no such table: posts
+    [none] idx-filter iter 11 error: no such table: posts
+    [none] idx-filter iter 12 error: no such table: posts
+    [none] idx-filter iter 13 error: no such table: posts
+    [none] idx-filter iter 14 error: no such table: posts
+    [none] idx-filter iter 15 error: no such table: posts
+    [none] idx-filter iter 16 error: no such table: posts
+    [none] idx-filter iter 17 error: no such table: posts
+    [none] idx-filter iter 18 error: no such table: posts
+    [none] idx-filter iter 19 error: no such table: posts
+  [none] idx-filter               0us        0us        0us        0.0          0KB
+    [none] scan-filter warmup 0 error: no such table: posts
+    [none] scan-filter warmup 1 error: no such table: posts
+    [none] scan-filter iter 0 error: no such table: posts
+    [none] scan-filter iter 1 error: no such table: posts
+    [none] scan-filter iter 2 error: no such table: posts
+    [none] scan-filter iter 3 error: no such table: posts
+    [none] scan-filter iter 4 error: no such table: posts
+    [none] scan-filter iter 5 error: no such table: posts
+    [none] scan-filter iter 6 error: no such table: posts
+    [none] scan-filter iter 7 error: no such table: posts
+    [none] scan-filter iter 8 error: no such table: posts
+    [none] scan-filter iter 9 error: no such table: posts
+    [none] scan-filter iter 10 error: no such table: posts
+    [none] scan-filter iter 11 error: no such table: posts
+    [none] scan-filter iter 12 error: no such table: posts
+    [none] scan-filter iter 13 error: no such table: posts
+    [none] scan-filter iter 14 error: no such table: posts
+    [none] scan-filter iter 15 error: no such table: posts
+    [none] scan-filter iter 16 error: no such table: posts
+    [none] scan-filter iter 17 error: no such table: posts
+    [none] scan-filter iter 18 error: no such table: posts
+    [none] scan-filter iter 19 error: no such table: posts
+  [none] scan-filter              0us        0us        0us        0.0          0KB
+
+=== CACHE LEVEL: DATA (everything cached, reuse connection) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+    [data] post+user iter 0 error: no such table: posts
+    [data] post+user iter 1 error: no such table: posts
+    [data] post+user iter 2 error: no such table: posts
+    [data] post+user iter 3 error: no such table: posts
+    [data] post+user iter 4 error: no such table: posts
+    [data] post+user iter 5 error: no such table: posts
+    [data] post+user iter 6 error: no such table: posts
+    [data] post+user iter 7 error: no such table: posts
+    [data] post+user iter 8 error: no such table: posts
+    [data] post+user iter 9 error: no such table: posts
+    [data] post+user iter 10 error: no such table: posts
+    [data] post+user iter 11 error: no such table: posts
+    [data] post+user iter 12 error: no such table: posts
+    [data] post+user iter 13 error: no such table: posts
+    [data] post+user iter 14 error: no such table: posts
+    [data] post+user iter 15 error: no such table: posts
+    [data] post+user iter 16 error: no such table: posts
+    [data] post+user iter 17 error: no such table: posts
+    [data] post+user iter 18 error: no such table: posts
+    [data] post+user iter 19 error: no such table: posts
+  [data] post+user                0us        0us        0us        0.0          0KB
+    [data] profile iter 0 error: no such table: users
+    [data] profile iter 1 error: no such table: users
+    [data] profile iter 2 error: no such table: users
+    [data] profile iter 3 error: no such table: users
+    [data] profile iter 4 error: no such table: users
+    [data] profile iter 5 error: no such table: users
+    [data] profile iter 6 error: no such table: users
+    [data] profile iter 7 error: no such table: users
+    [data] profile iter 8 error: no such table: users
+    [data] profile iter 9 error: no such table: users
+    [data] profile iter 10 error: no such table: users
+    [data] profile iter 11 error: no such table: users
+    [data] profile iter 12 error: no such table: users
+    [data] profile iter 13 error: no such table: users
+    [data] profile iter 14 error: no such table: users
+    [data] profile iter 15 error: no such table: users
+    [data] profile iter 16 error: no such table: users
+    [data] profile iter 17 error: no such table: users
+    [data] profile iter 18 error: no such table: users
+    [data] profile iter 19 error: no such table: users
+  [data] profile                  0us        0us        0us        0.0          0KB
+    [data] who-liked iter 0 error: no such table: likes
+    [data] who-liked iter 1 error: no such table: likes
+    [data] who-liked iter 2 error: no such table: likes
+    [data] who-liked iter 3 error: no such table: likes
+    [data] who-liked iter 4 error: no such table: likes
+    [data] who-liked iter 5 error: no such table: likes
+    [data] who-liked iter 6 error: no such table: likes
+    [data] who-liked iter 7 error: no such table: likes
+    [data] who-liked iter 8 error: no such table: likes
+    [data] who-liked iter 9 error: no such table: likes
+    [data] who-liked iter 10 error: no such table: likes
+    [data] who-liked iter 11 error: no such table: likes
+    [data] who-liked iter 12 error: no such table: likes
+    [data] who-liked iter 13 error: no such table: likes
+    [data] who-liked iter 14 error: no such table: likes
+    [data] who-liked iter 15 error: no such table: likes
+    [data] who-liked iter 16 error: no such table: likes
+    [data] who-liked iter 17 error: no such table: likes
+    [data] who-liked iter 18 error: no such table: likes
+    [data] who-liked iter 19 error: no such table: likes
+  [data] who-liked                0us        0us        0us        0.0          0KB
+    [data] mutual iter 0 error: no such table: friendships
+    [data] mutual iter 1 error: no such table: friendships
+    [data] mutual iter 2 error: no such table: friendships
+    [data] mutual iter 3 error: no such table: friendships
+    [data] mutual iter 4 error: no such table: friendships
+    [data] mutual iter 5 error: no such table: friendships
+    [data] mutual iter 6 error: no such table: friendships
+    [data] mutual iter 7 error: no such table: friendships
+    [data] mutual iter 8 error: no such table: friendships
+    [data] mutual iter 9 error: no such table: friendships
+    [data] mutual iter 10 error: no such table: friendships
+    [data] mutual iter 11 error: no such table: friendships
+    [data] mutual iter 12 error: no such table: friendships
+    [data] mutual iter 13 error: no such table: friendships
+    [data] mutual iter 14 error: no such table: friendships
+    [data] mutual iter 15 error: no such table: friendships
+    [data] mutual iter 16 error: no such table: friendships
+    [data] mutual iter 17 error: no such table: friendships
+    [data] mutual iter 18 error: no such table: friendships
+    [data] mutual iter 19 error: no such table: friendships
+  [data] mutual                   0us        0us        0us        0.0          0KB
+    [data] idx-filter iter 0 error: no such table: posts
+    [data] idx-filter iter 1 error: no such table: posts
+    [data] idx-filter iter 2 error: no such table: posts
+    [data] idx-filter iter 3 error: no such table: posts
+    [data] idx-filter iter 4 error: no such table: posts
+    [data] idx-filter iter 5 error: no such table: posts
+    [data] idx-filter iter 6 error: no such table: posts
+    [data] idx-filter iter 7 error: no such table: posts
+    [data] idx-filter iter 8 error: no such table: posts
+    [data] idx-filter iter 9 error: no such table: posts
+    [data] idx-filter iter 10 error: no such table: posts
+    [data] idx-filter iter 11 error: no such table: posts
+    [data] idx-filter iter 12 error: no such table: posts
+    [data] idx-filter iter 13 error: no such table: posts
+    [data] idx-filter iter 14 error: no such table: posts
+    [data] idx-filter iter 15 error: no such table: posts
+    [data] idx-filter iter 16 error: no such table: posts
+    [data] idx-filter iter 17 error: no such table: posts
+    [data] idx-filter iter 18 error: no such table: posts
+    [data] idx-filter iter 19 error: no such table: posts
+  [data] idx-filter               0us        0us        0us        0.0          0KB
+    [data] scan-filter iter 0 error: no such table: posts
+    [data] scan-filter iter 1 error: no such table: posts
+    [data] scan-filter iter 2 error: no such table: posts
+    [data] scan-filter iter 3 error: no such table: posts
+    [data] scan-filter iter 4 error: no such table: posts
+    [data] scan-filter iter 5 error: no such table: posts
+    [data] scan-filter iter 6 error: no such table: posts
+    [data] scan-filter iter 7 error: no such table: posts
+    [data] scan-filter iter 8 error: no such table: posts
+    [data] scan-filter iter 9 error: no such table: posts
+    [data] scan-filter iter 10 error: no such table: posts
+    [data] scan-filter iter 11 error: no such table: posts
+    [data] scan-filter iter 12 error: no such table: posts
+    [data] scan-filter iter 13 error: no such table: posts
+    [data] scan-filter iter 14 error: no such table: posts
+    [data] scan-filter iter 15 error: no such table: posts
+    [data] scan-filter iter 16 error: no such table: posts
+    [data] scan-filter iter 17 error: no such table: posts
+    [data] scan-filter iter 18 error: no such table: posts
+    [data] scan-filter iter 19 error: no such table: posts
+  [data] scan-filter              0us        0us        0us        0.0          0KB
+
+=== REMOTE I/O TAILS (whole run, all modes) ===
+                            count        p50        p95        p99       p999        max
+  max remote in-flight: 0
+
+
+--- 100,000 posts, 10,000 users (~81.3 MB, ~1301 pages, ~6 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(100000) starting
+  Reusing S3 prefix: social_100000_btree
+[bench] creating reader VFS...
+[bench] calling TurboliteVfs::with_backend()...
+[bench] TurboliteVfs::with_backend() returned OK
+[bench] registering VFS 'bench_reader_1'
+[bench] VFS registered, opening connection...
+[bench] connection opened, skipping COUNT(*) verification
+  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+  post+user    schedule: off / off
+  profile      schedule: 0.10,0.20,0.30 / 0.00,0.00,0.00,0.00
+  who-liked    schedule: 0.30,0.30,0.40 / 0.00,0.00,0.00
+  mutual       schedule: 0.40,0.30,0.30 / 0.00,0.00,0.00
+  idx-filter   schedule: 0.20,0.30,0.50 / 0.00,0.00,0.00
+  scan-filter  schedule: off / off
+
+=== CACHE LEVEL: NONE (everything from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+    [none] post+user warmup 0 error: no such table: posts
+    [none] post+user warmup 1 error: no such table: posts
+    [none] post+user iter 0 error: no such table: posts
+    [none] post+user iter 1 error: no such table: posts
+    [none] post+user iter 2 error: no such table: posts
+    [none] post+user iter 3 error: no such table: posts
+    [none] post+user iter 4 error: no such table: posts
+    [none] post+user iter 5 error: no such table: posts
+    [none] post+user iter 6 error: no such table: posts
+    [none] post+user iter 7 error: no such table: posts
+    [none] post+user iter 8 error: no such table: posts
+    [none] post+user iter 9 error: no such table: posts
+    [none] post+user iter 10 error: no such table: posts
+    [none] post+user iter 11 error: no such table: posts
+    [none] post+user iter 12 error: no such table: posts
+    [none] post+user iter 13 error: no such table: posts
+    [none] post+user iter 14 error: no such table: posts
+    [none] post+user iter 15 error: no such table: posts
+    [none] post+user iter 16 error: no such table: posts
+    [none] post+user iter 17 error: no such table: posts
+    [none] post+user iter 18 error: no such table: posts
+    [none] post+user iter 19 error: no such table: posts
+  [none] post+user                0us        0us        0us        0.0          0KB
+    [none] profile warmup 0 error: no such table: users
+    [none] profile warmup 1 error: no such table: users
+    [none] profile iter 0 error: no such table: users
+    [none] profile iter 1 error: no such table: users
+    [none] profile iter 2 error: no such table: users
+    [none] profile iter 3 error: no such table: users
+    [none] profile iter 4 error: no such table: users
+    [none] profile iter 5 error: no such table: users
+    [none] profile iter 6 error: no such table: users
+    [none] profile iter 7 error: no such table: users
+    [none] profile iter 8 error: no such table: users
+    [none] profile iter 9 error: no such table: users
+    [none] profile iter 10 error: no such table: users
+    [none] profile iter 11 error: no such table: users
+    [none] profile iter 12 error: no such table: users
+    [none] profile iter 13 error: no such table: users
+    [none] profile iter 14 error: no such table: users
+    [none] profile iter 15 error: no such table: users
+    [none] profile iter 16 error: no such table: users
+    [none] profile iter 17 error: no such table: users
+    [none] profile iter 18 error: no such table: users
+    [none] profile iter 19 error: no such table: users
+  [none] profile                  0us        0us        0us        0.0          0KB
+    [none] who-liked warmup 0 error: no such table: likes
+    [none] who-liked warmup 1 error: no such table: likes
+    [none] who-liked iter 0 error: no such table: likes
+    [none] who-liked iter 1 error: no such table: likes
+    [none] who-liked iter 2 error: no such table: likes
+    [none] who-liked iter 3 error: no such table: likes
+    [none] who-liked iter 4 error: no such table: likes
+    [none] who-liked iter 5 error: no such table: likes
+    [none] who-liked iter 6 error: no such table: likes
+    [none] who-liked iter 7 error: no such table: likes
+    [none] who-liked iter 8 error: no such table: likes
+    [none] who-liked iter 9 error: no such table: likes
+    [none] who-liked iter 10 error: no such table: likes
+    [none] who-liked iter 11 error: no such table: likes
+    [none] who-liked iter 12 error: no such table: likes
+    [none] who-liked iter 13 error: no such table: likes
+    [none] who-liked iter 14 error: no such table: likes
+    [none] who-liked iter 15 error: no such table: likes
+    [none] who-liked iter 16 error: no such table: likes
+    [none] who-liked iter 17 error: no such table: likes
+    [none] who-liked iter 18 error: no such table: likes
+    [none] who-liked iter 19 error: no such table: likes
+  [none] who-liked                0us        0us        0us        0.0          0KB
+    [none] mutual warmup 0 error: no such table: friendships
+    [none] mutual warmup 1 error: no such table: friendships
+    [none] mutual iter 0 error: no such table: friendships
+    [none] mutual iter 1 error: no such table: friendships
+    [none] mutual iter 2 error: no such table: friendships
+    [none] mutual iter 3 error: no such table: friendships
+    [none] mutual iter 4 error: no such table: friendships
+    [none] mutual iter 5 error: no such table: friendships
+    [none] mutual iter 6 error: no such table: friendships
+    [none] mutual iter 7 error: no such table: friendships
+    [none] mutual iter 8 error: no such table: friendships
+    [none] mutual iter 9 error: no such table: friendships
+    [none] mutual iter 10 error: no such table: friendships
+    [none] mutual iter 11 error: no such table: friendships
+    [none] mutual iter 12 error: no such table: friendships
+    [none] mutual iter 13 error: no such table: friendships
+    [none] mutual iter 14 error: no such table: friendships
+    [none] mutual iter 15 error: no such table: friendships
+    [none] mutual iter 16 error: no such table: friendships
+    [none] mutual iter 17 error: no such table: friendships
+    [none] mutual iter 18 error: no such table: friendships
+    [none] mutual iter 19 error: no such table: friendships
+  [none] mutual                   0us        0us        0us        0.0          0KB
+    [none] idx-filter warmup 0 error: no such table: posts
+    [none] idx-filter warmup 1 error: no such table: posts
+    [none] idx-filter iter 0 error: no such table: posts
+    [none] idx-filter iter 1 error: no such table: posts
+    [none] idx-filter iter 2 error: no such table: posts
+    [none] idx-filter iter 3 error: no such table: posts
+    [none] idx-filter iter 4 error: no such table: posts
+    [none] idx-filter iter 5 error: no such table: posts
+    [none] idx-filter iter 6 error: no such table: posts
+    [none] idx-filter iter 7 error: no such table: posts
+    [none] idx-filter iter 8 error: no such table: posts
+    [none] idx-filter iter 9 error: no such table: posts
+    [none] idx-filter iter 10 error: no such table: posts
+    [none] idx-filter iter 11 error: no such table: posts
+    [none] idx-filter iter 12 error: no such table: posts
+    [none] idx-filter iter 13 error: no such table: posts
+    [none] idx-filter iter 14 error: no such table: posts
+    [none] idx-filter iter 15 error: no such table: posts
+    [none] idx-filter iter 16 error: no such table: posts
+    [none] idx-filter iter 17 error: no such table: posts
+    [none] idx-filter iter 18 error: no such table: posts
+    [none] idx-filter iter 19 error: no such table: posts
+  [none] idx-filter               0us        0us        0us        0.0          0KB
+    [none] scan-filter warmup 0 error: no such table: posts
+    [none] scan-filter warmup 1 error: no such table: posts
+    [none] scan-filter iter 0 error: no such table: posts
+    [none] scan-filter iter 1 error: no such table: posts
+    [none] scan-filter iter 2 error: no such table: posts
+    [none] scan-filter iter 3 error: no such table: posts
+    [none] scan-filter iter 4 error: no such table: posts
+    [none] scan-filter iter 5 error: no such table: posts
+    [none] scan-filter iter 6 error: no such table: posts
+    [none] scan-filter iter 7 error: no such table: posts
+    [none] scan-filter iter 8 error: no such table: posts
+    [none] scan-filter iter 9 error: no such table: posts
+    [none] scan-filter iter 10 error: no such table: posts
+    [none] scan-filter iter 11 error: no such table: posts
+    [none] scan-filter iter 12 error: no such table: posts
+    [none] scan-filter iter 13 error: no such table: posts
+    [none] scan-filter iter 14 error: no such table: posts
+    [none] scan-filter iter 15 error: no such table: posts
+    [none] scan-filter iter 16 error: no such table: posts
+    [none] scan-filter iter 17 error: no such table: posts
+    [none] scan-filter iter 18 error: no such table: posts
+    [none] scan-filter iter 19 error: no such table: posts
+  [none] scan-filter              0us        0us        0us        0.0          0KB
+
+=== CACHE LEVEL: DATA (everything cached, reuse connection) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+    [data] post+user iter 0 error: no such table: posts
+    [data] post+user iter 1 error: no such table: posts
+    [data] post+user iter 2 error: no such table: posts
+    [data] post+user iter 3 error: no such table: posts
+    [data] post+user iter 4 error: no such table: posts
+    [data] post+user iter 5 error: no such table: posts
+    [data] post+user iter 6 error: no such table: posts
+    [data] post+user iter 7 error: no such table: posts
+    [data] post+user iter 8 error: no such table: posts
+    [data] post+user iter 9 error: no such table: posts
+    [data] post+user iter 10 error: no such table: posts
+    [data] post+user iter 11 error: no such table: posts
+    [data] post+user iter 12 error: no such table: posts
+    [data] post+user iter 13 error: no such table: posts
+    [data] post+user iter 14 error: no such table: posts
+    [data] post+user iter 15 error: no such table: posts
+    [data] post+user iter 16 error: no such table: posts
+    [data] post+user iter 17 error: no such table: posts
+    [data] post+user iter 18 error: no such table: posts
+    [data] post+user iter 19 error: no such table: posts
+  [data] post+user                0us        0us        0us        0.0          0KB
+    [data] profile iter 0 error: no such table: users
+    [data] profile iter 1 error: no such table: users
+    [data] profile iter 2 error: no such table: users
+    [data] profile iter 3 error: no such table: users
+    [data] profile iter 4 error: no such table: users
+    [data] profile iter 5 error: no such table: users
+    [data] profile iter 6 error: no such table: users
+    [data] profile iter 7 error: no such table: users
+    [data] profile iter 8 error: no such table: users
+    [data] profile iter 9 error: no such table: users
+    [data] profile iter 10 error: no such table: users
+    [data] profile iter 11 error: no such table: users
+    [data] profile iter 12 error: no such table: users
+    [data] profile iter 13 error: no such table: users
+    [data] profile iter 14 error: no such table: users
+    [data] profile iter 15 error: no such table: users
+    [data] profile iter 16 error: no such table: users
+    [data] profile iter 17 error: no such table: users
+    [data] profile iter 18 error: no such table: users
+    [data] profile iter 19 error: no such table: users
+  [data] profile                  0us        0us        0us        0.0          0KB
+    [data] who-liked iter 0 error: no such table: likes
+    [data] who-liked iter 1 error: no such table: likes
+    [data] who-liked iter 2 error: no such table: likes
+    [data] who-liked iter 3 error: no such table: likes
+    [data] who-liked iter 4 error: no such table: likes
+    [data] who-liked iter 5 error: no such table: likes
+    [data] who-liked iter 6 error: no such table: likes
+    [data] who-liked iter 7 error: no such table: likes
+    [data] who-liked iter 8 error: no such table: likes
+    [data] who-liked iter 9 error: no such table: likes
+    [data] who-liked iter 10 error: no such table: likes
+    [data] who-liked iter 11 error: no such table: likes
+    [data] who-liked iter 12 error: no such table: likes
+    [data] who-liked iter 13 error: no such table: likes
+    [data] who-liked iter 14 error: no such table: likes
+    [data] who-liked iter 15 error: no such table: likes
+    [data] who-liked iter 16 error: no such table: likes
+    [data] who-liked iter 17 error: no such table: likes
+    [data] who-liked iter 18 error: no such table: likes
+    [data] who-liked iter 19 error: no such table: likes
+  [data] who-liked                0us        0us        0us        0.0          0KB
+    [data] mutual iter 0 error: no such table: friendships
+    [data] mutual iter 1 error: no such table: friendships
+    [data] mutual iter 2 error: no such table: friendships
+    [data] mutual iter 3 error: no such table: friendships
+    [data] mutual iter 4 error: no such table: friendships
+    [data] mutual iter 5 error: no such table: friendships
+    [data] mutual iter 6 error: no such table: friendships
+    [data] mutual iter 7 error: no such table: friendships
+    [data] mutual iter 8 error: no such table: friendships
+    [data] mutual iter 9 error: no such table: friendships
+    [data] mutual iter 10 error: no such table: friendships
+    [data] mutual iter 11 error: no such table: friendships
+    [data] mutual iter 12 error: no such table: friendships
+    [data] mutual iter 13 error: no such table: friendships
+    [data] mutual iter 14 error: no such table: friendships
+    [data] mutual iter 15 error: no such table: friendships
+    [data] mutual iter 16 error: no such table: friendships
+    [data] mutual iter 17 error: no such table: friendships
+    [data] mutual iter 18 error: no such table: friendships
+    [data] mutual iter 19 error: no such table: friendships
+  [data] mutual                   0us        0us        0us        0.0          0KB
+    [data] idx-filter iter 0 error: no such table: posts
+    [data] idx-filter iter 1 error: no such table: posts
+    [data] idx-filter iter 2 error: no such table: posts
+    [data] idx-filter iter 3 error: no such table: posts
+    [data] idx-filter iter 4 error: no such table: posts
+    [data] idx-filter iter 5 error: no such table: posts
+    [data] idx-filter iter 6 error: no such table: posts
+    [data] idx-filter iter 7 error: no such table: posts
+    [data] idx-filter iter 8 error: no such table: posts
+    [data] idx-filter iter 9 error: no such table: posts
+    [data] idx-filter iter 10 error: no such table: posts
+    [data] idx-filter iter 11 error: no such table: posts
+    [data] idx-filter iter 12 error: no such table: posts
+    [data] idx-filter iter 13 error: no such table: posts
+    [data] idx-filter iter 14 error: no such table: posts
+    [data] idx-filter iter 15 error: no such table: posts
+    [data] idx-filter iter 16 error: no such table: posts
+    [data] idx-filter iter 17 error: no such table: posts
+    [data] idx-filter iter 18 error: no such table: posts
+    [data] idx-filter iter 19 error: no such table: posts
+  [data] idx-filter               0us        0us        0us        0.0          0KB
+    [data] scan-filter iter 0 error: no such table: posts
+    [data] scan-filter iter 1 error: no such table: posts
+    [data] scan-filter iter 2 error: no such table: posts
+    [data] scan-filter iter 3 error: no such table: posts
+    [data] scan-filter iter 4 error: no such table: posts
+    [data] scan-filter iter 5 error: no such table: posts
+    [data] scan-filter iter 6 error: no such table: posts
+    [data] scan-filter iter 7 error: no such table: posts
+    [data] scan-filter iter 8 error: no such table: posts
+    [data] scan-filter iter 9 error: no such table: posts
+    [data] scan-filter iter 10 error: no such table: posts
+    [data] scan-filter iter 11 error: no such table: posts
+    [data] scan-filter iter 12 error: no such table: posts
+    [data] scan-filter iter 13 error: no such table: posts
+    [data] scan-filter iter 14 error: no such table: posts
+    [data] scan-filter iter 15 error: no such table: posts
+    [data] scan-filter iter 16 error: no such table: posts
+    [data] scan-filter iter 17 error: no such table: posts
+    [data] scan-filter iter 18 error: no such table: posts
+    [data] scan-filter iter 19 error: no such table: posts
+  [data] scan-filter              0us        0us        0us        0.0          0KB
+
+=== REMOTE I/O TAILS (whole run, all modes) ===
+                            count        p50        p95        p99       p999        max
+  max remote in-flight: 0
+
+
+Reference: Neon cold start ~500ms (us-east-2, compute pool)
+Done.
