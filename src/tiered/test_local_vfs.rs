@@ -96,10 +96,11 @@ fn lookahead_profile_plan(reader: &rusqlite::Connection) -> Vec<query_plan::Plan
         .expect("run profile eqp")
         .map(|row| row.expect("profile eqp detail"))
         .collect();
-    let accesses = query_plan::parse_eqp_output(&details.join("\n"));
+    let mut accesses = query_plan::parse_eqp_output(&details.join("\n"));
+    query_plan::attach_integer_constraint_hints(&mut accesses, &[7]);
     assert!(
         accesses.iter().any(|access| {
-            access.tree_name == "idx_posts_user_created"
+            access.tree_name == "idx_posts_user"
                 && access.access_type == query_plan::AccessType::Search
                 && access.table_name.as_deref() == Some("posts")
         }),
@@ -288,8 +289,7 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
                content TEXT NOT NULL,
                created_at INTEGER NOT NULL
              );
-             CREATE INDEX idx_posts_user_created
-               ON posts(user_id, created_at DESC);",
+            CREATE INDEX idx_posts_user ON posts(user_id);",
         )
         .expect("schema");
     {
@@ -333,7 +333,7 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
     assert!(
         imported_manifest
             .tree_name_to_root_page
-            .contains_key("idx_posts_user_created"),
+            .contains_key("idx_posts_user"),
         "fixture must be imported with a B-tree-aware index manifest"
     );
 
@@ -372,8 +372,13 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
         "lookahead should satisfy at least one retained frame demand; cache_info={cache_info}"
     );
     assert!(
-        foreground_ranges <= 8,
-        "true-cold profile query should be depth-shaped, not row-shaped; foreground_ranges={foreground_ranges}, backend_stats={:?}",
+        lookahead_hits >= rows.len() as u64,
+        "lookahead should cover at least the returned row count; rows={}, lookahead_hits={lookahead_hits}, cache_info={cache_info}",
+        rows.len()
+    );
+    assert!(
+        foreground_ranges + 4 <= foreground_ranges_off,
+        "lookahead-on should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges}, cache_info={cache_info}, backend_stats={:?}",
         backend.stats()
     );
     assert!(

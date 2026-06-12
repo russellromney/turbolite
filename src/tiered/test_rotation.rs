@@ -1111,6 +1111,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
                     name: "users".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0],
+                    pages: vec![0, 5, 10, 15],
                 },
             );
             h.insert(
@@ -1119,6 +1120,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
                     name: "idx_users_name".into(),
                     obj_type: "index".into(),
                     group_ids: vec![1],
+                    pages: vec![1, 2, 3, 4],
                 },
             );
             h

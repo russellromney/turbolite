@@ -630,11 +630,15 @@ pub struct PageLocation {
 }
 
 /// B-tree metadata stored in the manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BTreeManifestEntry {
     pub name: String,
     /// "table" or "index"
     pub obj_type: String,
     /// Group IDs containing this B-tree's pages
     pub group_ids: Vec<u64>,
+    /// Exact 0-based pages belonging to this B-tree. Older manifests omit this
+    /// and fall back to group-level attribution.
+    #[serde(default)]
+    pub pages: Vec<u64>,
 }

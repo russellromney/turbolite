@@ -159,6 +159,7 @@ pub fn import_sqlite_file(
                     name: entry.name.clone(),
                     obj_type: entry.obj_type.clone(),
                     group_ids: gids,
+                    pages: entry.pages.clone(),
                 },
             );
         }

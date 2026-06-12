@@ -80,6 +80,19 @@ SEARCH posts USING INDEX idx_posts_user_created (user_id=?)";
 }
 
 #[test]
+fn test_attach_integer_constraint_hints_annotates_search_constraints() {
+    let eqp = "\
+SEARCH posts USING INDEX idx_posts_user (user_id=?)
+SCAN likes";
+    let mut result = parse_eqp_output(eqp);
+    attach_integer_constraint_hints(&mut result, &[42]);
+
+    assert_eq!(result[0].constraint_columns, vec!["user_id=42".to_string()]);
+    assert_eq!(first_integer_constraint_hint(&result[0]), Some(42));
+    assert!(result[1].constraint_columns.is_empty());
+}
+
+#[test]
 fn test_parse_covering_index() {
     let eqp = "SEARCH users USING COVERING INDEX idx_users_email_name (email=?)";
     let result = parse_eqp_output(eqp);

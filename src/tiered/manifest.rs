@@ -356,12 +356,20 @@ impl Manifest {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
                 self.group_to_tree_name.insert(gid, entry.name.clone());
             }
-            // Reverse index from pages -> tree name
-            for &gid in &entry.group_ids {
-                if let Some(pages) = self.group_pages.get(gid as usize) {
-                    for &page_num in pages {
-                        self.page_to_tree_name.insert(page_num, entry.name.clone());
+            // Reverse index from exact B-tree pages -> tree name. Manifests
+            // written before per-tree pages existed fall back to group-level
+            // attribution, which is less precise for small packed B-trees.
+            if entry.pages.is_empty() {
+                for &gid in &entry.group_ids {
+                    if let Some(pages) = self.group_pages.get(gid as usize) {
+                        for &page_num in pages {
+                            self.page_to_tree_name.insert(page_num, entry.name.clone());
+                        }
                     }
+                }
+            } else {
+                for &page_num in &entry.pages {
+                    self.page_to_tree_name.insert(page_num, entry.name.clone());
                 }
             }
             // Tree name -> group IDs

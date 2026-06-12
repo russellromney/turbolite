@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 use turbolite::tiered::{
-    parse_eqp_output, push_planned_accesses, set_local_checkpoint_only, CacheConfig,
-    CompressionConfig, PrefetchConfig, TurboliteConfig, TurboliteSharedState, TurboliteVfs,
+    attach_integer_constraint_hints, parse_eqp_output, push_planned_accesses,
+    set_local_checkpoint_only, CacheConfig, CompressionConfig, PrefetchConfig, TurboliteConfig,
+    TurboliteSharedState, TurboliteVfs,
 };
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1048,7 +1049,15 @@ fn push_query_plan(conn: &Connection, sql: &str, params: &[rusqlite::types::Valu
             &output
         );
     }
-    let accesses = parse_eqp_output(&output);
+    let mut accesses = parse_eqp_output(&output);
+    let integer_params: Vec<i64> = params
+        .iter()
+        .filter_map(|value| match value {
+            rusqlite::types::Value::Integer(value) => Some(*value),
+            _ => None,
+        })
+        .collect();
+    attach_integer_constraint_hints(&mut accesses, &integer_params);
     if std::env::var("BENCH_VERBOSE").is_ok() {
         let names: Vec<&str> = accesses.iter().map(|a| a.tree_name.as_str()).collect();
         eprintln!("  [push-plan] parsed={:?}", names);
@@ -1565,7 +1574,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             .expect("failed to check S3 manifest");
 
         let is_auto = cli.import.as_deref() == Some("auto");
-        if is_auto && existing_manifest.is_some() {
+        if is_auto && existing_manifest.is_some() && !cli.force {
             let m = existing_manifest.unwrap();
             eprintln!(
                 "[bench] S3 data already exists at prefix '{}' ({} pages, {} groups), skipping generation",

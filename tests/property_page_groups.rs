@@ -219,6 +219,7 @@ proptest! {
             name: "test_table".into(),
             obj_type: "table".into(),
             group_ids: (0..num_groups).collect(),
+            pages: all_pages.clone(),
         });
 
         let mut manifest = Manifest {

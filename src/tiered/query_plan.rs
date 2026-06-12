@@ -41,6 +41,39 @@ pub struct PlannedAccess {
     pub constraint_columns: Vec<String>,
 }
 
+/// Attach simple integer equality hints to planned SEARCH constraints.
+///
+/// The EQP text only says `col=?`; callers that still have the query's bound
+/// values can annotate that as `col=123`. Consumers must treat this as an
+/// advisory hint and fall back when it is absent.
+pub fn attach_integer_constraint_hints(accesses: &mut [PlannedAccess], values: &[i64]) {
+    if values.is_empty() {
+        return;
+    }
+    let mut value_iter = values.iter();
+    for access in accesses.iter_mut() {
+        if access.access_type != AccessType::Search {
+            continue;
+        }
+        for column in &mut access.constraint_columns {
+            if column.contains('=') {
+                continue;
+            }
+            let Some(value) = value_iter.next() else {
+                return;
+            };
+            *column = format!("{}={}", column, value);
+        }
+    }
+}
+
+pub(crate) fn first_integer_constraint_hint(access: &PlannedAccess) -> Option<i64> {
+    access.constraint_columns.iter().find_map(|column| {
+        let (_name, value) = column.split_once('=')?;
+        value.trim().parse::<i64>().ok()
+    })
+}
+
 #[derive(Debug, Clone)]
 struct PlannedAccessBatch {
     id: u64,

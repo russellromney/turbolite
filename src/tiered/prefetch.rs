@@ -453,11 +453,6 @@ impl PrefetchMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn lookahead_bailout_uncached(&self) {
-        self.lookahead_bailout_uncached
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     fn lookahead_bailout_parse(&self) {
         self.lookahead_bailout_parse.fetch_add(1, Ordering::Relaxed);
     }
@@ -1651,6 +1646,46 @@ impl PrefetchPool {
         self.active_gids.lock().contains(&gid)
     }
 
+    pub(crate) fn is_frame_pending(&self, gid: u64, frame_idx: usize) -> bool {
+        let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
+            return false;
+        };
+        self.queued_frame_ids.lock().contains(&id) || self.active_frame_ids.lock().contains(&id)
+    }
+
+    pub(crate) fn wait_for_frame_page(
+        &self,
+        cache: &DiskCache,
+        gid: u64,
+        frame_idx: usize,
+        page_num: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if cache.is_present(page_num) {
+                return true;
+            }
+            let pending = self.queued_frame_ids.lock().contains(&id)
+                || self.active_frame_ids.lock().contains(&id);
+            if !pending {
+                return false;
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let wait_for = remaining.min(std::time::Duration::from_millis(5));
+            match self.done_rx.recv_timeout(wait_for) {
+                Ok(_gid) => {}
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
     pub(crate) fn cancel_optional_fetching(&self, gid: u64) -> bool {
         let active = self.active_gids.lock();
         if active.contains(&gid) {
@@ -1708,10 +1743,6 @@ impl PrefetchPool {
 
     pub(crate) fn record_lookahead_bailout_no_anchor(&self) {
         self.metrics.lookahead_bailout_no_anchor();
-    }
-
-    pub(crate) fn record_lookahead_bailout_uncached(&self) {
-        self.metrics.lookahead_bailout_uncached();
     }
 
     pub(crate) fn record_lookahead_bailout_parse(&self) {

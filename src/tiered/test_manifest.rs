@@ -382,6 +382,53 @@ fn test_manifest_btree_page_location_non_sequential() {
 }
 
 #[test]
+fn test_manifest_page_to_tree_name_uses_exact_pages_in_shared_group() {
+    let mut manifest = Manifest {
+        page_count: 8,
+        page_size: 4096,
+        pages_per_group: 8,
+        group_pages: vec![vec![0, 1, 2, 3, 4, 5, 6, 7]],
+        btrees: {
+            let mut h = HashMap::new();
+            h.insert(
+                0,
+                BTreeManifestEntry {
+                    name: "users".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                    pages: vec![0, 1, 2],
+                },
+            );
+            h.insert(
+                4,
+                BTreeManifestEntry {
+                    name: "posts".into(),
+                    obj_type: "table".into(),
+                    group_ids: vec![0],
+                    pages: vec![4, 5, 6],
+                },
+            );
+            h
+        },
+        ..Manifest::empty()
+    };
+    manifest.build_page_index();
+
+    assert_eq!(
+        manifest.page_to_tree_name.get(&1).map(String::as_str),
+        Some("users")
+    );
+    assert_eq!(
+        manifest.page_to_tree_name.get(&5).map(String::as_str),
+        Some("posts")
+    );
+    assert!(
+        !manifest.page_to_tree_name.contains_key(&7),
+        "unclaimed page in a shared group must not inherit another tree name"
+    );
+}
+
+#[test]
 fn test_manifest_serde_roundtrip_btree_groups() {
     // group_pages and btrees must survive JSON serialization.
     // page_index is #[serde(skip)] and rebuilt from group_pages.
@@ -404,6 +451,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
                     name: "users".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0],
+                    pages: vec![0, 5, 10, 15],
                 },
             );
             h.insert(
@@ -412,6 +460,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
                     name: "idx_users_name".into(),
                     obj_type: "index".into(),
                     group_ids: vec![1],
+                    pages: vec![1, 2, 3, 4],
                 },
             );
             h
@@ -686,6 +735,7 @@ fn test_prefetch_siblings() {
                 name: "test_table".into(),
                 obj_type: "table".into(),
                 group_ids: vec![0, 1],
+                pages: Vec::new(),
             },
         )]),
         ..Manifest::empty()

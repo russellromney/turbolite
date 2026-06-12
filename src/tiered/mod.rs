@@ -109,8 +109,8 @@ pub use vfs::TurboliteVfs;
 pub use wire::{base_anchor_checksum, PayloadVersionError};
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{
-    check_and_clear_end_query, parse_eqp_output, push_planned_accesses, run_eqp_and_parse,
-    signal_end_query, AccessType, PlannedAccess,
+    attach_integer_constraint_hints, check_and_clear_end_query, parse_eqp_output,
+    push_planned_accesses, run_eqp_and_parse, signal_end_query, AccessType, PlannedAccess,
 };
 #[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;

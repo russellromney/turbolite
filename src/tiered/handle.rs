@@ -4,8 +4,8 @@ use crate::{DatabaseHandle, LockKind};
 use hadb_storage::StorageBackend;
 use tokio::runtime::Handle as TokioHandle;
 
-use super::btree_peek::parse_index_leaf_rowids;
-use super::lookahead::resolve_rowids_to_pages_with_paths;
+use super::btree_peek::{parse_index_leaf_rowids, parse_table_leaf_rowids};
+use super::lookahead::resolve_rowids_to_pages_with_paths_and_known_interiors;
 use super::storage as storage_helpers;
 use std::ops::Range;
 
@@ -23,6 +23,14 @@ struct RetainedLookahead {
     index_tree_name: String,
     table_name: String,
     rowids: Vec<i64>,
+    first_int_keys: Vec<Option<i64>>,
+    key_hint: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedLookaheadSearch {
+    table_name: String,
+    key_hint: Option<i64>,
 }
 
 fn anchored_lookahead_window(
@@ -56,6 +64,76 @@ fn anchored_lookahead_window(
     Some(start..end)
 }
 
+fn key_or_anchor_lookahead_window(
+    row_count: usize,
+    first_int_keys: &[Option<i64>],
+    key_hint: Option<i64>,
+    anchor_matches: &[usize],
+    cap: usize,
+) -> Option<Range<usize>> {
+    if row_count == 0 || cap == 0 {
+        return None;
+    }
+    let key_matches: Vec<usize> = key_hint
+        .map(|hint| {
+            first_int_keys
+                .iter()
+                .take(row_count)
+                .enumerate()
+                .filter_map(|(idx, key)| (*key == Some(hint)).then_some(idx))
+                .collect()
+        })
+        .unwrap_or_default();
+    if key_matches.is_empty() {
+        if anchor_matches.is_empty() {
+            return None;
+        }
+        return anchored_lookahead_window(row_count, anchor_matches, cap);
+    }
+
+    let first = key_matches[0];
+    let last = *key_matches.last().unwrap_or(&first);
+    if last + 1 - first <= cap {
+        return Some(first..last + 1);
+    }
+
+    let key_anchor_matches: Vec<usize> = anchor_matches
+        .iter()
+        .copied()
+        .filter(|idx| *idx >= first && *idx <= last)
+        .collect();
+    let anchor_for_key = if key_anchor_matches.is_empty() {
+        vec![first]
+    } else {
+        key_anchor_matches
+    };
+    anchored_lookahead_window(row_count, &anchor_for_key, cap)
+        .map(|range| range.start.max(first)..range.end.min(last + 1))
+        .filter(|range| range.start < range.end)
+}
+
+fn anchored_frame_window(frame_count: usize, anchor_frame: usize, cap: usize) -> Range<usize> {
+    if frame_count == 0 || cap == 0 {
+        return 0..0;
+    }
+    let cap = frame_count.min(cap);
+    let mut start = anchor_frame.saturating_sub(cap / 2);
+    if start + cap > frame_count {
+        start = frame_count - cap;
+    }
+    start..start + cap
+}
+
+fn lookahead_frame_wait_timeout() -> std::time::Duration {
+    static WAIT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*WAIT_MS.get_or_init(|| {
+        std::env::var("TURBOLITE_LOOKAHEAD_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(32)
+    }))
+}
+
 fn manifest_usable_size(manifest: &Manifest) -> usize {
     let reserved = manifest
         .db_header
@@ -64,6 +142,19 @@ fn manifest_usable_size(manifest: &Manifest) -> usize {
         .copied()
         .unwrap_or(0) as usize;
     (manifest.page_size as usize).saturating_sub(reserved)
+}
+
+fn tree_groups_all_present(manifest: &Manifest, cache: &DiskCache, tree_name: &str) -> bool {
+    manifest
+        .tree_name_to_groups
+        .get(tree_name)
+        .map(|groups| {
+            !groups.is_empty()
+                && groups
+                    .iter()
+                    .all(|gid| cache.group_state(*gid) == GroupState::Present)
+        })
+        .unwrap_or(false)
 }
 
 /// Database handle for tiered turbolite storage.
@@ -116,7 +207,7 @@ pub struct TurboliteHandle {
     /// Tree names from current query plan that are SEARCH (not SCAN).
     search_trees: HashSet<String>,
     /// SEARCH index tree -> table tree mappings from the current query plan.
-    planned_lookahead_searches: HashMap<String, String>,
+    planned_lookahead_searches: HashMap<String, PlannedLookaheadSearch>,
     /// Parsed index-leaf rowids retained until the first anchored table miss.
     retained_lookahead: HashMap<String, RetainedLookahead>,
     /// Fixed thread pool for background prefetch.
@@ -949,14 +1040,17 @@ impl TurboliteHandle {
                     }
                     return;
                 }
-                let Some(table_name) = self.planned_lookahead_searches.get(tree_name).cloned()
+                let Some(planned_search) = self.planned_lookahead_searches.get(tree_name).cloned()
                 else {
                     return;
                 };
+                if tree_groups_all_present(manifest, cache, &planned_search.table_name) {
+                    return;
+                }
                 let parsed = parse_index_leaf_rowids(
                     page,
                     page_num == 0,
-                    256,
+                    usize::MAX,
                     Some(manifest_usable_size(manifest)),
                 );
                 if parsed.rowids.is_empty() {
@@ -971,16 +1065,18 @@ impl TurboliteHandle {
                     pool.record_lookahead_retained(parsed.rowids.len() as u64);
                 }
                 self.retained_lookahead.insert(
-                    table_name.clone(),
+                    planned_search.table_name.clone(),
                     RetainedLookahead {
                         index_tree_name: tree_name.clone(),
-                        table_name,
+                        table_name: planned_search.table_name.clone(),
                         rowids: parsed.rowids,
+                        first_int_keys: parsed.first_int_keys,
+                        key_hint: planned_search.key_hint,
                     },
                 );
             }
             Some(0x0d) if self.retained_lookahead.contains_key(tree_name) => {
-                self.fire_retained_lookahead(tree_name, page_num, cache, manifest);
+                self.fire_retained_lookahead(tree_name, page_num, Some(page), cache, manifest);
             }
             _ => {}
         }
@@ -990,52 +1086,72 @@ impl TurboliteHandle {
         &mut self,
         table_name: &str,
         anchor_page_num: u64,
+        anchor_page: Option<&[u8]>,
         cache: &DiskCache,
         manifest: &Manifest,
     ) {
-        let Some(retained) = self.retained_lookahead.remove(table_name) else {
+        let Some(retained) = self.retained_lookahead.get(table_name).cloned() else {
             return;
         };
         let Some(pool) = self.prefetch_pool.as_ref().map(Arc::clone) else {
+            self.retained_lookahead.remove(table_name);
             return;
         };
         if manifest.sub_pages_per_frame == 0 {
             pool.record_lookahead_bailout_no_frames();
+            self.retained_lookahead.remove(table_name);
             return;
         }
         let Some(&table_root_page) = manifest.tree_name_to_root_page.get(&retained.table_name)
         else {
             pool.record_lookahead_bailout_no_anchor();
+            self.retained_lookahead.remove(table_name);
             return;
         };
 
-        let resolutions =
-            resolve_rowids_to_pages_with_paths(table_root_page, &retained.rowids, cache);
-        let anchor_matches: Vec<usize> = resolutions
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, r)| {
-                (r.page_num == Some(anchor_page_num) || r.path.contains(&anchor_page_num))
-                    .then_some(idx)
-            })
-            .collect();
-        let Some(window) = anchored_lookahead_window(retained.rowids.len(), &anchor_matches, 32)
-        else {
-            if resolutions.iter().any(|r| r.page_num.is_none()) {
-                pool.record_lookahead_bailout_uncached();
-            } else {
-                pool.record_lookahead_bailout_no_anchor();
+        let mut anchor_matches = Vec::new();
+        if let Some(anchor_page) = anchor_page {
+            let anchor_leaf_rowids =
+                parse_table_leaf_rowids(anchor_page, anchor_page_num == 0, usize::MAX);
+            if !anchor_leaf_rowids.rowids.is_empty() {
+                let anchor_rowids: HashSet<i64> = anchor_leaf_rowids.rowids.into_iter().collect();
+                anchor_matches.extend(
+                    retained
+                        .rowids
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, rowid)| anchor_rowids.contains(rowid).then_some(idx)),
+                );
             }
+        }
+
+        let Some(window) = key_or_anchor_lookahead_window(
+            retained.rowids.len(),
+            &retained.first_int_keys,
+            retained.key_hint,
+            &anchor_matches,
+            32,
+        ) else {
+            pool.record_lookahead_bailout_no_anchor();
+            self.retained_lookahead.remove(table_name);
             return;
         };
 
         let sub_ppf = manifest.sub_pages_per_frame as usize;
         if sub_ppf == 0 {
             pool.record_lookahead_bailout_no_frames();
+            self.retained_lookahead.remove(table_name);
             return;
         }
         let mut frames_by_gid: HashMap<u64, HashSet<usize>> = HashMap::new();
-        for resolution in &resolutions[window] {
+        let window_rowids = &retained.rowids[window];
+        let resolutions = resolve_rowids_to_pages_with_paths_and_known_interiors(
+            table_root_page,
+            window_rowids,
+            cache,
+            None,
+        );
+        for resolution in &resolutions {
             let Some(page_num) = resolution.page_num else {
                 continue;
             };
@@ -1053,6 +1169,20 @@ impl TurboliteHandle {
                     .entry(loc.group_id)
                     .or_default()
                     .insert(frame_idx);
+            }
+        }
+        if frames_by_gid.is_empty() {
+            if let Some(anchor_loc) = manifest.page_location(anchor_page_num) {
+                let anchor_frame_idx = anchor_loc.index as usize / sub_ppf;
+                if let Some(frame_table) = manifest.frame_tables.get(anchor_loc.group_id as usize) {
+                    for frame_idx in anchored_frame_window(frame_table.len(), anchor_frame_idx, 32)
+                    {
+                        frames_by_gid
+                            .entry(anchor_loc.group_id)
+                            .or_default()
+                            .insert(frame_idx);
+                    }
+                }
             }
         }
 
@@ -1099,8 +1229,10 @@ impl TurboliteHandle {
         }
 
         if submitted_frames > 0 {
+            self.retained_lookahead.remove(table_name);
             pool.record_lookahead_fired(submitted_frames);
         } else {
+            self.retained_lookahead.remove(table_name);
             pool.record_lookahead_bailout_no_frames();
         }
     }
@@ -1766,8 +1898,13 @@ impl DatabaseHandle for TurboliteHandle {
                         self.search_trees.insert(access.tree_name.clone());
                         if let Some(table_name) = &access.table_name {
                             if table_name != &access.tree_name {
-                                self.planned_lookahead_searches
-                                    .insert(access.tree_name.clone(), table_name.clone());
+                                self.planned_lookahead_searches.insert(
+                                    access.tree_name.clone(),
+                                    PlannedLookaheadSearch {
+                                        table_name: table_name.clone(),
+                                        key_hint: query_plan::first_integer_constraint_hint(access),
+                                    },
+                                );
                             }
                         }
                     }
@@ -2096,6 +2233,38 @@ impl DatabaseHandle for TurboliteHandle {
                                     &manifest,
                                 );
                                 cache.touch_group(gid);
+                                return Ok(());
+                            }
+                        }
+                        if pool.is_frame_pending(gid, frame_idx) {
+                            let wait_start = Instant::now();
+                            let installed = pool.wait_for_frame_page(
+                                cache,
+                                gid,
+                                frame_idx,
+                                page_num,
+                                lookahead_frame_wait_timeout(),
+                            );
+                            pool.record_foreground_wait(wait_start.elapsed());
+                            if installed && cache.is_present(page_num) {
+                                self.reset_misses(current_tree_name.as_ref());
+                                cache.read_page(page_num, buf)?;
+                                self.detect_interior_page(buf, page_num, cache);
+                                self.record_lookahead_hit_if_present(gid, loc, &manifest);
+                                self.note_served_page_for_lookahead(
+                                    page_num,
+                                    current_tree_name.as_ref(),
+                                    buf,
+                                    cache,
+                                    &manifest,
+                                );
+                                cache.touch_group(gid);
+                                let _ = cache.stat_misses.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |m| Some(m.saturating_sub(1)),
+                                );
+                                cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(());
                             }
                         }
@@ -2967,6 +3136,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         name: entry.name.clone(),
                                         obj_type: entry.obj_type.clone(),
                                         group_ids: gids,
+                                        pages: entry.pages.clone(),
                                     },
                                 );
                             }

@@ -7,6 +7,7 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct IndexLeafRowids {
     pub(crate) rowids: Vec<i64>,
+    pub(crate) first_int_keys: Vec<Option<i64>>,
     pub(crate) overflow_cells: usize,
     pub(crate) malformed_cells: usize,
     pub(crate) stopped_early: bool,
@@ -24,6 +25,13 @@ pub(crate) struct TableInteriorCells {
     /// SQLite's rightmost child pointer, 1-based.
     pub(crate) rightmost_child_page: Option<u32>,
     pub(crate) cells: Vec<TableInteriorCell>,
+    pub(crate) malformed_cells: usize,
+    pub(crate) stopped_early: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TableLeafRowids {
+    pub(crate) rowids: Vec<i64>,
     pub(crate) malformed_cells: usize,
     pub(crate) stopped_early: bool,
 }
@@ -59,7 +67,8 @@ pub(crate) fn parse_index_leaf_rowids(
             out.stopped_early = true;
             break;
         };
-        let Some((rowid, overflowed)) = parse_index_leaf_cell_rowid(page, cell_off, max_local)
+        let Some((rowid, first_int_key, overflowed)) =
+            parse_index_leaf_cell_rowid(page, cell_off, max_local)
         else {
             out.malformed_cells += 1;
             continue;
@@ -68,6 +77,49 @@ pub(crate) fn parse_index_leaf_rowids(
             out.overflow_cells += 1;
             continue;
         }
+        out.rowids.push(rowid);
+        out.first_int_keys.push(first_int_key);
+    }
+
+    out
+}
+
+pub(crate) fn parse_table_leaf_rowids(page: &[u8], page1: bool, cap: usize) -> TableLeafRowids {
+    let mut out = TableLeafRowids::default();
+    if cap == 0 {
+        return out;
+    }
+    let Some(header) = btree_header(page, page1, 8) else {
+        return out;
+    };
+    if page.get(header).copied() != Some(0x0d) {
+        return out;
+    }
+
+    let cell_count = read_u16(page, header + 3).unwrap_or(0) as usize;
+    let pointer_array = header + 8;
+    for i in 0..cell_count {
+        if out.rowids.len() >= cap {
+            out.stopped_early = true;
+            break;
+        }
+        let ptr_off = pointer_array + i * 2;
+        let Some(cell_off) = read_u16(page, ptr_off).map(usize::from) else {
+            out.stopped_early = true;
+            break;
+        };
+        let Some((_payload_len, payload_len_bytes)) = read_varint(page, cell_off) else {
+            out.malformed_cells += 1;
+            continue;
+        };
+        let Some((rowid, _rowid_bytes)) = read_varint(page, cell_off + payload_len_bytes) else {
+            out.malformed_cells += 1;
+            continue;
+        };
+        let Ok(rowid) = i64::try_from(rowid) else {
+            out.malformed_cells += 1;
+            continue;
+        };
         out.rowids.push(rowid);
     }
 
@@ -115,14 +167,14 @@ fn parse_index_leaf_cell_rowid(
     page: &[u8],
     cell_off: usize,
     max_local: usize,
-) -> Option<(i64, bool)> {
+) -> Option<(i64, Option<i64>, bool)> {
     let (payload_len, payload_len_bytes) = read_varint(page, cell_off)?;
     let payload_len = usize::try_from(payload_len).ok()?;
     let payload_start = cell_off.checked_add(payload_len_bytes)?;
     let payload_end = payload_start.checked_add(payload_len)?;
     let overflowed = payload_len > max_local;
     if overflowed || payload_end > page.len() {
-        return Some((0, overflowed));
+        return Some((0, None, overflowed));
     }
 
     let (header_len, header_len_bytes) = read_varint(page, payload_start)?;
@@ -148,17 +200,19 @@ fn parse_index_leaf_cell_rowid(
     let &rowid_serial = serials.last()?;
 
     let mut body_pos = header_end;
+    let first_int_key = read_record_int_key(page, body_pos, serials[0])?;
     for serial in serials.iter().take(serials.len().saturating_sub(1)) {
-        body_pos = body_pos.checked_add(serial_type_size(*serial)?)?;
-        if body_pos > payload_end {
+        let size = serial_type_size(*serial)?;
+        if body_pos.checked_add(size)? > payload_end {
             return None;
         }
+        body_pos = body_pos.checked_add(size)?;
     }
     let rowid_size = serial_type_size(rowid_serial)?;
     if body_pos + rowid_size > payload_end {
         return None;
     }
-    read_record_int(page, body_pos, rowid_serial).map(|rowid| (rowid, false))
+    read_record_int(page, body_pos, rowid_serial).map(|rowid| (rowid, first_int_key, false))
 }
 
 fn btree_header(page: &[u8], page1: bool, header_len: usize) -> Option<usize> {
@@ -255,6 +309,14 @@ fn read_record_int(buf: &[u8], off: usize, serial_type: u64) -> Option<i64> {
     Some((val << shift) >> shift)
 }
 
+fn read_record_int_key(buf: &[u8], off: usize, serial_type: u64) -> Option<Option<i64>> {
+    match serial_type {
+        0 | 7 => Some(None),
+        1..=6 | 8 | 9 => read_record_int(buf, off, serial_type).map(Some),
+        _ => Some(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,15 +399,20 @@ mod tests {
             .expect("index btree");
 
         let mut rowids = Vec::new();
+        let mut first_int_keys = Vec::new();
         for &page_num in &index.pages {
             let page = read_db_page(&file, page_size, page_num).unwrap();
             let header = if page_num == 0 { 100 } else { 0 };
             if page.get(header).copied() == Some(0x0a) {
-                rowids.extend(parse_index_leaf_rowids(page, page_num == 0, 512, None).rowids);
+                let parsed = parse_index_leaf_rowids(page, page_num == 0, 512, None);
+                rowids.extend(parsed.rowids);
+                first_int_keys.extend(parsed.first_int_keys);
             }
         }
         rowids.sort_unstable();
         assert_eq!(rowids, (1..=200).collect::<Vec<_>>());
+        assert!(first_int_keys.contains(&Some(7)));
+        assert!(first_int_keys.contains(&Some(16)));
     }
 
     #[test]

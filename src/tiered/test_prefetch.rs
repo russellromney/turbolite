@@ -449,6 +449,7 @@ fn test_btree_groups_single_btree_multiple_groups() {
                     name: "users".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0, 1, 2],
+                    pages: Vec::new(),
                 },
             );
             h
@@ -485,6 +486,7 @@ fn test_btree_groups_multiple_btrees_disjoint() {
                     name: "table_a".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0, 1],
+                    pages: Vec::new(),
                 },
             );
             h.insert(
@@ -493,6 +495,7 @@ fn test_btree_groups_multiple_btrees_disjoint() {
                     name: "table_b".into(),
                     obj_type: "table".into(),
                     group_ids: vec![2, 3],
+                    pages: Vec::new(),
                 },
             );
             h
@@ -529,6 +532,7 @@ fn test_btree_groups_single_group_btree_has_self_only() {
                     name: "small_table".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0],
+                    pages: Vec::new(),
                 },
             );
             h
@@ -580,6 +584,7 @@ fn test_btree_groups_group_not_in_any_btree() {
                     name: "users".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0, 1], // only groups 0 and 1
+                    pages: Vec::new(),
                 },
             );
             h
@@ -613,6 +618,7 @@ fn test_btree_groups_rebuild_clears_stale() {
                     name: "v1".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0, 1],
+                    pages: Vec::new(),
                 },
             );
             h
@@ -631,6 +637,7 @@ fn test_btree_groups_rebuild_clears_stale() {
             name: "v2_a".into(),
             obj_type: "table".into(),
             group_ids: vec![0],
+            pages: Vec::new(),
         },
     );
     m.btrees.insert(
@@ -639,6 +646,7 @@ fn test_btree_groups_rebuild_clears_stale() {
             name: "v2_b".into(),
             obj_type: "table".into(),
             group_ids: vec![1],
+            pages: Vec::new(),
         },
     );
     m.build_page_index();
@@ -669,6 +677,7 @@ fn test_btree_groups_overwrite_when_group_in_multiple_btrees() {
                     name: "tree_a".into(),
                     obj_type: "table".into(),
                     group_ids: vec![0],
+                    pages: Vec::new(),
                 },
             );
             h.insert(
@@ -677,6 +686,7 @@ fn test_btree_groups_overwrite_when_group_in_multiple_btrees() {
                     name: "tree_b".into(),
                     obj_type: "index".into(),
                     group_ids: vec![0, 1], // group 0 also here
+                    pages: Vec::new(),
                 },
             );
             h

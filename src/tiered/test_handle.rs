@@ -46,6 +46,23 @@ fn lookahead_anchor_window_aims_contiguous_run_around_served_leaf() {
     assert_eq!(anchored_lookahead_window(10, &[], 32), None);
 }
 
+#[test]
+fn lookahead_key_hint_narrows_to_contiguous_key_run() {
+    let mut keys = vec![Some(1); 20];
+    keys.extend(vec![Some(7); 12]);
+    keys.extend(vec![Some(9); 20]);
+
+    assert_eq!(
+        key_or_anchor_lookahead_window(keys.len(), &keys, Some(7), &[2, 3, 4, 21, 22], 32),
+        Some(20..32),
+        "exact key hints must beat noisy table-leaf anchor matches from unrelated keys"
+    );
+    assert_eq!(
+        key_or_anchor_lookahead_window(keys.len(), &keys, None, &[21], 32),
+        anchored_lookahead_window(keys.len(), &[21], 32)
+    );
+}
+
 fn handle_with_manifest(
     dir: &TempDir,
     page_group_keys: Vec<String>,
@@ -451,6 +468,8 @@ fn retained_lookahead_missing_table_root_bails_without_firing() {
             index_tree_name: "idx_posts_user_created".to_string(),
             table_name: "posts".to_string(),
             rowids: vec![1, 2, 3],
+            first_int_keys: vec![Some(7), Some(7), Some(7)],
+            key_hint: Some(7),
         },
     );
 
@@ -459,7 +478,7 @@ fn retained_lookahead_missing_table_root_bails_without_firing() {
     manifest.frame_tables = vec![vec![FrameEntry { offset: 0, len: 1 }]];
     handle.manifest.store(Arc::new(manifest.clone()));
     assert!(!manifest.tree_name_to_root_page.contains_key("posts"));
-    handle.fire_retained_lookahead("posts", 0, cache.as_ref(), &manifest);
+    handle.fire_retained_lookahead("posts", 0, None, cache.as_ref(), &manifest);
 
     let stats = pool.stats_json();
     assert_eq!(stats["lookahead"]["fired"], 0);
@@ -702,9 +721,13 @@ fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_fram
     handle.prefetch_pool = Some(Arc::clone(&pool));
     handle.query_plan_prefetch = true;
     handle.lookahead_enabled = true;
-    handle
-        .planned_lookahead_searches
-        .insert("idx_items_category_bucket".to_string(), "items".to_string());
+    handle.planned_lookahead_searches.insert(
+        "idx_items_category_bucket".to_string(),
+        PlannedLookaheadSearch {
+            table_name: "items".to_string(),
+            key_hint: None,
+        },
+    );
 
     let manifest_arc = shared_manifest.load_full();
     let index_page = sqlite_page(&db, page_size, index_leaf_page_num);
@@ -722,7 +745,13 @@ fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_fram
             .map(|retained| retained.rowids.len()),
         Some(index_rowids.len())
     );
-    handle.fire_retained_lookahead("items", anchor_page_num, cache.as_ref(), &manifest_arc);
+    handle.fire_retained_lookahead(
+        "items",
+        anchor_page_num,
+        Some(sqlite_page(&db, page_size, anchor_page_num)),
+        cache.as_ref(),
+        &manifest_arc,
+    );
 
     let mut submitted_frames = Vec::new();
     for _ in 0..1000 {
@@ -739,6 +768,250 @@ fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_fram
     assert_eq!(
         pool.stats_json()["lookahead"]["frames_submitted"],
         expected_frames.len() as u64
+    );
+
+    backend.release.store(true, Ordering::Release);
+    pool.wait_idle();
+}
+
+#[test]
+fn retained_lookahead_falls_back_to_served_leaf_anchor_when_root_uncached() {
+    query_plan::drain_planned_accesses();
+    let sqlite_dir = TempDir::new().unwrap();
+    let db_path = sqlite_dir.path().join("real_index_uncached_root.db");
+    let writer = rusqlite::Connection::open(&db_path).expect("open sqlite fixture");
+    writer
+        .execute_batch(
+            "PRAGMA page_size=4096;
+             CREATE TABLE items (
+               id INTEGER PRIMARY KEY,
+               category TEXT NOT NULL,
+               bucket INTEGER NOT NULL,
+               payload TEXT NOT NULL
+             );
+             CREATE INDEX idx_items_category_bucket
+               ON items(category, bucket);",
+        )
+        .expect("schema");
+    {
+        let tx = writer.unchecked_transaction().expect("fixture tx");
+        let payload = "y".repeat(180);
+        for n in 0..420i64 {
+            let id = 20_000 + n;
+            tx.execute(
+                "INSERT INTO items (id, category, bucket, payload)
+                 VALUES (?1, 'target', ?2, ?3)",
+                rusqlite::params![id, n, payload],
+            )
+            .expect("insert fixture row");
+        }
+        tx.commit().expect("commit fixture");
+    }
+    let table_root_page_1based: u64 = writer
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'items'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("items rootpage") as u64;
+    drop(writer);
+
+    let db = std::fs::read(&db_path).expect("read sqlite fixture");
+    let page_size = page_size_from_sqlite_header(&db);
+    let page_count = db.len() / page_size;
+    let mut rowid_to_leaf = HashMap::new();
+    let mut index_leaf_candidates = Vec::new();
+    for page_num in 0..page_count as u64 {
+        let page = sqlite_page(&db, page_size, page_num);
+        match sqlite_page_type(page, page_num) {
+            Some(0x0d) => {
+                for rowid in table_leaf_rowids_for_test(page, page_num) {
+                    if rowid >= 20_000 {
+                        rowid_to_leaf.insert(rowid, page_num);
+                    }
+                }
+            }
+            Some(0x0a) => {
+                let parsed = parse_index_leaf_rowids(page, page_num == 0, 256, Some(page_size));
+                if parsed.rowids.len() > 32 {
+                    index_leaf_candidates.push((page_num, parsed.rowids));
+                }
+            }
+            _ => {}
+        }
+    }
+    let (index_leaf_page_num, index_rowids) = index_leaf_candidates
+        .into_iter()
+        .max_by_key(|(_, rowids)| rowids.len())
+        .expect("fixture should have a populated index leaf");
+    let anchor_rowid = index_rowids[index_rowids.len() / 2];
+    let anchor_page_num = *rowid_to_leaf
+        .get(&anchor_rowid)
+        .expect("anchor rowid should resolve to a table leaf");
+
+    let pages: Vec<Option<Vec<u8>>> = (0..page_count as u64)
+        .map(|page_num| Some(sqlite_page(&db, page_size, page_num).to_vec()))
+        .collect();
+    let (blob, frame_table) = encode_page_group_seekable(
+        &pages,
+        page_size as u32,
+        1,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        &[],
+        None,
+    )
+    .expect("encode seekable fixture");
+
+    let cache_dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(
+            cache_dir.path(),
+            3600,
+            page_count as u32,
+            1,
+            page_size as u32,
+            page_count as u64,
+            None,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut manifest = Manifest {
+        page_count: page_count as u64,
+        page_size: page_size as u32,
+        pages_per_group: page_count as u32,
+        sub_pages_per_frame: 1,
+        page_group_keys: vec!["g0".to_string()],
+        group_pages: vec![(0..page_count as u64).collect()],
+        frame_tables: vec![frame_table.clone()],
+        tree_name_to_root_page: HashMap::from([("items".to_string(), table_root_page_1based - 1)]),
+        page_to_tree_name: HashMap::from([
+            (index_leaf_page_num, "idx_items_category_bucket".to_string()),
+            (anchor_page_num, "items".to_string()),
+        ]),
+        ..Manifest::empty()
+    };
+    manifest.tree_name_to_groups = HashMap::from([
+        ("items".to_string(), vec![0]),
+        ("idx_items_category_bucket".to_string(), vec![0]),
+    ]);
+
+    cache
+        .write_pages_scattered(
+            &[anchor_page_num],
+            sqlite_page(&db, page_size, anchor_page_num),
+            0,
+            anchor_page_num as u32,
+        )
+        .unwrap();
+
+    let backend = Arc::new(BlockingRangeSeekableBackend {
+        blob,
+        release: AtomicBool::new(false),
+        range_gets: AtomicU64::new(0),
+    });
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest.clone()));
+    let storage: Arc<dyn StorageBackend> = backend.clone();
+    let mut handle = TurboliteHandle::new_tiered(
+        Some(storage.clone()),
+        Some(rt.handle().clone()),
+        Arc::clone(&cache),
+        Arc::clone(&shared_manifest),
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        cache_dir.path().join("uncached-root.lock"),
+        page_count as u32,
+        0,
+        true,
+        vec![0.3, 0.3, 0.4],
+        vec![0.0, 0.0, 0.0],
+        None,
+        false,
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        false,
+        false,
+        4,
+        32 * 1024 * 1024,
+        None,
+        false,
+        0,
+        0,
+        false,
+        true,
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+    let pool = Arc::new(PrefetchPool::new(
+        1,
+        storage,
+        rt.handle().clone(),
+        Arc::clone(&cache),
+        page_count as u32,
+        Arc::new(AtomicU64::new(page_count as u64)),
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        Arc::clone(&shared_manifest),
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+        64,
+        RemoteIoBudget::new(1, 0),
+    ));
+    handle.prefetch_pool = Some(Arc::clone(&pool));
+    handle.query_plan_prefetch = true;
+    handle.lookahead_enabled = true;
+    handle.planned_lookahead_searches.insert(
+        "idx_items_category_bucket".to_string(),
+        PlannedLookaheadSearch {
+            table_name: "items".to_string(),
+            key_hint: None,
+        },
+    );
+
+    let manifest_arc = shared_manifest.load_full();
+    handle.note_served_page_for_lookahead(
+        index_leaf_page_num,
+        Some(&"idx_items_category_bucket".to_string()),
+        sqlite_page(&db, page_size, index_leaf_page_num),
+        cache.as_ref(),
+        &manifest_arc,
+    );
+    handle.fire_retained_lookahead(
+        "items",
+        anchor_page_num,
+        Some(sqlite_page(&db, page_size, anchor_page_num)),
+        cache.as_ref(),
+        &manifest_arc,
+    );
+
+    let anchor_frame = anchor_page_num as usize;
+    let mut expected_frames: Vec<usize> =
+        anchored_frame_window(frame_table.len(), anchor_frame, 32).collect();
+    expected_frames.retain(|frame| *frame != anchor_frame);
+    let mut submitted_frames = Vec::new();
+    for _ in 0..1000 {
+        submitted_frames = pool.pending_frame_indices_for_gid(0);
+        if !submitted_frames.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        submitted_frames, expected_frames,
+        "served-leaf fallback should submit the bounded contiguous frame run around the anchor"
+    );
+    assert_eq!(pool.stats_json()["lookahead"]["fired"], 1);
+    assert_eq!(
+        pool.stats_json()["lookahead"]["bailouts"]["uncached"],
+        0,
+        "served leaf should provide the anchor even when the table root is not cached"
     );
 
     backend.release.store(true, Ordering::Release);

@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::Ordering;
 
@@ -41,16 +42,22 @@ pub(crate) fn resolve_rowids_to_pages(
         .collect()
 }
 
-pub(crate) fn resolve_rowids_to_pages_with_paths(
+pub(crate) fn resolve_rowids_to_pages_with_paths_and_known_interiors(
     table_root_page: u64,
     rowids: &[i64],
     cache: &DiskCache,
+    known_table_interiors: Option<&HashSet<u64>>,
 ) -> Vec<RowidPathResolution> {
     rowids
         .iter()
         .copied()
-        .map(
-            |rowid| match resolve_rowid_to_page_with_path(table_root_page, rowid, cache) {
+        .map(|rowid| {
+            match resolve_rowid_to_page_with_path(
+                table_root_page,
+                rowid,
+                cache,
+                known_table_interiors,
+            ) {
                 Ok((page_num, path)) => RowidPathResolution {
                     rowid,
                     page_num,
@@ -61,8 +68,8 @@ pub(crate) fn resolve_rowids_to_pages_with_paths(
                     page_num: None,
                     path: Vec::new(),
                 },
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -128,6 +135,7 @@ fn resolve_rowid_to_page_with_path(
     table_root_page: u64,
     rowid: i64,
     cache: &DiskCache,
+    known_table_interiors: Option<&HashSet<u64>>,
 ) -> io::Result<(Option<u64>, Vec<u64>)> {
     let mut page_num = table_root_page;
     let page_size = cache.page_size.load(Ordering::Acquire) as usize;
@@ -157,6 +165,12 @@ fn resolve_rowid_to_page_with_path(
                 let child_page = u64::from(child_1based - 1);
                 if !cache.is_present(child_page) {
                     path.push(child_page);
+                    if known_table_interiors
+                        .map(|interiors| !interiors.contains(&child_page))
+                        .unwrap_or(false)
+                    {
+                        return Ok((Some(child_page), path));
+                    }
                     let inferred = parent_has_cached_table_leaf_child(&interior, cache, page_size)
                         .then_some(child_page);
                     return Ok((inferred, path));
@@ -353,6 +367,73 @@ mod tests {
         let resolved = resolve_rowids_to_pages(table.root_page, &[1500], &cache);
         assert_eq!(resolved[0].rowid, 1500);
         assert_eq!(resolved[0].page_num, None);
+    }
+
+    #[test]
+    fn resolver_infers_uncached_leaf_when_table_interiors_are_known_complete() {
+        let (_dir, file, page_size, table) = build_resolver_fixture();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(
+            cache_dir.path(),
+            3600,
+            8,
+            1,
+            page_size as u32,
+            4000,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut known_interiors = HashSet::new();
+        let mut target = None;
+        for &page_num in &table.pages {
+            let page = read_db_page(&file, page_size, page_num).unwrap();
+            let hdr = if page_num == 0 { 100 } else { 0 };
+            if page.get(hdr).copied() != Some(0x05) {
+                continue;
+            }
+            cache.write_page(page_num, page).unwrap();
+            known_interiors.insert(page_num);
+            let interior = parse_table_interior_cells(page, page_num == 0);
+            for child_1based in interior
+                .cells
+                .iter()
+                .map(|cell| cell.child_page)
+                .chain(interior.rightmost_child_page)
+            {
+                if child_1based == 0 {
+                    continue;
+                }
+                let child_page_num = u64::from(child_1based - 1);
+                let child = read_db_page(&file, page_size, child_page_num).unwrap();
+                let child_hdr = if child_page_num == 0 { 100 } else { 0 };
+                if child.get(child_hdr).copied() == Some(0x0d) {
+                    let rowid = table_leaf_rowids(child, child_page_num == 0)
+                        .into_iter()
+                        .next()
+                        .expect("leaf rowid");
+                    target = Some((rowid, child_page_num));
+                    break;
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+        }
+        let (rowid, expected_leaf) = target.expect("leaf child");
+
+        let resolved = resolve_rowids_to_pages_with_paths_and_known_interiors(
+            table.root_page,
+            &[rowid],
+            &cache,
+            Some(&known_interiors),
+        );
+        assert_eq!(resolved[0].page_num, Some(expected_leaf));
+        assert!(
+            resolved[0].path.contains(&expected_leaf),
+            "path should record the inferred leaf"
+        );
     }
 
     #[test]
