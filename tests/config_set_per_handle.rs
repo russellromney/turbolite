@@ -126,6 +126,19 @@ fn turbolite_config_set_rejects_bad_input() {
         format!("{err:?}").contains("invalid hop schedule"),
         "expected invalid-hop-schedule error, got {err:?}"
     );
+
+    // Bad boolean for lookahead.
+    let err = conn
+        .query_row(
+            "SELECT turbolite_config_set('lookahead', 'maybe')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("expected true/false/1/0"),
+        "expected boolean validation error, got {err:?}"
+    );
 }
 
 /// The heisenbug regression test. Two connections, each on its OWN
@@ -290,6 +303,57 @@ fn multi_connection_same_thread_routes_per_connection() {
         settings::peek_top_for_key("prefetch_search").is_none(),
         "queue_b (top of stack) must not carry A's push — the closure \
          bypasses the thread-local and pushes directly to queue_a"
+    );
+}
+
+/// Same-thread routing for the lookahead key specifically. The generic
+/// schedule tests above prove the queue mechanism; this pins the exact
+/// per-query lookahead knob so connection A cannot accidentally enable
+/// lookahead on connection B.
+#[test]
+fn lookahead_key_routes_per_connection() {
+    let tmp = TempDir::new().unwrap();
+    let vfs_name = unique_name("lookahead_route");
+
+    let vfs = TurboliteVfs::new_local(TurboliteConfig {
+        cache_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("vfs");
+    tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn_a = open_connection(&vfs_name, "lookahead_a.db");
+    let conn_b = open_connection(&vfs_name, "lookahead_b.db");
+    // Stack top is B, but A's SQL function must still push to A's
+    // captured queue.
+
+    let rc: i64 = conn_a
+        .query_row(
+            "SELECT turbolite_config_set('lookahead', 'true')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("A set lookahead");
+    assert_eq!(rc, 0);
+
+    assert!(
+        settings::peek_top_for_key("lookahead").is_none(),
+        "B is top-of-stack and must not inherit A's lookahead=true push"
+    );
+
+    let rc: i64 = conn_b
+        .query_row(
+            "SELECT turbolite_config_set('lookahead', 'false')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("B set lookahead");
+    assert_eq!(rc, 0);
+
+    assert_eq!(
+        settings::peek_top_for_key("lookahead").as_deref(),
+        Some("false"),
+        "B should see only B's own lookahead=false push"
     );
 }
 

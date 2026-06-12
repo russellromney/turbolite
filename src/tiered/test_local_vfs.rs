@@ -111,12 +111,20 @@ fn lookahead_profile_plan(reader: &rusqlite::Connection) -> Vec<query_plan::Plan
 
 type LookaheadProfileReaderResult = (Vec<(i64, String, i64)>, u64, u64, u64, serde_json::Value);
 
+#[derive(Debug, Clone, Copy)]
+enum QueryTimeLookahead {
+    None,
+    Rust(bool),
+    Sql(bool),
+}
+
 fn run_lookahead_profile_reader(
     backend: Arc<CountingStorageBackend>,
     runtime: &tokio::runtime::Runtime,
     cache_dir: &std::path::Path,
     config_lookahead: bool,
-    query_time_lookahead: Option<bool>,
+    query_plan_prefetch: bool,
+    query_time_lookahead: QueryTimeLookahead,
     name_suffix: &str,
 ) -> LookaheadProfileReaderResult {
     query_plan::drain_planned_accesses();
@@ -131,7 +139,7 @@ fn run_lookahead_profile_reader(
     reader_config.prefetch.queue_capacity = 64;
     reader_config.prefetch.io_permits = 16;
     reader_config.prefetch.foreground_reserved_permits = 1;
-    reader_config.prefetch.query_plan = true;
+    reader_config.prefetch.query_plan = query_plan_prefetch;
     reader_config.prefetch.lookahead = config_lookahead;
     reader_config.prefetch.manifest_source = ManifestSource::Remote;
 
@@ -148,18 +156,34 @@ fn run_lookahead_profile_reader(
     )
     .expect("open reader");
 
-    let accesses = lookahead_profile_plan(&reader);
-    shared.clear_cache_all();
-    backend.reset_stats();
-    query_plan::push_planned_accesses(accesses);
-    if let Some(enabled) = query_time_lookahead {
-        crate::tiered::settings::set("lookahead", if enabled { "true" } else { "false" })
-            .expect("set lookahead on active reader handle");
+    if matches!(query_time_lookahead, QueryTimeLookahead::Sql(_)) {
+        crate::install_config_functions(&reader).expect("install turbolite_config_set");
     }
 
+    let accesses = lookahead_profile_plan(&reader);
+    match query_time_lookahead {
+        QueryTimeLookahead::None => {}
+        QueryTimeLookahead::Rust(enabled) => {
+            crate::tiered::settings::set("lookahead", if enabled { "true" } else { "false" })
+                .expect("set lookahead on active reader handle");
+        }
+        QueryTimeLookahead::Sql(enabled) => {
+            let sql = format!(
+                "SELECT turbolite_config_set('lookahead', '{}')",
+                if enabled { "true" } else { "false" }
+            );
+            let rc: i64 = reader
+                .query_row(&sql, [], |row| row.get(0))
+                .expect("set lookahead via SQL function");
+            assert_eq!(rc, 0);
+        }
+    }
     let mut stmt = reader
         .prepare(lookahead_profile_sql())
         .expect("prepare profile");
+    shared.clear_cache_all();
+    backend.reset_stats();
+    query_plan::push_planned_accesses(accesses);
     let mut cursor = stmt.query([7i64]).expect("query profile");
     let mut rows = Vec::new();
     while let Some(row) = cursor.next().expect("step profile row") {
@@ -263,12 +287,8 @@ fn test_local_vfs_sqlite_roundtrip() {
     assert_eq!(val, "hello");
 }
 
-/// Phase 008 fail-first: a true-cold profile-shaped index->table query should
-/// stop paying one foreground range wait per returned row. Current main still
-/// does roughly N serialized foreground ranges; lookahead should reduce that
-/// shape to about b-tree depth plus the first anchored table miss.
 #[test]
-fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
+fn lookahead_profile_query_time_controls_are_e2e() {
     query_plan::drain_planned_accesses();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let inner: Arc<dyn StorageBackend> = Arc::new(MemStorage::new());
@@ -281,7 +301,10 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
     let source_path = source_dir.path().join("lookahead_profile.db");
     let import_cache = TempDir::new().unwrap();
     let reader_cache_off = TempDir::new().unwrap();
-    let reader_cache_on = TempDir::new().unwrap();
+    let reader_cache_rust_on = TempDir::new().unwrap();
+    let reader_cache_sql_on = TempDir::new().unwrap();
+    let reader_cache_sql_off = TempDir::new().unwrap();
+    let reader_cache_plan_off = TempDir::new().unwrap();
 
     let writer = rusqlite::Connection::open(&source_path).expect("open source sqlite");
     writer
@@ -348,50 +371,141 @@ fn lookahead_profile_query_true_cold_foreground_rounds_are_depth_shaped() {
             &runtime,
             reader_cache_off.path(),
             false,
-            None,
+            true,
+            QueryTimeLookahead::None,
             "lookahead_reader_off",
         );
-    let (rows, foreground_ranges, lookahead_fired, lookahead_hits, cache_info) =
+    let (rows_rust_on, foreground_ranges_rust_on, fired_rust_on, hits_rust_on, cache_info_rust_on) =
         run_lookahead_profile_reader(
             backend.clone(),
             &runtime,
-            reader_cache_on.path(),
+            reader_cache_rust_on.path(),
             false,
-            Some(true),
-            "lookahead_reader_query_time_on",
+            true,
+            QueryTimeLookahead::Rust(true),
+            "lookahead_reader_query_time_rust_on",
         );
+    let (rows_sql_on, foreground_ranges_sql_on, fired_sql_on, hits_sql_on, cache_info_sql_on) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_sql_on.path(),
+            false,
+            true,
+            QueryTimeLookahead::Sql(true),
+            "lookahead_reader_query_time_sql_on",
+        );
+    let (rows_sql_off, foreground_ranges_sql_off, fired_sql_off, hits_sql_off, cache_info_sql_off) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_sql_off.path(),
+            true,
+            true,
+            QueryTimeLookahead::Sql(false),
+            "lookahead_reader_query_time_sql_off",
+        );
+    let (
+        rows_plan_off,
+        foreground_ranges_plan_off,
+        fired_plan_off,
+        hits_plan_off,
+        cache_info_plan_off,
+    ) = run_lookahead_profile_reader(
+        backend.clone(),
+        &runtime,
+        reader_cache_plan_off.path(),
+        false,
+        false,
+        QueryTimeLookahead::Sql(true),
+        "lookahead_reader_query_time_plan_off",
+    );
+
     assert_eq!(
-        rows, rows_off,
-        "lookahead must not change profile query results"
+        rows_rust_on, rows_off,
+        "Rust query-time lookahead must not change profile query results"
+    );
+    assert_eq!(
+        rows_sql_on, rows_off,
+        "SQL query-time lookahead must not change profile query results"
+    );
+    assert_eq!(
+        rows_sql_off, rows_off,
+        "SQL query-time lookahead=false must not change profile query results"
+    );
+    assert_eq!(
+        rows_plan_off, rows_off,
+        "SQL query-time lookahead with plan_aware=false must not change profile query results"
     );
     assert_eq!(fired_off, 0, "lookahead-off reader must not fire");
     assert_eq!(hits_off, 0, "lookahead-off reader must not count hits");
     assert!(
-        foreground_ranges_off >= rows.len() as u64,
+        foreground_ranges_off >= rows_off.len() as u64,
         "lookahead-off true-cold profile query should remain row-shaped; foreground_ranges_off={foreground_ranges_off}, cache_info_off={cache_info_off}"
     );
     assert!(
-        lookahead_fired > 0,
-        "query-time lookahead should retain an index leaf and fire at the anchored table leaf; cache_info={cache_info}"
+        fired_rust_on > 0,
+        "Rust query-time lookahead should retain an index leaf and fire at the anchored table leaf; cache_info={cache_info_rust_on}"
     );
     assert!(
-        lookahead_hits > 0,
-        "query-time lookahead should satisfy at least one retained frame demand; cache_info={cache_info}"
+        hits_rust_on > 0,
+        "Rust query-time lookahead should satisfy at least one retained frame demand; cache_info={cache_info_rust_on}"
     );
     assert!(
-        lookahead_hits >= rows.len() as u64,
-        "lookahead should cover at least the returned row count; rows={}, lookahead_hits={lookahead_hits}, cache_info={cache_info}",
-        rows.len()
+        hits_rust_on >= rows_off.len() as u64,
+        "Rust lookahead should cover at least the returned row count; rows={}, hits_rust_on={hits_rust_on}, cache_info={cache_info_rust_on}",
+        rows_off.len()
     );
     assert!(
-        foreground_ranges + 4 <= foreground_ranges_off,
-        "lookahead-on should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges}, cache_info={cache_info}, backend_stats={:?}",
+        foreground_ranges_rust_on + 4 <= foreground_ranges_off,
+        "Rust query-time lookahead should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges_rust_on}, cache_info={cache_info_rust_on}, backend_stats={:?}",
         backend.stats()
     );
     assert!(
-        foreground_ranges < foreground_ranges_off,
-        "lookahead-on should beat the same true-cold query with lookahead off; off={foreground_ranges_off}, on={foreground_ranges}"
+        foreground_ranges_rust_on < foreground_ranges_off,
+        "Rust query-time lookahead should beat the same true-cold query with lookahead off; off={foreground_ranges_off}, on={foreground_ranges_rust_on}"
     );
+
+    assert!(
+        fired_sql_on > 0,
+        "SQL turbolite_config_set('lookahead','true') should fire lookahead; cache_info={cache_info_sql_on}"
+    );
+    assert!(
+        hits_sql_on >= rows_off.len() as u64,
+        "SQL-enabled lookahead should satisfy retained frame demands; rows={}, hits_sql_on={hits_sql_on}, cache_info={cache_info_sql_on}",
+        rows_off.len()
+    );
+    assert!(
+        foreground_ranges_sql_on + 4 <= foreground_ranges_off,
+        "SQL-enabled lookahead should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges_sql_on}, cache_info={cache_info_sql_on}"
+    );
+
+    assert_eq!(
+        fired_sql_off, 0,
+        "SQL turbolite_config_set('lookahead','false') must disable a config-default-on reader; cache_info={cache_info_sql_off}"
+    );
+    assert_eq!(
+        hits_sql_off, 0,
+        "disabled SQL lookahead must not count hits; cache_info={cache_info_sql_off}"
+    );
+    assert!(
+        foreground_ranges_sql_off >= rows_off.len() as u64,
+        "disabled SQL lookahead should preserve row-shaped foreground reads; foreground_ranges_sql_off={foreground_ranges_sql_off}, cache_info={cache_info_sql_off}"
+    );
+
+    assert_eq!(
+        fired_plan_off, 0,
+        "lookahead requires query-plan prefetch; SQL lookahead=true with plan_aware=false must not fire; cache_info={cache_info_plan_off}"
+    );
+    assert_eq!(
+        hits_plan_off, 0,
+        "plan_aware=false must not count lookahead hits; cache_info={cache_info_plan_off}"
+    );
+    assert!(
+        foreground_ranges_plan_off >= rows_off.len() as u64,
+        "plan_aware=false should preserve row-shaped foreground reads; foreground_ranges_plan_off={foreground_ranges_plan_off}, cache_info={cache_info_plan_off}"
+    );
+    query_plan::drain_planned_accesses();
 }
 
 #[test]
