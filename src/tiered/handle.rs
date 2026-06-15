@@ -1728,7 +1728,16 @@ impl DatabaseHandle for TurboliteHandle {
         // and a cached-but-now-out-of-bounds page must NOT short-circuit here —
         // it has to fall through to the slow path's zero-fill. Without the bound
         // a read returned stale pre-truncate bytes.
-        if !(self.dirty_since_sync || self.query_plan_prefetch && self.lookahead_enabled) {
+        //
+        // Lookahead lives entirely in the slow path (index-leaf retain, anchor
+        // fire, hit accounting), so it needs the slow path — but ONLY for
+        // queries that can actually use it. `planned_lookahead_searches` is
+        // populated at plan-drain solely for SEARCH index->table accesses, so a
+        // pure SCAN plan leaves it empty and keeps the fast path. This stops
+        // lookahead from taxing scans/warm reads that it never fires on.
+        let lookahead_active =
+            self.lookahead_enabled && !self.planned_lookahead_searches.is_empty();
+        if !(self.dirty_since_sync || lookahead_active) {
             if let Some(cache) = &self.cache {
                 let current_gen = cache.generation.load(Ordering::Acquire);
                 let page_count = self.manifest.load().page_count;

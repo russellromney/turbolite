@@ -434,6 +434,10 @@ fn planned_scan_read_path_does_not_submit_current_group_to_optional_window() {
 
     let stats = pool.stats_json();
     assert!(stats["max_queued"].as_u64().unwrap() <= 2);
+    // A pure SCAN plan leaves planned_lookahead_searches empty. The read-path
+    // fast path is gated on `lookahead_enabled && !planned_lookahead_searches
+    // .is_empty()`, so an empty map here is exactly what keeps scans on the
+    // fast path instead of paying the lookahead slow path.
     assert!(handle.planned_lookahead_searches.is_empty());
     assert_eq!(stats["lookahead"]["fired"], 0);
     assert!(handle.active_scan_prefetch["users"].submitted.len() <= 2);
@@ -1211,6 +1215,17 @@ fn demand_cache_hit_after_lookahead_frame_install_counts_hit() {
     handle.prefetch_pool = Some(Arc::clone(&pool));
     handle.query_plan_prefetch = true;
     handle.lookahead_enabled = true;
+    // Hits accrue while a lookahead-armed SEARCH query is live: the reads that
+    // consume installed frames happen in the same query that populated
+    // planned_lookahead_searches. The read-path fast path is gated on that map
+    // being non-empty, so reproduce the arming context here.
+    handle.planned_lookahead_searches.insert(
+        "idx_data".to_string(),
+        PlannedLookaheadSearch {
+            table_name: "data".to_string(),
+            key_hint: None,
+        },
+    );
     let mut manifest_for_hit = (**handle.manifest.load()).clone();
     manifest_for_hit.sub_pages_per_frame = 2;
     manifest_for_hit.frame_tables = vec![frame_table.clone()];
