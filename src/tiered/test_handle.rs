@@ -393,7 +393,7 @@ fn scan_prefetch_refill_admits_only_fixed_window() {
 
 #[test]
 fn planned_scan_read_path_does_not_submit_current_group_to_optional_window() {
-    query_plan::drain_planned_accesses();
+    let _plan_guard = query_plan::plan_queue_test_guard();
     let dir = TempDir::new().unwrap();
     let keys: Vec<String> = (0..5).map(|gid| format!("g{gid}")).collect();
     let (mut handle, cache) = handle_with_manifest(&dir, keys);
@@ -493,7 +493,7 @@ fn retained_lookahead_missing_table_root_bails_without_firing() {
 
 #[test]
 fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_frames() {
-    query_plan::drain_planned_accesses();
+    let _plan_guard = query_plan::plan_queue_test_guard();
     let sqlite_dir = TempDir::new().unwrap();
     let db_path = sqlite_dir.path().join("real_index.db");
     let writer = rusqlite::Connection::open(&db_path).expect("open sqlite fixture");
@@ -780,7 +780,7 @@ fn retained_lookahead_from_real_multi_key_index_submits_anchored_contiguous_fram
 
 #[test]
 fn retained_lookahead_falls_back_to_served_leaf_anchor_when_root_uncached() {
-    query_plan::drain_planned_accesses();
+    let _plan_guard = query_plan::plan_queue_test_guard();
     let sqlite_dir = TempDir::new().unwrap();
     let db_path = sqlite_dir.path().join("real_index_uncached_root.db");
     let writer = rusqlite::Connection::open(&db_path).expect("open sqlite fixture");

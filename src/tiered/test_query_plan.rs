@@ -1,13 +1,11 @@
 use super::*;
 
-// The end-query signal (`signal_end_query` / `check_and_clear_end_query`) is
-// process-global, so the tests asserting its exact set/clear semantics must not
-// run concurrently with each other — cargo runs tests in parallel, and a
-// sibling's `check_and_clear_end_query()` would steal a set signal mid-test.
-// Serialize them on this lock. `unwrap_or_else(into_inner)` keeps one test's
-// panic from poisoning the rest.
-static END_QUERY_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static PLAN_QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The plan queue AND the end-query signal are process-global. Any test that
+// touches either must hold `plan_queue_test_guard()` (defined in query_plan.rs),
+// which serializes those tests against each other across ALL test files and
+// resets the queue + signal to a clean slate. This replaces the previous
+// per-file locks, which only serialized within this file and let the
+// cross-file lookahead E2E tests contaminate these via the global mirror.
 
 #[test]
 fn test_parse_search_with_index() {
@@ -121,9 +119,7 @@ COMPOUND SUBQUERY 1";
 
 #[test]
 fn test_queue_push_drain() {
-    let _guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     // Drain any leftover from other tests
     drain_planned_accesses();
 
@@ -154,9 +150,7 @@ fn test_queue_push_drain() {
 
 #[test]
 fn test_queue_accumulates_multiple_pushes() {
-    let _guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     drain_planned_accesses();
     push_planned_accesses(vec![PlannedAccess {
         tree_name: "users".into(),
@@ -179,9 +173,7 @@ fn test_queue_accumulates_multiple_pushes() {
 
 #[test]
 fn test_empty_push_is_noop() {
-    let _guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     drain_planned_accesses();
     push_planned_accesses(vec![]);
     let drained = drain_planned_accesses();
@@ -190,9 +182,7 @@ fn test_empty_push_is_noop() {
 
 #[test]
 fn test_queue_cross_thread_fallback_drains_mirrored_plan() {
-    let _guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     drain_planned_accesses();
 
     let producer = std::thread::spawn(|| {
@@ -213,9 +203,7 @@ fn test_queue_cross_thread_fallback_drains_mirrored_plan() {
 
 #[test]
 fn test_queue_cross_thread_global_drain_suppresses_owner_local_copy() {
-    let _guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     drain_planned_accesses();
 
     let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
@@ -329,18 +317,14 @@ SEARCH users USING INDEX idx_users_email (email=?)";
 
 #[test]
 fn test_end_query_signal_default_false() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     assert!(!check_and_clear_end_query());
 }
 
 #[test]
 fn test_end_query_signal_set_and_clear() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     signal_end_query();
     assert!(check_and_clear_end_query());
@@ -349,9 +333,7 @@ fn test_end_query_signal_set_and_clear() {
 
 #[test]
 fn test_end_query_signal_multiple_signals_collapse() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     signal_end_query();
     signal_end_query();
@@ -366,12 +348,7 @@ fn test_end_query_signal_multiple_signals_collapse() {
 
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _plan_guard = PLAN_QUEUE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     drain_planned_accesses();
 

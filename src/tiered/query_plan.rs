@@ -193,6 +193,38 @@ pub fn check_and_clear_end_query() -> bool {
     END_QUERY_SIGNAL.swap(false, Ordering::AcqRel)
 }
 
+/// Test-only serialization guard for the process-global plan queue.
+///
+/// In production the trace push and the VFS drain (handle.rs read path) run on
+/// the same SQLite-calling thread, so the thread-local queue is authoritative
+/// and the global mirror/fallback is never exercised. Tests are the only place
+/// where multiple connections drive the plan queue in one process, in parallel.
+/// A test whose thread-local is empty (e.g. a top-of-test cleanup drain) would
+/// otherwise hit the cross-thread fallback and consume a *parallel* test's
+/// mirrored batch, making that test's lookahead misfire nondeterministically.
+///
+/// Hold this guard for the duration of any test that pushes/drains the plan
+/// queue or touches the end-query signal. It serializes those tests against
+/// each other (across all test files) and resets the queue + consumed-id set +
+/// end-query signal so each starts from a clean slate. Drop releases the lock.
+/// Not reentrant — acquire it once per test (the mutex is non-recursive).
+#[cfg(test)]
+pub(crate) fn plan_queue_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    let guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    PLAN_QUEUE.with(|q| q.borrow_mut().clear());
+    global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    global_consumed_plan_batch_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    END_QUERY_SIGNAL.store(false, Ordering::Release);
+    guard
+}
+
 /// Parse EXPLAIN QUERY PLAN output text into PlannedAccess entries.
 ///
 /// EQP output rows look like:

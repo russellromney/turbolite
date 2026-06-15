@@ -289,7 +289,7 @@ fn test_local_vfs_sqlite_roundtrip() {
 
 #[test]
 fn lookahead_profile_query_time_controls_are_e2e() {
-    query_plan::drain_planned_accesses();
+    let _plan_guard = query_plan::plan_queue_test_guard();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let inner: Arc<dyn StorageBackend> = Arc::new(MemStorage::new());
     let delayed: Arc<dyn StorageBackend> = Arc::new(DelayedReadStorageBackend::new(
