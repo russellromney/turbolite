@@ -1,0 +1,111 @@
+[bench] main() starting
+[bench] CLI parsed
+=== Tiered VFS Benchmark (Page Group Model) ===
+Bucket:       turbolite-bench--use2-az1--x-s3
+Endpoint:     (default S3)
+Page size:    65536 bytes
+Pages/group:  256 (16.0 MB uncompressed per group)
+Iterations:   10 measured + 2 warmup per cold query, 10 per warm query
+Prefetch:     7 worker threads
+Queries:      post detail, profile, who-liked, mutual friends
+Plan-aware:   ENABLED (Phase Marne query-plan prefetch)
+
+--- 1,000,000 posts, 100,000 users (~812.5 MB, ~13001 pages, ~51 page groups) ---
+    prefetch_search: [0.3, 0.3, 0.4]
+    prefetch_lookup: [0.0, 0.0, 0.0]
+[bench] run_benchmark(1000000) starting
+[bench] generating local DB: /tmp/.tmphxQ2YQ/social_1000000.db
+  Generating: 100,000 users, 1,000,000 posts, 2,500,000 friendships, 3,000,000 likes
+    users inserted: 100,000
+    posts inserted: 1,000,000
+    friendships inserted: 2,500,000
+    likes inserted: 3,000,000
+[local-gen] 1000000 posts, 23294 pages x 65536 bytes = 1455.9 MB
+  Local gen:   47.54s
+[import] file=/tmp/.tmphxQ2YQ/social_1000000.db size=1455.9MB page_size=65536 pages=23294 groups=91
+[import] encoding: seekable multi-frame (sub_ppf=4)
+[import] walking B-trees...
+[import] found 13 B-trees, 1 unowned pages
+[import] packed into 97 groups (was 91 positional)
+[import] encoded 50/97 groups (3 interior pages so far)
+[import] encoded 97/97 groups (15 interior pages so far)
+[import] uploaded 50/97 page groups
+[import] uploaded 97/97 page groups
+[import] interior chunk 15: 2 pages, 110.8KB
+[import] interior chunk 29: 1 pages, 49.7KB
+[import] interior chunk 0: 12 pages, 410.2KB
+[import] uploaded 3 interior chunks
+[import] index chunk 38: 325 pages, 11401.6KB
+[import] index chunk 25: 10 pages, 372.2KB
+[import] index chunk 40: 364 pages, 14026.4KB
+[import] index chunk 5: 9 pages, 361.1KB
+[import] index chunk 32: 14 pages, 538.4KB
+[import] index chunk 24: 13 pages, 492.8KB
+[import] index chunk 34: 9 pages, 346.9KB
+[import] index chunk 3: 12 pages, 500.7KB
+[import] index chunk 36: 320 pages, 11701.9KB
+[import] index chunk 35: 131 pages, 4753.8KB
+[import] index chunk 7: 9 pages, 337.9KB
+[import] index chunk 19: 10 pages, 382.7KB
+[import] index chunk 43: 363 pages, 14019.1KB
+[import] index chunk 29: 9 pages, 385.3KB
+[import] index chunk 9: 10 pages, 414.1KB
+[import] index chunk 18: 17 pages, 649.6KB
+[import] index chunk 13: 6 pages, 232.6KB
+[import] index chunk 42: 363 pages, 13942.4KB
+[import] index chunk 11: 13 pages, 503.3KB
+[import] index chunk 41: 362 pages, 13862.9KB
+[import] index chunk 37: 321 pages, 11809.9KB
+[import] index chunk 20: 11 pages, 437.8KB
+[import] index chunk 21: 9 pages, 363.9KB
+[import] index chunk 23: 12 pages, 471.1KB
+[import] index chunk 45: 174 pages, 6388.4KB
+[import] index chunk 27: 9 pages, 361.5KB
+[import] index chunk 4: 12 pages, 493.9KB
+[import] index chunk 10: 11 pages, 409.2KB
+[import] index chunk 15: 10 pages, 372.4KB
+[import] index chunk 26: 15 pages, 584.0KB
+[import] index chunk 33: 12 pages, 441.9KB
+[import] index chunk 6: 15 pages, 568.3KB
+[import] index chunk 2: 11 pages, 476.3KB
+[import] index chunk 12: 13 pages, 504.5KB
+[import] index chunk 44: 357 pages, 13668.7KB
+[import] index chunk 39: 342 pages, 12773.0KB
+[import] index chunk 0: 32 pages, 612.1KB
+[import] index chunk 14: 16 pages, 639.0KB
+[import] index chunk 22: 13 pages, 481.8KB
+[import] index chunk 28: 14 pages, 562.0KB
+[import] index chunk 8: 14 pages, 550.1KB
+[import] index chunk 31: 11 pages, 447.8KB
+[import] index chunk 17: 10 pages, 372.3KB
+[import] index chunk 1: 11 pages, 433.1KB
+[import] index chunk 16: 11 pages, 433.7KB
+[import] index chunk 30: 10 pages, 421.0KB
+[import] uploaded 46 index leaf chunks
+[import] manifest uploaded: version=670 pages=23294 groups=97 interior_chunks=3 seekable=true
+  S3 import:   12.14s (23294 pages, 97 groups, 3 interior chunks)
+[bench] creating reader VFS...
+[bench] calling TurboliteVfs::with_backend()...
+[bench] TurboliteVfs::with_backend() returned OK
+[bench] registering VFS 'bench_reader_0'
+[bench] VFS registered, opening connection...
+[bench] connection opened, skipping COUNT(*) verification
+  Plan-aware:  ENABLED (Phase Marne query-plan prefetch)
+  profile      schedule: 0.10,0.20,0.30 / 0.00,0.00,0.00,0.00
+
+=== CACHE LEVEL: NONE (everything from S3) ===
+                                  p50        p90        p99    s3 GETs     s3 bytes
+  ------------------------ ---------- ---------- ---------- ---------- ------------
+  [none] profile              280.5ms    313.1ms    313.1ms       31.5       25.8MB
+
+=== REMOTE I/O TAILS (whole run, all modes) ===
+                            count        p50        p95        p99       p999        max
+  foreground_range            194      8.2ms      8.2ms     16.4ms     16.4ms     10.3ms
+  prefetch_group              191     16.4ms     65.5ms     65.5ms     65.5ms     57.4ms
+  foreground_wait              40     65.5ms    131.1ms    131.1ms    131.1ms     89.4ms
+  queue_wait                  193       32us     16.4ms     32.8ms     32.8ms     30.2ms
+  max remote in-flight: 4
+
+
+Reference: Neon cold start ~500ms (us-east-2, compute pool)
+Done.

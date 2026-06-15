@@ -1,0 +1,10 @@
+[1mApp[0m
+ Name     │ turbolite-tiered-bench                                       
+ Owner    │ personal                                                     
+ Hostname │ turbolite-tiered-bench.fly.dev                               
+ Image    │ turbolite-tiered-bench:deployment-01KTYNV9ESFPJE53Z7A3A00KND 
+
+[1mMachines[0m
+ PROCESS │ ID             │ VERSION │ REGION │ STATE   │ ROLE │ CHECKS │ LAST UPDATED         
+ app     │ 7815691b351228 │ 75      │ iad    │ stopped │      │        │ 2026-06-12T19:46:24Z 
+

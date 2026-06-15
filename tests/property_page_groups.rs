@@ -31,6 +31,7 @@ fn make_manifest(
         btree_groups: HashMap::new(),
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
+        tree_name_to_root_page: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None,
         discontinuity_stamp: 0,
@@ -159,7 +160,6 @@ proptest! {
         );
 
         let expected = compute_total_groups(page_count, ppg);
-        prop_assert!(expected >= 0);
         if page_count > 0 {
             prop_assert!(expected > 0);
         }
@@ -219,6 +219,7 @@ proptest! {
             name: "test_table".into(),
             obj_type: "table".into(),
             group_ids: (0..num_groups).collect(),
+            pages: all_pages.clone(),
         });
 
         let mut manifest = Manifest {
@@ -240,6 +241,7 @@ proptest! {
             btree_groups: HashMap::new(),
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
+            tree_name_to_root_page: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
             discontinuity_stamp: 0,

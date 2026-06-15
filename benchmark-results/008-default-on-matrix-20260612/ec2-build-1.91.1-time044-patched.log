@@ -1,0 +1,52 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+   Compiling aws-runtime v1.7.4
+   Compiling libsqlite3-sys v0.33.0
+   Compiling turbolite v0.5.0 (/home/ec2-user/turbolite)
+error[E0405]: cannot find trait `SignMessage` in this scope
+   --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-runtime-1.7.4/src/auth/sigv4.rs:259:35
+    |
+259 |                     )) as Box<dyn SignMessage + Send + Sync>,
+    |                                   ^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these traits
+    |
+  6 + use aws_smithy_eventstream::frame::SignMessage;
+    |
+  6 + use aws_smithy_types::event_stream::SignMessage;
+    |
+
+error[E0405]: cannot find trait `SignMessage` in this scope
+   --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-runtime-1.7.4/src/auth/sigv4.rs:251:33
+    |
+251 |                 .send::<Box<dyn SignMessage + Send + Sync>>(
+    |                                 ^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these traits
+    |
+  6 + use aws_smithy_eventstream::frame::SignMessage;
+    |
+  6 + use aws_smithy_types::event_stream::SignMessage;
+    |
+
+   Compiling rusqlite v0.35.0
+error[E0107]: method takes 0 generic arguments but 1 generic argument was supplied
+   --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-runtime-1.7.4/src/auth/sigv4.rs:251:18
+    |
+251 |                 .send::<Box<dyn SignMessage + Send + Sync>>(
+    |                  ^^^^-------------------------------------- help: remove the unnecessary generics
+    |                  |
+    |                  expected 0 generic arguments
+    |
+note: method defined here, with 0 generic parameters
+   --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-runtime-1.7.4/src/content_encoding/sign.rs:78:19
+    |
+ 78 |     pub(crate) fn send(
+    |                   ^^^^
+
+Some errors have detailed explanations: E0107, E0405.
+For more information about an error, try `rustc --explain E0107`.
+error: could not compile `aws-runtime` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

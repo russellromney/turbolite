@@ -1,0 +1,206 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+info: syncing channel updates for 1.91.1-x86_64-unknown-linux-gnu
+info: latest update on 2025-11-10 for version 1.91.1 (ed61e7d7e 2025-11-07)
+info: downloading 3 components
+
+  1.91.1-x86_64-unknown-linux-gnu installed - rustc 1.91.1 (ed61e7d7e 2025-11-07)
+
+info: checking for self-update (current version: 1.29.0)
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.186
+   Compiling zeroize v1.9.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling smallvec v1.15.2
+   Compiling bytes v1.11.1
+   Compiling scopeguard v1.2.0
+   Compiling pin-project-lite v0.2.17
+   Compiling lock_api v0.4.14
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-core v0.3.32
+   Compiling itoa v1.0.18
+   Compiling typenum v1.20.1
+   Compiling once_cell v1.21.4
+   Compiling futures-sink v0.3.32
+   Compiling fnv v1.0.7
+   Compiling subtle v2.6.1
+   Compiling version_check v0.9.5
+   Compiling autocfg v1.5.1
+   Compiling tracing-core v0.1.36
+   Compiling http v1.4.2
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.117
+   Compiling generic-array v0.14.7
+   Compiling http v0.2.12
+   Compiling futures-task v0.3.32
+   Compiling futures-util v0.3.32
+   Compiling jobserver v0.1.34
+   Compiling cc v1.2.64
+   Compiling http-body v1.0.1
+   Compiling const-oid v0.9.6
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling signal-hook-registry v1.4.8
+   Compiling parking_lot v0.12.5
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling http-body v0.4.6
+   Compiling either v1.16.0
+   Compiling deranged v0.5.8
+   Compiling powerfmt v0.2.0
+   Compiling outref v0.5.2
+   Compiling vsimd v0.8.0
+   Compiling ring v0.17.14
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+   Compiling bytes-utils v0.1.4
+   Compiling num-integer v0.1.46
+   Compiling http-body-util v0.1.3
+   Compiling pin-utils v0.1.0
+   Compiling base64-simd v0.8.0
+   Compiling ryu v1.0.23
+   Compiling cmake v0.1.58
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling untrusted v0.9.0
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling digest v0.10.7
+   Compiling rand_core v0.6.4
+   Compiling equivalent v1.0.2
+   Compiling rustls-pki-types v1.14.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling aws-lc-rs v1.17.0
+   Compiling aws-lc-sys v0.41.0
+   Compiling log v0.4.32
+   Compiling base64ct v1.8.3
+   Compiling percent-encoding v2.3.2
+   Compiling hashbrown v0.17.1
+   Compiling time v0.3.48
+   Compiling pem-rfc7468 v0.7.0
+   Compiling hybrid-array v0.4.12
+   Compiling synstructure v0.13.2
+   Compiling indexmap v2.14.0
+   Compiling crc32fast v1.5.0
+   Compiling httparse v1.10.1
+   Compiling slab v0.4.12
+   Compiling der v0.7.10
+   Compiling cmov v0.5.4
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling ctutils v0.4.2
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling futures-channel v0.3.32
+   Compiling rustls v0.23.40
+   Compiling tower-service v0.3.3
+   Compiling const-oid v0.10.2
+   Compiling ff v0.13.1
+   Compiling base16ct v0.2.0
+   Compiling rustls v0.21.12
+   Compiling atomic-waker v1.1.2
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling zerofrom-derive v0.1.7
+   Compiling tokio v1.52.3
+   Compiling aws-smithy-runtime-api-macros v1.0.0
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling tracing v0.1.44
+   Compiling zerofrom v0.1.8
+   Compiling spki v0.7.3
+   Compiling displaydoc v0.2.6
+   Compiling pkcs8 v0.10.2
+   Compiling digest v0.11.3
+   Compiling yoke v0.8.3
+   Compiling sec1 v0.7.3
+   Compiling group v0.13.0
+   Compiling zerovec v0.11.6
+   Compiling crypto-bigint v0.5.5
+   Compiling cpufeatures v0.3.0
+   Compiling base64 v0.22.1
+   Compiling hmac v0.12.1
+   Compiling socket2 v0.5.10
+   Compiling writeable v0.6.3
+   Compiling tinystr v0.8.3
+   Compiling litemap v0.8.2
+   Compiling openssl-probe v0.2.1
+   Compiling semver v1.0.28
+   Compiling cpufeatures v0.2.17
+   Compiling ipnet v2.12.0
+   Compiling pkg-config v0.3.33
+   Compiling httpdate v1.0.3
+   Compiling rustc_version v0.4.1
+   Compiling icu_locale_core v2.2.0
+   Compiling rustls-native-certs v0.8.4
+   Compiling potential_utf v0.1.5
+   Compiling elliptic-curve v0.13.8
+   Compiling rfc6979 v0.4.0
+   Compiling zerotrie v0.2.4
+   Compiling form_urlencoded v1.2.2
+   Compiling signature v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_properties_data v2.2.0
+   Compiling tower-layer v0.3.3
+   Compiling icu_collections v2.2.0
+   Compiling ecdsa v0.16.9
+   Compiling icu_provider v2.2.0
+   Compiling tower v0.5.3
+   Compiling primeorder v0.13.6
+   Compiling aws-types v1.3.16
+   Compiling sha2 v0.10.9
+   Compiling sha2 v0.11.0
+   Compiling tokio-util v0.7.18
+   Compiling aws-smithy-async v1.2.14
+   Compiling rustversion v1.0.22
+   Compiling hex v0.4.3
+   Compiling aws-smithy-types v1.5.0
+   Compiling h2 v0.4.14
+   Compiling h2 v0.3.27
+   Compiling aws-smithy-runtime-api v1.12.3
+   Compiling aws-smithy-eventstream v0.60.21
+   Compiling aws-smithy-schema v0.1.0
+   Compiling hyper v1.10.1
+   Compiling hyper v0.14.32
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling hyper-util v0.1.20
+   Compiling aws-smithy-http v0.63.6
+error[E0119]: conflicting implementations of trait `From<time::format_description::parse::format_item::HourBase>` for type `<time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type`
+  --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-http-0.63.6/src/event_stream/sender.rs:70:1
+   |
+70 | / impl<T, E, S> From<S> for EventStreamSender<T, E>
+71 | | where
+72 | |     S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+   | |___________________________________________________________^
+   |
+   = note: conflicting implementation in crate `time`:
+           - impl From<time::format_description::parse::format_item::HourBase> for <time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type;
+   = note: upstream crates may add a new impl of trait `futures_core::Stream` for type `time::format_description::parse::format_item::HourBase` in future versions
+
+   Compiling aws-credential-types v1.2.14
+   Compiling zerocopy v0.8.52
+error[E0119]: conflicting implementations of trait `From<time::format_description::parse::format_item::HourBase>` for type `<time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type`
+  --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-credential-types-1.2.14/src/attributes.rs:21:1
+   |
+21 | / impl<T> From<T> for AccountId
+22 | | where
+23 | |     T: Into<String>,
+   | |____________________^
+   |
+   = note: conflicting implementation in crate `time`:
+           - impl From<time::format_description::parse::format_item::HourBase> for <time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type;
+   = note: upstream crates may add a new impl of trait `std::convert::Into<std::string::String>` for type `time::format_description::parse::format_item::HourBase` in future versions
+
+For more information about this error, try `rustc --explain E0119`.
+error: could not compile `aws-smithy-http` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `aws-credential-types` (lib) due to 1 previous error

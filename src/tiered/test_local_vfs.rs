@@ -1,5 +1,219 @@
 use super::*;
+use anyhow::Result;
+use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
+use hadb_storage_mem::MemStorage;
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
+
+struct DelayedReadStorageBackend {
+    inner: Arc<dyn StorageBackend>,
+    delay: Duration,
+}
+
+impl DelayedReadStorageBackend {
+    fn new(inner: Arc<dyn StorageBackend>, delay: Duration) -> Self {
+        Self { inner, delay }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for DelayedReadStorageBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.range_get(key, start, len).await
+    }
+
+    async fn delete_many(&self, keys: &[String]) -> Result<usize> {
+        self.inner.delete_many(keys).await
+    }
+
+    async fn put_many(&self, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        self.inner.put_many(entries).await
+    }
+
+    fn backend_name(&self) -> &str {
+        self.inner.backend_name()
+    }
+}
+
+fn unique_test_vfs_name(prefix: &str) -> String {
+    format!(
+        "{}_{}_{}",
+        prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+fn lookahead_profile_sql() -> &'static str {
+    "SELECT posts.id, posts.content, posts.created_at
+     FROM users
+     JOIN posts ON posts.user_id = users.id
+     WHERE users.id = ?1
+     ORDER BY posts.created_at DESC
+     LIMIT 10"
+}
+
+fn lookahead_profile_plan(reader: &rusqlite::Connection) -> Vec<query_plan::PlannedAccess> {
+    let eqp_sql = format!("EXPLAIN QUERY PLAN {}", lookahead_profile_sql());
+    let mut stmt = reader.prepare(&eqp_sql).expect("prepare profile eqp");
+    let details: Vec<String> = stmt
+        .query_map([7i64], |row| row.get::<_, String>(3))
+        .expect("run profile eqp")
+        .map(|row| row.expect("profile eqp detail"))
+        .collect();
+    let mut accesses = query_plan::parse_eqp_output(&details.join("\n"));
+    query_plan::attach_integer_constraint_hints(&mut accesses, &[7]);
+    assert!(
+        accesses.iter().any(|access| {
+            access.tree_name == "idx_posts_user"
+                && access.access_type == query_plan::AccessType::Search
+                && access.table_name.as_deref() == Some("posts")
+        }),
+        "profile EQP must map the searched index to its table for lookahead; details={details:?}, accesses={accesses:?}"
+    );
+    accesses
+}
+
+type LookaheadProfileReaderResult = (Vec<(i64, String, i64)>, u64, u64, u64, serde_json::Value);
+
+#[derive(Debug, Clone, Copy)]
+enum QueryTimeLookahead {
+    None,
+    Rust(bool),
+    Sql(bool),
+}
+
+fn run_lookahead_profile_reader(
+    backend: Arc<CountingStorageBackend>,
+    runtime: &tokio::runtime::Runtime,
+    cache_dir: &std::path::Path,
+    config_lookahead: bool,
+    query_plan_prefetch: bool,
+    query_time_lookahead: QueryTimeLookahead,
+    name_suffix: &str,
+) -> LookaheadProfileReaderResult {
+    query_plan::drain_planned_accesses();
+    let mut reader_config = TurboliteConfig {
+        cache_dir: cache_dir.to_path_buf(),
+        read_only: true,
+        ..Default::default()
+    };
+    reader_config.cache.pages_per_group = 8;
+    reader_config.cache.sub_pages_per_frame = 1;
+    reader_config.prefetch.threads = 8;
+    reader_config.prefetch.queue_capacity = 64;
+    reader_config.prefetch.io_permits = 16;
+    reader_config.prefetch.foreground_reserved_permits = 1;
+    reader_config.prefetch.query_plan = query_plan_prefetch;
+    reader_config.prefetch.lookahead = config_lookahead;
+    reader_config.prefetch.manifest_source = ManifestSource::Remote;
+
+    let reader_vfs =
+        TurboliteVfs::with_backend(reader_config, backend.clone(), runtime.handle().clone())
+            .expect("reader VFS");
+    let shared = reader_vfs.shared_state();
+    let reader_vfs_name = unique_test_vfs_name(name_suffix);
+    crate::tiered::register(&reader_vfs_name, reader_vfs).expect("register reader");
+    let reader = rusqlite::Connection::open_with_flags_and_vfs(
+        "lookahead_profile.db",
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        &reader_vfs_name,
+    )
+    .expect("open reader");
+
+    if matches!(query_time_lookahead, QueryTimeLookahead::Sql(_)) {
+        crate::install_config_functions(&reader).expect("install turbolite_config_set");
+    }
+
+    let accesses = lookahead_profile_plan(&reader);
+    match query_time_lookahead {
+        QueryTimeLookahead::None => {}
+        QueryTimeLookahead::Rust(enabled) => {
+            crate::tiered::settings::set("lookahead", if enabled { "true" } else { "false" })
+                .expect("set lookahead on active reader handle");
+        }
+        QueryTimeLookahead::Sql(enabled) => {
+            let sql = format!(
+                "SELECT turbolite_config_set('lookahead', '{}')",
+                if enabled { "true" } else { "false" }
+            );
+            let rc: i64 = reader
+                .query_row(&sql, [], |row| row.get(0))
+                .expect("set lookahead via SQL function");
+            assert_eq!(rc, 0);
+        }
+    }
+    let mut stmt = reader
+        .prepare(lookahead_profile_sql())
+        .expect("prepare profile");
+    shared.clear_cache_all();
+    backend.reset_stats();
+    query_plan::push_planned_accesses(accesses);
+    let mut cursor = stmt.query([7i64]).expect("query profile");
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next().expect("step profile row") {
+        rows.push((
+            row.get::<_, i64>(0).unwrap(),
+            row.get::<_, String>(1).unwrap(),
+            row.get::<_, i64>(2).unwrap(),
+        ));
+    }
+    assert_eq!(rows.len(), 10);
+
+    let cache_info: serde_json::Value =
+        serde_json::from_str(&shared.cache_info()).expect("cache info json");
+    let foreground_ranges = cache_info["prefetch"]["traffic"]["foreground_range"]["ops"]
+        .as_u64()
+        .unwrap_or(0);
+    let lookahead_fired = cache_info["prefetch"]["lookahead"]["fired"]
+        .as_u64()
+        .unwrap_or(0);
+    let lookahead_hits = cache_info["prefetch"]["lookahead"]["hits"]
+        .as_u64()
+        .unwrap_or(0);
+    (
+        rows,
+        foreground_ranges,
+        lookahead_fired,
+        lookahead_hits,
+        cache_info,
+    )
+}
 
 /// RED TEST: TurboliteVfs::new_local() with StorageBackend::Local should succeed
 /// without any S3 credentials, tokio runtime, or cloud dependencies.
@@ -71,6 +285,227 @@ fn test_local_vfs_sqlite_roundtrip() {
         .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
         .unwrap();
     assert_eq!(val, "hello");
+}
+
+#[test]
+fn lookahead_profile_query_time_controls_are_e2e() {
+    let _plan_guard = query_plan::plan_queue_test_guard();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemStorage::new());
+    let delayed: Arc<dyn StorageBackend> = Arc::new(DelayedReadStorageBackend::new(
+        inner,
+        Duration::from_millis(2),
+    ));
+    let backend = Arc::new(CountingStorageBackend::new(delayed));
+    let source_dir = TempDir::new().unwrap();
+    let source_path = source_dir.path().join("lookahead_profile.db");
+    let import_cache = TempDir::new().unwrap();
+    let reader_cache_off = TempDir::new().unwrap();
+    let reader_cache_rust_on = TempDir::new().unwrap();
+    let reader_cache_sql_on = TempDir::new().unwrap();
+    let reader_cache_sql_off = TempDir::new().unwrap();
+    let reader_cache_plan_off = TempDir::new().unwrap();
+
+    let writer = rusqlite::Connection::open(&source_path).expect("open source sqlite");
+    writer
+        .execute_batch(
+            "PRAGMA page_size=4096;
+             CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE posts (
+               id INTEGER PRIMARY KEY,
+               user_id INTEGER NOT NULL,
+               content TEXT NOT NULL,
+               created_at INTEGER NOT NULL
+             );
+            CREATE INDEX idx_posts_user ON posts(user_id);",
+        )
+        .expect("schema");
+    {
+        let tx = writer.unchecked_transaction().expect("tx");
+        for user_id in 0..20i64 {
+            tx.execute(
+                "INSERT INTO users (id, name) VALUES (?1, ?2)",
+                rusqlite::params![user_id, format!("user-{user_id}")],
+            )
+            .expect("insert user");
+        }
+        let content = "x".repeat(2600);
+        for post_id in 0..500i64 {
+            tx.execute(
+                "INSERT INTO posts (id, user_id, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![post_id, post_id % 20, content, post_id],
+            )
+            .expect("insert post");
+        }
+        tx.commit().expect("commit");
+    }
+    writer
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint writer");
+    drop(writer);
+
+    let mut import_config = TurboliteConfig {
+        cache_dir: import_cache.path().to_path_buf(),
+        ..Default::default()
+    };
+    import_config.cache.pages_per_group = 8;
+    import_config.cache.sub_pages_per_frame = 1;
+    import_config.prefetch.threads = 0;
+    let import_vfs =
+        TurboliteVfs::with_backend(import_config, backend.clone(), runtime.handle().clone())
+            .expect("import VFS");
+    let imported_manifest = import_vfs
+        .import_sqlite_file(&source_path)
+        .expect("import sqlite file");
+    assert!(
+        imported_manifest
+            .tree_name_to_root_page
+            .contains_key("idx_posts_user"),
+        "fixture must be imported with a B-tree-aware index manifest"
+    );
+
+    let (rows_off, foreground_ranges_off, fired_off, hits_off, cache_info_off) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_off.path(),
+            false,
+            true,
+            QueryTimeLookahead::None,
+            "lookahead_reader_off",
+        );
+    let (rows_rust_on, foreground_ranges_rust_on, fired_rust_on, hits_rust_on, cache_info_rust_on) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_rust_on.path(),
+            false,
+            true,
+            QueryTimeLookahead::Rust(true),
+            "lookahead_reader_query_time_rust_on",
+        );
+    let (rows_sql_on, foreground_ranges_sql_on, fired_sql_on, hits_sql_on, cache_info_sql_on) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_sql_on.path(),
+            false,
+            true,
+            QueryTimeLookahead::Sql(true),
+            "lookahead_reader_query_time_sql_on",
+        );
+    let (rows_sql_off, foreground_ranges_sql_off, fired_sql_off, hits_sql_off, cache_info_sql_off) =
+        run_lookahead_profile_reader(
+            backend.clone(),
+            &runtime,
+            reader_cache_sql_off.path(),
+            true,
+            true,
+            QueryTimeLookahead::Sql(false),
+            "lookahead_reader_query_time_sql_off",
+        );
+    let (
+        rows_plan_off,
+        foreground_ranges_plan_off,
+        fired_plan_off,
+        hits_plan_off,
+        cache_info_plan_off,
+    ) = run_lookahead_profile_reader(
+        backend.clone(),
+        &runtime,
+        reader_cache_plan_off.path(),
+        false,
+        false,
+        QueryTimeLookahead::Sql(true),
+        "lookahead_reader_query_time_plan_off",
+    );
+
+    assert_eq!(
+        rows_rust_on, rows_off,
+        "Rust query-time lookahead must not change profile query results"
+    );
+    assert_eq!(
+        rows_sql_on, rows_off,
+        "SQL query-time lookahead must not change profile query results"
+    );
+    assert_eq!(
+        rows_sql_off, rows_off,
+        "SQL query-time lookahead=false must not change profile query results"
+    );
+    assert_eq!(
+        rows_plan_off, rows_off,
+        "SQL query-time lookahead with plan_aware=false must not change profile query results"
+    );
+    assert_eq!(fired_off, 0, "lookahead-off reader must not fire");
+    assert_eq!(hits_off, 0, "lookahead-off reader must not count hits");
+    assert!(
+        foreground_ranges_off >= rows_off.len() as u64,
+        "lookahead-off true-cold profile query should remain row-shaped; foreground_ranges_off={foreground_ranges_off}, cache_info_off={cache_info_off}"
+    );
+    assert!(
+        fired_rust_on > 0,
+        "Rust query-time lookahead should retain an index leaf and fire at the anchored table leaf; cache_info={cache_info_rust_on}"
+    );
+    assert!(
+        hits_rust_on > 0,
+        "Rust query-time lookahead should satisfy at least one retained frame demand; cache_info={cache_info_rust_on}"
+    );
+    assert!(
+        hits_rust_on >= rows_off.len() as u64,
+        "Rust lookahead should cover at least the returned row count; rows={}, hits_rust_on={hits_rust_on}, cache_info={cache_info_rust_on}",
+        rows_off.len()
+    );
+    assert!(
+        foreground_ranges_rust_on + 4 <= foreground_ranges_off,
+        "Rust query-time lookahead should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges_rust_on}, cache_info={cache_info_rust_on}, backend_stats={:?}",
+        backend.stats()
+    );
+    assert!(
+        foreground_ranges_rust_on < foreground_ranges_off,
+        "Rust query-time lookahead should beat the same true-cold query with lookahead off; off={foreground_ranges_off}, on={foreground_ranges_rust_on}"
+    );
+
+    assert!(
+        fired_sql_on > 0,
+        "SQL turbolite_config_set('lookahead','true') should fire lookahead; cache_info={cache_info_sql_on}"
+    );
+    assert!(
+        hits_sql_on >= rows_off.len() as u64,
+        "SQL-enabled lookahead should satisfy retained frame demands; rows={}, hits_sql_on={hits_sql_on}, cache_info={cache_info_sql_on}",
+        rows_off.len()
+    );
+    assert!(
+        foreground_ranges_sql_on + 4 <= foreground_ranges_off,
+        "SQL-enabled lookahead should materially reduce true-cold foreground ranges; off={foreground_ranges_off}, on={foreground_ranges_sql_on}, cache_info={cache_info_sql_on}"
+    );
+
+    assert_eq!(
+        fired_sql_off, 0,
+        "SQL turbolite_config_set('lookahead','false') must disable a config-default-on reader; cache_info={cache_info_sql_off}"
+    );
+    assert_eq!(
+        hits_sql_off, 0,
+        "disabled SQL lookahead must not count hits; cache_info={cache_info_sql_off}"
+    );
+    assert!(
+        foreground_ranges_sql_off >= rows_off.len() as u64,
+        "disabled SQL lookahead should preserve row-shaped foreground reads; foreground_ranges_sql_off={foreground_ranges_sql_off}, cache_info={cache_info_sql_off}"
+    );
+
+    assert_eq!(
+        fired_plan_off, 0,
+        "lookahead requires query-plan prefetch; SQL lookahead=true with plan_aware=false must not fire; cache_info={cache_info_plan_off}"
+    );
+    assert_eq!(
+        hits_plan_off, 0,
+        "plan_aware=false must not count lookahead hits; cache_info={cache_info_plan_off}"
+    );
+    assert!(
+        foreground_ranges_plan_off >= rows_off.len() as u64,
+        "plan_aware=false should preserve row-shaped foreground reads; foreground_ranges_plan_off={foreground_ranges_plan_off}, cache_info={cache_info_plan_off}"
+    );
+    query_plan::drain_planned_accesses();
 }
 
 #[test]

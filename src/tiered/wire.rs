@@ -369,6 +369,7 @@ mod tests {
                 name: "users".into(),
                 obj_type: "table".into(),
                 group_ids: vec![1, 2],
+                pages: vec![5, 6, 7],
             },
         );
         btrees.insert(
@@ -377,6 +378,7 @@ mod tests {
                 name: "sqlite_schema".into(),
                 obj_type: "table".into(),
                 group_ids: vec![0],
+                pages: vec![1],
             },
         );
 
@@ -512,8 +514,10 @@ mod tests {
         // - e0ade56a...801202 : current pin (base_object_checksum as
         //   CBOR byte string via serde_bytes — ~30 bytes smaller per
         //   hash on the wire).
+        // - c7be0813...f8eae : BTreeManifestEntry carries exact per-tree
+        //   pages for precise page_to_tree_name rebuilds.
         const EXPECTED_HEX: &str =
-            "e0ade56a6b38b3b50cfa168abbe704225ad68df56635f62ce3132b66e9801202";
+            "c7be08137cc7a005815785f0626141e9ba1a307ab7317240cb27b95dd52f8eae";
 
         let m = golden_fixture();
         let bytes = encode(&m).expect("encode");

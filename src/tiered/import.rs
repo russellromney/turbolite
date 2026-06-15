@@ -159,6 +159,7 @@ pub fn import_sqlite_file(
                     name: entry.name.clone(),
                     obj_type: entry.obj_type.clone(),
                     group_ids: gids,
+                    pages: entry.pages.clone(),
                 },
             );
         }
@@ -353,6 +354,7 @@ pub fn import_sqlite_file(
         btree_groups: HashMap::new(),
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
+        tree_name_to_root_page: HashMap::new(),
         group_to_tree_name: HashMap::new(),
         db_header: None, // import doesn't need db_header (fresh import)
         cursor: super::manifest::ReplayCursor::default(),

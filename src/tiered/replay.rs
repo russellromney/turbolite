@@ -1150,12 +1150,12 @@ mod tests {
         // Distinctive bytes for the first 100 bytes (the SQLite db
         // header) so we can prove the manifest captures them.
         let mut new_page0 = vec![0u8; page_size as usize];
-        for i in 0..100 {
-            new_page0[i] = (0xA0 ^ i) as u8;
+        for (i, byte) in new_page0.iter_mut().enumerate().take(100) {
+            *byte = (0xA0 ^ i) as u8;
         }
         // Pad out the rest.
-        for i in 100..page_size as usize {
-            new_page0[i] = 0x77;
+        for byte in new_page0.iter_mut().take(page_size as usize).skip(100) {
+            *byte = 0x77;
         }
 
         let mut handle = vfs.begin_replay().unwrap();
@@ -1191,8 +1191,8 @@ mod tests {
         // Seed db_header to a known value via a first cycle that
         // replays page 1.
         let mut page0 = vec![0u8; page_size as usize];
-        for i in 0..100 {
-            page0[i] = (0x10 + i) as u8;
+        for (i, byte) in page0.iter_mut().enumerate().take(100) {
+            *byte = (0x10 + i) as u8;
         }
         let mut h0 = vfs.begin_replay().unwrap();
         h0.apply_page(1, &page0).unwrap();
@@ -1856,8 +1856,8 @@ mod tests {
 
             // Distinctive new page 0 bytes (db_header changes).
             let mut new_page0 = vec![0u8; page_size as usize];
-            for i in 0..100 {
-                new_page0[i] = (0xC0 ^ i) as u8;
+            for (i, byte) in new_page0.iter_mut().enumerate().take(100) {
+                *byte = (0xC0 ^ i) as u8;
             }
 
             // Distinctive growth-page bytes well past current page_count.
@@ -1928,9 +1928,9 @@ mod tests {
             .db_header
             .as_ref()
             .expect("db_header must be set after restart recovery");
-        for i in 0..100 {
+        for (i, byte) in header.iter().enumerate().take(100) {
             assert_eq!(
-                header[i],
+                *byte,
                 (0xC0u8 ^ i as u8),
                 "db_header byte {i} must equal the replayed page 0 bytes"
             );

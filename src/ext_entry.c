@@ -134,7 +134,7 @@ static void turbolite_s3_bytes_func(
 /*
  * turbolite_config_set(key TEXT, value TEXT)
  * Runtime prefetch tuning. Keys: 'prefetch_search', 'prefetch_lookup',
- * 'prefetch' (both), 'prefetch_reset', 'plan_aware'.
+ * 'prefetch' (both), 'prefetch_reset', 'plan_aware', 'lookahead'.
  * Returns 0 on success, error on invalid key/value.
  */
 static void turbolite_config_set_func(
@@ -447,8 +447,9 @@ int sqlite3_turbolite_init(
     );
 
     /* Runtime prefetch tuning: turbolite_config_set(key, value).
-     * Keys: 'prefetch_search', 'prefetch_lookup', 'prefetch', 'prefetch_reset', 'plan_aware'.
-     * Pushes to global settings queue; VFS drains on next read. */
+     * Keys: 'prefetch_search', 'prefetch_lookup', 'prefetch',
+     * 'prefetch_reset', 'plan_aware', 'lookahead'.
+     * Pushes to the active handle's settings queue; VFS drains on next read. */
     sqlite3_create_function_v2(
         db, "turbolite_config_set", 2,
         SQLITE_UTF8, 0, turbolite_config_set_func, 0, 0, 0

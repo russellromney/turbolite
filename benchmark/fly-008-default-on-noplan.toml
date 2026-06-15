@@ -1,0 +1,35 @@
+app = "turbolite-tiered-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "warn"
+  BENCH_CACHE_INFO = "1"
+  BENCH_POST_PREFETCH = "off"
+  BENCH_POST_LOOKUP = "off"
+  BENCH_PROFILE_PREFETCH = "0.2,0.3,0.5"
+  BENCH_PROFILE_LOOKUP = "0,0.1,0.2"
+  BENCH_WHO_LIKED_PREFETCH = "0.3,0.3,0.4"
+  BENCH_WHO_LIKED_LOOKUP = "0,0,0,0"
+  BENCH_MUTUAL_PREFETCH = "0.4,0.3,0.3"
+  BENCH_MUTUAL_LOOKUP = "0.1,0.2,0.3"
+  BENCH_IDX_FILTER_PREFETCH = "0.3,0.3,0.4"
+  BENCH_IDX_FILTER_LOOKUP = "0.1,0.2,0.3"
+  BENCH_SCAN_FILTER_PREFETCH = "off"
+  BENCH_SCAN_FILTER_LOOKUP = "off"
+  TURBOLITE_PREFETCH_QUEUE_CAPACITY = "256"
+  TURBOLITE_CLOUD_IO_PERMITS = "8"
+  TURBOLITE_FOREGROUND_IO_RESERVED = "1"
+
+[mounts]
+  source = "bench_data"
+  destination = "/data"
+
+[processes]
+  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 10 --warmup 2 --modes none --queries post,profile,who-liked,mutual,idx-filter,scan-filter --prefetch-search 0.3,0.3,0.4 --prefetch-lookup 0,0,0 --skip-verify"
+
+[[vm]]
+  size = "performance-8x"
+  memory = "16384"

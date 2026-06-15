@@ -1,12 +1,11 @@
 use super::*;
 
-// The end-query signal (`signal_end_query` / `check_and_clear_end_query`) is
-// process-global, so the tests asserting its exact set/clear semantics must not
-// run concurrently with each other — cargo runs tests in parallel, and a
-// sibling's `check_and_clear_end_query()` would steal a set signal mid-test.
-// Serialize them on this lock. `unwrap_or_else(into_inner)` keeps one test's
-// panic from poisoning the rest.
-static END_QUERY_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The plan queue AND the end-query signal are process-global. Any test that
+// touches either must hold `plan_queue_test_guard()` (defined in query_plan.rs),
+// which serializes those tests against each other across ALL test files and
+// resets the queue + signal to a clean slate. This replaces the previous
+// per-file locks, which only serialized within this file and let the
+// cross-file lookahead E2E tests contaminate these via the global mirror.
 
 #[test]
 fn test_parse_search_with_index() {
@@ -15,6 +14,8 @@ fn test_parse_search_with_index() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].tree_name, "idx_users_email");
     assert_eq!(result[0].access_type, AccessType::Search);
+    assert_eq!(result[0].table_name.as_deref(), Some("users"));
+    assert_eq!(result[0].constraint_columns, vec!["email".to_string()]);
 }
 
 #[test]
@@ -57,8 +58,36 @@ SCAN likes";
     assert_eq!(result[0].access_type, AccessType::Search);
     assert_eq!(result[1].tree_name, "idx_posts_user_id");
     assert_eq!(result[1].access_type, AccessType::Search);
+    assert_eq!(result[1].table_name.as_deref(), Some("posts"));
+    assert_eq!(result[1].constraint_columns, vec!["user_id".to_string()]);
     assert_eq!(result[2].tree_name, "likes");
     assert_eq!(result[2].access_type, AccessType::Scan);
+}
+
+#[test]
+fn test_parse_profile_lookahead_shape_keeps_table_mapping() {
+    let eqp = "\
+SEARCH users USING INTEGER PRIMARY KEY (rowid=?)
+SEARCH posts USING INDEX idx_posts_user_created (user_id=?)";
+    let result = parse_eqp_output(eqp);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].tree_name, "idx_posts_user_created");
+    assert_eq!(result[0].access_type, AccessType::Search);
+    assert_eq!(result[0].table_name.as_deref(), Some("posts"));
+    assert_eq!(result[0].constraint_columns, vec!["user_id".to_string()]);
+}
+
+#[test]
+fn test_attach_integer_constraint_hints_annotates_search_constraints() {
+    let eqp = "\
+SEARCH posts USING INDEX idx_posts_user (user_id=?)
+SCAN likes";
+    let mut result = parse_eqp_output(eqp);
+    attach_integer_constraint_hints(&mut result, &[42]);
+
+    assert_eq!(result[0].constraint_columns, vec!["user_id=42".to_string()]);
+    assert_eq!(first_integer_constraint_hint(&result[0]), Some(42));
+    assert!(result[1].constraint_columns.is_empty());
 }
 
 #[test]
@@ -90,6 +119,7 @@ COMPOUND SUBQUERY 1";
 
 #[test]
 fn test_queue_push_drain() {
+    let _guard = plan_queue_test_guard();
     // Drain any leftover from other tests
     drain_planned_accesses();
 
@@ -120,34 +150,89 @@ fn test_queue_push_drain() {
 
 #[test]
 fn test_queue_accumulates_multiple_pushes() {
-    // Lock the queue for the duration to prevent other tests from draining
-    let mut queue = super::PLAN_QUEUE.lock().expect("plan queue poisoned");
-    queue.clear();
-
-    // Simulate two pushes by extending directly
-    queue.push(PlannedAccess {
+    let _guard = plan_queue_test_guard();
+    drain_planned_accesses();
+    push_planned_accesses(vec![PlannedAccess {
         tree_name: "users".into(),
         access_type: AccessType::Scan,
         table_name: None,
         constraint_columns: vec![],
-    });
-    queue.push(PlannedAccess {
+    }]);
+    push_planned_accesses(vec![PlannedAccess {
         tree_name: "posts".into(),
         access_type: AccessType::Search,
         table_name: None,
         constraint_columns: vec![],
-    });
+    }]);
 
-    assert_eq!(queue.len(), 2);
-    queue.clear();
+    let drained = drain_planned_accesses();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].tree_name, "users");
+    assert_eq!(drained[1].tree_name, "posts");
 }
 
 #[test]
 fn test_empty_push_is_noop() {
+    let _guard = plan_queue_test_guard();
     drain_planned_accesses();
     push_planned_accesses(vec![]);
     let drained = drain_planned_accesses();
     assert!(drained.is_empty());
+}
+
+#[test]
+fn test_queue_cross_thread_fallback_drains_mirrored_plan() {
+    let _guard = plan_queue_test_guard();
+    drain_planned_accesses();
+
+    let producer = std::thread::spawn(|| {
+        push_planned_accesses(vec![PlannedAccess {
+            tree_name: "cross_thread".into(),
+            access_type: AccessType::Search,
+            table_name: None,
+            constraint_columns: vec![],
+        }]);
+    });
+    producer.join().unwrap();
+
+    let drained = drain_planned_accesses();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].tree_name, "cross_thread");
+    assert!(drain_planned_accesses().is_empty());
+}
+
+#[test]
+fn test_queue_cross_thread_global_drain_suppresses_owner_local_copy() {
+    let _guard = plan_queue_test_guard();
+    drain_planned_accesses();
+
+    let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        push_planned_accesses(vec![PlannedAccess {
+            tree_name: "owner_local".into(),
+            access_type: AccessType::Search,
+            table_name: Some("posts".into()),
+            constraint_columns: vec!["user_id".into()],
+        }]);
+        pushed_tx.send(()).unwrap();
+        drain_rx.recv().unwrap();
+        drain_planned_accesses()
+    });
+
+    pushed_rx.recv().unwrap();
+    let global_drained = drain_planned_accesses();
+    assert_eq!(global_drained.len(), 1);
+    assert_eq!(global_drained[0].tree_name, "owner_local");
+
+    drain_tx.send(()).unwrap();
+    let owner_drained = owner.join().unwrap();
+    assert_eq!(
+        owner_drained.len(),
+        0,
+        "cross-thread fallback must consume the owner's mirrored local batch to avoid processing one plan twice"
+    );
+    assert!(drain_planned_accesses().is_empty());
 }
 
 #[test]
@@ -232,18 +317,14 @@ SEARCH users USING INDEX idx_users_email (email=?)";
 
 #[test]
 fn test_end_query_signal_default_false() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     assert!(!check_and_clear_end_query());
 }
 
 #[test]
 fn test_end_query_signal_set_and_clear() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     signal_end_query();
     assert!(check_and_clear_end_query());
@@ -252,9 +333,7 @@ fn test_end_query_signal_set_and_clear() {
 
 #[test]
 fn test_end_query_signal_multiple_signals_collapse() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     signal_end_query();
     signal_end_query();
@@ -269,9 +348,7 @@ fn test_end_query_signal_multiple_signals_collapse() {
 
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {
-    let _guard = END_QUERY_SIGNAL_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = plan_queue_test_guard();
     check_and_clear_end_query();
     drain_planned_accesses();
 

@@ -4,7 +4,10 @@ use crate::{DatabaseHandle, LockKind};
 use hadb_storage::StorageBackend;
 use tokio::runtime::Handle as TokioHandle;
 
+use super::btree_peek::{parse_index_leaf_rowids, parse_table_leaf_rowids};
+use super::lookahead::resolve_rowids_to_pages_with_paths_and_known_interiors;
 use super::storage as storage_helpers;
+use std::ops::Range;
 
 // ===== TurboliteHandle =====
 
@@ -13,6 +16,145 @@ struct ActiveScanPrefetch {
     group_ids: Vec<u64>,
     cursor: usize,
     submitted: HashSet<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RetainedLookahead {
+    index_tree_name: String,
+    table_name: String,
+    rowids: Vec<i64>,
+    first_int_keys: Vec<Option<i64>>,
+    key_hint: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedLookaheadSearch {
+    table_name: String,
+    key_hint: Option<i64>,
+}
+
+fn anchored_lookahead_window(
+    row_count: usize,
+    anchor_matches: &[usize],
+    cap: usize,
+) -> Option<Range<usize>> {
+    if row_count == 0 || anchor_matches.is_empty() || cap == 0 {
+        return None;
+    }
+    let cap = row_count.min(cap);
+    let first = anchor_matches[0];
+    if first >= row_count {
+        return None;
+    }
+    let mut last = *anchor_matches.last()?;
+    if last >= row_count {
+        last = row_count - 1;
+    }
+    if last + 1 - first > cap {
+        last = first;
+    }
+
+    let anchor_len = last - first + 1;
+    let mut start = first.saturating_sub(cap.saturating_sub(anchor_len) / 2);
+    if start + cap < last + 1 {
+        start = last + 1 - cap;
+    }
+    let end = (start + cap).min(row_count);
+    start = end.saturating_sub(cap);
+    Some(start..end)
+}
+
+fn key_or_anchor_lookahead_window(
+    row_count: usize,
+    first_int_keys: &[Option<i64>],
+    key_hint: Option<i64>,
+    anchor_matches: &[usize],
+    cap: usize,
+) -> Option<Range<usize>> {
+    if row_count == 0 || cap == 0 {
+        return None;
+    }
+    let key_matches: Vec<usize> = key_hint
+        .map(|hint| {
+            first_int_keys
+                .iter()
+                .take(row_count)
+                .enumerate()
+                .filter_map(|(idx, key)| (*key == Some(hint)).then_some(idx))
+                .collect()
+        })
+        .unwrap_or_default();
+    if key_matches.is_empty() {
+        if anchor_matches.is_empty() {
+            return None;
+        }
+        return anchored_lookahead_window(row_count, anchor_matches, cap);
+    }
+
+    let first = key_matches[0];
+    let last = *key_matches.last().unwrap_or(&first);
+    if last + 1 - first <= cap {
+        return Some(first..last + 1);
+    }
+
+    let key_anchor_matches: Vec<usize> = anchor_matches
+        .iter()
+        .copied()
+        .filter(|idx| *idx >= first && *idx <= last)
+        .collect();
+    let anchor_for_key = if key_anchor_matches.is_empty() {
+        vec![first]
+    } else {
+        key_anchor_matches
+    };
+    anchored_lookahead_window(row_count, &anchor_for_key, cap)
+        .map(|range| range.start.max(first)..range.end.min(last + 1))
+        .filter(|range| range.start < range.end)
+}
+
+fn anchored_frame_window(frame_count: usize, anchor_frame: usize, cap: usize) -> Range<usize> {
+    if frame_count == 0 || cap == 0 {
+        return 0..0;
+    }
+    let cap = frame_count.min(cap);
+    let mut start = anchor_frame.saturating_sub(cap / 2);
+    if start + cap > frame_count {
+        start = frame_count - cap;
+    }
+    start..start + cap
+}
+
+fn lookahead_frame_wait_timeout() -> std::time::Duration {
+    static WAIT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*WAIT_MS.get_or_init(|| {
+        std::env::var("TURBOLITE_LOOKAHEAD_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(32)
+    }))
+}
+
+fn manifest_usable_size(manifest: &Manifest) -> usize {
+    let reserved = manifest
+        .db_header
+        .as_deref()
+        .and_then(|header| header.get(20))
+        .copied()
+        .unwrap_or(0) as usize;
+    (manifest.page_size as usize).saturating_sub(reserved)
+}
+
+fn tree_groups_all_present(manifest: &Manifest, cache: &DiskCache, tree_name: &str) -> bool {
+    manifest
+        .tree_name_to_groups
+        .get(tree_name)
+        .map(|groups| {
+            !groups.is_empty()
+                && groups
+                    .iter()
+                    .all(|gid| cache.group_state(*gid) == GroupState::Present)
+        })
+        .unwrap_or(false)
 }
 
 /// Database handle for tiered turbolite storage.
@@ -64,6 +206,10 @@ pub struct TurboliteHandle {
     prefetch_lookup: Vec<f32>,
     /// Tree names from current query plan that are SEARCH (not SCAN).
     search_trees: HashSet<String>,
+    /// SEARCH index tree -> table tree mappings from the current query plan.
+    planned_lookahead_searches: HashMap<String, PlannedLookaheadSearch>,
+    /// Parsed index-leaf rowids retained until the first anchored table miss.
+    retained_lookahead: HashMap<String, RetainedLookahead>,
     /// Fixed thread pool for background prefetch.
     prefetch_pool: Option<Arc<PrefetchPool>>,
 
@@ -103,6 +249,8 @@ pub struct TurboliteHandle {
     // Query-plan-aware prefetch
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
+    /// Enable retain-and-re-fire index-leaf lookahead.
+    lookahead_enabled: bool,
     scan_window_groups: u32,
     scan_window_bytes: u64,
     active_scan_prefetch: HashMap<String, ActiveScanPrefetch>,
@@ -406,6 +554,7 @@ impl TurboliteHandle {
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
         query_plan_prefetch: bool,
+        lookahead_enabled: bool,
         scan_window_groups: u32,
         scan_window_bytes: u64,
         max_cache_bytes: Option<u64>,
@@ -602,6 +751,8 @@ impl TurboliteHandle {
             prefetch_search,
             prefetch_lookup,
             search_trees: HashSet::new(),
+            planned_lookahead_searches: HashMap::new(),
+            retained_lookahead: HashMap::new(),
             prefetch_pool,
             dirty_since_sync: false,
             synced_since_write: false,
@@ -617,6 +768,7 @@ impl TurboliteHandle {
             #[cfg(feature = "zstd")]
             dictionary_bytes: dictionary.map(|d| d.to_vec()),
             query_plan_prefetch,
+            lookahead_enabled,
             scan_window_groups,
             scan_window_bytes,
             active_scan_prefetch: HashMap::new(),
@@ -670,6 +822,8 @@ impl TurboliteHandle {
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
+            planned_lookahead_searches: HashMap::new(),
+            retained_lookahead: HashMap::new(),
             prefetch_pool: None,
             dirty_since_sync: false,
             synced_since_write: false,
@@ -685,6 +839,7 @@ impl TurboliteHandle {
             #[cfg(feature = "zstd")]
             dictionary_bytes: None,
             query_plan_prefetch: false,
+            lookahead_enabled: false,
             scan_window_groups: 4,
             scan_window_bytes: 32 * 1024 * 1024,
             active_scan_prefetch: HashMap::new(),
@@ -857,6 +1012,262 @@ impl TurboliteHandle {
             }
         }
         cache.unclaim_if_fetching(gid)
+    }
+
+    fn note_served_page_for_lookahead(
+        &mut self,
+        page_num: u64,
+        current_tree_name: Option<&String>,
+        page: &[u8],
+        cache: &DiskCache,
+        manifest: &Manifest,
+    ) {
+        if !self.lookahead_enabled || !self.query_plan_prefetch {
+            return;
+        }
+        let Some(tree_name) = current_tree_name else {
+            return;
+        };
+        let hdr_off = if page_num == 0 { 100 } else { 0 };
+        match page.get(hdr_off).copied() {
+            Some(0x0a) => {
+                if self.retained_lookahead.contains_key(tree_name)
+                    && !self.planned_lookahead_searches.contains_key(tree_name)
+                {
+                    self.retained_lookahead.remove(tree_name);
+                    if let Some(pool) = &self.prefetch_pool {
+                        pool.record_lookahead_bailout_parse();
+                    }
+                    return;
+                }
+                let Some(planned_search) = self.planned_lookahead_searches.get(tree_name).cloned()
+                else {
+                    return;
+                };
+                if tree_groups_all_present(manifest, cache, &planned_search.table_name) {
+                    return;
+                }
+                let parsed = parse_index_leaf_rowids(
+                    page,
+                    page_num == 0,
+                    usize::MAX,
+                    Some(manifest_usable_size(manifest)),
+                );
+                if parsed.rowids.is_empty() {
+                    if parsed.malformed_cells > 0 || parsed.overflow_cells > 0 {
+                        if let Some(pool) = &self.prefetch_pool {
+                            pool.record_lookahead_bailout_parse();
+                        }
+                    }
+                    return;
+                }
+                if let Some(pool) = &self.prefetch_pool {
+                    pool.record_lookahead_retained(parsed.rowids.len() as u64);
+                }
+                self.retained_lookahead.insert(
+                    planned_search.table_name.clone(),
+                    RetainedLookahead {
+                        index_tree_name: tree_name.clone(),
+                        table_name: planned_search.table_name.clone(),
+                        rowids: parsed.rowids,
+                        first_int_keys: parsed.first_int_keys,
+                        key_hint: planned_search.key_hint,
+                    },
+                );
+            }
+            Some(0x0d) if self.retained_lookahead.contains_key(tree_name) => {
+                self.fire_retained_lookahead(tree_name, page_num, Some(page), cache, manifest);
+            }
+            _ => {}
+        }
+    }
+
+    fn fire_retained_lookahead(
+        &mut self,
+        table_name: &str,
+        anchor_page_num: u64,
+        anchor_page: Option<&[u8]>,
+        cache: &DiskCache,
+        manifest: &Manifest,
+    ) {
+        let Some(retained) = self.retained_lookahead.get(table_name).cloned() else {
+            return;
+        };
+        let Some(pool) = self.prefetch_pool.as_ref().map(Arc::clone) else {
+            self.retained_lookahead.remove(table_name);
+            return;
+        };
+        if manifest.sub_pages_per_frame == 0 {
+            pool.record_lookahead_bailout_no_frames();
+            self.retained_lookahead.remove(table_name);
+            return;
+        }
+        let Some(&table_root_page) = manifest.tree_name_to_root_page.get(&retained.table_name)
+        else {
+            pool.record_lookahead_bailout_no_anchor();
+            self.retained_lookahead.remove(table_name);
+            return;
+        };
+
+        let mut anchor_matches = Vec::new();
+        if let Some(anchor_page) = anchor_page {
+            let anchor_leaf_rowids =
+                parse_table_leaf_rowids(anchor_page, anchor_page_num == 0, usize::MAX);
+            if !anchor_leaf_rowids.rowids.is_empty() {
+                let anchor_rowids: HashSet<i64> = anchor_leaf_rowids.rowids.into_iter().collect();
+                anchor_matches.extend(
+                    retained
+                        .rowids
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, rowid)| anchor_rowids.contains(rowid).then_some(idx)),
+                );
+            }
+        }
+
+        let Some(window) = key_or_anchor_lookahead_window(
+            retained.rowids.len(),
+            &retained.first_int_keys,
+            retained.key_hint,
+            &anchor_matches,
+            32,
+        ) else {
+            pool.record_lookahead_bailout_no_anchor();
+            self.retained_lookahead.remove(table_name);
+            return;
+        };
+
+        let sub_ppf = manifest.sub_pages_per_frame as usize;
+        if sub_ppf == 0 {
+            pool.record_lookahead_bailout_no_frames();
+            self.retained_lookahead.remove(table_name);
+            return;
+        }
+        let mut frames_by_gid: HashMap<u64, HashSet<usize>> = HashMap::new();
+        let window_rowids = &retained.rowids[window];
+        let resolutions = resolve_rowids_to_pages_with_paths_and_known_interiors(
+            table_root_page,
+            window_rowids,
+            cache,
+            None,
+        );
+        for resolution in &resolutions {
+            let Some(page_num) = resolution.page_num else {
+                continue;
+            };
+            let Some(loc) = manifest.page_location(page_num) else {
+                continue;
+            };
+            let frame_idx = loc.index as usize / sub_ppf;
+            if manifest
+                .frame_tables
+                .get(loc.group_id as usize)
+                .map(|ft| frame_idx < ft.len())
+                .unwrap_or(false)
+            {
+                frames_by_gid
+                    .entry(loc.group_id)
+                    .or_default()
+                    .insert(frame_idx);
+            }
+        }
+        if frames_by_gid.is_empty() {
+            if let Some(anchor_loc) = manifest.page_location(anchor_page_num) {
+                let anchor_frame_idx = anchor_loc.index as usize / sub_ppf;
+                if let Some(frame_table) = manifest.frame_tables.get(anchor_loc.group_id as usize) {
+                    for frame_idx in anchored_frame_window(frame_table.len(), anchor_frame_idx, 32)
+                    {
+                        frames_by_gid
+                            .entry(anchor_loc.group_id)
+                            .or_default()
+                            .insert(frame_idx);
+                    }
+                }
+            }
+        }
+
+        let mut submitted_frames = 0u64;
+        for (gid, frames) in frames_by_gid {
+            let Some(key) = manifest.page_group_keys.get(gid as usize).cloned() else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            let frame_table = manifest
+                .frame_tables
+                .get(gid as usize)
+                .cloned()
+                .unwrap_or_default();
+            if frame_table.is_empty() {
+                continue;
+            }
+            let group_page_nums = manifest.group_page_nums(gid).into_owned();
+            let overrides = manifest
+                .subframe_overrides
+                .get(gid as usize)
+                .cloned()
+                .unwrap_or_default();
+            let mut frame_indices: Vec<usize> = frames.into_iter().collect();
+            frame_indices.sort_unstable();
+            let outcome = pool.submit_frame_batch(
+                Some(retained.index_tree_name.clone()),
+                gid,
+                key,
+                frame_table,
+                manifest.page_size,
+                manifest.sub_pages_per_frame,
+                group_page_nums,
+                frame_indices,
+                overrides,
+                manifest.version,
+                cache,
+            );
+            if outcome.outcome == PrefetchSubmitOutcome::Accepted {
+                submitted_frames += outcome.accepted_frames as u64;
+            }
+        }
+
+        if submitted_frames > 0 {
+            self.retained_lookahead.remove(table_name);
+            pool.record_lookahead_fired(submitted_frames);
+        } else {
+            self.retained_lookahead.remove(table_name);
+            pool.record_lookahead_bailout_no_frames();
+        }
+    }
+
+    fn record_lookahead_hit_if_present(&self, gid: u64, loc: PageLocation, manifest: &Manifest) {
+        if !self.lookahead_enabled || manifest.sub_pages_per_frame == 0 {
+            return;
+        }
+        let Some(pool) = &self.prefetch_pool else {
+            return;
+        };
+        let frame_idx = loc.index as usize / manifest.sub_pages_per_frame as usize;
+        if let Some(cache) = &self.cache {
+            pool.record_lookahead_hit_if_present(cache, gid, frame_idx);
+        }
+    }
+
+    fn clear_lookahead_frame(&self, gid: u64, loc: PageLocation, manifest: &Manifest) {
+        if !self.lookahead_enabled || manifest.sub_pages_per_frame == 0 {
+            return;
+        }
+        let Some(pool) = &self.prefetch_pool else {
+            return;
+        };
+        let frame_idx = loc.index as usize / manifest.sub_pages_per_frame as usize;
+        pool.clear_lookahead_frame(gid, frame_idx);
+    }
+
+    fn clear_lookahead_group(&self, gid: u64) {
+        if !self.lookahead_enabled {
+            return;
+        }
+        if let Some(pool) = &self.prefetch_pool {
+            pool.clear_lookahead_group(gid);
+        }
     }
 
     #[allow(dead_code)]
@@ -1317,7 +1728,16 @@ impl DatabaseHandle for TurboliteHandle {
         // and a cached-but-now-out-of-bounds page must NOT short-circuit here —
         // it has to fall through to the slow path's zero-fill. Without the bound
         // a read returned stale pre-truncate bytes.
-        if !self.dirty_since_sync {
+        //
+        // Lookahead lives entirely in the slow path (index-leaf retain, anchor
+        // fire, hit accounting), so it needs the slow path — but ONLY for
+        // queries that can actually use it. `planned_lookahead_searches` is
+        // populated at plan-drain solely for SEARCH index->table accesses, so a
+        // pure SCAN plan leaves it empty and keeps the fast path. This stops
+        // lookahead from taxing scans/warm reads that it never fires on.
+        let lookahead_active =
+            self.lookahead_enabled && !self.planned_lookahead_searches.is_empty();
+        if !(self.dirty_since_sync || lookahead_active) {
             if let Some(cache) = &self.cache {
                 let current_gen = cache.generation.load(Ordering::Acquire);
                 let page_count = self.manifest.load().page_count;
@@ -1359,7 +1779,11 @@ impl DatabaseHandle for TurboliteHandle {
             .expect("page within manifest bounds must have group assignment");
 
         let gid = loc.group_id;
-        let current_tree_name = manifest_ref.group_to_tree_name.get(&gid).cloned();
+        let current_tree_name = manifest_ref
+            .page_to_tree_name
+            .get(&page_num)
+            .cloned()
+            .or_else(|| manifest_ref.group_to_tree_name.get(&gid).cloned());
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
@@ -1396,6 +1820,9 @@ impl DatabaseHandle for TurboliteHandle {
                     "plan_aware" => {
                         self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
                     }
+                    "lookahead" => {
+                        self.lookahead_enabled = matches!(update.value.as_str(), "true" | "1");
+                    }
                     "cache_limit" => {
                         if let Some(bytes) = settings::parse_byte_size(&update.value) {
                             self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
@@ -1423,6 +1850,11 @@ impl DatabaseHandle for TurboliteHandle {
         // Order matters: evict BEFORE draining settings and plan queue, so the
         // new query starts with a trimmed cache.
         if query_plan::check_and_clear_end_query() {
+            self.planned_lookahead_searches.clear();
+            self.retained_lookahead.clear();
+            if let Some(pool) = &self.prefetch_pool {
+                pool.clear_lookahead_provenance();
+            }
             if let Some(limit) = self.cache_limit {
                 if let Some(cache) = &self.cache {
                     // Build skip set: dirty pages + pending flush + fetching groups
@@ -1468,14 +1900,27 @@ impl DatabaseHandle for TurboliteHandle {
                 // Collect SEARCH tree names for per-query hop schedule selection.
                 // Clear previous query's search trees and populate from new plan.
                 self.search_trees.clear();
+                self.planned_lookahead_searches.clear();
+                self.retained_lookahead.clear();
                 for access in &planned {
                     if access.access_type == query_plan::AccessType::Search {
                         self.search_trees.insert(access.tree_name.clone());
+                        if let Some(table_name) = &access.table_name {
+                            if table_name != &access.tree_name {
+                                self.planned_lookahead_searches.insert(
+                                    access.tree_name.clone(),
+                                    PlannedLookaheadSearch {
+                                        table_name: table_name.clone(),
+                                        key_hint: query_plan::first_integer_constraint_hint(access),
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
 
                 if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
-                    let manifest_snap = (**self.manifest.load()).clone();
+                    let manifest_snap = self.manifest.load_full();
                     let tree_names: Vec<&String> =
                         manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> =
@@ -1527,7 +1972,7 @@ impl DatabaseHandle for TurboliteHandle {
             && !self.active_scan_prefetch.is_empty()
             && self.last_scan_refill_gid != Some(gid)
         {
-            let manifest_snap = (**self.manifest.load()).clone();
+            let manifest_snap = self.manifest.load_full();
             self.refill_active_scan_prefetch(&manifest_snap, cache, Some(gid));
             self.last_scan_refill_gid = Some(gid);
         }
@@ -1546,6 +1991,15 @@ impl DatabaseHandle for TurboliteHandle {
                 );
             }
             self.detect_interior_page(buf, page_num, cache);
+            let manifest_snap = self.manifest.load_full();
+            self.record_lookahead_hit_if_present(gid, loc, &manifest_snap);
+            self.note_served_page_for_lookahead(
+                page_num,
+                current_tree_name.as_ref(),
+                buf,
+                cache,
+                &manifest_snap,
+            );
             cache.touch_group(gid);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
@@ -1577,7 +2031,7 @@ impl DatabaseHandle for TurboliteHandle {
             if let (Some(ref storage), Some(runtime)) =
                 (self.storage.as_ref(), self.runtime.as_ref())
             {
-                let manifest = (**self.manifest.load()).clone();
+                let manifest = self.manifest.load_full();
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
                         if let Ok(Some(pg_data)) =
@@ -1625,6 +2079,7 @@ impl DatabaseHandle for TurboliteHandle {
                             };
 
                             if decoded_ok {
+                                self.clear_lookahead_group(gid);
                                 // Apply override frames
                                 if let Some(overrides) =
                                     manifest.subframe_overrides.get(gid as usize)
@@ -1675,6 +2130,15 @@ impl DatabaseHandle for TurboliteHandle {
                             // Now read the page from cache
                             if cache.is_present(page_num) {
                                 cache.read_page(page_num, buf)?;
+                                self.detect_interior_page(buf, page_num, cache);
+                                self.note_served_page_for_lookahead(
+                                    page_num,
+                                    current_tree_name.as_ref(),
+                                    buf,
+                                    cache,
+                                    &manifest,
+                                );
+                                cache.touch_group(gid);
                                 return Ok(());
                             }
                         }
@@ -1688,12 +2152,20 @@ impl DatabaseHandle for TurboliteHandle {
             ));
         }
 
-        let manifest = (**self.manifest.load()).clone();
+        let manifest = self.manifest.load_full();
 
         // 5a. Re-check cache: a sibling prefetch may have completed since step 4.
         if cache.is_present(page_num) {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
+            self.record_lookahead_hit_if_present(gid, loc, &manifest);
+            self.note_served_page_for_lookahead(
+                page_num,
+                current_tree_name.as_ref(),
+                buf,
+                cache,
+                &manifest,
+            );
             cache.touch_group(gid);
             self.reset_misses(current_tree_name.as_ref());
             // Undo the miss counted at step 4 now that a sibling prefetch made
@@ -1762,7 +2234,46 @@ impl DatabaseHandle for TurboliteHandle {
                                 self.reset_misses(current_tree_name.as_ref());
                                 cache.read_page(page_num, buf)?;
                                 self.detect_interior_page(buf, page_num, cache);
+                                self.note_served_page_for_lookahead(
+                                    page_num,
+                                    current_tree_name.as_ref(),
+                                    buf,
+                                    cache,
+                                    &manifest,
+                                );
                                 cache.touch_group(gid);
+                                return Ok(());
+                            }
+                        }
+                        if pool.is_frame_pending(gid, frame_idx) {
+                            let wait_start = Instant::now();
+                            let installed = pool.wait_for_frame_page(
+                                cache,
+                                gid,
+                                frame_idx,
+                                page_num,
+                                lookahead_frame_wait_timeout(),
+                            );
+                            pool.record_foreground_wait(wait_start.elapsed());
+                            if installed && cache.is_present(page_num) {
+                                self.reset_misses(current_tree_name.as_ref());
+                                cache.read_page(page_num, buf)?;
+                                self.detect_interior_page(buf, page_num, cache);
+                                self.record_lookahead_hit_if_present(gid, loc, &manifest);
+                                self.note_served_page_for_lookahead(
+                                    page_num,
+                                    current_tree_name.as_ref(),
+                                    buf,
+                                    cache,
+                                    &manifest,
+                                );
+                                cache.touch_group(gid);
+                                let _ = cache.stat_misses.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |m| Some(m.saturating_sub(1)),
+                                );
+                                cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(());
                             }
                         }
@@ -1889,6 +2400,7 @@ impl DatabaseHandle for TurboliteHandle {
                                             gid,
                                             frame_start_idx as u32,
                                         )?;
+                                        self.clear_lookahead_frame(gid, loc, &manifest);
                                     }
                                 }
                                 // Scan for page types in the sub-chunk
@@ -1914,6 +2426,13 @@ impl DatabaseHandle for TurboliteHandle {
                             }
 
                             self.detect_interior_page(buf, page_num, cache);
+                            self.note_served_page_for_lookahead(
+                                page_num,
+                                current_tree_name.as_ref(),
+                                buf,
+                                cache,
+                                &manifest,
+                            );
                             cache.touch_group(gid);
                             self.reset_misses(current_tree_name.as_ref());
 
@@ -2063,6 +2582,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         }
                                     }
                                     let write_ms = write_start.elapsed().as_millis();
+                                    self.clear_lookahead_group(gid);
                                     // Scan for interior/index pages
                                     for (i, &pnum) in gp.iter().enumerate() {
                                         let hdr_off = if pnum == 0 { 100 } else { 0 };
@@ -2127,6 +2647,13 @@ impl DatabaseHandle for TurboliteHandle {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
+            self.note_served_page_for_lookahead(
+                page_num,
+                current_tree_name.as_ref(),
+                buf,
+                cache,
+                &manifest,
+            );
             cache.touch_group(gid);
             return Ok(());
         }
@@ -2135,7 +2662,15 @@ impl DatabaseHandle for TurboliteHandle {
         if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
             cache.bitmap_mark(page_num);
             cache.mark_group_present(gid);
+            self.clear_lookahead_group(gid);
             self.detect_interior_page(buf, page_num, cache);
+            self.note_served_page_for_lookahead(
+                page_num,
+                current_tree_name.as_ref(),
+                buf,
+                cache,
+                &manifest,
+            );
             cache.touch_group(gid);
             return Ok(());
         }
@@ -2610,6 +3145,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         name: entry.name.clone(),
                                         obj_type: entry.obj_type.clone(),
                                         group_ids: gids,
+                                        pages: entry.pages.clone(),
                                     },
                                 );
                             }
@@ -3242,6 +3778,7 @@ impl DatabaseHandle for TurboliteHandle {
                 btree_groups: HashMap::new(),
                 page_to_tree_name: HashMap::new(),
                 tree_name_to_groups: HashMap::new(),
+                tree_name_to_root_page: HashMap::new(),
                 group_to_tree_name: HashMap::new(),
                 db_header,
             };

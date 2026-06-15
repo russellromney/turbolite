@@ -657,8 +657,13 @@ mod tests {
 
         let checkpoint = checkpoint_fixture();
         let delta = delta_fixture();
-        let plan = select_recovery_plan(&root, &[checkpoint.clone()], &[delta.clone()], 128)
-            .expect("root reachable checkpoint plus contiguous delta plans");
+        let plan = select_recovery_plan(
+            &root,
+            std::slice::from_ref(&checkpoint),
+            std::slice::from_ref(&delta),
+            128,
+        )
+        .expect("root reachable checkpoint plus contiguous delta plans");
 
         assert_eq!(plan.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
         assert_eq!(plan.deltas, vec![delta]);
@@ -739,7 +744,7 @@ mod tests {
         delta.base_database_page_count = checkpoint.database_page_count + 1;
         delta.checksum = delta.fixture_checksum();
 
-        let err = select_recovery_plan(&root, &[checkpoint.clone()], &[delta], 128)
+        let err = select_recovery_plan(&root, std::slice::from_ref(&checkpoint), &[delta], 128)
             .expect_err("delta must start from checkpoint page count");
 
         assert_eq!(
@@ -802,7 +807,7 @@ mod tests {
         }
         delta.checksum = delta.fixture_checksum();
 
-        let err = select_recovery_plan(&root, &[checkpoint.clone()], &[delta], 128)
+        let err = select_recovery_plan(&root, std::slice::from_ref(&checkpoint), &[delta], 128)
             .expect_err("delta page size must match checkpoint page size");
 
         assert_eq!(
@@ -846,7 +851,7 @@ mod tests {
 
         let plan = select_recovery_plan(
             &root,
-            &[checkpoint.clone()],
+            std::slice::from_ref(&checkpoint),
             &[delta1.clone(), delta2.clone(), delta3.clone()],
             128,
         )

@@ -1,7 +1,7 @@
 //! Query-plan-aware prefetch.
 //!
-//! A global queue of planned B-tree accesses populated by the trace callback
-//! (in ext_entry.c) and drained by the VFS on first cache miss.
+//! A per-thread queue of planned B-tree accesses populated by the trace
+//! callback (in ext_entry.c) and drained by the VFS on first cache miss.
 //!
 //! The trace callback runs EXPLAIN QUERY PLAN on each SQL statement at the
 //! start of sqlite3_step(), extracts SCAN/SEARCH + table/index names, and
@@ -11,8 +11,11 @@
 //! When the queue is empty (extension not loaded, or DDL/PRAGMA), the VFS
 //! falls back to the hop schedule.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
 
 /// Access type from EXPLAIN QUERY PLAN output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,31 +41,135 @@ pub struct PlannedAccess {
     pub constraint_columns: Vec<String>,
 }
 
-/// Global queue of planned accesses. The trace callback pushes, VFS drains.
+/// Attach simple integer equality hints to planned SEARCH constraints.
 ///
-/// Using a simple Mutex<Vec> because:
-/// - Push path (trace callback): runs once per step(), ~10us EQP cost dominates
-/// - Drain path (VFS read): one drain per query on first cache miss
-/// - No contention in practice: push completes before drain starts (synchronous trace)
-static PLAN_QUEUE: Mutex<Vec<PlannedAccess>> = Mutex::new(Vec::new());
+/// The EQP text only says `col=?`; callers that still have the query's bound
+/// values can annotate that as `col=123`. Consumers must treat this as an
+/// advisory hint and fall back when it is absent.
+pub fn attach_integer_constraint_hints(accesses: &mut [PlannedAccess], values: &[i64]) {
+    if values.is_empty() {
+        return;
+    }
+    let mut value_iter = values.iter();
+    for access in accesses.iter_mut() {
+        if access.access_type != AccessType::Search {
+            continue;
+        }
+        for column in &mut access.constraint_columns {
+            if column.contains('=') {
+                continue;
+            }
+            let Some(value) = value_iter.next() else {
+                return;
+            };
+            *column = format!("{}={}", column, value);
+        }
+    }
+}
+
+pub(crate) fn first_integer_constraint_hint(access: &PlannedAccess) -> Option<i64> {
+    access.constraint_columns.iter().find_map(|column| {
+        let (_name, value) = column.split_once('=')?;
+        value.trim().parse::<i64>().ok()
+    })
+}
+
+#[derive(Debug, Clone)]
+struct PlannedAccessBatch {
+    id: u64,
+    accesses: Vec<PlannedAccess>,
+}
+
+static NEXT_PLAN_BATCH_ID: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_PLAN_QUEUE: OnceLock<Mutex<Vec<PlannedAccessBatch>>> = OnceLock::new();
+static GLOBAL_CONSUMED_PLAN_BATCH_IDS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+fn global_plan_queue() -> &'static Mutex<Vec<PlannedAccessBatch>> {
+    GLOBAL_PLAN_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn global_consumed_plan_batch_ids() -> &'static Mutex<HashSet<u64>> {
+    GLOBAL_CONSUMED_PLAN_BATCH_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+// Same-thread queue of planned accesses. SQLite normally invokes the trace
+// callback and VFS reads on the connection's thread; keeping this queue
+// thread-local prevents unrelated connections/tests from stealing another
+// query's plan before that first cache miss. Each push is also mirrored into a
+// process-global fallback queue so a cross-thread VFS read can still consume
+// the advisory plan instead of silently disabling plan-aware prefetch.
+thread_local! {
+    static PLAN_QUEUE: RefCell<Vec<PlannedAccessBatch>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Push planned accesses to the global queue (called from trace callback).
 pub fn push_planned_accesses(accesses: Vec<PlannedAccess>) {
     if accesses.is_empty() {
         return;
     }
-    let mut queue = PLAN_QUEUE.lock().expect("plan queue poisoned");
-    queue.extend(accesses);
+    let batch = PlannedAccessBatch {
+        id: NEXT_PLAN_BATCH_ID.fetch_add(1, AtomicOrdering::Relaxed),
+        accesses,
+    };
+    PLAN_QUEUE.with(|queue| queue.borrow_mut().push(batch.clone()));
+    global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(batch);
 }
 
 /// Drain all planned accesses from the queue (called from VFS on first cache miss).
 /// Returns an empty Vec if nothing is queued.
 pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
-    let mut queue = PLAN_QUEUE.lock().expect("plan queue poisoned");
-    if queue.is_empty() {
+    let local = PLAN_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut *queue))
+        }
+    });
+
+    if let Some(batches) = local {
+        let mut consumed = global_consumed_plan_batch_ids()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let batches: Vec<PlannedAccessBatch> = batches
+            .into_iter()
+            .filter(|batch| !consumed.remove(&batch.id))
+            .collect();
+        drop(consumed);
+        if batches.is_empty() {
+            return Vec::new();
+        }
+        let drained_ids: HashSet<u64> = batches.iter().map(|batch| batch.id).collect();
+        global_plan_queue()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|batch| !drained_ids.contains(&batch.id));
+        return batches
+            .into_iter()
+            .flat_map(|batch| batch.accesses)
+            .collect();
+    }
+
+    let mut global = global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if global.is_empty() {
         return Vec::new();
     }
-    std::mem::take(&mut *queue)
+    let batches = std::mem::take(&mut *global);
+    let consumed_ids: HashSet<u64> = batches.iter().map(|batch| batch.id).collect();
+    drop(global);
+    global_consumed_plan_batch_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(consumed_ids);
+    batches
+        .into_iter()
+        .flat_map(|batch| batch.accesses)
+        .collect()
 }
 
 /// End-of-query signal. Set by the SQLITE_TRACE_PROFILE callback when a
@@ -84,6 +191,38 @@ pub fn signal_end_query() {
 /// to decide whether to run between-query eviction.
 pub fn check_and_clear_end_query() -> bool {
     END_QUERY_SIGNAL.swap(false, Ordering::AcqRel)
+}
+
+/// Test-only serialization guard for the process-global plan queue.
+///
+/// In production the trace push and the VFS drain (handle.rs read path) run on
+/// the same SQLite-calling thread, so the thread-local queue is authoritative
+/// and the global mirror/fallback is never exercised. Tests are the only place
+/// where multiple connections drive the plan queue in one process, in parallel.
+/// A test whose thread-local is empty (e.g. a top-of-test cleanup drain) would
+/// otherwise hit the cross-thread fallback and consume a *parallel* test's
+/// mirrored batch, making that test's lookahead misfire nondeterministically.
+///
+/// Hold this guard for the duration of any test that pushes/drains the plan
+/// queue or touches the end-query signal. It serializes those tests against
+/// each other (across all test files) and resets the queue + consumed-id set +
+/// end-query signal so each starts from a clean slate. Drop releases the lock.
+/// Not reentrant — acquire it once per test (the mutex is non-recursive).
+#[cfg(test)]
+pub(crate) fn plan_queue_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    let guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    PLAN_QUEUE.with(|q| q.borrow_mut().clear());
+    global_plan_queue()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    global_consumed_plan_batch_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    END_QUERY_SIGNAL.store(false, Ordering::Release);
+    guard
 }
 
 /// Parse EXPLAIN QUERY PLAN output text into PlannedAccess entries.

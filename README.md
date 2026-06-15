@@ -152,6 +152,8 @@ You can tune the prefetch schedule at open time by setting `prefetch.search` / `
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
+**Index-leaf lookahead** (optional) sharpens the index→table case. When a `SEARCH` query reads an index leaf, that page already lists the rowids SQLite is about to chase into the table — otherwise one round trip per matching row. turbolite reads ahead: it parses those rowids off the leaf, resolves them to their table-leaf frames through the cached interior pages, and prefetches just those frames in one batch. The serial chain of per-row fetches collapses toward a single parallel hop. It aims only at the rows the query is actually standing on, not the whole leaf, so it cuts request count without inflating bytes. Off by default; enable with `lookahead` on `TurboliteConfig` or `TURBOLITE_LOOKAHEAD` around index-to-table queries.
+
 ### In-memory page cache
 
 turbolite has its own in-memory page cache that replaces SQLite's built-in page cache. SQLite's pager caches pages internally and never re-reads from the VFS for cached pages. This is fine for single-writer databases, but for read replicas (HA followers, manifest-polling readers), SQLite's cache becomes stale when the underlying data changes via replication.
@@ -258,12 +260,27 @@ let config = TurboliteConfig {
 
 For per-query retuning without reopening the connection, use the
 `turbolite_config_set` SQL function (Phase Cirrus c). Each push is
-scoped to the calling connection's handle:
+scoped to the calling connection's handle and remains in effect until
+you change it again:
 
 ```sql
 SELECT turbolite_config_set('prefetch_search', '0.5,0.5,0.0');
 SELECT turbolite_config_set('prefetch_lookup', '0.0,0.0,0.0');
 SELECT * FROM posts WHERE created_at > ?;   -- runs with the new schedule
+```
+
+Index-leaf lookahead is default-off because it helps targeted
+index-to-table probes but can hurt scans or already-warm queries. It
+requires query-plan prefetch (`plan_aware`, default true). Turn it on
+around the specific query shapes that benefit, then turn it back off:
+
+```sql
+SELECT turbolite_config_set('lookahead', 'true');
+SELECT posts.*
+FROM users
+JOIN posts ON posts.user_id = users.id
+WHERE users.id = ?;
+SELECT turbolite_config_set('lookahead', 'false');
 ```
 
 Rust callers can invoke the same path via `turbolite::tiered::settings::set`.

@@ -1669,6 +1669,7 @@ impl TurboliteVfs {
                 self.config.compression.dictionary.as_deref(),
                 self.config.encryption.key,
                 self.config.prefetch.query_plan,
+                self.config.prefetch.lookahead,
                 self.config.prefetch.scan_window_groups,
                 self.config.prefetch.scan_window_bytes,
                 self.config.cache.max_bytes,

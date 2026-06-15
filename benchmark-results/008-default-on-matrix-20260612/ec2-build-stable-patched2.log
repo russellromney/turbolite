@@ -1,0 +1,32 @@
+Warning: Permanently added '3.129.23.181' (ED25519) to the list of known hosts.
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+   Compiling aws-smithy-runtime-api v1.12.3
+   Compiling rustls-webpki v0.103.13
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling aws-smithy-eventstream v0.60.21
+   Compiling hyper v0.14.32
+   Compiling hyper-util v0.1.20
+   Compiling glob v0.3.3
+   Compiling zerocopy v0.8.52
+   Compiling clang-sys v1.8.1
+   Compiling rustls v0.23.40
+   Compiling rustls v0.21.12
+   Compiling aws-smithy-http v0.63.6
+error[E0119]: conflicting implementations of trait `From<time::format_description::parse::format_item::HourBase>` for type `<time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type`
+  --> /home/ec2-user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-http-0.63.6/src/event_stream/sender.rs:70:1
+   |
+70 | / impl<T, E, S> From<S> for EventStreamSender<T, E>
+71 | | where
+72 | |     S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+   | |___________________________________________________________^
+   |
+   = note: conflicting implementation in crate `time`:
+           - impl From<time::format_description::parse::format_item::HourBase> for <time::format_description::parse::format_item::HourBase as time::format_description::parse::format_item::ModifierValue>::Type;
+   = note: upstream crates may add a new impl of trait `futures_core::Stream` for type `time::format_description::parse::format_item::HourBase` in future versions
+
+For more information about this error, try `rustc --explain E0119`.
+error: could not compile `aws-smithy-http` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
