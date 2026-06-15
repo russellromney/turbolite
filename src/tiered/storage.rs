@@ -45,6 +45,15 @@ pub(crate) fn range_get(
 ) -> io::Result<Option<Vec<u8>>> {
     let result = block_on(runtime, backend.range_get(key, start, len))
         .map_err(|e| io::Error::other(format!("storage range_get {key}: {e}")))?;
+    validate_range_get_result(key, start, len, result)
+}
+
+fn validate_range_get_result(
+    key: &str,
+    start: u64,
+    len: u32,
+    result: Option<Vec<u8>>,
+) -> io::Result<Option<Vec<u8>>> {
     if let Some(bytes) = &result {
         if bytes.len() != len as usize {
             return Err(io::Error::new(
@@ -216,10 +225,12 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
 
-    struct RangeIgnoringBackend;
+    struct WrongLengthRangeBackend {
+        bytes: Vec<u8>,
+    }
 
     #[async_trait]
-    impl StorageBackend for RangeIgnoringBackend {
+    impl StorageBackend for WrongLengthRangeBackend {
         async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
             Ok(Some(vec![1, 2, 3, 4, 5, 6]))
         }
@@ -256,16 +267,18 @@ mod tests {
         }
 
         async fn range_get(&self, _key: &str, _start: u64, _len: u32) -> Result<Option<Vec<u8>>> {
-            Ok(Some(vec![1, 2, 3, 4, 5, 6]))
+            Ok(Some(self.bytes.clone()))
         }
     }
 
     #[test]
-    fn range_get_rejects_overlong_backend_response() {
+    fn range_get_rejects_wrong_length_backend_response() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let backend: Arc<dyn StorageBackend> = Arc::new(RangeIgnoringBackend);
-        let err = range_get(backend.as_ref(), rt.handle(), "g0", 1, 2).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("exact range"));
+        for bytes in [vec![1], vec![1, 2, 3, 4, 5, 6]] {
+            let backend: Arc<dyn StorageBackend> = Arc::new(WrongLengthRangeBackend { bytes });
+            let err = range_get(backend.as_ref(), rt.handle(), "g0", 1, 2).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("exact range"));
+        }
     }
 }
