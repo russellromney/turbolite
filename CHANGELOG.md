@@ -2,6 +2,15 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`)
 
+## Ranger: index-leaf lookahead
+
+When a query uses an index to reach table rows (`SEARCH ... USING INDEX`), the index leaf SQLite reads already names the rowids it's about to fetch. turbolite now parses them off the leaf, resolves them through the cached interior pages, and prefetches the table frames in one batch instead of one S3 round trip per row.
+
+- **On by default.** Only engages for indexed `SEARCH` that chases into a table; scans, point-by-rowid reads, and warm queries take the normal path untouched (byte-identical to lookahead off).
+- Aimed at the rows the query is actually on — the contiguous run of index entries around the first table page it hits — so it cuts request count without inflating bytes.
+- Benchmarks (1M rows, S3 Express / Tigris): index→table joins ~20–32% faster cold; fan-out reads up to ~46% lower p90 and ~19% fewer bytes; scans unchanged. Aiming lands ~86% of prefetched frames with no duplicate fetches.
+- Disable with `lookahead=false` (`TurboliteConfig` or `TURBOLITE_LOOKAHEAD`) for fully-warm, CPU-bound workloads.
+
 ## Soyuz: sqlite-plugin VFS backend
 
 Migrated the VFS from `sqlite-vfs` to `sqlite-plugin` and removed sqlite-vfs entirely — it is now the sole backend.

@@ -152,7 +152,7 @@ You can tune the prefetch schedule at open time by setting `prefetch.search` / `
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
-**Index-leaf lookahead** (optional) sharpens the index→table case. When a `SEARCH` query reads an index leaf, that page already lists the rowids SQLite is about to chase into the table — otherwise one round trip per matching row. turbolite reads ahead: it parses those rowids off the leaf, resolves them to their table-leaf frames through the cached interior pages, and prefetches just those frames in one batch. The serial chain of per-row fetches collapses toward a single parallel hop. It aims only at the rows the query is actually standing on, not the whole leaf, so it cuts request count without inflating bytes. Off by default; enable with `lookahead` on `TurboliteConfig` or `TURBOLITE_LOOKAHEAD` around index-to-table queries.
+**Index-leaf lookahead** does the same for indexed `SEARCH`. An index leaf already lists the table rowids SQLite is about to request — so turbolite resolves them through the cached interior pages and prefetches those table frames in one batch instead of one-by-one, cutting request count.
 
 ### In-memory page cache
 
@@ -269,19 +269,19 @@ SELECT turbolite_config_set('prefetch_lookup', '0.0,0.0,0.0');
 SELECT * FROM posts WHERE created_at > ?;   -- runs with the new schedule
 ```
 
-Index-leaf lookahead is default-off because it helps targeted
-index-to-table probes but can hurt scans or already-warm queries. It
-requires query-plan prefetch (`plan_aware`, default true). Turn it on
-around the specific query shapes that benefit, then turn it back off:
+### Index-leaf lookahead
+
+When a query uses an index to find table rows (`SEARCH ... USING INDEX`), the index leaf SQLite reads already names the table rowids it's about to fetch. Lookahead parses those rowids, resolves them to their table-leaf frames through the cached interior pages, and prefetches the frames in one batch — so the table rows arrive together instead of one S3 round trip at a time.
+
+It's **on by default** and only engages for indexed `SEARCH` that chases into a table. Scans, point-by-rowid reads, and fully-warm queries take the normal path untouched, so there's rarely a reason to turn it off. It needs query-plan prefetch (`plan_aware`, default true).
+
+The one case for disabling it is a fully-warm, CPU-sensitive workload, where parsing each index leaf costs a little and prefetches nothing because the pages are already cached:
 
 ```sql
-SELECT turbolite_config_set('lookahead', 'true');
-SELECT posts.*
-FROM users
-JOIN posts ON posts.user_id = users.id
-WHERE users.id = ?;
 SELECT turbolite_config_set('lookahead', 'false');
 ```
+
+Or set `lookahead` on `TurboliteConfig` / the `TURBOLITE_LOOKAHEAD` env var at open time.
 
 Rust callers can invoke the same path via `turbolite::tiered::settings::set`.
 

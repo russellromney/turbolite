@@ -158,7 +158,9 @@ pub struct PrefetchConfig {
     pub scan_window_bytes: u64,
     /// Enable query-plan-aware prefetch.
     pub query_plan: bool,
-    /// Enable advisory index-leaf lookahead for SEARCH -> table rowid chasing.
+    /// Advisory index-leaf lookahead for SEARCH -> table rowid chasing. On by
+    /// default; only engages for indexed SEARCH that chases into a table, so
+    /// scans, point-by-rowid reads, and warm queries are untouched.
     pub lookahead: bool,
     /// Enable predictive cross-tree prefetch.
     pub prediction: bool,
@@ -279,7 +281,7 @@ impl Default for PrefetchConfig {
             scan_window_groups: 4,
             scan_window_bytes: 32 * 1024 * 1024,
             query_plan: true,
-            lookahead: false,
+            lookahead: true,
             prediction: false,
             manifest_source: ManifestSource::Auto,
         }
