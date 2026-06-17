@@ -1194,3 +1194,83 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
         "group 1 should have no overrides"
     );
 }
+
+// =========================================================================
+// Manifest decoder validation (C7)
+// =========================================================================
+
+#[test]
+fn manifest_validate_field_ranges_accepts_valid() {
+    let m = Manifest {
+        page_size: 4096,
+        pages_per_group: 16384,
+        page_count: 100,
+        page_group_keys: vec!["k".into()],
+        frame_tables: vec![vec![]],
+        subframe_overrides: vec![HashMap::new()],
+        group_pages: vec![vec![]],
+        ..Manifest::empty()
+    };
+    m.validate_field_ranges().expect("valid manifest");
+}
+
+#[test]
+fn manifest_validate_field_ranges_rejects_invalid_page_size() {
+    let m = Manifest {
+        page_size: 3072,
+        ..Manifest::empty()
+    };
+    assert!(m.validate_field_ranges().is_err());
+}
+
+#[test]
+fn manifest_validate_field_ranges_rejects_oversized_pages_per_group() {
+    let m = Manifest {
+        page_size: 4096,
+        pages_per_group: 16385,
+        ..Manifest::empty()
+    };
+    assert!(m.validate_field_ranges().is_err());
+}
+
+#[test]
+fn manifest_validate_field_ranges_rejects_per_group_vectors_longer_than_keys() {
+    let mut m = Manifest {
+        page_size: 4096,
+        pages_per_group: 32,
+        page_group_keys: vec!["k".into()],
+        frame_tables: vec![vec![], vec![]],
+        ..Manifest::empty()
+    };
+    assert!(m.validate_field_ranges().is_err(), "frame_tables too long");
+
+    m.frame_tables = vec![vec![]];
+    m.subframe_overrides = vec![HashMap::new(), HashMap::new()];
+    assert!(
+        m.validate_field_ranges().is_err(),
+        "subframe_overrides too long"
+    );
+
+    m.subframe_overrides = vec![HashMap::new()];
+    m.group_pages = vec![vec![], vec![]];
+    assert!(m.validate_field_ranges().is_err(), "group_pages too long");
+}
+
+#[test]
+fn decode_manifest_bytes_rejects_oversized_input() {
+    let huge = vec![0u8; MAX_MANIFEST_BYTES + 1];
+    let err = decode_manifest_bytes(&huge).expect_err("oversized must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn wire_decode_rejects_invalid_manifest_body() {
+    let mut m = Manifest::empty();
+    m.page_size = 3072;
+    let bytes = super::wire::encode(&m).expect("encode");
+    let err = super::wire::decode(&bytes).expect_err("decode invalid page_size");
+    assert!(
+        matches!(err, super::wire::PayloadVersionError::BodyDecode(_)),
+        "expected BodyDecode, got {err:?}"
+    );
+}

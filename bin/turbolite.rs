@@ -798,8 +798,13 @@ fn cmd_validate(
 ) -> Result<()> {
     let (vfs, _runtime) = build_vfs(cache_dir, Some(bucket), prefix, endpoint, region, true)?;
     let vfs_name = format!("turbolite-validate-{}", std::process::id());
-    let (shared, conn) = open_shared(&db, vfs, &vfs_name)?;
+    let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
+    turbolite::tiered::register_shared(&vfs_name, shared.clone())
+        .context("failed to register shared VFS")?;
 
+    // Validate S3 object presence against the manifest *before* SQLite tries
+    // to read any pages. Missing objects must be reported as MISSING, not as
+    // a raw disk I/O error.
     println!("validating manifest...");
     let result = shared
         .validate()
@@ -847,11 +852,18 @@ fn cmd_validate(
         );
     }
 
-    println!("\nvalidating database...");
-    let integrity: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .context("integrity_check failed")?;
-    println!("  integrity_check:   {}", integrity);
+    let mut integrity = String::from("skipped");
+    if result.s3_ok() {
+        println!("\nvalidating database...");
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(&db, flags, &vfs_name)
+            .context("failed to open database")?;
+        integrity = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .context("integrity_check failed")?;
+        println!("  integrity_check:   {}", integrity);
+    }
 
     println!();
     if result.s3_ok() && integrity == "ok" {

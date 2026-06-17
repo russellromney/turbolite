@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 /// Chosen to be extremely unlikely as a valid page number.
 pub(crate) const MANIFEST_MAGIC: u64 = 0xCAFE_FACE_DEAD_BEEF;
 
+/// Returns true for a supported SQLite page size: a power of two between
+/// 512 and 65536 bytes inclusive.
+pub(crate) fn is_valid_page_size(ps: u32) -> bool {
+    ps.is_power_of_two() && (512..=65536).contains(&ps)
+}
+
 /// A single pending flush: staging log path + metadata recorded by sync().
 #[derive(Debug)]
 pub(crate) struct PendingFlush {
@@ -123,7 +129,7 @@ pub(crate) fn read_staging_log(path: &Path, _page_size: u32) -> io::Result<HashM
     let mut ps_buf = [0u8; 4];
     reader.read_exact(&mut ps_buf)?;
     let page_size = u32::from_le_bytes(ps_buf);
-    if page_size == 0 || page_size > 65536 {
+    if !is_valid_page_size(page_size) {
         return Ok(HashMap::new());
     }
 
@@ -170,7 +176,7 @@ pub(crate) fn read_staging_manifest(path: &Path, _page_size: u32) -> io::Result<
     let mut ps_buf = [0u8; 4];
     reader.read_exact(&mut ps_buf)?;
     let page_size = u32::from_le_bytes(ps_buf);
-    if page_size == 0 || page_size > 65536 {
+    if !is_valid_page_size(page_size) {
         return Ok(None);
     }
 
@@ -309,7 +315,7 @@ mod tests {
     fn staging_duplicate_page_last_write_wins() {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
-        let page_size = 64u32; // small for test
+        let page_size = 512u32; // small for test
 
         let mut writer = StagingWriter::open(&staging_dir, 1, page_size).unwrap();
         let first = vec![0x11u8; page_size as usize];
@@ -342,7 +348,7 @@ mod tests {
     fn staging_recover_multiple_logs() {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
-        let page_size = 64u32;
+        let page_size = 512u32;
 
         // Create 3 staging logs with different versions
         for version in [5, 2, 10] {
@@ -366,7 +372,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
         fs::create_dir_all(&staging_dir).unwrap();
-        let page_size = 64u32;
+        let page_size = 512u32;
 
         // Valid log
         let mut writer = StagingWriter::open(&staging_dir, 1, page_size).unwrap();
@@ -414,7 +420,7 @@ mod tests {
         f.write_all(&[0u8; 5]).unwrap();
 
         // Should return empty (can't read a complete record), not error
-        let result = read_staging_log(&path, 64);
+        let result = read_staging_log(&path, 512);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -427,7 +433,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
         fs::create_dir_all(&staging_dir).unwrap();
-        let page_size = 64u32;
+        let page_size = 512u32;
 
         // Two complete records via the writer, then append a torn third.
         let mut writer = StagingWriter::open(&staging_dir, 1, page_size).unwrap();
@@ -463,18 +469,18 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         // Write 2 pages + manifest trailer
-        let mut writer = StagingWriter::open(&staging_dir, 1, 64).unwrap();
-        writer.append(0, &[10u8; 64]).unwrap();
-        writer.append(1, &[20u8; 64]).unwrap();
+        let mut writer = StagingWriter::open(&staging_dir, 1, 512).unwrap();
+        writer.append(0, &[10u8; 512]).unwrap();
+        writer.append(1, &[20u8; 512]).unwrap();
         writer.append_manifest(b"test-manifest-data").unwrap();
         let (path, pages) = writer.finalize().unwrap();
         assert_eq!(pages, 2);
 
         // read_staging_log should return 2 pages, ignoring the manifest trailer
-        let result = read_staging_log(&path, 64).unwrap();
+        let result = read_staging_log(&path, 512).unwrap();
         assert_eq!(result.len(), 2, "should have 2 pages");
-        assert_eq!(result[&0], vec![10u8; 64]);
-        assert_eq!(result[&1], vec![20u8; 64]);
+        assert_eq!(result[&0], vec![10u8; 512]);
+        assert_eq!(result[&1], vec![20u8; 512]);
     }
 
     #[test]
@@ -484,14 +490,43 @@ mod tests {
         fs::create_dir_all(&staging_dir).unwrap();
 
         // Write a staging log with manifest trailer (non-multiple of record_size)
-        let mut writer = StagingWriter::open(&staging_dir, 42, 64).unwrap();
-        writer.append(0, &[1u8; 64]).unwrap();
+        let mut writer = StagingWriter::open(&staging_dir, 42, 512).unwrap();
+        writer.append(0, &[1u8; 512]).unwrap();
         writer.append_manifest(b"some-manifest").unwrap();
         let (_path, _) = writer.finalize().unwrap();
 
         // recover_staging_logs should NOT skip this file
-        let recovered = recover_staging_logs(&staging_dir, 64).unwrap();
+        let recovered = recover_staging_logs(&staging_dir, 512).unwrap();
         assert_eq!(recovered.len(), 1, "should recover 1 staging log");
         assert_eq!(recovered[0].version, 42);
+    }
+
+    #[test]
+    fn is_valid_page_size_accepts_powers_of_two_in_range() {
+        assert!(is_valid_page_size(512));
+        assert!(is_valid_page_size(4096));
+        assert!(is_valid_page_size(65536));
+        assert!(!is_valid_page_size(0));
+        assert!(!is_valid_page_size(513));
+        assert!(!is_valid_page_size(1023));
+        assert!(!is_valid_page_size(65537));
+        assert!(!is_valid_page_size(2048 * 1024));
+    }
+
+    #[test]
+    fn read_staging_log_rejects_non_power_of_two_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("staging");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let path = staging_dir.join("1.log");
+        let mut f = File::create(&path).unwrap();
+        // 3072 is inside the old 0..=65536 range but is not a power of two.
+        f.write_all(&3072u32.to_le_bytes()).unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+        f.sync_all().unwrap();
+
+        let pages = read_staging_log(&path, 64).unwrap();
+        assert!(pages.is_empty(), "non-power-of-two page_size must be rejected");
     }
 }

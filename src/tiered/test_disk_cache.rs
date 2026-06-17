@@ -2318,7 +2318,8 @@ fn test_mem_cache_eviction_frees_memory() {
 
     // Verify AtomicPtr slots are null
     if let Some(ref mc) = cache.mem_cache {
-        for (p, slot) in mc.iter().enumerate().take(4) {
+        let guard = mc.read();
+        for (p, slot) in guard.iter().enumerate().take(4) {
             assert!(
                 slot.load(Ordering::Relaxed).is_null(),
                 "slot {} should be null after eviction",
@@ -2446,7 +2447,7 @@ fn test_mem_cache_invalidated_on_write() {
     cache.write_page(0, &original).unwrap();
 
     // Promote to mem_cache (simulates what happens after S3 fetch decode).
-    cache.promote_bulk_to_mem_cache(0, &original, 1);
+    cache.promote_bulk_to_mem_cache(0, &original, 1).unwrap();
 
     // Verify mem_cache has the page.
     let mut buf = vec![0u8; ps as usize];
@@ -2500,7 +2501,7 @@ fn test_mem_cache_invalidated_on_evict_group() {
     for p in 0..4u64 {
         let data = vec![(p + 1) as u8; ps as usize];
         cache.write_page(p, &data).unwrap();
-        cache.promote_bulk_to_mem_cache(p, &data, 1);
+        cache.promote_bulk_to_mem_cache(p, &data, 1).unwrap();
     }
     cache.mark_group_present(0);
 
@@ -2569,4 +2570,490 @@ fn test_clear_pages_at_or_above() {
     for p in 10..16u64 {
         assert!(!cache.is_present(p), "page {p} at/above floor is cleared");
     }
+}
+// Regression test for adversarial review B3:
+// mem_cache slots must be immutable once published; concurrent readers must not
+// see a page being mutated in place.
+#[test]
+fn test_mem_cache_no_torn_reads() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_compression(
+            dir.path(),
+            3600,
+            4,
+            2,
+            64,
+            1,
+            None,
+            Vec::new(),
+            false,
+            0,
+            #[cfg(feature = "zstd")]
+            None,
+            1024 * 1024,
+        )
+        .unwrap(),
+    );
+
+    let cache_w = cache.clone();
+    let writer = std::thread::spawn(move || {
+        for i in 0..10_000usize {
+            let page = if i % 2 == 0 { [0xAAu8; 64] } else { [0xBBu8; 64] };
+            cache_w.write_page(0, &page).unwrap();
+        }
+    });
+
+    let cache_r = cache.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        for _ in 0..10_000usize {
+            cache_r.read_page(0, &mut buf).unwrap();
+            let first = buf[0];
+            assert!(
+                first == 0xAA || first == 0xBB || first == 0,
+                "unexpected byte {first:#x}"
+            );
+            assert!(
+                buf.iter().all(|&b| b == first),
+                "torn read: mixed bytes in page buffer"
+            );
+        }
+    });
+
+    writer.join().unwrap();
+    reader.join().unwrap();
+}
+// Regression test for adversarial review B4:
+// concurrent eviction (hole-punch + bitmap clear) and page install must not
+// leave the bitmap bit set while the disk region contains zeros.
+#[test]
+fn test_evict_install_no_zero_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new(dir.path(), 3600, 4, 2, 64, 4, None, Vec::new()).unwrap(),
+    );
+
+    // Seed page 0 with non-zero data so it is present.
+    cache.write_page(0, &[0xAAu8; 64]).unwrap();
+
+    let cache_ev = cache.clone();
+    let evictor = std::thread::spawn(move || {
+        for _ in 0..5_000usize {
+            let id = {
+                let tracker = cache_ev.tracker.lock();
+                tracker.sub_chunk_for_page(0)
+            };
+            cache_ev.evict_sub_chunk(id);
+        }
+    });
+
+    let cache_wr = cache.clone();
+    let writer = std::thread::spawn(move || {
+        for i in 0..5_000usize {
+            let byte = if i % 2 == 0 { 0xAAu8 } else { 0xBBu8 };
+            cache_wr.write_page(0, &[byte; 64]).unwrap();
+        }
+    });
+
+    let cache_rd = cache.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let mut successful_reads = 0usize;
+        for _ in 0..50_000usize {
+            // Use the atomic presence+read path so the test exercises the same
+            // eviction-lock serialization production readers rely on.
+            if !cache_rd.read_page_if_present(0, &mut buf).unwrap() {
+                continue;
+            }
+            successful_reads += 1;
+            let first = buf[0];
+            // The page should be all 0xAA or all 0xBB. A zero page means an
+            // evictor hole-punched the file and a concurrent install set the
+            // bit without re-writing, or a reader saw the bit set and then read
+            // zeros after eviction. Both are forbidden.
+            assert!(
+                first == 0xAA || first == 0xBB,
+                "unexpected byte {first:#x}: read zeros from an evicted page"
+            );
+            assert!(
+                buf.iter().all(|&b| b == first),
+                "torn page: mixed bytes after eviction"
+            );
+        }
+        assert!(
+            successful_reads > 10,
+            "test should observe present page reads, got {}",
+            successful_reads
+        );
+    });
+
+    evictor.join().unwrap();
+    writer.join().unwrap();
+    reader.join().unwrap();
+}
+
+
+// =========================================================================
+// P3 DiskCache regression tests
+// =========================================================================
+
+/// B1: try_claim_group and mark_group_present grow group_states for gids
+/// beyond the initial page_count-derived capacity.
+#[test]
+fn test_group_states_resize_on_claim_and_mark() {
+    let dir = TempDir::new().unwrap();
+    // 8 pages / 4 ppg => 2 groups initially.
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    assert!(cache.try_claim_group(10));
+    assert_eq!(cache.group_state(10), GroupState::Fetching);
+    cache.mark_group_present(10);
+    assert_eq!(cache.group_state(10), GroupState::Present);
+    assert!(cache.group_states.lock().len() > 10);
+}
+
+/// B1: mark_pages_present grows group_states to accommodate the highest group.
+#[test]
+fn test_mark_pages_present_resizes_group_states() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    cache.mark_pages_present(&[100]); // group 25
+    assert!(cache.group_states.lock().len() > 25);
+    assert_eq!(cache.group_state(25), GroupState::Present);
+}
+
+/// B1: mark_all_pages_present grows group_states to the new group count.
+#[test]
+fn test_mark_all_pages_present_resizes_group_states() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    cache.mark_all_pages_present(100); // 25 groups
+    assert_eq!(cache.group_states.lock().len(), 25);
+    assert_eq!(cache.group_state(24), GroupState::Present);
+}
+
+/// B2: mem_cache initial capacity is budget/page_size, not page_count.
+#[test]
+fn test_mem_cache_sized_to_budget_not_page_count() {
+    let dir = TempDir::new().unwrap();
+    // page_count=1000 would have sized the old vector to 1000 slots;
+    // the fix sizes it to 128/64 = 2 slots.
+    let cache = cache_with_mem_budget(dir.path(), 64, 1000, 128);
+    if let Some(ref mc) = cache.mem_cache {
+        assert_eq!(mc.read().len(), 2, "mem_cache capacity should be budget/page_size");
+    } else {
+        panic!("mem_cache should be enabled");
+    }
+}
+
+/// When page_size is unknown at construction, mem_cache starts empty but
+/// already wrapped; set_page_size resizes the slot table safely under the lock.
+#[test]
+fn test_mem_cache_set_page_size_allocates_lazily() {
+    let dir = TempDir::new().unwrap();
+    let gp = positional_group_pages(4, 16);
+    let cache = DiskCache::new_with_compression(
+        dir.path(),
+        3600,
+        4,
+        2,
+        0, // page_size unknown at construction
+        16,
+        None,
+        gp,
+        false,
+        3,
+        #[cfg(feature = "zstd")]
+        None,
+        256,
+    )
+    .unwrap();
+    assert!(cache.mem_cache.is_some());
+    assert_eq!(cache.mem_cache.as_ref().unwrap().read().len(), 0);
+    cache.set_page_size(64);
+    assert_eq!(cache.mem_cache.as_ref().unwrap().read().len(), 4); // 256/64
+}
+
+/// B2: ensure_mem_cache_capacity grows the slot table for pages above the
+/// initial budget-sized capacity.
+#[test]
+fn test_mem_cache_grows_lazily_for_high_page_numbers() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 4, 256); // capacity 4
+    let data = vec![0xABu8; 64];
+    cache.write_page(100, &data).unwrap();
+    if let Some(ref mc) = cache.mem_cache {
+        assert!(mc.read().len() > 100, "slot table should grow for page 100");
+    }
+    let mut buf = vec![0u8; 64];
+    cache.read_page(100, &mut buf).unwrap();
+    assert_eq!(buf, data);
+}
+
+/// B5: deferred frees use a ring of generations; a rotation moves current
+/// into the ring and enough rotations drop the oldest generation.
+#[test]
+fn test_deferred_frees_multi_generation_rotation() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 4, 256);
+    let data = vec![0xAAu8; 64];
+    cache.write_page(0, &data).unwrap();
+    // Evict page 0 from mem_cache; this pushes the buffer to current and
+    // rotates at the end of clear_pages_from_mem_cache.
+    cache.clear_pages_from_mem_cache(&[0]);
+    {
+        let df = cache.deferred_frees.lock();
+        assert_eq!(df.current.len(), 0);
+        assert_eq!(df.older.iter().map(|v| v.len()).sum::<usize>(), 1);
+    }
+    // The buffer survives many rotations, then is dropped once it reaches the
+    // end of the ring.
+    for _ in 0..crate::tiered::disk_cache::DEFERRED_FREE_GENERATIONS {
+        cache.rotate_deferred_frees();
+    }
+    {
+        let df = cache.deferred_frees.lock();
+        assert_eq!(df.current.len(), 0);
+        assert_eq!(df.older.iter().map(|v| v.len()).sum::<usize>(), 0);
+    }
+}
+
+/// Concurrent readers copying from mem_cache slots must not see freed or
+/// corrupted buffers while evictions and deferred-free rotations run. This
+/// exercises the realistic case: readers hold a pointer only for a bounded
+/// memcpy, not across arbitrary scheduler delays.
+#[test]
+fn test_deferred_frees_concurrent_readers_while_rotating() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(cache_with_mem_budget(dir.path(), 64, 4, 256));
+    let data = vec![0xAAu8; 64];
+    cache.write_page(0, &data).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let evictor = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..1_000usize {
+                cache.clear_pages_from_mem_cache(&[0]);
+                // clear_pages_from_mem_cache already rotates once; add more
+                // rotations to stress the ring.
+                cache.rotate_deferred_frees();
+            }
+        })
+    };
+
+    let rewriter = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..1_000usize {
+                cache.write_page(0, &data).unwrap();
+            }
+        })
+    };
+
+    let reader = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut buf = vec![0u8; 64];
+            let mut successes = 0usize;
+            for _ in 0..5_000usize {
+                if cache.read_page_if_present(0, &mut buf).unwrap() {
+                    successes += 1;
+                    assert!(
+                        buf.iter().all(|&b| b == 0xAA),
+                        "concurrent reader saw corrupted or freed buffer"
+                    );
+                }
+            }
+            successes
+        })
+    };
+
+    evictor.join().unwrap();
+    rewriter.join().unwrap();
+    let successes = reader.join().unwrap();
+    assert!(
+        successes > 100,
+        "reader should observe many present reads, got {}",
+        successes
+    );
+}
+
+/// set_page_size resizes the mem_cache slot table under the RwLock, so it is
+/// safe even when the DiskCache is already shared across threads. The test
+/// hammers set_page_size concurrently with reads and writes and verifies the
+/// cache ends in a consistent state with no crash or data race.
+#[test]
+fn test_set_page_size_race_with_concurrent_reader_writer() {
+    let dir = TempDir::new().unwrap();
+    // page_size == 0 at construction => mem_cache starts empty; this is the
+    // geometry the writer VFS uses before the first xWrite discovers the real
+    // page size.
+    let cache = Arc::new(cache_with_mem_budget(dir.path(), 0, 0, 256));
+
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let setter = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..1_000 {
+                cache.set_page_size(64);
+            }
+        })
+    };
+
+    let writer = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..100u64 {
+                let byte = (i % 256) as u8;
+                cache.write_page(i, &vec![byte; 64]).unwrap();
+            }
+        })
+    };
+
+    let reader = {
+        let cache = cache.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let mut buf = vec![0u8; 64];
+            for _ in 0..5_000usize {
+                // Concurrent reads must not crash or observe a torn slot table.
+                let _ = cache.read_page_if_present(0, &mut buf);
+            }
+        })
+    };
+
+    setter.join().unwrap();
+    writer.join().unwrap();
+    reader.join().unwrap();
+
+    // Final state: all 100 pages written with deterministic bytes.
+    let mut buf = vec![0u8; 64];
+    for i in 0..100u64 {
+        cache.read_page(i, &mut buf).unwrap();
+        let expected = (i % 256) as u8;
+        assert_eq!(buf[0], expected, "page {} final value mismatch", i);
+        assert!(buf.iter().all(|&b| b == expected), "page {} torn", i);
+    }
+}
+
+/// B6: after evict_to_budget the bitmap and tracker agree (no sub-chunk
+/// reported present whose pages are still marked in the bitmap).
+#[test]
+fn test_evict_to_budget_tracker_bitmap_consistent() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    for gid in 0..2u64 {
+        let data = vec![0xABu8; 4 * 64];
+        cache.write_pages_bulk(gid * 4, &data, 4).unwrap();
+        cache.mark_group_present(gid);
+    }
+    let skip = HashSet::new();
+    cache.evict_to_budget(0, &skip);
+    let tracker = cache.tracker.lock();
+    for id in tracker.present.iter() {
+        for p in cache.sub_chunk_page_nums(*id) {
+            assert!(
+                !cache.is_present(p),
+                "page {} still present after eviction but its sub-chunk is tracked",
+                p
+            );
+        }
+    }
+}
+
+/// B7: truncating to a smaller page count evicts truncated pages from mem_cache.
+#[test]
+fn test_truncate_to_page_count_invalidates_mem_cache() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+    for p in [0u64, 15] {
+        let data = vec![p as u8; 64];
+        cache.write_page(p, &data).unwrap();
+    }
+    assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) > 0);
+    cache.truncate_to_page_count(8, 64).unwrap();
+    if let Some(ref mc) = cache.mem_cache {
+        if let Some(slot) = mc.read().get(15) {
+            assert!(
+                slot.load(Ordering::Relaxed).is_null(),
+                "page 15 should be evicted from mem_cache by truncate"
+            );
+        }
+    }
+    assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) < 1024);
+}
+
+/// B8: write_pages_bulk rejects data shorter than num_pages * page_size.
+#[test]
+fn test_write_pages_bulk_rejects_short_data() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    let data = vec![0u8; 64]; // 1 page, claims 2
+    let err = cache.write_pages_bulk(0, &data, 2).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+/// write_pages_scattered ignores partial trailing data and only marks fully-covered pages.
+#[test]
+fn test_write_pages_scattered_only_marks_full_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    let page_nums = vec![0u64, 5];
+    let data = vec![0xAA; 64]; // 1 page, claims 2
+    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    assert!(cache.is_present(0), "page 0 with full data should be present");
+    assert!(
+        !cache.bitmap.read().is_present(5),
+        "page 5 with no data should not be present"
+    );
+}
+
+/// B8: promote_bulk_to_mem_cache rejects data shorter than num_pages * page_size.
+#[test]
+fn test_promote_bulk_rejects_short_data() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+    let data = vec![0u8; 64];
+    let err = cache.promote_bulk_to_mem_cache(0, &data, 2).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+/// B8: promote_scattered_to_mem_cache rejects data shorter than page_nums.len() * page_size.
+#[test]
+fn test_promote_scattered_rejects_short_data() {
+    let dir = TempDir::new().unwrap();
+    let cache = cache_with_mem_budget(dir.path(), 64, 16, 1024);
+    let page_nums = vec![0u64, 5];
+    let data = vec![0u8; 64];
+    let err = cache
+        .promote_scattered_to_mem_cache(&page_nums, &data)
+        .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+/// B9: all write paths refuse to mutate a tainted cache.
+#[test]
+fn test_tainted_rejects_write_paths() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap();
+    cache.tainted.store(true, Ordering::Release);
+    let data = vec![0u8; 64];
+    assert!(cache.write_page(0, &data).is_err());
+    assert!(cache.write_page_no_visibility(0, &data).is_err());
+    assert!(cache.write_pages_bulk(0, &data, 1).is_err());
+    assert!(cache.write_pages_scattered(&[0], &data, 0, 0).is_err());
 }

@@ -338,11 +338,26 @@ pub fn rotate_encryption_key(
         turbolite_debug!("[rotate] verification passed: new data is readable");
     }
 
+    // Clear local cache BEFORE uploading the new manifest. The manifest upload
+    // is the commit point; if we crash after it but before clearing cache, the
+    // next open would see new manifest pointing at new objects while the local
+    // cache still holds old-ciphertext pages (or plaintext if removing
+    // encryption) — reads would return garbage (adversarial review E5).
+    let cache_path = config
+        .local_data_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| config.cache_dir.join("data.cache"));
+    let _ = std::fs::remove_file(&cache_path);
+    let _ = std::fs::remove_file(config.cache_dir.join("local_state.msgpack"));
+    turbolite_debug!("[rotate] cleared local cache before commit");
+
     // COMMIT POINT: upload new manifest
     storage_helpers::put_manifest(backend_ref, runtime_ref, &new_manifest)?;
     turbolite_debug!("[rotate] manifest uploaded (version {})", new_version);
 
-    // GC old objects
+    // GC old objects only after the new manifest is durable. If GC is partially
+    // lost, the old objects are unreachable via the new manifest.
     if !replaced_keys.is_empty() {
         storage_helpers::delete_objects(backend_ref, runtime_ref, &replaced_keys)?;
         turbolite_debug!(
@@ -350,16 +365,6 @@ pub fn rotate_encryption_key(
             replaced_keys.len()
         );
     }
-
-    // Clear local cache (simpler than re-encrypting, cache repopulates on next open)
-    let cache_path = config
-        .local_data_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| config.cache_dir.join("data.cache"));
-    let _ = std::fs::remove_file(cache_path);
-    let _ = std::fs::remove_file(config.cache_dir.join("local_state.msgpack"));
-    turbolite_debug!("[rotate] cleared local cache");
 
     turbolite_debug!("[rotate] {} complete", mode);
     Ok(())

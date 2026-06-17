@@ -57,7 +57,7 @@ pub fn walk_all_btrees(
 
     // sqlite_master itself is a B-tree rooted at page 1 (page 0 in 0-based)
     // Add it explicitly since it doesn't appear in its own records
-    let master_pages = walk_btree(0, page_size, read_page);
+    let master_pages = walk_btree(0, page_count, page_size, read_page);
     all_owned.extend(&master_pages);
     btrees.insert(
         0,
@@ -75,7 +75,7 @@ pub fn walk_all_btrees(
         }
         // sqlite stores 1-based page numbers; we use 0-based internally
         let root_0based = entry.root_page - 1;
-        let pages = walk_btree(root_0based, page_size, read_page);
+        let pages = walk_btree(root_0based, page_count, page_size, read_page);
         all_owned.extend(&pages);
         btrees.insert(
             root_0based,
@@ -105,6 +105,7 @@ pub fn walk_all_btrees(
 /// Walk a single B-tree from its root page, returning all page numbers (0-based).
 fn walk_btree(
     root_page: u64,
+    page_count: u64,
     page_size: u32,
     read_page: &dyn Fn(u64) -> Option<Vec<u8>>,
 ) -> Vec<u64> {
@@ -150,25 +151,27 @@ fn walk_btree(
                     if ovfl_1based == 0 {
                         continue;
                     }
-                    // Follow the overflow chain
+                    // Follow the overflow chain. Only record an overflow page
+                    // after read_page succeeds and it is within the live page
+                    // count; malformed pointers are ignored.
                     let mut ovfl = ovfl_1based as u64 - 1;
-                    while visited.insert(ovfl) {
+                    while !visited.contains(&ovfl) && ovfl < page_count {
+                        let Some(ovfl_buf) = read_page(ovfl) else {
+                            break;
+                        };
+                        visited.insert(ovfl);
                         pages.push(ovfl);
-                        if let Some(ovfl_buf) = read_page(ovfl) {
-                            if ovfl_buf.len() >= 4 {
-                                let next = u32::from_be_bytes([
-                                    ovfl_buf[0],
-                                    ovfl_buf[1],
-                                    ovfl_buf[2],
-                                    ovfl_buf[3],
-                                ]);
-                                if next == 0 {
-                                    break;
-                                }
-                                ovfl = next as u64 - 1;
-                            } else {
+                        if ovfl_buf.len() >= 4 {
+                            let next = u32::from_be_bytes([
+                                ovfl_buf[0],
+                                ovfl_buf[1],
+                                ovfl_buf[2],
+                                ovfl_buf[3],
+                            ]);
+                            if next == 0 {
                                 break;
                             }
+                            ovfl = next as u64 - 1;
                         } else {
                             break;
                         }
@@ -197,6 +200,11 @@ fn extract_interior_children(buf: &[u8], hdr_off: usize, _page_size: u32) -> Vec
     }
 
     let cell_count = u16::from_be_bytes([buf[hdr_off + 3], buf[hdr_off + 4]]) as usize;
+    // Cap cell_count so the cell pointer array and a minimal 4-byte child
+    // pointer for each cell both fit within the buffer. Prevents unbounded
+    // work on corrupted headers.
+    let max_cells = buf.len().saturating_sub(hdr_off + 12) / 2;
+    let cell_count = cell_count.min(max_cells);
 
     // Right-most child pointer (4 bytes at hdr_off + 8)
     let right_child = u32::from_be_bytes([
@@ -848,5 +856,96 @@ mod tests {
         assert_eq!(serial_type_size(17), 2); // TEXT len 2
         assert_eq!(serial_type_size(12), 0); // BLOB len 0
         assert_eq!(serial_type_size(14), 1); // BLOB len 1
+    }
+
+    /// F-02: overflow page numbers must only be recorded after read_page
+    /// succeeds and the page number is within page_count.
+    #[test]
+    fn test_overflow_pages_not_recorded_before_existence_check() {
+        let page_size: u32 = 1024;
+        let usable = page_size as usize;
+        let max_local = usable - 35;
+        let min_local = ((usable - 12) * 32 / 255) - 23;
+
+        // Build a minimal table leaf page with one cell that claims an
+        // overflow page far beyond the live page count.
+        let mut leaf = vec![0u8; page_size as usize];
+        leaf[0] = 0x0D; // leaf table
+        leaf[3..5].copy_from_slice(&1u16.to_be_bytes()); // 1 cell
+        leaf[8..10].copy_from_slice(&200u16.to_be_bytes()); // cell pointer
+
+        // Cell at offset 200: payload size > max_local, rowid, local payload,
+        // overflow pointer pointing to page 100 (1-based) => 0-based 99.
+        let mut pos = 200;
+        // Payload size: max_local + 1 to force overflow
+        let payload_size = (max_local + 1) as u64;
+        let (pl_bytes, pl_len) = encode_varint_for_test(payload_size);
+        leaf[pos..pos + pl_len].copy_from_slice(&pl_bytes);
+        pos += pl_len;
+        // rowid
+        let (rowid_bytes, rowid_len) = encode_varint_for_test(1);
+        leaf[pos..pos + rowid_len].copy_from_slice(&rowid_bytes);
+        pos += rowid_len;
+        // local payload + overflow pointer
+        let surplus = min_local + (payload_size as usize - min_local) % (usable - 4);
+        let local_size = if surplus <= max_local { surplus } else { min_local };
+        pos += local_size;
+        // overflow pointer: page 100 (1-based)
+        leaf[pos..pos + 4].copy_from_slice(&100u32.to_be_bytes());
+
+        // Database has only 2 pages (page 0 and page 1); page 99 is out of bounds.
+        let pages: std::collections::HashMap<u64, Vec<u8>> =
+            [(0, leaf.clone()), (1, vec![0u8; page_size as usize])]
+                .into_iter()
+                .collect();
+
+        let result = walk_all_btrees(2, page_size, &|pnum| {
+            pages.get(&pnum).cloned()
+        });
+
+        let btree = result.btrees.get(&0).expect("sqlite_master btree");
+        // The out-of-bounds overflow page must NOT appear in the btree pages.
+        assert!(
+            !btree.pages.contains(&99),
+            "out-of-bounds overflow page should not be recorded"
+        );
+        // The leaf itself should still be recorded.
+        assert!(btree.pages.contains(&0));
+    }
+
+    /// F-14: extract_interior_children must cap cell_count to prevent
+    /// unbounded work on a corrupted header.
+    #[test]
+    fn test_extract_interior_children_caps_cell_count() {
+        let page_size: u32 = 1024;
+        let mut page = vec![0u8; page_size as usize];
+        // Interior index page header: type, freeblock, cell_count = u16::MAX,
+        // cell content start, fragmented bytes, rightmost child.
+        page[0] = 0x02;
+        page[3..5].copy_from_slice(&u16::MAX.to_be_bytes());
+        page[8..12].copy_from_slice(&2u32.to_be_bytes());
+
+        let children = extract_interior_children(&page, 0, page_size);
+        // Rightmost child plus at most (buf.len() - 12) / 2 cell pointers.
+        let max_cells = page.len().saturating_sub(12) / 2;
+        assert_eq!(children.len(), 1 + max_cells);
+    }
+
+    fn encode_varint_for_test(mut value: u64) -> (Vec<u8>, usize) {
+        if value <= 0x7f {
+            return (vec![value as u8], 1);
+        }
+        let mut bytes = Vec::new();
+        while value > 0 {
+            bytes.push((value & 0x7f) as u8);
+            value >>= 7;
+        }
+        bytes.reverse();
+        let last = bytes.len() - 1;
+        for b in &mut bytes[..last] {
+            *b |= 0x80;
+        }
+        let len = bytes.len();
+        (bytes, len)
     }
 }

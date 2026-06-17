@@ -100,14 +100,16 @@ pub fn decompress(data: &[u8], _: Option<&()>) -> io::Result<Vec<u8>> {
 /// Decompress with a hard output cap (anti decompression-bomb).
 #[cfg(all(feature = "lz4", not(feature = "zstd")))]
 pub fn decompress_capped(data: &[u8], _: Option<&()>, max_len: usize) -> io::Result<Vec<u8>> {
-    let out = decompress(data, None)?;
-    if out.len() > max_len {
+    use lz4_flex::block::uncompressed_size;
+    let (declared, _) = uncompressed_size(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if declared > max_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decompressed output exceeds cap (possible decompression bomb)",
         ));
     }
-    Ok(out)
+    decompress(data, None)
 }
 
 // ===== Snappy Compression =====
@@ -452,5 +454,20 @@ mod crypto_regression_tests {
         let sub_ct = &whole_ct[50..90];
         let sub_plain = ctr_xor_at(sub_ct, nonce, 50, &KEY).unwrap();
         assert_eq!(sub_plain, &plain[50..90]);
+    }
+}
+
+#[cfg(test)]
+mod decompress_cap_tests {
+    use super::*;
+
+    /// The active codec's capped decompressor must reject an input whose
+    /// declared/output size exceeds the caller-supplied bound (E1/E2).
+    #[test]
+    fn decompress_capped_rejects_bomb_for_active_codec() {
+        let big = vec![0u8; 8192];
+        let compressed = compress(&big, 1, None).unwrap();
+        let err = decompress_capped(&compressed, None, 4096).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

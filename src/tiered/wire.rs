@@ -177,9 +177,19 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, PayloadVersionError> {
     }
 
     let body = &bytes[MAGIC.len() + 2..];
+    if body.len() > super::manifest::MAX_MANIFEST_BYTES {
+        return Err(PayloadVersionError::BodyDecode(format!(
+            "manifest body too large: {} bytes",
+            body.len()
+        )));
+    }
     let canonical: CanonicalManifestV1 =
         ciborium::from_reader(body).map_err(|e| PayloadVersionError::BodyDecode(e.to_string()))?;
-    Ok(Manifest::from(canonical))
+    let manifest = Manifest::from(canonical);
+    manifest
+        .validate_field_ranges()
+        .map_err(|e| PayloadVersionError::BodyDecode(e.to_string()))?;
+    Ok(manifest)
 }
 
 /// BLAKE3 over the envelope bytes — the value that lands in

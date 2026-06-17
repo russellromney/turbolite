@@ -41,10 +41,10 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Register a tiered VFS with SQLite through sqlite-plugin.
 #[inline]
@@ -61,43 +61,69 @@ thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
-// Track closed handle addresses to prevent use-after-close and double-close.
-//
-// This MUST be a process-global set, not thread-local: language bindings
-// (Python, Go, Node) routinely open a handle on one thread and close it on
-// another. A thread-local guard never sees a handle closed on a different
-// thread, so a second close from that thread would `Box::from_raw` an
-// already-freed pointer (double-free / use-after-free). A process-global
-// Mutex<HashSet<usize>> makes the closed-set visible across all threads.
-// Concurrent operations on the *same* handle remain the caller's
-// responsibility (a single TurboliteDb is not internally synchronized).
-fn closed_handles() -> &'static Mutex<HashSet<usize>> {
-    static CLOSED_HANDLES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    CLOSED_HANDLES.get_or_init(|| Mutex::new(HashSet::new()))
+// Opaque database connection handle. The `conn` field is wrapped in a Mutex
+// so the handle can be kept alive across threads with an `Arc` while still
+// satisfying Rust's Send/Sync requirements for the global handle table.
+pub struct TurboliteDb {
+    conn: Mutex<rusqlite::Connection>,
 }
 
-fn handle_is_closed(addr: usize) -> bool {
-    closed_handles()
+struct HandleSlot {
+    next_id: u64,
+    handles: HashMap<u64, Arc<TurboliteDb>>,
+}
+
+/// Process-global handle table keyed by a monotonic integer generation. The
+/// pointer returned by `turbolite_open` / `turbolite_open_local` is that opaque
+// ID, not a raw address, so allocator reuse cannot resurrect a stale handle
+/// (G1/G2). Operations clone the `Arc` for the duration of the call, so a
+/// concurrent close cannot drop the connection out from under an in-flight
+/// exec/query.
+fn handle_table() -> &'static Mutex<HandleSlot> {
+    static HANDLE_TABLE: OnceLock<Mutex<HandleSlot>> = OnceLock::new();
+    HANDLE_TABLE.get_or_init(|| {
+        Mutex::new(HandleSlot {
+            next_id: 1,
+            handles: HashMap::new(),
+        })
+    })
+}
+
+/// Shared process-global tokio runtime reused by every S3-backed registration.
+/// Building a fresh runtime per registration leaks it (the VFS holds a handle),
+/// so keep one runtime alive for the process lifetime.
+#[cfg(feature = "cli-s3")]
+fn shared_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime"))
+}
+
+fn insert_handle(conn: rusqlite::Connection) -> *mut TurboliteDb {
+    let mut slot = handle_table()
         .lock()
-        .map(|h| h.contains(&addr))
-        .unwrap_or(false)
+        .unwrap_or_else(|e| e.into_inner());
+    let id = slot.next_id;
+    slot.next_id += 1;
+    slot.handles.insert(id, Arc::new(TurboliteDb {
+        conn: Mutex::new(conn),
+    }));
+    id as *mut TurboliteDb
 }
 
-fn mark_handle_open(addr: usize) {
-    if let Ok(mut h) = closed_handles().lock() {
-        h.remove(&addr);
-    }
+fn lookup_handle(id: usize) -> Option<Arc<TurboliteDb>> {
+    let slot = handle_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slot.handles.get(&(id as u64)).cloned()
 }
 
-/// Returns true if this call transitioned the handle from open to closed
-/// (i.e. the caller now owns the free). A concurrent/duplicate close returns
-/// false.
-fn mark_handle_closed(addr: usize) -> bool {
-    match closed_handles().lock() {
-        Ok(mut h) => h.insert(addr),
-        // Poisoned lock: treat as "already closed" to avoid a double-free.
-        Err(_) => false,
-    }
+/// Remove the handle from the table. Returns `true` if the handle existed and
+/// was removed (this call owns the drop); `false` if it was already closed.
+fn remove_handle(id: usize) -> bool {
+    let mut slot = handle_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slot.handles.remove(&(id as u64)).is_some()
 }
 
 fn set_last_error(msg: &str) {
@@ -439,6 +465,29 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
     })
 }
 
+/// Build an `S3Storage` from caller-supplied parameters, honoring the
+/// optional `endpoint_url` and `region`. The `prefix` is applied via
+/// `with_prefix` so all keys are scoped under it.
+#[cfg(feature = "cli-s3")]
+async fn build_s3_storage(
+    bucket: &str,
+    prefix: &str,
+    endpoint_url: Option<&str>,
+    region: Option<&str>,
+) -> Result<hadb_storage_s3::S3Storage, anyhow::Error> {
+    let mut base_loader = aws_config::from_env();
+    if let Some(region) = region {
+        base_loader = base_loader.region(aws_sdk_s3::config::Region::new(region.to_string()));
+    }
+    let base = base_loader.load().await;
+    let mut s3_config = aws_sdk_s3::config::Builder::from(&base);
+    if let Some(endpoint) = endpoint_url {
+        s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
+    }
+    let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+    Ok(hadb_storage_s3::S3Storage::new(client, bucket).with_prefix(prefix))
+}
+
 /// Register an S3-backed cloud VFS.
 ///
 /// The VFS stores data in S3 with a local NVMe cache. Requires the `cloud`
@@ -490,23 +539,17 @@ pub extern "C" fn turbolite_register_cloud(
             ..Default::default()
         };
 
-        // Wire hadb-storage-s3 via env vars + an owned tokio runtime (the
-        // FFI boundary can't inherit one from the caller).
-        let runtime = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                set_last_error(&format!("tokio runtime: {}", e));
-                return -1;
-            }
-        };
+        // Wire hadb-storage-s3 via env vars using the shared process-global
+        // tokio runtime. The VFS holds a handle into it, so a single runtime is
+        // kept alive instead of leaking one per registration.
+        let runtime = shared_runtime();
         let handle = runtime.handle().clone();
-        let _ = (prefix, region); // reserved for Phase Turbogenesis CLI wiring
         let backend = match handle.block_on(async {
-            hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint_url).await
+            build_s3_storage(bucket, prefix, endpoint_url, region).await
         }) {
             Ok(b) => std::sync::Arc::new(b) as std::sync::Arc<dyn hadb_storage::StorageBackend>,
             Err(e) => {
-                set_last_error(&format!("S3Storage::from_env: {}", e));
+                set_last_error(&format!("S3Storage: {}", e));
                 return -1;
             }
         };
@@ -518,9 +561,6 @@ pub extern "C" fn turbolite_register_cloud(
                 return -1;
             }
         };
-        // Leak the runtime for the process lifetime; the VFS captures a handle
-        // into it. The FFI boundary owns no cleanup hook.
-        std::mem::forget(runtime);
         match register_turbolite_vfs(name, vfs) {
             Ok(()) => 0,
             Err(e) => {
@@ -581,11 +621,6 @@ pub extern "C" fn turbolite_invalidate_cache(path: *const c_char) -> c_int {
 // open databases, run queries, and read results through the VFS without
 // needing their own SQLite linkage.
 
-/// Opaque database connection handle.
-pub struct TurboliteDb {
-    conn: rusqlite::Connection,
-}
-
 /// Open a database using a previously registered VFS.
 ///
 /// # Parameters
@@ -614,10 +649,7 @@ pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -
             Ok(conn) => {
                 // turbolite manages its own manifest-aware page cache. Disable SQLite's.
                 let _ = conn.execute_batch("PRAGMA cache_size=0;");
-                let db = Box::into_raw(Box::new(TurboliteDb { conn }));
-                // Clear any stale "closed" marker if this address was reused.
-                mark_handle_open(db as usize);
-                db
+                insert_handle(conn)
             }
             Err(e) => {
                 set_last_error(&format!("open failed: {}", e));
@@ -651,11 +683,7 @@ pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb 
         };
 
         match turbolite::open_local(path) {
-            Ok(conn) => {
-                let db = Box::into_raw(Box::new(TurboliteDb { conn }));
-                mark_handle_open(db as usize);
-                db
-            }
+            Ok(conn) => insert_handle(conn),
             Err(e) => {
                 set_last_error(&format!("open_local failed: {}", e));
                 std::ptr::null_mut()
@@ -673,24 +701,27 @@ pub extern "C" fn turbolite_open_local(path: *const c_char) -> *mut TurboliteDb 
 /// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
 /// a valid NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
+pub extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char) -> c_int {
     ffi_guard(-1, || {
         clear_last_error();
         if db.is_null() {
             set_last_error("db handle must not be NULL");
             return -1;
         }
-        if handle_is_closed(db as usize) {
-            set_last_error("db handle is already closed");
-            return -1;
-        }
+        let db = match lookup_handle(db as usize) {
+            Some(db) => db,
+            None => {
+                set_last_error("db handle is invalid or already closed");
+                return -1;
+            }
+        };
         let sql = match unsafe { cstr_to_str(&sql, "sql") } {
             Ok(s) => s,
             Err(code) => return code,
         };
 
-        let db = unsafe { &*db };
-        match db.conn.execute_batch(sql) {
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        match conn.execute_batch(sql) {
             Ok(()) => 0,
             Err(e) => {
                 set_last_error(&format!("exec failed: {}", e));
@@ -712,7 +743,7 @@ pub unsafe extern "C" fn turbolite_exec(db: *mut TurboliteDb, sql: *const c_char
 /// `db` must be a live handle from `turbolite_open` (not yet closed), and `sql`
 /// a valid NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_query_json(
+pub extern "C" fn turbolite_query_json(
     db: *mut TurboliteDb,
     sql: *const c_char,
 ) -> *mut c_char {
@@ -722,19 +753,21 @@ pub unsafe extern "C" fn turbolite_query_json(
             set_last_error("db handle must not be NULL");
             return std::ptr::null_mut();
         }
-        if handle_is_closed(db as usize) {
-            set_last_error("db handle is already closed");
-            return std::ptr::null_mut();
-        }
+        let db = match lookup_handle(db as usize) {
+            Some(db) => db,
+            None => {
+                set_last_error("db handle is invalid or already closed");
+                return std::ptr::null_mut();
+            }
+        };
         let sql = match unsafe { cstr_to_str(&sql, "sql") } {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
         };
 
-        let db = unsafe { &*db };
         let result = (|| -> Result<String, String> {
-            let mut stmt = db
-                .conn
+            let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| format!("prepare: {}", e))?;
             let col_count = stmt.column_count();
@@ -789,7 +822,7 @@ pub unsafe extern "C" fn turbolite_query_json(
 /// `s` must be NULL or a pointer returned by `turbolite_query_json` that has
 /// not already been freed.
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_free_string(s: *mut c_char) {
+pub extern "C" fn turbolite_free_string(s: *mut c_char) {
     ffi_guard((), || {
         if !s.is_null() {
             unsafe {
@@ -805,22 +838,16 @@ pub unsafe extern "C" fn turbolite_free_string(s: *mut c_char) {
 /// `db` must be NULL or a handle from `turbolite_open`. A double close is safe
 /// (the handle is freed exactly once).
 #[no_mangle]
-pub unsafe extern "C" fn turbolite_close(db: *mut TurboliteDb) {
+pub extern "C" fn turbolite_close(db: *mut TurboliteDb) {
     ffi_guard((), || {
         if db.is_null() {
             return;
         }
-        // Atomically claim the free under the process-global guard. Only the
-        // caller that transitions the handle from open->closed owns the
-        // `Box::from_raw`. A concurrent or duplicate close (any thread) sees
-        // the address already in the set and returns without freeing, so the
-        // pointer is dropped exactly once.
-        if !mark_handle_closed(db as usize) {
-            return;
-        }
-        unsafe {
-            drop(Box::from_raw(db));
-        }
+        // Remove the handle from the global table. The Arc (and the underlying
+        // Connection) is dropped when the returned Arc goes out of scope. Any
+        // in-flight operation holds its own Arc clone, so this cannot free the
+        // connection under it. A duplicate close finds no entry and is a no-op.
+        let _ = remove_handle(db as usize);
     });
 }
 

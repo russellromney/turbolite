@@ -19,6 +19,17 @@ use super::{
     encode_page_group, encode_page_group_seekable, keys, FrameEntry, Manifest,
 };
 
+/// Read the live page count from page 0 header offset 28 (4 bytes big-endian),
+/// falling back to the manifest's value if the header is unavailable.
+fn read_live_page_count(read_page: &dyn Fn(u64) -> Option<Vec<u8>>, fallback: u64) -> u64 {
+    match read_page(0) {
+        Some(page0) if page0.len() >= 32 => {
+            u32::from_be_bytes([page0[28], page0[29], page0[30], page0[31]]) as u64
+        }
+        _ => fallback,
+    }
+}
+
 /// Per-B-tree dead space analysis.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -52,7 +63,8 @@ pub fn analyze_dead_space(
     read_page: &dyn Fn(u64) -> Option<Vec<u8>>,
     threshold: f64,
 ) -> DeadSpaceReport {
-    let walk = crate::btree_walker::walk_all_btrees(manifest.page_count, page_size, read_page);
+    let live_page_count = read_live_page_count(read_page, manifest.page_count);
+    let walk = crate::btree_walker::walk_all_btrees(live_page_count, page_size, read_page);
 
     let mut btrees = Vec::new();
     let mut total_live = 0usize;
@@ -130,7 +142,8 @@ pub fn compact_btree(
     page_size: u32,
     read_page: &dyn Fn(u64) -> Option<Vec<u8>>,
 ) -> io::Result<CompactResult> {
-    let walk = crate::btree_walker::walk_all_btrees(manifest.page_count, page_size, read_page);
+    let live_page_count = read_live_page_count(read_page, manifest.page_count);
+    let walk = crate::btree_walker::walk_all_btrees(live_page_count, page_size, read_page);
 
     let walk_entry = walk.btrees.get(&btree_root).ok_or_else(|| {
         io::Error::new(
@@ -514,5 +527,49 @@ pub(crate) fn compact_override_group(
             encoded,
             replaced_keys,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-18: compaction must use the live page count from page 0 header
+    /// offset 28, not the stale manifest page_count.
+    #[test]
+    fn compaction_uses_live_page_count_from_page0() {
+        let page_size: u32 = 1024;
+
+        // Build a minimal manifest whose page_count is stale (e.g., 100).
+        let mut manifest = Manifest::empty();
+        manifest.page_count = 100;
+        manifest.page_size = page_size;
+        manifest.pages_per_group = 4;
+
+        // Build a fake page 0 whose header claims only 3 pages live.
+        let mut page0 = vec![0u8; page_size as usize];
+        page0[0] = 0x0D; // leaf table
+        page0[3..5].copy_from_slice(&0u16.to_be_bytes());
+        page0[28..32].copy_from_slice(&3u32.to_be_bytes());
+
+        let mut pages: std::collections::HashMap<u64, Vec<u8>> =
+            [(0u64, page0)].into_iter().collect();
+        pages.insert(1, vec![0u8; page_size as usize]);
+        pages.insert(2, vec![0u8; page_size as usize]);
+
+        let read_page = |pnum: u64| pages.get(&pnum).cloned();
+
+        let live = read_live_page_count(&read_page, manifest.page_count);
+        assert_eq!(live, 3, "live page count must come from page 0 header");
+
+        // analyze_dead_space should walk only the live 3 pages, not 100.
+        let report = analyze_dead_space(
+            &manifest,
+            page_size,
+            &read_page,
+            0.0, // threshold 0 so empty results are visible
+        );
+        assert_eq!(report.total_dead, 0);
+        assert_eq!(report.total_live, 0);
     }
 }

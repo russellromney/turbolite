@@ -211,14 +211,9 @@ fn compress_zstd(data: &[u8], _level: i32) -> io::Result<Vec<u8>> {
 
 #[cfg(feature = "zstd")]
 fn decompress_zstd(data: &[u8], max_page: usize) -> io::Result<Vec<u8>> {
-    let out = crate::compress::decompress(data, None)?;
-    if out.len() > max_page {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "decompressed page exceeds page size (possible bomb)",
-        ));
-    }
-    Ok(out)
+    // Use the capped decoder so a malicious size prefix cannot force an
+    // unbounded allocation before the post-decompression length check (E2).
+    crate::compress::decompress_capped(data, None, max_page)
 }
 
 #[cfg(not(feature = "zstd"))]
@@ -467,5 +462,21 @@ mod tests {
             ..codec
         };
         assert!(decode_page(&blob, &wrong_codec, 4096).is_err());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn decode_rejects_zstd_decompression_bomb() {
+        // A zstd payload that decompresses to more than the caller's max page
+        // size must be rejected before unbounded memory is allocated (E2).
+        let codec = PageCodec {
+            compress: true,
+            level: 1,
+            key: None,
+        };
+        let big = vec![0u8; 8192];
+        let blob = encode_page(&big, &codec).unwrap();
+        let err = decode_page(&blob, &codec, 4096).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

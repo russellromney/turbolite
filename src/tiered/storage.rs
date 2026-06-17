@@ -48,7 +48,7 @@ pub(crate) fn range_get(
     validate_range_get_result(key, start, len, result)
 }
 
-fn validate_range_get_result(
+pub(crate) fn validate_range_get_result(
     key: &str,
     start: u64,
     len: u32,
@@ -171,11 +171,39 @@ pub(crate) fn get_manifest(
 
 /// Serialise + upload the canonical manifest. `MANIFEST_KEY` is the
 /// source-of-truth object every turbolite backend stores.
+///
+/// Best-effort CAS: before overwriting, fetch the remote manifest and reject
+/// the upload if it already has a version >= the one we are writing (C1). This
+/// prevents a slow/follower writer from silently clobbering a newer manifest.
+/// It is not a true atomic compare-and-swap because the backend trait does not
+/// expose ETags, but it closes the most common cross-writer race window.
 pub(crate) fn put_manifest(
     backend: &dyn StorageBackend,
     runtime: &TokioHandle,
     manifest: &Manifest,
 ) -> io::Result<()> {
+    // Optimistic version check. First write (version 1) skips the fetch.
+    if manifest.version > 1 {
+        match get_manifest(backend, runtime) {
+            Ok(Some(remote)) if remote.version >= manifest.version => {
+                return Err(io::Error::other(format!(
+                    "manifest CAS conflict: remote v{} >= local v{}",
+                    remote.version, manifest.version
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // If we cannot verify the remote manifest, we must not proceed:
+                // publishing without checking the version could overwrite a newer
+                // manifest. The caller can retry after the transient read error
+                // resolves.
+                return Err(io::Error::other(format!(
+                    "manifest version check failed: cannot read remote manifest: {e}"
+                )));
+            }
+        }
+    }
+
     let bytes = rmp_serde::to_vec(manifest)
         .map_err(|e| io::Error::other(format!("encode manifest: {e}")))?;
     put(backend, runtime, keys::MANIFEST_KEY, &bytes)

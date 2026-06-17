@@ -197,6 +197,13 @@ pub struct TurboliteHandle {
     pages_per_group: u32,
     compression_level: i32,
     read_only: bool,
+    /// Optional VFS-level lock used to serialize `sync()` local flushes with
+    /// background `flush_to_storage()` runs (C4). Tests can leave this `None`.
+    flush_lock: Option<Arc<parking_lot::Mutex<()>>>,
+    /// Highest page number this handle has written, plus one. Kept local so
+    /// uncommitted file growth is not visible to other handles through the
+    /// shared manifest (A6). `sync()` publishes this value to the manifest.
+    pending_page_count: u64,
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
     tree_miss_counts: HashMap<String, u8>,
@@ -469,6 +476,8 @@ impl PassthroughNonceMap {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        // Durability: the rename must survive a crash, so fsync the parent dir.
+        Self::fsync_parent(&self.path)?;
         // Reopen for append so subsequent writes extend the compacted file.
         self.append = Some(
             std::fs::OpenOptions::new()
@@ -479,17 +488,31 @@ impl PassthroughNonceMap {
         Ok(())
     }
 
+    fn fsync_parent(path: &std::path::Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            let f = std::fs::File::open(parent)?;
+            f.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Append a single record to the sidecar log and fdatasync it. Opens the
     /// append handle on demand if compaction hasn't already.
     fn append_record(&mut self, start: u64, len: u64, nonce: u64) -> io::Result<()> {
         use std::io::Write;
         if self.append.is_none() {
+            let newly_created = !self.path.exists();
             self.append = Some(
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&self.path)?,
             );
+            if newly_created {
+                // First creation of the sidecar: fsync parent dir so the
+                // directory entry survives a crash (E4/E3).
+                Self::fsync_parent(&self.path)?;
+            }
         }
         let f = self.append.as_mut().unwrap();
         let mut rec = [0u8; 24];
@@ -497,7 +520,7 @@ impl PassthroughNonceMap {
         rec[8..16].copy_from_slice(&len.to_le_bytes());
         rec[16..24].copy_from_slice(&nonce.to_le_bytes());
         f.write_all(&rec)?;
-        // Durable before the caller writes the matching ciphertext.
+        // Durable after the matching ciphertext is already on disk.
         f.sync_data()?;
         Ok(())
     }
@@ -506,14 +529,23 @@ impl PassthroughNonceMap {
     /// append it durably to the sidecar log, and update the in-memory map.
     /// Drops any prior entries fully contained in the new extent so stale
     /// sub-writes can't shadow this one. Returns the chosen nonce.
+    #[allow(dead_code)]
     fn record_write(&mut self, start: u64, len: u64) -> io::Result<u64> {
         use rand::RngCore;
         let mut b = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut b);
         let nonce = u64::from_le_bytes(b);
+        self.commit_record(start, len, nonce)?;
+        Ok(nonce)
+    }
+
+    /// Append a caller-supplied nonce to the sidecar and apply it to the
+    /// in-memory map. The caller generates the nonce and writes the matching
+    /// ciphertext first, so the sidecar fsync happens AFTER the data fsync.
+    fn commit_record(&mut self, start: u64, len: u64, nonce: u64) -> io::Result<()> {
         self.append_record(start, len, nonce)?;
         Self::apply_record(&mut self.entries, start, len, nonce);
-        Ok(nonce)
+        Ok(())
     }
 
     /// Find the nonce + extent start covering `[offset, offset+len)`.
@@ -715,6 +747,8 @@ impl TurboliteHandle {
             None => (None, None),
         };
 
+        let initial_page_count = manifest.page_count;
+
         // Drop the snapshot; handle uses the shared Arc from now on
         drop(manifest);
 
@@ -747,6 +781,7 @@ impl TurboliteHandle {
             pages_per_group,
             compression_level,
             read_only,
+            flush_lock: None,
             tree_miss_counts: HashMap::new(),
             prefetch_search,
             prefetch_lookup,
@@ -757,6 +792,7 @@ impl TurboliteHandle {
             dirty_since_sync: false,
             synced_since_write: false,
             cached_generation: 0,
+            pending_page_count: initial_page_count,
             gc_enabled,
             override_threshold,
             compaction_threshold,
@@ -867,11 +903,26 @@ impl TurboliteHandle {
             // main-db handle.
             settings_queue: settings::new_queue(),
             plugin_shm: None,
+            pending_page_count: 0,
+            flush_lock: None,
         }
     }
 
     pub(crate) fn is_passthrough(&self) -> bool {
         self.passthrough_file.is_some()
+    }
+
+    /// Attach the VFS-level flush lock. Must be called once after construction
+    /// by the VFS that owns this handle (C4).
+    pub(crate) fn set_flush_lock(&mut self, lock: Arc<parking_lot::Mutex<()>>) {
+        self.flush_lock = Some(lock);
+    }
+
+    /// Page count visible to this handle: committed shared manifest count plus
+    /// any speculative growth from uncommitted writes on this handle (A6).
+    fn effective_page_count(&self) -> u64 {
+        let manifest_count = self.manifest.load().page_count;
+        self.pending_page_count.max(manifest_count)
     }
 
     /// Get miss count for a tree. Returns 0 for unknown trees.
@@ -1668,6 +1719,79 @@ impl TurboliteHandle {
         }
         Ok(())
     }
+
+    /// Best-effort local persistence of any dirty state on close.
+    ///
+    /// Unlike `sync()`, this does **not** upload to remote storage. It only
+    /// writes the manifest (and cache bitmap) to the local cache directory so
+    /// that a reopen on the same cache sees the final page state. This gives
+    /// clean-close durability for local backends even under
+    /// `PRAGMA synchronous=OFF` (where SQLite never calls xSync) without
+    /// publishing speculative file growth to the shared in-process manifest
+    /// while the handle is alive (A6).
+    pub(crate) fn close_local_commit(&mut self) -> Result<(), io::Error> {
+        if self.is_passthrough() || self.read_only {
+            return Ok(());
+        }
+        let Some(cache) = self.cache.as_ref().cloned() else {
+            return Ok(());
+        };
+        let page_size = self.page_size.load(Ordering::Relaxed) as usize;
+        if page_size == 0 {
+            return Ok(());
+        }
+
+        let dirty_snapshot: HashSet<u64> = self.dirty_page_nums.read().clone();
+        if dirty_snapshot.is_empty() && self.pending_page_count <= self.manifest.load().page_count {
+            return Ok(());
+        }
+
+        let mut manifest = (**self.manifest.load()).clone();
+        let mut changed = false;
+
+        let target_page_count = self.pending_page_count.max(manifest.page_count);
+        if target_page_count != manifest.page_count {
+            manifest.page_count = target_page_count;
+            changed = true;
+        }
+
+        let ppg = self.pages_per_group.max(1);
+        let unassigned: Vec<u64> = dirty_snapshot
+            .iter()
+            .filter(|&&pn| manifest.page_location(pn).is_none())
+            .copied()
+            .collect();
+        if !unassigned.is_empty() {
+            Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+            changed = true;
+        }
+
+        // Detect interior pages among pages that just received a group assignment.
+        let mut type_buf = vec![0u8; page_size];
+        for &page_num in &unassigned {
+            if let Some(loc) = manifest.page_location(page_num) {
+                if cache.read_page(page_num, &mut type_buf).is_ok() {
+                    let type_byte = if page_num == 0 {
+                        type_buf.get(100)
+                    } else {
+                        type_buf.first()
+                    };
+                    if let Some(&b) = type_byte {
+                        if b == 0x05 || b == 0x02 {
+                            cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                        }
+                    }
+                }
+            }
+        }
+
+        if changed {
+            manifest.build_page_index();
+            manifest::persist_manifest_local(&cache.cache_dir, &manifest)?;
+            let _ = cache.persist_bitmap();
+        }
+        Ok(())
+    }
 }
 
 impl DatabaseHandle for TurboliteHandle {
@@ -1678,8 +1802,9 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         let manifest = self.manifest.load();
-        if manifest.page_size > 0 && manifest.page_count > 0 {
-            Ok(manifest.page_count * manifest.page_size as u64)
+        let page_count = self.effective_page_count();
+        if manifest.page_size > 0 && page_count > 0 {
+            Ok(page_count * manifest.page_size as u64)
         } else {
             Ok(0)
         }
@@ -1688,23 +1813,26 @@ impl DatabaseHandle for TurboliteHandle {
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), io::Error> {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
-            let file = self.passthrough_file.as_ref().unwrap().read();
-            file.read_exact_at(buf, offset)?;
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                // Recover the per-write random nonce covering this range from
-                // the sidecar, then seek the CTR keystream by the in-extent
-                // offset. A read with no recorded extent (e.g. reading a hole
-                // SQLite never wrote, or a sidecar lost on crash) decrypts to
-                // garbage rather than leaking a fixed-keystream plaintext xor.
-                let nonces = self.passthrough_nonces.as_ref().unwrap().read();
-                let (skip, nonce) = match nonces.lookup(offset, buf.len() as u64) {
+                // Hold the nonce read lock across the data-file read and the
+                // decryption so a concurrent writer cannot update the sidecar
+                // between the two (E4/A4). Lock order is always nonce -> data
+                // file to avoid deadlocks with write_all_at.
+                let nonces = self.passthrough_nonces.as_ref().unwrap();
+                let nonces_guard = nonces.read();
+                let file = self.passthrough_file.as_ref().unwrap().read();
+                file.read_exact_at(buf, offset)?;
+                let (skip, nonce) = match nonces_guard.lookup(offset, buf.len() as u64) {
                     Some((start, nonce)) => (offset - start, nonce),
                     None => (0, offset),
                 };
                 let decrypted = compress::ctr_xor_at(buf, nonce, skip, key)?;
                 buf[..decrypted.len()].copy_from_slice(&decrypted);
+                return Ok(());
             }
+            let file = self.passthrough_file.as_ref().unwrap().read();
+            file.read_exact_at(buf, offset)?;
             return Ok(());
         }
 
@@ -1761,7 +1889,9 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // 2. Bounds check - page beyond manifest is zero-filled
+        // 2. Bounds check - page beyond the committed manifest size is zero-filled.
+        // Use the shared manifest page_count so uncommitted speculative growth on
+        // another handle is not visible here (A6, A2).
         let manifest_page_count = self.manifest.load().page_count;
         if page_num >= manifest_page_count {
             buf.fill(0);
@@ -1769,14 +1899,15 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // 3. Look up page location.
-        // Safe to .expect() here because:
-        //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
-        //    - Pages beyond page_count are zero-filled (returned above)
-        //    - sync() assigns new pages to groups before clearing dirty_page_nums
+        // Pages that are within page_count but have no group assignment (e.g.
+        // after a truncate-then-regrow before the regrown pages are rewritten)
+        // are defined to read as zeros, matching SQLite's expectation for
+        // unallocated in-bounds space.
         let manifest_ref = self.manifest.load();
-        let loc = manifest_ref
-            .page_location(page_num)
-            .expect("page within manifest bounds must have group assignment");
+        let Some(loc) = manifest_ref.page_location(page_num) else {
+            buf.fill(0);
+            return Ok(());
+        };
 
         let gid = loc.group_id;
         let current_tree_name = manifest_ref
@@ -1852,6 +1983,9 @@ impl DatabaseHandle for TurboliteHandle {
         if query_plan::check_and_clear_end_query() {
             self.planned_lookahead_searches.clear();
             self.retained_lookahead.clear();
+            self.search_trees.clear();
+            self.active_scan_prefetch.clear();
+            self.last_scan_refill_gid = None;
             if let Some(pool) = &self.prefetch_pool {
                 pool.clear_lookahead_provenance();
             }
@@ -1976,9 +2110,8 @@ impl DatabaseHandle for TurboliteHandle {
             self.refill_active_scan_prefetch(&manifest_snap, cache, Some(gid));
             self.last_scan_refill_gid = Some(gid);
         }
-        if cache.is_present(page_num) {
+        if cache.read_page_if_present(page_num, buf)? {
             self.reset_misses(current_tree_name.as_ref());
-            cache.read_page(page_num, buf)?;
             // Debug: log reads of first 5 pages to trace HA promotion data visibility
             if page_num < 5 {
                 let nonzero = buf.iter().filter(|&&b| b != 0).count();
@@ -2155,8 +2288,7 @@ impl DatabaseHandle for TurboliteHandle {
         let manifest = self.manifest.load_full();
 
         // 5a. Re-check cache: a sibling prefetch may have completed since step 4.
-        if cache.is_present(page_num) {
-            cache.read_page(page_num, buf)?;
+        if cache.read_page_if_present(page_num, buf)? {
             self.detect_interior_page(buf, page_num, cache);
             self.record_lookahead_hit_if_present(gid, loc, &manifest);
             self.note_served_page_for_lookahead(
@@ -2660,7 +2792,14 @@ impl DatabaseHandle for TurboliteHandle {
 
         // Fallback read from cache file even if bitmap says absent.
         if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
-            cache.bitmap_mark(page_num);
+            // Re-write the page under the disk-cache's eviction serialization.
+            // Without this, an eviction that punches a hole between the read and
+            // the bitmap mark could leave the bit set with zeros on disk (B4).
+            if let Err(e) = cache.write_page(page_num, buf) {
+                return Err(io::Error::other(format!(
+                    "fallback page re-install failed: {e}"
+                )));
+            }
             cache.mark_group_present(gid);
             self.clear_lookahead_group(gid);
             self.detect_interior_page(buf, page_num, cache);
@@ -2675,30 +2814,45 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        buf.fill(0);
-        Ok(())
+        // We are in the remote backend path and the page is inside the committed
+        // file size, but no backend object yielded its bytes. Returning zeros
+        // would fabricate data and hide missing/corrupt objects (A2).
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "page {} in group {} missing from remote storage",
+                page_num, gid
+            ),
+        ))
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error> {
         if self.is_passthrough() {
             use std::os::unix::fs::FileExt;
-            let file = self.passthrough_file.as_ref().unwrap().read();
             #[cfg(feature = "encryption")]
             if let Some(ref key) = self.encryption_key {
-                // Fresh random nonce per write, recorded in the sidecar keyed by
-                // this write's start offset. This is what makes in-place WAL
-                // frame rewrites safe (no keystream reuse). The data file stays
-                // the same size — only the sidecar carries the nonce.
-                let nonce = {
-                    let mut nonces = self.passthrough_nonces.as_ref().unwrap().write();
-                    // record_write appends the nonce to the sidecar log and
-                    // fdatasyncs it before we write the matching ciphertext.
-                    nonces.record_write(offset, buf.len() as u64)?
-                };
+                // Acquire the nonce lock first to establish a consistent lock
+                // order (nonce -> data file) with read_exact_at. Generate the
+                // nonce here, but do not commit it until after the matching
+                // ciphertext is on disk (E4/A4).
+                let nonces = self.passthrough_nonces.as_ref().unwrap();
+                let mut nonces_guard = nonces.write();
+                use rand::RngCore;
+                let mut b = [0u8; 8];
+                rand::thread_rng().fill_bytes(&mut b);
+                let nonce = u64::from_le_bytes(b);
                 let encrypted = compress::ctr_xor_at(buf, nonce, 0, key)?;
-                return file.write_all_at(&encrypted, offset);
+                let file = self.passthrough_file.as_ref().unwrap().read();
+                file.write_all_at(&encrypted, offset)?;
+                file.sync_data()?;
+                drop(file);
+                nonces_guard.commit_record(offset, buf.len() as u64, nonce)?;
+                return Ok(());
             }
-            return file.write_all_at(buf, offset);
+            let file = self.passthrough_file.as_ref().unwrap().read();
+            file.write_all_at(buf, offset)?;
+            file.sync_data()?;
+            return Ok(());
         }
 
         if self.read_only {
@@ -2796,22 +2950,23 @@ impl DatabaseHandle for TurboliteHandle {
         // lock-downgrade flush must not publish them unless xSync fires again.
         self.synced_since_write = false;
 
-        // Update manifest page_count if this page extends the database.
-        // Fast path: read lock to check if update is needed (common case: no).
+        // Track speculative file growth locally; do not publish page_count to
+        // the shared manifest until sync() commits it (A6). Geometry fields
+        // (page_size, pages_per_group, sub_pages_per_frame) are not speculative
+        // and are published when first discovered.
         {
             let new_count = page_num + 1;
-            let needs_update = {
+            if new_count > self.pending_page_count {
+                self.pending_page_count = new_count;
+            }
+            let needs_geometry = {
                 let m = self.manifest.load();
-                new_count > m.page_count
-                    || m.page_size == 0
+                m.page_size == 0
                     || m.pages_per_group == 0
                     || m.sub_pages_per_frame == 0
             };
-            if needs_update {
+            if needs_geometry {
                 let mut manifest = (**self.manifest.load()).clone();
-                if new_count > manifest.page_count {
-                    manifest.page_count = new_count;
-                }
                 if manifest.page_size == 0 {
                     manifest.page_size = buf.len() as u32;
                 }
@@ -2828,13 +2983,14 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                 }
-
-                // Ensure group states capacity for new groups
-                if let Some(cache) = &self.cache {
-                    let total_groups = manifest.total_groups() as usize;
-                    cache.ensure_group_capacity(total_groups);
-                }
                 self.manifest.store(Arc::new(manifest));
+            }
+            // Ensure group states capacity covers the speculative size too.
+            if let Some(cache) = &self.cache {
+                let total_groups =
+                    Manifest::total_groups_for(self.effective_page_count(), self.pages_per_group)
+                        as usize;
+                cache.ensure_group_capacity(total_groups);
             }
         }
 
@@ -3009,6 +3165,9 @@ impl DatabaseHandle for TurboliteHandle {
             //     network. `flush_to_storage()` drains pending_flushes later,
             //     outside the lock, via the same flush_dirty_groups path.
             if self.is_local {
+                // Serialize inline local flushes with background
+                // `flush_to_storage()` runs on the same VFS (C4).
+                let _flush_guard = self.flush_lock.as_ref().map(|l| l.lock());
                 if let (Some(ref storage), Some(runtime)) =
                     (self.storage.as_ref(), self.runtime.as_ref())
                 {
@@ -3074,10 +3233,23 @@ impl DatabaseHandle for TurboliteHandle {
 
                         if do_rewalk {
                             let mut manifest = (**self.manifest.load()).clone();
-                            let page_count = manifest.page_count;
+
+                            // VACUUM rewrote the file and changed the page count.
+                            // Read the live page count from page 0 header offset 28
+                            // (4 bytes big-endian) before re-walking, falling back
+                            // to the manifest's stale value if the header is short.
+                            let live_page_count = if page0.len() >= 32 {
+                                u32::from_be_bytes([
+                                    page0[28], page0[29], page0[30], page0[31],
+                                ]) as u64
+                            } else {
+                                manifest.page_count
+                            };
+                            manifest.page_count = live_page_count;
+                            self.pending_page_count = live_page_count;
 
                             let walk = crate::btree_walker::walk_all_btrees(
-                                page_count,
+                                live_page_count,
                                 page_size,
                                 &|pnum| {
                                     let mut buf = vec![0u8; page_size as usize];
@@ -3152,7 +3324,7 @@ impl DatabaseHandle for TurboliteHandle {
 
                             turbolite_debug!(
                                 "[sync] VACUUM: repacked {} pages into {} groups (was {} groups)",
-                                page_count,
+                                live_page_count,
                                 new_group_pages.len(),
                                 manifest.group_pages.len(),
                             );
@@ -3307,78 +3479,104 @@ impl DatabaseHandle for TurboliteHandle {
                             }
                         }
 
-                        // Remote merge if needed
+                        // Backend merge if needed. Required even for local backends
+                        // because the local cache may have evicted pages.
                         if need_s3_merge {
-                            if let Some(existing_key) = new_keys.get(gid as usize) {
-                                if !existing_key.is_empty() {
-                                    if let Ok(Some(pg_data)) = storage_helpers::get_page_group(
-                                        storage_ref,
-                                        runtime_ref,
-                                        existing_key,
-                                    ) {
-                                        let existing_ft =
-                                            manifest_snap.frame_tables.get(gid as usize);
-                                        let has_ft = use_seekable
-                                            && existing_ft
-                                                .map(|ft| !ft.is_empty())
-                                                .unwrap_or(false);
-                                        if has_ft {
-                                            let ft = existing_ft.expect("checked");
-                                            if let Ok((_pc, _ps, bulk_data)) =
-                                                decode_page_group_seekable_full(
-                                                    &pg_data,
-                                                    ft,
-                                                    page_size,
-                                                    pages_in_group.len() as u32,
-                                                    page_count,
-                                                    0,
-                                                    #[cfg(feature = "zstd")]
-                                                    None::<&zstd::dict::DecoderDictionary<'static>>,
-                                                    &keys::aad_page_group(gid),
-                                                    encryption_key.as_ref(),
-                                                )
-                                            {
-                                                let ps = page_size as usize;
-                                                for j in 0..pages_in_group.len() {
-                                                    if pages_in_group[j] >= page_count {
-                                                        break;
-                                                    }
-                                                    if pages[j].is_none() {
-                                                        let start = j * ps;
-                                                        let end = start + ps;
-                                                        if end <= bulk_data.len() {
-                                                            pages[j] = Some(
-                                                                bulk_data[start..end].to_vec(),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else if let Ok((_pc, _ps, existing_pages)) =
-                                            decode_page_group(
-                                                &pg_data,
-                                                #[cfg(feature = "zstd")]
-                                                None::<&zstd::dict::DecoderDictionary<'static>>,
-                                                &keys::aad_page_group(gid),
-                                                encryption_key.as_ref(),
-                                            )
-                                        {
-                                            for (j, existing_page) in
-                                                existing_pages.into_iter().enumerate()
-                                            {
-                                                if j >= pages_in_group.len() {
-                                                    break;
-                                                }
-                                                if pages_in_group[j] >= page_count {
-                                                    break;
-                                                }
-                                                if pages[j].is_none() {
-                                                    pages[j] = Some(existing_page);
-                                                }
-                                            }
+                            let existing_key = match new_keys.get(gid as usize) {
+                                Some(k) if !k.is_empty() => k,
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "sync: group {} has missing pages and no existing backend key",
+                                            gid
+                                        ),
+                                    ));
+                                }
+                            };
+                            let pg_data = storage_helpers::get_page_group(
+                                storage_ref,
+                                runtime_ref,
+                                existing_key,
+                            )?;
+                            let pg_data = match pg_data {
+                                Some(d) => d,
+                                None => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "sync: group {} has missing pages and existing backend key is absent",
+                                            gid
+                                        ),
+                                    ));
+                                }
+                            };
+                            let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+                            let has_ft = use_seekable
+                                && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+                            if has_ft {
+                                let ft = existing_ft.expect("checked");
+                                let (_pc, _ps, bulk_data) = decode_page_group_seekable_full(
+                                    &pg_data,
+                                    ft,
+                                    page_size,
+                                    pages_in_group.len() as u32,
+                                    page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    None::<&zstd::dict::DecoderDictionary<'static>>,
+                                    &keys::aad_page_group(gid),
+                                    encryption_key.as_ref(),
+                                )?;
+                                let ps = page_size as usize;
+                                for j in 0..pages_in_group.len() {
+                                    if pages_in_group[j] >= page_count {
+                                        break;
+                                    }
+                                    if pages[j].is_none() {
+                                        let start = j * ps;
+                                        let end = start + ps;
+                                        if end <= bulk_data.len() {
+                                            pages[j] = Some(bulk_data[start..end].to_vec());
                                         }
                                     }
                                 }
+                            } else {
+                                let (_pc, _ps, existing_pages) = decode_page_group(
+                                    &pg_data,
+                                    #[cfg(feature = "zstd")]
+                                    None::<&zstd::dict::DecoderDictionary<'static>>,
+                                    &keys::aad_page_group(gid),
+                                    encryption_key.as_ref(),
+                                )?;
+                                for (j, existing_page) in existing_pages.into_iter().enumerate() {
+                                    if j >= pages_in_group.len() {
+                                        break;
+                                    }
+                                    if pages_in_group[j] >= page_count {
+                                        break;
+                                    }
+                                    if pages[j].is_none() {
+                                        pages[j] = Some(existing_page);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Every in-bounds page must be sourced from cache or the
+                        // backend. Encoding a missing page as zeros would corrupt readers.
+                        for (i, &pnum) in pages_in_group.iter().enumerate() {
+                            if pnum >= page_count {
+                                break;
+                            }
+                            if pages[i].is_none() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "sync: page {} in group {} is missing and has no backend source",
+                                        pnum, gid
+                                    ),
+                                ));
                             }
                         }
 
@@ -3749,7 +3947,8 @@ impl DatabaseHandle for TurboliteHandle {
                 discontinuity_stamp: old_manifest.discontinuity_stamp,
                 cursor: old_manifest.cursor.clone(),
                 writer_id: old_manifest.writer_id.clone(),
-                page_count: old_manifest.page_count,
+                // Publish any speculative growth from this handle's writes.
+                page_count: old_manifest.page_count.max(self.pending_page_count),
                 page_size: old_manifest.page_size,
                 pages_per_group: ppg,
                 page_group_keys: new_keys,
@@ -3789,6 +3988,7 @@ impl DatabaseHandle for TurboliteHandle {
             {
                 // Update cache's group_pages to match new manifest
                 cache.set_group_pages(new_manifest.group_pages.clone());
+                self.pending_page_count = new_manifest.page_count;
                 self.manifest.store(Arc::new(new_manifest));
             }
             {
@@ -3924,9 +4124,29 @@ impl DatabaseHandle for TurboliteHandle {
         };
 
         let old_page_count = self.manifest.load().page_count;
+        let ppg = self.manifest.load().pages_per_group;
 
         let mut manifest = (**self.manifest.load()).clone();
         manifest.page_count = new_page_count;
+        // set_len is an explicit truncate/growth visible to all handles.
+        self.pending_page_count = new_page_count;
+
+        // Keep BTree-aware group_pages and page_index consistent with the new
+        // page_count. Truncating drops pages >= new_page_count from their
+        // groups; regrowing assigns new pages to groups so reads/prefetch have
+        // valid locations instead of panicking or returning stale bytes.
+        if manifest.strategy != GroupingStrategy::Positional {
+            if new_page_count < old_page_count {
+                for group in manifest.group_pages.iter_mut() {
+                    group.retain(|&pnum| pnum < new_page_count);
+                }
+                manifest.build_page_index();
+            } else if new_page_count > old_page_count {
+                let unassigned: Vec<u64> = (old_page_count..new_page_count).collect();
+                Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
+            }
+        }
+
         self.manifest.store(Arc::new(manifest));
 
         // Remove dirty pages beyond new size
@@ -3988,9 +4208,10 @@ impl DatabaseHandle for TurboliteHandle {
             && (lock == LockKind::Shared || lock == LockKind::None)
             && self.synced_since_write
         {
-            if let Err(e) = self.sync(false) {
-                eprintln!("[turbolite] flush-on-lock-downgrade failed: {e}");
-            }
+            // Do not swallow flush errors: if we cannot durably publish the
+            // committed transaction, the lock downgrade must fail so SQLite
+            // knows the operation did not succeed (A5).
+            self.sync(false)?;
         }
 
         let lock_file = self.ensure_lock_file()?;

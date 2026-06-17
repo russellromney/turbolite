@@ -429,6 +429,21 @@ fn planned_scan_read_path_does_not_submit_current_group_to_optional_window() {
         constraint_columns: Vec::new(),
     }]);
 
+    // Pre-seed group 0 in the local cache so the read path can exercise the
+    // SCAN prefetch logic without relying on fabricated zeros for missing
+    // remote objects (A2).
+    let page_size = 64u32;
+    let pages_per_group = 4u32;
+    let page_nums: Vec<u64> = (0..pages_per_group as u64).collect();
+    let data: Vec<u8> = (0..pages_per_group)
+        .flat_map(|i| vec![i as u8; page_size as usize])
+        .collect();
+    cache.write_pages_scattered(&page_nums, &data, 0, 0).unwrap();
+    cache.mark_group_present(0);
+    // Force the slow path so the plan queue is drained and SCAN prefetch
+    // state is populated; otherwise the fast path returns before touching it.
+    cache.bump_generation();
+
     let mut buf = vec![0u8; 64];
     handle.read_exact_at(&mut buf, 0).unwrap();
 
@@ -1771,10 +1786,11 @@ fn tiered_read_releases_claim_when_page_group_key_missing() {
     let (mut handle, cache) = handle_with_manifest(&dir, Vec::new());
 
     let mut buf = vec![0u8; 64];
-    handle.read_exact_at(&mut buf, 0).unwrap();
+    let err = handle.read_exact_at(&mut buf, 0).unwrap_err();
 
+    // Remote reads for in-bounds pages with no backend object must error (A2).
     assert_eq!(cache.group_state(0), GroupState::None);
-    assert_eq!(buf, vec![0u8; 64]);
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[test]
@@ -1783,10 +1799,10 @@ fn tiered_read_releases_claim_when_page_group_key_empty() {
     let (mut handle, cache) = handle_with_manifest(&dir, vec![String::new()]);
 
     let mut buf = vec![0u8; 64];
-    handle.read_exact_at(&mut buf, 0).unwrap();
+    let err = handle.read_exact_at(&mut buf, 0).unwrap_err();
 
     assert_eq!(cache.group_state(0), GroupState::None);
-    assert_eq!(buf, vec![0u8; 64]);
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[test]
@@ -2439,5 +2455,333 @@ fn seekable_timeout_takeover_keeps_foreground_frame_when_stale_prefetch_finishes
     );
     assert_eq!(cache.group_state(1), GroupState::None);
     assert_eq!(pool.stats_json()["cancelled"], 1);
+}
+
+struct FailingPutBackend;
+
+#[async_trait]
+impl StorageBackend for FailingPutBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Err(anyhow::anyhow!("simulated put failure"))
+    }
+    async fn delete(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+    async fn put_if_match(
+        &self,
+        _key: &str,
+        _data: &[u8],
+        _etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        Ok(hadb_storage::CasResult {
+            success: true,
+            etag: None,
+        })
+    }
+    async fn range_get(&self, _key: &str, _start: u64, _len: u32) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+/// A flush failure during lock downgrade must be propagated to the caller,
+/// not swallowed with an eprintln (A5).
+#[test]
+fn test_lock_downgrade_flush_error_propagated() {
+    let dir = TempDir::new().unwrap();
+    let page_size = 64u32;
+    let pages_per_group = 4u32;
+    let cache = Arc::new(
+        DiskCache::new(
+            dir.path(),
+            3600,
+            pages_per_group,
+            2,
+            page_size,
+            pages_per_group as u64,
+            None,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let manifest = Manifest {
+        page_count: pages_per_group as u64,
+        page_size,
+        pages_per_group,
+        page_group_keys: vec!["".to_string(); 1],
+        ..Manifest::empty()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut handle = TurboliteHandle::new_tiered(
+        Some(Arc::new(FailingPutBackend)),
+        Some(rt.handle().clone()),
+        Arc::clone(&cache),
+        Arc::new(ArcSwap::from_pointee(manifest)),
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        dir.path().join("db.lock"),
+        pages_per_group,
+        0,
+        false, // read/write
+        vec![0.3, 0.3, 0.4],
+        vec![0.0, 0.0, 0.0],
+        None,
+        false,
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        false,
+        false,
+        4,
+        32 * 1024 * 1024,
+        None,
+        false,
+        0,
+        0,
+        false,
+        false,
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+
+    // Acquire exclusive lock via the normal SQLite escalation path.
+    assert!(handle.lock(LockKind::Shared).unwrap());
+    assert!(handle.lock(LockKind::Exclusive).unwrap());
+
+    // Write every page in group 0 so flush does not need to fetch missing
+    // pages from the backend.
+    for i in 0..pages_per_group as u64 {
+        handle
+            .write_all_at(&vec![0xABu8; page_size as usize], i * page_size as u64)
+            .unwrap();
+    }
+
+    // Pretend xSync fired, so a subsequent downgrade would try to flush.
+    handle.synced_since_write = true;
+
+    // Downgrading to shared must fail because the backend put fails, and the
+    // error must be returned (not swallowed).
+    let err = handle.lock(LockKind::Shared).unwrap_err();
+    assert!(
+        err.to_string().contains("simulated put failure"),
+        "expected flush error to propagate, got: {}",
+        err
+    );
+}
+
+/// Remote reads for in-bounds pages whose backend object is missing must
+/// return a hard I/O error instead of silently zero-filling (A2).
+#[test]
+fn test_remote_read_missing_group_errors() {
+    let dir = TempDir::new().unwrap();
+    let page_size = 64u32;
+    let pages_per_group = 4u32;
+    let cache = Arc::new(
+        DiskCache::new(
+            dir.path(),
+            3600,
+            pages_per_group,
+            2,
+            page_size,
+            pages_per_group as u64,
+            None,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let manifest = Manifest {
+        page_count: pages_per_group as u64,
+        page_size,
+        pages_per_group,
+        // Point to a key that the backend does not contain.
+        page_group_keys: vec!["nonexistent-group-key".to_string()],
+        ..Manifest::empty()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut handle = TurboliteHandle::new_tiered(
+        Some(Arc::new(MemStorage::new())),
+        Some(rt.handle().clone()),
+        Arc::clone(&cache),
+        Arc::new(ArcSwap::from_pointee(manifest)),
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        dir.path().join("db.lock"),
+        pages_per_group,
+        0,
+        false,
+        vec![0.3, 0.3, 0.4],
+        vec![0.0, 0.0, 0.0],
+        None,
+        false,
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        false,
+        false,
+        4,
+        32 * 1024 * 1024,
+        None,
+        false,
+        0,
+        0,
+        false,
+        false,
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+
+    let mut buf = vec![0u8; page_size as usize];
+    let err = handle.read_exact_at(&mut buf, 0).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        io::ErrorKind::NotFound,
+        "missing remote group should produce NotFound, got: {}",
+        err
+    );
+}
+
+/// Speculative file growth from xWrite must not be visible to other handles
+/// through the shared manifest until sync() commits it (A6).
+#[test]
+fn test_speculative_page_count_not_shared() {
+    let dir = TempDir::new().unwrap();
+    let page_size = 64u32;
+    let pages_per_group = 4u32;
+    let shared_manifest = Arc::new(ArcSwap::from_pointee(Manifest {
+        page_count: 1,
+        page_size,
+        pages_per_group,
+        ..Manifest::empty()
+    }));
+    let shared_dirty = Arc::new(Mutex::new(HashSet::new()));
+    let shared_pending = Arc::new(Mutex::new(Vec::new()));
+    let shared_seq = Arc::new(AtomicU64::new(0));
+
+    let make_handle = || {
+        let cache = Arc::new(
+            DiskCache::new(
+                dir.path(),
+                3600,
+                pages_per_group,
+                2,
+                page_size,
+                16,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        TurboliteHandle::new_tiered(
+            Some(Arc::new(MemStorage::new())),
+            Some(rt.handle().clone()),
+            cache,
+            Arc::clone(&shared_manifest),
+            Arc::clone(&shared_dirty),
+            Arc::clone(&shared_pending),
+            Arc::clone(&shared_seq),
+            dir.path().join("db.lock"),
+            pages_per_group,
+            0,
+            false,
+            vec![0.3, 0.3, 0.4],
+            vec![0.0, 0.0, 0.0],
+            None,
+            false,
+            #[cfg(feature = "zstd")]
+            None,
+            None,
+            false,
+            false,
+            4,
+            32 * 1024 * 1024,
+            None,
+            false,
+            0,
+            0,
+            false,
+            false,
+            Arc::new(parking_lot::RwLock::new(())),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap()
+    };
+
+    let mut writer = make_handle();
+    let reader = make_handle();
+
+    assert_eq!(reader.size().unwrap(), page_size as u64);
+    assert_eq!(shared_manifest.load().page_count, 1);
+
+    // Write a page beyond the current file size.
+    writer
+        .write_all_at(&vec![0xCDu8; page_size as usize], 3 * page_size as u64)
+        .unwrap();
+
+    // The writing handle sees the speculative size; the shared manifest and
+    // the other handle do not.
+    assert_eq!(writer.size().unwrap(), 4 * page_size as u64);
+    assert_eq!(shared_manifest.load().page_count, 1);
+    assert_eq!(reader.size().unwrap(), page_size as u64);
+}
+
+// --- D4/D5 regression test ---
+
+#[test]
+fn end_of_query_clears_prefetch_state() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, vec!["g0".to_string()]);
+
+    // Seed page 0 so the slow-path read can succeed without remote I/O.
+    let page = vec![1u8; 64];
+    cache
+        .write_pages_scattered(&[0], &page, 0, 0)
+        .expect("seed page");
+
+    // Populate per-query prefetch state as if a query just ran.
+    handle.search_trees.insert("users".to_string());
+    handle.active_scan_prefetch.insert(
+        "posts".to_string(),
+        ActiveScanPrefetch {
+            group_ids: vec![0],
+            cursor: 0,
+            submitted: HashSet::new(),
+        },
+    );
+    handle.last_scan_refill_gid = Some(0);
+
+    // Signal end-of-query and force the slow path so the cleanup block runs.
+    query_plan::signal_end_query();
+    handle.dirty_since_sync = true;
+    let mut buf = vec![0u8; 64];
+    handle.read_exact_at(&mut buf, 0).expect("read seeded page");
+
+    assert!(
+        handle.search_trees.is_empty(),
+        "search_trees must be cleared at end of query"
+    );
+    assert!(
+        handle.active_scan_prefetch.is_empty(),
+        "active_scan_prefetch must be cleared at end of query"
+    );
+    assert_eq!(
+        handle.last_scan_refill_gid, None,
+        "last_scan_refill_gid must be cleared at end of query"
+    );
 }
 

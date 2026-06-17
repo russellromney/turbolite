@@ -687,6 +687,105 @@ fn set_manifest_adopts_same_version_higher_replay_cursor() {
 }
 
 #[test]
+fn set_manifest_preserves_pending_dirty_groups() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+
+    // Simulate unflushed local-checkpoint dirty groups.
+    {
+        let mut dirty = vfs.shared_dirty_groups.lock().unwrap();
+        dirty.insert(7);
+        dirty.insert(9);
+    }
+
+    let mut incoming = Manifest::empty();
+    incoming.version = 5;
+    incoming.page_size = 4096;
+    vfs.set_manifest(incoming);
+
+    let persisted = super::manifest::load_dirty_groups(dir.path()).expect("load dirty groups");
+    assert_eq!(persisted.len(), 2);
+    assert!(persisted.contains(&7));
+    assert!(persisted.contains(&9));
+}
+
+#[test]
+fn recovery_skips_staging_log_with_mismatched_page_size() {
+    let dir = TempDir::new().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+
+    // Seed an authoritative local manifest with a 4096-byte page size.
+    let mut manifest = Manifest::empty();
+    manifest.version = 1;
+    manifest.page_size = 4096;
+    manifest.page_count = 5;
+    super::manifest::persist_manifest_local(&cache_dir, &manifest).unwrap();
+
+    // Drop a staging log whose header claims 8192-byte pages and a stray high page.
+    let staging_dir = cache_dir.join("staging");
+    let mut writer = super::staging::StagingWriter::open(&staging_dir, 1, 8192).unwrap();
+    writer
+        .append(99, &vec![0xBBu8; 8192])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let config = TurboliteConfig {
+        cache_dir,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    let recovered = vfs.manifest();
+    assert_eq!(recovered.page_size, 4096);
+    assert_eq!(recovered.page_count, 5);
+}
+
+#[test]
+fn recovery_caps_page_count_to_adopted_trailer() {
+    let dir = TempDir::new().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let staging_dir = cache_dir.join("staging");
+    let page_size = 4096u32;
+
+    // Older log contains a stray page far above the committed length.
+    let mut older = super::staging::StagingWriter::open(&staging_dir, 0, page_size).unwrap();
+    older
+        .append(99, &vec![0xAAu8; page_size as usize])
+        .unwrap();
+    older.finalize().unwrap();
+
+    // Newer log carries a manifest trailer pinning the committed length at 10 pages.
+    let mut newer = super::staging::StagingWriter::open(&staging_dir, 1, page_size).unwrap();
+    newer
+        .append(3, &vec![0xCCu8; page_size as usize])
+        .unwrap();
+    let trailer = {
+        let mut m = Manifest::empty();
+        m.version = 1;
+        m.page_size = page_size;
+        m.page_count = 10;
+        rmp_serde::to_vec(&m).unwrap()
+    };
+    newer.append_manifest(&trailer).unwrap();
+    newer.finalize().unwrap();
+
+    let config = TurboliteConfig {
+        cache_dir,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    let recovered = vfs.manifest();
+    assert_eq!(
+        recovered.page_count, 10,
+        "older stray pages must not grow beyond the adopted trailer's page_count"
+    );
+    assert_eq!(recovered.page_size, page_size);
+}
+
+#[test]
 fn exact_replay_cursor_can_replace_sqlite_header_counter() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {

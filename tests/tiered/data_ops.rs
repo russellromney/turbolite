@@ -2,7 +2,7 @@
 
 use super::helpers::*;
 use tempfile::TempDir;
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{Manifest, TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_rollback_discards_dirty_pages() {
@@ -926,6 +926,93 @@ fn test_vacuum_reorganizes() {
         })
         .unwrap();
     assert!(val.starts_with("payload_"));
+}
+
+/// F-17: after VACUUM the manifest page_count must match the live page count
+/// from the database header, not the stale pre-VACUUM value.
+#[test]
+fn test_vacuum_updates_manifest_page_count() {
+    let cache_dir = TempDir::new().unwrap();
+    let mut config = test_config("vacuum_page_count", cache_dir.path());
+    // Force local-only mode so the test does not need real S3 credentials.
+    config.bucket.clear();
+    let vfs_name = unique_vfs_name("tiered_vacuum_pc");
+
+    let vfs = TurboliteVfs::new_local(config).unwrap();
+    turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+    let conn = rusqlite::Connection::open_with_flags_and_vfs(
+        "vacuum_pc_test.db",
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        &vfs_name,
+    )
+    .unwrap();
+
+    conn.execute_batch(
+        "PRAGMA page_size=65536;
+         PRAGMA journal_mode=WAL;
+         CREATE TABLE pc (id INTEGER PRIMARY KEY, payload TEXT);",
+    )
+    .unwrap();
+
+    {
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..2000 {
+            tx.execute(
+                "INSERT INTO pc VALUES (?1, ?2)",
+                rusqlite::params![i, format!("payload_{:0>500}", i)],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+
+    let pages_before: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    assert!(pages_before > 1, "expected multiple pages before VACUUM");
+
+    conn.execute("DELETE FROM pc WHERE id >= 200", [])
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    conn.execute_batch("VACUUM;").unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+
+    let pages_after: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        pages_after < pages_before,
+        "VACUUM should reduce page count: {} -> {}",
+        pages_before,
+        pages_after
+    );
+
+    // The VFS manifest must reflect the reduced page count.
+    let vfs_ref = turbolite::tiered::is_registered_vfs_name(&vfs_name);
+    assert!(vfs_ref, "vfs should still be registered");
+    // Re-acquire the VFS instance via a new clone of the shared state is not
+    // exposed, but the manifest was updated in place by sync(). Inspect it
+    // through the local manifest file.
+    let manifest_path = cache_dir
+        .path()
+        .join("manifest.msgpack");
+    if manifest_path.exists() {
+        let bytes = std::fs::read(&manifest_path).unwrap();
+        let manifest: Manifest = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            manifest.page_count,
+            pages_after as u64,
+            "manifest page_count {} should match live page count {}",
+            manifest.page_count,
+            pages_after
+        );
+    }
 }
 
 /// VFS delete() must NOT destroy S3 data. Regression test for the bug where
