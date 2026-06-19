@@ -26,14 +26,29 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 
 | Query | Type | Cold (S3 Express) | Cold (Tigris) |
 |-------|------|-------------------|---------------|
-| Post + user | point lookup + join | 77ms | 192ms |
-| Profile | multi-table join (5 JOINs) | 190ms | 524ms |
-| Who-liked | index search + join | 129ms | 340ms |
-| Mutual friends | multi-search join | 82ms | 183ms |
-| Indexed filter | covered index scan | 74ms | 173ms |
-| Full scan + filter | full table scan | 586ms | 984ms |
+| Post + user | point lookup + join | 86ms | 172ms |
+| Profile | multi-table join (5 JOINs) | 251ms | 479ms |
+| Who-liked | index search + join | 206ms | 302ms |
+| Mutual friends | multi-search join | 19ms | 49ms |
+| Indexed filter | covered index scan | 79ms | 88ms |
+| Full scan + filter | full table scan | 476ms | 532ms |
 
-1M rows, 1.5GB at with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 7 prefetch threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
+1M posts / 100K users (~1.5GB stored) with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 7 prefetch worker threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
+
+### vs sqlite-s3vfs
+
+[sqlite-s3vfs](https://github.com/simonw/sqlite-s3vfs) stores each SQLite page as a separate S3 object — the naive "one object per page" baseline. Both benchmarks below use the same 100K posts / 10K users dataset, 64KB pages, Fly `performance-8x` in IAD, and Tigris (`t3.storage.dev`). Cold = fresh process, empty cache, every byte from S3.
+
+| Query | sqlite-s3vfs p50 | turbolite p50 | Speedup |
+|-------|------------------|---------------|---------|
+| Post + user | 1,048ms | 139ms | **7.5x** |
+| Profile | 1,428ms | 172ms | **8.3x** |
+| Who-liked | 1,110ms | 138ms | **8.0x** |
+| Mutual friends | 1,047ms | 88ms | **11.9x** |
+| Indexed filter | 936ms | 92ms | **10.2x** |
+| Full scan + filter | 28,466ms | 108ms | **263x** |
+
+The gap is largest for scans: sqlite-s3vfs issues thousands of sequential per-page GETs, while turbolite prefetches whole page groups in parallel and uses seekable zstd compression to avoid reading the full group. Point queries win because turbolite bundles interior/index pages and fetches them in a handful of parallel range GETs instead of one round-trip per page.
 
 Benchmarks are organized by **cache level** (what's already on local disk when the query runs):
 
@@ -604,6 +619,13 @@ The most common approach: put an unmodified `.db` file on S3 or a CDN and issue 
 
 These are all read-only and fetch uncompressed pages from the raw file. A point lookup transfers a raw 4KB (or 64KB) page per request.
 
+### Page-level replication / edge sync
+
+These treat object storage as the source of truth and replicate individual pages or changesets, enabling partial replicas and offline-first / edge deployments.
+
+- [**Graft**](https://graft.rs/) ([`orbitinghail/graft`](https://github.com/orbitinghail/graft)): A transactional storage engine for lazy, partial, strongly consistent replication over S3. The `libgraft` SQLite extension implements a VFS that reads and writes 4KB pages through Graft volumes. Uses framed zstd compression and splinter-based changesets. Closest architectural cousin to turbolite in the "replicate pages, not WAL frames" space, with a focus on multi-writer edge sync rather than cold-read latency.
+- [**mvsqlite**](https://github.com/losfair/mvsqlite): Pages stored in FoundationDB as content-addressed KV pairs. Full MVCC with time-travel to any snapshot, XOR+zstd delta encoding between page versions. The most sophisticated storage engine in this space, but requires FoundationDB, not S3.
+
 ### Replication and backup to S3
 
 These replicate local writes to S3 for backup or restore.
@@ -615,8 +637,8 @@ These replicate local writes to S3 for backup or restore.
 
 ### Custom storage engines
 
-- [**mvsqlite**](https://github.com/losfair/mvsqlite): Pages stored in FoundationDB as content-addressed KV pairs. Full MVCC with time-travel to any snapshot, XOR+zstd delta encoding between page versions. The most sophisticated storage engine in this space, but requires FoundationDB, not S3.
-- [**sqlite-s3vfs**](https://github.com/simonw/sqlite-s3vfs): Each SQLite page stored as a separate S3 object. Enables writes but at one PUT per page, costing \$0.02 per 4096 pages vs turbolite's $0.000005 for the same batch (at 64KB page default).
+- [**sqlite-s3vfs**](https://github.com/simonw/sqlite-s3vfs): Each SQLite page stored as a separate S3 object. Enables writes but at one PUT per page, costing \$0.02 per 4096 pages vs turbolite's $0.000005 for the same batch (at 64KB page default). See the benchmark table above for cold-query latency comparison; turbolite is 7.5–263× faster on the same dataset.
+- [**wa-sqlite-s3vfs**](https://github.com/LoneRifle/wa-sqlite-s3vfs): TypeScript / browser port of sqlite-s3vfs for `wa-sqlite`. Same one-object-per-page model, adapted to WASM / client-side use.
 
 ### Compression
 
@@ -625,22 +647,24 @@ These replicate local writes to S3 for backup or restore.
 
 ### Where turbolite differs
 
-| | turbolite | Raw-file range GETs | Litestream VFS | sqlite_web_vfs + zstd_vfs | mvsqlite | sqlite-s3vfs |
-|---|---|---|---|---|---|---|
-| Reads from S3 | seekable range GETs on compressed page groups | range GETs on raw pages | range GETs on LTX files | range GETs on compressed outer DB | KV lookups on FoundationDB | one GetObject per page |
-| Writes to S3 | checkpoint (one PUT per group) | no | no | no | yes (MVCC) | one PUT per page |
-| Compression | seekable multi-frame zstd | none | none | zstd (nested DB) | zstd delta encoding | none |
-| Encryption | AES-256-GCM per page | none | none | none | none | none |
-| Prefetch | look-ahead + hop schedule | none or basic readahead | LRU cache | adaptive consolidation | client buffers | none |
-| Interior page optimization | detected, pinned, bundled separately | none | page index from LTX trailers | optional .dbi file | none | none |
-| Bytes per point lookup (cache: index) | ~100KB (one compressed frame) | 4-64KB (one raw page) | varies | varies | varies | 4KB (one page) |
-| Write cost per 4096 pages | ~$0.000005 (one PUT) | n/a | n/a | n/a | FoundationDB ops | ~$0.02 (4096 PUTs) |
+| | turbolite | Raw-file range GETs | Litestream VFS | sqlite_web_vfs + zstd_vfs | mvsqlite | Graft | sqlite-s3vfs |
+|---|---|---|---|---|---|---|---|
+| Reads from S3 | seekable range GETs on compressed page groups | range GETs on raw pages | range GETs on LTX files | range GETs on compressed outer DB | KV lookups on FoundationDB | lazy fetch of 4KB pages / changesets | one GetObject per page |
+| Writes to S3 | checkpoint (one PUT per group) | no | no | no | yes (MVCC) | yes (async changeset replication) | one PUT per page |
+| Compression | seekable multi-frame zstd | none | none | zstd (nested DB) | zstd delta encoding | framed zstd | none |
+| Encryption | AES-256-GCM per page | none | none | none | none | none listed | none |
+| Prefetch | look-ahead + hop schedule | none or basic readahead | LRU cache | adaptive consolidation | client buffers | lazy / on-demand | none |
+| Interior page optimization | detected, pinned, bundled separately | none | page index from LTX trailers | optional .dbi file | none | none listed | none |
+| Bytes per point lookup (cache: index) | ~100KB (one compressed frame) | 4-64KB (one raw page) | varies | varies | varies | 4KB (one page) | 4KB (one page) |
+| Write cost per 4096 pages | ~$0.000005 (one PUT) | n/a | n/a | n/a | FoundationDB ops | batched changesets | ~$0.02 (4096 PUTs) |
 
 ## Benchmarking
 
 All benchmarks live in [`benchmark/`](benchmark/). See [`benchmark/README.md`](benchmark/README.md) for deployment scenarios (local, Fly.io, EC2).
 
 The `tiered-bench` binary generates a social media dataset (users, posts, likes, friendships) and benchmarks queries at each cache level against S3.
+
+A separate [`benchmark/bench_s3vfs.py`](benchmark/bench_s3vfs.py) harness runs the same queries against [sqlite-s3vfs](https://github.com/simonw/sqlite-s3vfs) for head-to-head comparison. It is deployed via [`benchmark/fly-s3vfs.toml`](benchmark/fly-s3vfs.toml) and uses the same deterministic dataset generator as `tiered-bench`.
 
 ```bash
 # Basic benchmark: 100K posts, default settings

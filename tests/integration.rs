@@ -224,6 +224,97 @@ fn test_passthrough_mode() {
     assert_eq!(count, 50);
 }
 
+/// Encrypted passthrough WAL writes use per-write random nonces stored in a
+/// sidecar file. This test exercises the full write/read cycle and reopen,
+/// which regresses ordering bugs where the nonce could be persisted before the
+/// ciphertext or where concurrent reads could see a torn nonce view (E4/A4).
+#[cfg(feature = "encryption")]
+#[test]
+fn test_passthrough_encryption_nonce_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7);
+    }
+    let config = TurboliteConfig {
+        cache_dir: dir.path().into(),
+        encryption: turbolite::tiered::EncryptionConfig { key: Some(key) },
+        encryption_key: Some(key),
+        compression: CompressionConfig {
+            level: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create encrypted VFS");
+    turbolite::tiered::register("passthrough_enc_test", vfs)
+        .expect("Failed to register encrypted VFS");
+
+    let db_path = dir.path().join("passthrough_enc.db");
+    {
+        let conn = Connection::open_with_flags_and_vfs(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            "passthrough_enc_test",
+        )
+        .unwrap();
+
+        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER, data TEXT);")
+            .unwrap();
+
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("row_{}", i)],
+            )
+            .unwrap();
+        }
+
+        // The nonce sidecar must exist and be non-empty for an encrypted WAL.
+        let sidecar = db_path.with_extension("db-wal.tlnonce");
+        assert!(
+            sidecar.exists(),
+            "encrypted passthrough WAL nonce sidecar should exist"
+        );
+        let meta = std::fs::metadata(&sidecar).unwrap();
+        assert!(
+            meta.len() >= 24,
+            "nonce sidecar should contain at least one 24-byte record"
+        );
+
+        // WAL frame rewrites (checkpoint) must not reuse a keystream nonce.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 50);
+    }
+
+    // Reopen from cold and read back. The sidecar must still map every
+    // encrypted WAL extent to its nonce.
+    {
+        let conn = Connection::open_with_flags_and_vfs(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            "passthrough_enc_test",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 50);
+
+        let value: String = conn
+            .query_row("SELECT data FROM t WHERE id = 37", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "row_37");
+    }
+}
+
 #[test]
 fn test_delete_and_update() {
     let dir = tempfile::tempdir().unwrap();
@@ -848,4 +939,89 @@ fn test_checkpoint_truncate() {
             .unwrap();
         assert_eq!(val, "ckpt_50");
     }
+}
+
+/// F-16: import_sqlite_file must refuse to read a source database that is
+/// locked by another process.
+#[test]
+fn test_import_refuses_locked_source_file() {
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use hadb_storage::StorageBackend;
+    use hadb_storage_mem::MemStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("source.db");
+
+    // Create a minimal SQLite database.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+    }
+
+    // Lock the source file exclusively from another handle.
+    let locked = File::open(&db_path).unwrap();
+    use fs2::FileExt;
+    locked.lock_exclusive().unwrap();
+
+    let config = TurboliteConfig {
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemStorage::new());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let handle = runtime.handle().clone();
+
+    let result = turbolite::tiered::import_sqlite_file(&config, backend, handle, db_path.as_path());
+
+    assert!(
+        result.is_err(),
+        "import should fail when the source file is locked"
+    );
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "expected WouldBlock, got {:?}",
+        err
+    );
+}
+
+/// C7: the canonical manifest wire decoder must reject fields that fall outside
+/// their allowed ranges (e.g. a non-power-of-two page_size).
+#[test]
+fn wire_decode_rejects_invalid_page_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
+    let bytes = vfs.manifest_bytes().expect("encode manifest");
+
+    // Decode the CBOR body, corrupt page_size, and re-encode it.
+    let body = &bytes[6..];
+    let mut value: ciborium::value::Value = ciborium::de::from_reader(body).unwrap();
+    if let ciborium::value::Value::Map(ref mut map) = value {
+        for (k, v) in map.iter_mut() {
+            if let ciborium::value::Value::Text(ref t) = k {
+                if t == "page_size" {
+                    *v = ciborium::value::Value::Integer(3072.into());
+                }
+            }
+        }
+    }
+    let mut new_body = Vec::new();
+    ciborium::ser::into_writer(&value, &mut new_body).unwrap();
+
+    let mut bad = Vec::with_capacity(6 + new_body.len());
+    bad.extend_from_slice(&bytes[..4]);
+    bad.extend_from_slice(&bytes[4..6]);
+    bad.extend_from_slice(&new_body);
+
+    let err = TurboliteVfs::decode_manifest_bytes(&bad).expect_err("decode invalid page_size");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }

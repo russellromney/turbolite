@@ -138,15 +138,19 @@ pub fn drain_queue(q: &SettingsQueue) -> Vec<SettingUpdate> {
 }
 
 /// Parse a comma-separated hop schedule string into `Vec<f32>`. Returns
-/// `None` on parse failure or empty input.
+/// `None` on parse failure, empty input, non-finite values, or values
+/// outside the inclusive `[0, 1]` range.
 pub fn parse_hops(value: &str) -> Option<Vec<f32>> {
     let hops: Result<Vec<f32>, _> = value.split(',').map(|s| s.trim().parse::<f32>()).collect();
-    hops.ok().filter(|v| !v.is_empty())
+    hops.ok()
+        .filter(|v| !v.is_empty())
+        .filter(|v| v.iter().all(|h| h.is_finite() && (0.0..=1.0).contains(h)))
 }
 
 /// Parse a human-readable byte size string into `u64` bytes.
 /// Supports: "512MB", "2GB", "512M", "2G", "1073741824", "0" (unlimited).
-/// Case-insensitive suffixes. Returns None on parse failure.
+/// Case-insensitive suffixes. Returns None on parse failure, non-finite
+/// input, or overflow beyond `u64`.
 pub fn parse_byte_size(value: &str) -> Option<u64> {
     let s = value.trim();
     if s.is_empty() {
@@ -172,10 +176,14 @@ pub fn parse_byte_size(value: &str) -> Option<u64> {
         return None;
     };
     let num: f64 = num_part.trim().parse().ok()?;
-    if num < 0.0 {
+    if num < 0.0 || !num.is_finite() {
         return None;
     }
-    Some((num * multiplier as f64) as u64)
+    let product = num * multiplier as f64;
+    if !product.is_finite() || product > u64::MAX as f64 {
+        return None;
+    }
+    Some(product as u64)
 }
 
 /// Push a setting update from a Rust caller. Same semantics as the FFI
@@ -410,5 +418,25 @@ mod tests {
         assert_eq!(parse_byte_size("abc"), None);
         assert_eq!(parse_byte_size("MB"), None);
         assert_eq!(parse_byte_size("-1GB"), None);
+    }
+
+    // G7 regression: reject NaN, inf, and overflow before casting to u64.
+    #[test]
+    fn parse_byte_size_rejects_non_finite_and_overflow() {
+        assert_eq!(parse_byte_size("NaN GB"), None);
+        assert_eq!(parse_byte_size("inf GB"), None);
+        assert_eq!(parse_byte_size("-inf GB"), None);
+        assert_eq!(parse_byte_size("1e309 GB"), None);
+        assert_eq!(parse_byte_size("18446744073709551615GB"), None);
+    }
+
+    // G7 regression: hop schedules must be finite and in [0, 1].
+    #[test]
+    fn parse_hops_rejects_out_of_range_and_non_finite() {
+        assert_eq!(parse_hops("1.1"), None);
+        assert_eq!(parse_hops("-0.1"), None);
+        assert_eq!(parse_hops("NaN"), None);
+        assert_eq!(parse_hops("inf"), None);
+        assert_eq!(parse_hops("0.5,1.0,1.0001"), None);
     }
 }

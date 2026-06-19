@@ -97,11 +97,77 @@ pub(crate) fn flush_dirty_groups(
     result
 }
 
+/// Fetch the existing base page group for `gid` and decode it into page buffers.
+/// Returns `Ok(None)` when there is no existing key or object. Returns `Err` on
+/// backend/decode failures so callers can fail the flush instead of encoding zeros.
+#[allow(clippy::too_many_arguments)]
+fn fetch_existing_group_pages(
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
+    gid: u64,
+    manifest_snap: &Manifest,
+    pages_in_group: &[u64],
+    #[cfg(feature = "zstd")] decoder_dict: Option<&zstd::dict::DecoderDictionary<'static>>,
+    encryption_key: Option<[u8; 32]>,
+) -> io::Result<Option<Vec<Vec<u8>>>> {
+    let existing_key = match manifest_snap.page_group_keys.get(gid as usize) {
+        Some(k) if !k.is_empty() => k,
+        _ => return Ok(None),
+    };
+    let pg_data = match storage_helpers::get_page_group(backend, runtime, existing_key)? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let page_size = manifest_snap.page_size;
+    let use_seekable = manifest_snap.sub_pages_per_frame > 0;
+    let existing_ft = manifest_snap.frame_tables.get(gid as usize);
+    let has_ft = use_seekable && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
+    if has_ft {
+        let ft = existing_ft.expect("checked above");
+        let (_pc, _ps, bulk_data) = decode_page_group_seekable_full(
+            &pg_data,
+            ft,
+            page_size,
+            pages_in_group.len() as u32,
+            manifest_snap.page_count,
+            0,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
+            &keys::aad_page_group(gid),
+            encryption_key.as_ref(),
+        )?;
+        let ps = page_size as usize;
+        let mut pages = Vec::with_capacity(pages_in_group.len());
+        for j in 0..pages_in_group.len() {
+            let start = j * ps;
+            let end = start + ps;
+            if end > bulk_data.len() {
+                return Err(io::Error::other(format!(
+                    "flush: seekable group {gid} frame is short: page {j} expected {} bytes, got {}",
+                    ps,
+                    bulk_data.len().saturating_sub(start)
+                )));
+            }
+            pages.push(bulk_data[start..end].to_vec());
+        }
+        Ok(Some(pages))
+    } else {
+        let (_pc, _ps, existing_pages) = decode_page_group(
+            &pg_data,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
+            &keys::aad_page_group(gid),
+            encryption_key.as_ref(),
+        )?;
+        Ok(Some(existing_pages))
+    }
+}
+
 /// Inner flush logic. Separated so the outer function can restore state on error.
 fn flush_inner(
     backend: &dyn StorageBackend,
     runtime: &TokioHandle,
-    is_local: bool,
+    _is_local: bool,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
@@ -232,6 +298,35 @@ fn flush_inner(
             while new_subframe_overrides.len() <= gid as usize {
                 new_subframe_overrides.push(HashMap::new());
             }
+
+            // If any page in a dirty frame is missing from both staging and the
+            // local cache, fetch the base group once so the override contains real
+            // bytes rather than zeros.
+            let needs_base = dirty_frames.iter().any(|&frame_idx| {
+                let frame_start = frame_idx * old_sub_ppf as usize;
+                let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
+                (frame_start..frame_end).any(|pos| {
+                    let pnum = pages_in_group[pos];
+                    pnum < page_count
+                        && !staged_pages.contains_key(&pnum)
+                        && !cache.is_present(pnum)
+                })
+            });
+            let existing_pages = if needs_base {
+                fetch_existing_group_pages(
+                    backend,
+                    runtime,
+                    gid,
+                    &manifest_snap,
+                    &pages_in_group,
+                    #[cfg(feature = "zstd")]
+                    decoder_dict.as_ref(),
+                    encryption_key,
+                )?
+            } else {
+                None
+            };
+
             for &frame_idx in &dirty_frames {
                 let frame_start = frame_idx * old_sub_ppf as usize;
                 let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
@@ -243,15 +338,29 @@ fn flush_inner(
                     }
                     let data = if let Some(staged) = staged_pages.get(&pnum) {
                         staged.clone()
-                    } else if cache.is_present(pnum) {
-                        let mut buf = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut buf).is_ok() {
-                            buf
-                        } else {
-                            vec![0u8; page_size as usize]
-                        }
                     } else {
-                        vec![0u8; page_size as usize]
+                        let mut buf = vec![0u8; page_size as usize];
+                        if cache.read_page_if_present(pnum, &mut buf)? {
+                            buf
+                        } else if let Some(ref base) = existing_pages {
+                            match base.get(pos) {
+                                Some(page) => page.clone(),
+                                None => {
+                                    return Err(io::Error::other(format!(
+                                        "flush: override frame page {} in group {} missing from fetched base",
+                                        pnum, gid
+                                    )));
+                                }
+                            }
+                        } else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "flush: page {} in group {} is missing and has no backend source",
+                                    pnum, gid
+                                ),
+                            ));
+                        }
                     };
                     frame_pages.push((pnum, data));
                 }
@@ -291,79 +400,59 @@ fn flush_inner(
                 }
                 if let Some(staged_data) = staged_pages.get(&pnum) {
                     pages[i] = Some(staged_data.clone());
-                } else if cache.is_present(pnum) {
+                } else {
                     let mut page_buf = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut page_buf).is_ok() {
+                    if cache.read_page_if_present(pnum, &mut page_buf)? {
                         pages[i] = Some(page_buf);
                     } else {
                         need_merge = true;
                     }
-                } else {
-                    need_merge = true;
                 }
             }
 
-            // Backend merge: for remote mode, if we're missing pages, pull the
-            // existing page group down and use its pages for the holes. Local
-            // mode skips this (all pages should already be in the cache).
-            if need_merge && !is_local {
-                if let Some(existing_key) = new_keys.get(gid as usize) {
-                    if !existing_key.is_empty() {
-                        if let Ok(Some(pg_data)) =
-                            storage_helpers::get_page_group(backend, runtime, existing_key)
-                        {
-                            let existing_ft = manifest_snap.frame_tables.get(gid as usize);
-                            let has_ft = use_seekable
-                                && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
-                            if has_ft {
-                                let ft = existing_ft.expect("checked above");
-                                if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
-                                    &pg_data,
-                                    ft,
-                                    page_size,
-                                    pages_in_group.len() as u32,
-                                    page_count,
-                                    0,
-                                    #[cfg(feature = "zstd")]
-                                    decoder_dict.as_ref(),
-                                    &keys::aad_page_group(gid),
-                                    encryption_key.as_ref(),
-                                ) {
-                                    let ps = page_size as usize;
-                                    for j in 0..pages_in_group.len() {
-                                        if pages_in_group[j] >= page_count {
-                                            break;
-                                        }
-                                        if pages[j].is_none() {
-                                            let start = j * ps;
-                                            let end = start + ps;
-                                            if end <= bulk_data.len() {
-                                                pages[j] = Some(bulk_data[start..end].to_vec());
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
-                                &pg_data,
-                                #[cfg(feature = "zstd")]
-                                decoder_dict.as_ref(),
-                                &keys::aad_page_group(gid),
-                                encryption_key.as_ref(),
-                            ) {
-                                for (j, existing_page) in existing_pages.into_iter().enumerate() {
-                                    if j >= pages_in_group.len() {
-                                        break;
-                                    }
-                                    if pages_in_group[j] >= page_count {
-                                        break;
-                                    }
-                                    if pages[j].is_none() {
-                                        pages[j] = Some(existing_page);
-                                    }
-                                }
-                            }
+            // Backend merge: if pages are missing from staging/cache, pull the
+            // existing page group down and use its pages for the holes. This is
+            // required for both local and remote backends because eviction can
+            // remove pages from the local cache even in LocalThenFlush mode.
+            if need_merge {
+                if let Some(existing_pages) = fetch_existing_group_pages(
+                    backend,
+                    runtime,
+                    gid,
+                    &manifest_snap,
+                    &pages_in_group,
+                    #[cfg(feature = "zstd")]
+                    decoder_dict.as_ref(),
+                    encryption_key,
+                )? {
+                    for (j, existing_page) in existing_pages.into_iter().enumerate() {
+                        if j >= pages_in_group.len() {
+                            break;
+                        }
+                        if pages_in_group[j] >= page_count {
+                            break;
+                        }
+                        if pages[j].is_none() {
+                            pages[j] = Some(existing_page);
                         }
                     }
+                }
+            }
+
+            // Every in-bounds page must be sourced from staging, cache, or the
+            // backend. Encoding a missing page as zeros would corrupt readers.
+            for (i, &pnum) in pages_in_group.iter().enumerate() {
+                if pnum >= page_count {
+                    break;
+                }
+                if pages[i].is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "flush: page {} in group {} is missing and has no backend source",
+                            pnum, gid
+                        ),
+                    ));
                 }
             }
 
@@ -419,7 +508,7 @@ fn flush_inner(
     let interior_count;
     let index_chunk_count;
 
-    if !is_local {
+    if !_is_local {
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
         {
             let known_interior = cache.interior_pages.lock().clone();
@@ -502,15 +591,11 @@ fn flush_inner(
                     if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
                         continue;
                     }
+                    let mut b = vec![0u8; page_size as usize];
                     let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
                         Some(staged_data.clone())
-                    } else if cache.is_present(pnum) {
-                        let mut b = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut b).is_ok() {
-                            Some(b)
-                        } else {
-                            None
-                        }
+                    } else if cache.read_page_if_present(pnum, &mut b)? {
+                        Some(b)
                     } else {
                         None
                     };
@@ -673,17 +758,19 @@ fn flush_inner(
     };
     storage_helpers::put_manifest(backend, runtime, &new_manifest)?;
 
-    // 7. Commit to shared state
+    // 7. Persist local manifest + clear dirty_groups file BEFORE updating shared
+    //    state. If local persistence fails, the in-memory manifest remains the old
+    //    one and the next VFS open will not start from a stale local file.
+    manifest::persist_manifest_local(&cache.cache_dir, &new_manifest).map_err(|e| {
+        io::Error::other(format!("flush: failed to persist local manifest: {}", e))
+    })?;
+    manifest::persist_dirty_groups(&cache.cache_dir, &[]).map_err(|e| {
+        io::Error::other(format!("flush: failed to clear dirty_groups: {}", e))
+    })?;
+
+    // 8. Commit to shared state (in-memory)
     cache.set_group_pages(new_manifest.group_pages.clone());
     shared_manifest.store(Arc::new(new_manifest.clone()));
-
-    // 8. Persist local manifest + clear dirty_groups file (flush complete)
-    if let Err(e) = manifest::persist_manifest_local(&cache.cache_dir, &new_manifest) {
-        eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
-    }
-    if let Err(e) = manifest::persist_dirty_groups(&cache.cache_dir, &[]) {
-        eprintln!("[flush] ERROR: failed to clear dirty_groups: {}", e);
-    }
 
     let _ = cache.persist_bitmap();
 

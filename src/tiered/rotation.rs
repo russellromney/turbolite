@@ -272,8 +272,7 @@ pub fn rotate_encryption_key(
     if let Some(verify_key) = new_manifest.page_group_keys.iter().find(|k| !k.is_empty()) {
         let verify_blob = storage_helpers::get_page_group(backend_ref, runtime_ref, verify_key)?
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     "verification failed: newly uploaded page group not found in S3",
                 )
             })?;
@@ -290,8 +289,7 @@ pub fn rotate_encryption_key(
             let frame = &new_manifest.frame_tables[verify_gid][0];
             let end = frame.offset as usize + frame.len as usize;
             if end > verify_blob.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "verification failed: frame extends beyond blob",
                 ));
             }
@@ -309,10 +307,10 @@ pub fn rotate_encryption_key(
                 None,
             )
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("verification failed: cannot decompress new data: {}", e),
-                )
+                io::Error::other(format!(
+                    "verification failed: cannot decompress new data: {}",
+                    e
+                ))
             })?;
         } else {
             // Non-seekable: verify whole blob
@@ -329,20 +327,35 @@ pub fn rotate_encryption_key(
                 None,
             )
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("verification failed: cannot decompress new data: {}", e),
-                )
+                io::Error::other(format!(
+                    "verification failed: cannot decompress new data: {}",
+                    e
+                ))
             })?;
         }
         turbolite_debug!("[rotate] verification passed: new data is readable");
     }
 
+    // Clear local cache BEFORE uploading the new manifest. The manifest upload
+    // is the commit point; if we crash after it but before clearing cache, the
+    // next open would see new manifest pointing at new objects while the local
+    // cache still holds old-ciphertext pages (or plaintext if removing
+    // encryption) — reads would return garbage (adversarial review E5).
+    let cache_path = config
+        .local_data_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| config.cache_dir.join("data.cache"));
+    let _ = std::fs::remove_file(&cache_path);
+    let _ = std::fs::remove_file(config.cache_dir.join("local_state.msgpack"));
+    turbolite_debug!("[rotate] cleared local cache before commit");
+
     // COMMIT POINT: upload new manifest
     storage_helpers::put_manifest(backend_ref, runtime_ref, &new_manifest)?;
     turbolite_debug!("[rotate] manifest uploaded (version {})", new_version);
 
-    // GC old objects
+    // GC old objects only after the new manifest is durable. If GC is partially
+    // lost, the old objects are unreachable via the new manifest.
     if !replaced_keys.is_empty() {
         storage_helpers::delete_objects(backend_ref, runtime_ref, &replaced_keys)?;
         turbolite_debug!(
@@ -350,16 +363,6 @@ pub fn rotate_encryption_key(
             replaced_keys.len()
         );
     }
-
-    // Clear local cache (simpler than re-encrypting, cache repopulates on next open)
-    let cache_path = config
-        .local_data_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| config.cache_dir.join("data.cache"));
-    let _ = std::fs::remove_file(cache_path);
-    let _ = std::fs::remove_file(config.cache_dir.join("local_state.msgpack"));
-    turbolite_debug!("[rotate] cleared local cache");
 
     turbolite_debug!("[rotate] {} complete", mode);
     Ok(())

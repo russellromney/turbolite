@@ -1,0 +1,21 @@
+app = "turbolite-tiered-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "warn"
+  BENCH_BIN = "run_s3vfs_bench.sh"
+  PYTHONUNBUFFERED = "1"
+
+[mounts]
+  source = "bench_data"
+  destination = "/data"
+
+[processes]
+  app = "100000 --page-size 65536 --iterations 10 --warmup 2 --queries post,profile,who-liked,mutual,idx-filter,scan-filter --per-query-timeout 120"
+
+[[vm]]
+  size = "performance-8x"
+  memory = "16384"

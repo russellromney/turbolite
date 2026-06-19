@@ -15,12 +15,10 @@ use turbolite::tiered::{
 };
 
 fn unique_vfs_name(label: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos();
-    format!("anvil-crash-{label}-{nanos}")
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("anvil-crash-{label}-{}-{}", std::process::id(), n)
 }
 
 fn build_remote_vfs(

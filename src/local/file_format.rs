@@ -164,22 +164,40 @@ pub fn decode_page(blob: &[u8], codec: &PageCodec, max_page: usize) -> io::Resul
     }
     let tag = blob[0];
     let payload = maybe_decrypt(&blob[1..], codec)?;
-    match tag {
+    let page = match tag {
         CODEC_RAW => {
-            if payload.len() > max_page {
+            if payload.len() != max_page {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "raw page exceeds page size",
+                    format!(
+                        "raw page length {} does not match expected page size {}",
+                        payload.len(), max_page
+                    ),
                 ));
             }
-            Ok(payload)
+            payload
         }
-        CODEC_ZSTD => decompress_zstd(&payload, max_page),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown page codec tag {other}"),
-        )),
-    }
+        CODEC_ZSTD => {
+            let decompressed = decompress_zstd(&payload, max_page)?;
+            if decompressed.len() != max_page {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "decompressed page length {} does not match expected page size {}",
+                        decompressed.len(), max_page
+                    ),
+                ));
+            }
+            decompressed
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown page codec tag {other}"),
+            ))
+        }
+    };
+    Ok(page)
 }
 
 fn compress_page(page: &[u8], codec: &PageCodec) -> io::Result<(u8, Vec<u8>)> {
@@ -211,14 +229,9 @@ fn compress_zstd(data: &[u8], _level: i32) -> io::Result<Vec<u8>> {
 
 #[cfg(feature = "zstd")]
 fn decompress_zstd(data: &[u8], max_page: usize) -> io::Result<Vec<u8>> {
-    let out = crate::compress::decompress(data, None)?;
-    if out.len() > max_page {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "decompressed page exceeds page size (possible bomb)",
-        ));
-    }
-    Ok(out)
+    // Use the capped decoder so a malicious size prefix cannot force an
+    // unbounded allocation before the post-decompression length check (E2).
+    crate::compress::decompress_capped(data, None, max_page)
 }
 
 #[cfg(not(feature = "zstd"))]
@@ -362,7 +375,7 @@ mod tests {
 
     #[test]
     fn page_roundtrip_no_compression() {
-        let page = vec![7u8; 1024];
+        let page = vec![7u8; 4096];
         let codec = PageCodec {
             compress: false,
             level: 0,
@@ -467,5 +480,21 @@ mod tests {
             ..codec
         };
         assert!(decode_page(&blob, &wrong_codec, 4096).is_err());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn decode_rejects_zstd_decompression_bomb() {
+        // A zstd payload that decompresses to more than the caller's max page
+        // size must be rejected before unbounded memory is allocated (E2).
+        let codec = PageCodec {
+            compress: true,
+            level: 1,
+            key: None,
+        };
+        let big = vec![0u8; 8192];
+        let blob = encode_page(&big, &codec).unwrap();
+        let err = decode_page(&blob, &codec, 4096).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

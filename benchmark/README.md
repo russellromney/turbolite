@@ -244,6 +244,16 @@ The process args in `fly.toml` control what runs:
   app = "--sizes 1000000 --iterations 10 --skip-verify --modes none,interior,index,data"
 ```
 
+### sqlite-s3vfs comparison
+
+To compare against [sqlite-s3vfs](https://github.com/simonw/sqlite-s3vfs) on the same dataset, deploy [`fly-s3vfs.toml`](fly-s3vfs.toml):
+
+```bash
+fly deploy --config benchmark/fly-s3vfs.toml --app turbolite-tiered-bench
+```
+
+This uses [`bench_s3vfs.py`](bench_s3vfs.py), which mirrors the `tiered-bench` queries and parameter generation. It first generates a local `social_100000.db`, uploads it to sqlite-s3vfs format (one S3 object per page), then runs cold-latency iterations for each query.
+
 ### View results
 
 Results are uploaded to S3 by the entrypoint:

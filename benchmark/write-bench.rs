@@ -19,6 +19,8 @@
 //!   cargo run --release --features tiered,zstd --bin write-bench -- --scenario sustained
 //! ```
 
+#![allow(deprecated)]
+
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -1187,9 +1189,7 @@ fn scenario_cold_write(cli: &Cli) {
     )
     .expect("cold open");
     cold_conn
-        .execute_batch(&format!(
-            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
-        ))
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
         .expect("pragma");
 
     // Measure first write on cold DB
@@ -1528,7 +1528,7 @@ fn scenario_arctic_write(cli: &Cli) {
 
     // Measure write on truly arctic DB
     println!("\n--- Arctic write: single INSERT ---");
-    let before = s3_snapshot(&bench);
+    let _before = s3_snapshot(&bench);
     bench.reset_s3_counters();
     let t = Instant::now();
     conn.execute(

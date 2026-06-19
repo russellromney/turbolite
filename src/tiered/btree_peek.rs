@@ -173,8 +173,16 @@ fn parse_index_leaf_cell_rowid(
     let payload_start = cell_off.checked_add(payload_len_bytes)?;
     let payload_end = payload_start.checked_add(payload_len)?;
     let overflowed = payload_len > max_local;
-    if overflowed || payload_end > page.len() {
-        return Some((0, None, overflowed));
+    // Separate overflow and truncation checks. Real overflow cells store most
+    // of their payload on separate overflow pages, so payload_end may legitimately
+    // extend past the leaf page; report them as overflowed. A non-overflow cell
+    // whose claimed payload runs off the page is a truncated malformed cell and
+    // must be counted as malformed by the caller, not returned as rowid 0.
+    if overflowed {
+        return Some((0, None, true));
+    }
+    if payload_end > page.len() {
+        return None;
     }
 
     let (header_len, header_len_bytes) = read_varint(page, payload_start)?;
@@ -706,5 +714,29 @@ mod tests {
             let _ = parse_table_interior_cells(&page, false);
             let _ = parse_table_interior_cells(&page, true);
         }
+    }
+
+    /// F-08: a truncated malformed index-leaf cell must be counted as
+    /// malformed, not returned as a fabricated rowid 0.
+    #[test]
+    fn truncated_index_leaf_cell_is_malformed_not_rowid_zero() {
+        let mut page = vec![0u8; 256];
+        page[0] = 0x0a;
+        page[3..5].copy_from_slice(&1u16.to_be_bytes());
+        // Point the sole cell pointer near the end of the page.
+        page[8..10].copy_from_slice(&250u16.to_be_bytes());
+
+        // Cell at offset 250: payload_len is small enough not to overflow
+        // (10 <= max_local for a 256-byte page), but the payload extends
+        // past the end of the page, so the cell is truncated/malformed.
+        page[250] = 10; // payload_len = 10
+
+        let parsed = parse_index_leaf_rowids(&page, false, 64, None);
+        assert!(parsed.rowids.is_empty());
+        assert_eq!(
+            parsed.malformed_cells, 1,
+            "truncated cell must be malformed"
+        );
+        assert_eq!(parsed.overflow_cells, 0, "truncation is not overflow");
     }
 }

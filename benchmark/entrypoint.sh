@@ -8,6 +8,18 @@ fi
 # Build the command. For tiered-tune, queries must be passed as separate --query args
 # to preserve spaces and commas. Other args come from env vars (TUNE_*) or "$@".
 BENCH_CMD="${BENCH_BIN:-tiered-bench}"
+if [ "$BENCH_CMD" = "s3vfs-bench" ]; then
+  BENCH_CMD="/usr/local/bin/bench_s3vfs.py"
+fi
+if [ "$BENCH_CMD" = "run_s3vfs_bench.sh" ]; then
+  BENCH_CMD="/usr/local/bin/run_s3vfs_bench.sh"
+fi
+if [ "$BENCH_CMD" = "run_graft_bench.sh" ]; then
+  BENCH_CMD="/usr/local/bin/run_graft_bench.sh"
+fi
+if [ "$BENCH_CMD" = "run_s3sqlite_bench.sh" ]; then
+  BENCH_CMD="/usr/local/bin/run_s3sqlite_bench.sh"
+fi
 EXTRA_ARGS=()
 if [ "$BENCH_CMD" = "tiered-tune" ] && [ -n "$TUNE_QUERY_1" ]; then
   EXTRA_ARGS+=(--query "$TUNE_QUERY_1")

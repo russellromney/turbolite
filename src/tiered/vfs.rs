@@ -351,11 +351,31 @@ impl TurboliteVfs {
                 }
             }
 
+            // The adopted trailer's page_count is authoritative; older logs can
+            // fill in missing pages below it but must not grow past it.
+            let committed_page_count = if adopted_trailer {
+                manifest.page_count
+            } else {
+                u64::MAX
+            };
+
             // Replay staging log pages into cache so cold reopens can
             // serve reads immediately without waiting for a background
             // flush to materialise them.
             for flush_entry in &recovered_staging {
                 if flush_entry.page_size > 0 {
+                    // Skip logs whose geometry doesn't match the authoritative
+                    // manifest/cache page_size, unless the manifest is still
+                    // empty and hasn't pinned a page_size yet.
+                    if manifest.page_size != 0 && flush_entry.page_size != manifest.page_size {
+                        turbolite_debug!(
+                            "[tiered] skipping staging log v{}: page_size {} != manifest {}",
+                            flush_entry.version,
+                            flush_entry.page_size,
+                            manifest.page_size,
+                        );
+                        continue;
+                    }
                     // The staging header carries the real page size for these
                     // records; derive from it unconditionally so a default
                     // 4096 placeholder never masks the true geometry.
@@ -375,15 +395,11 @@ impl TurboliteVfs {
                 {
                     for (page_num, data) in &pages {
                         let _ = cache.write_page(*page_num, data);
-                        // Only grow page_count from stray pages when no trailer
-                        // manifest pinned the committed length. If a trailer was
-                        // adopted, its page_count is exact: a higher stray page
-                        // is a partial/rolled-back write and must not re-grow it.
-                        if !adopted_trailer {
-                            let new_count = *page_num + 1;
-                            if new_count > manifest.page_count {
-                                manifest.page_count = new_count;
-                            }
+                        // Grow page_count from stray pages, but never beyond the
+                        // committed length pinned by an adopted trailer.
+                        let new_count = (*page_num + 1).min(committed_page_count);
+                        if new_count > manifest.page_count {
+                            manifest.page_count = new_count;
                         }
                     }
                 }
@@ -1233,9 +1249,20 @@ impl TurboliteVfs {
                 e,
             );
         }
-        if let Err(e) = super::manifest::persist_dirty_groups(&self.config.cache_dir, &[]) {
+        // Persist a snapshot of the in-memory pending dirty groups instead of
+        // clearing them. set_manifest is used by HA followers when swapping in
+        // a newer remote manifest; local checkpoints that haven't been flushed
+        // yet must survive the swap.
+        let pending: Vec<u64> = self
+            .shared_dirty_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        if let Err(e) = super::manifest::persist_dirty_groups(&self.config.cache_dir, &pending) {
             eprintln!(
-                "[set_manifest] warning: failed to clear dirty_groups: {}",
+                "[set_manifest] warning: failed to persist dirty_groups: {}",
                 e,
             );
         }
@@ -1526,6 +1553,9 @@ impl TurboliteVfs {
                         for state in states.iter() {
                             state.store(GroupState::None as u8, Ordering::Release);
                         }
+                        // Drop bitmap/tracker/index/mem-cache state for every group so
+                        // a follower/reopen doesn't read stale newer pages (A3).
+                        self.cache.invalidate_all_groups();
                         self.cache.group_condvar.notify_all();
                     } else {
                         let mut invalidated = 0usize;
@@ -1542,6 +1572,9 @@ impl TurboliteVfs {
                                     state.store(GroupState::None as u8, Ordering::Release);
                                     invalidated += 1;
                                 }
+                                // Drop bitmap/tracker/index/mem-cache state for this group
+                                // so a stale object/key can't be served (A3).
+                                self.cache.invalidate_group(gid as u64, ppg);
                             }
                             let old_ovs = old_manifest.subframe_overrides.get(gid);
                             let new_ovs = manifest.subframe_overrides.get(gid);
@@ -1552,6 +1585,9 @@ impl TurboliteVfs {
                                         invalidated += 1;
                                     }
                                 }
+                                // Subframe override changes can move pages between objects;
+                                // invalidate the group state (A3).
+                                self.cache.invalidate_group(gid as u64, ppg);
                             }
                         }
                         if invalidated > 0 {
@@ -1649,7 +1685,7 @@ impl TurboliteVfs {
                 }
             }
 
-            TurboliteHandle::new_tiered(
+            let mut handle = TurboliteHandle::new_tiered(
                 Some(Arc::clone(&self.storage)),
                 Some(self.runtime.clone()),
                 Arc::clone(&self.cache),
@@ -1680,7 +1716,9 @@ impl TurboliteVfs {
                 self.local_checkpoint_only,
                 Arc::clone(&self.replay_gate),
                 Arc::clone(&self.replay_epoch),
-            )
+            )?;
+            handle.set_flush_lock(self.flush_lock.clone());
+            Ok(handle)
         } else {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -1691,11 +1729,10 @@ impl TurboliteVfs {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
-            Ok(TurboliteHandle::new_passthrough(
-                file,
-                path,
-                self.config.encryption.key,
-            ))
+            let mut handle =
+                TurboliteHandle::new_passthrough(file, path, self.config.encryption.key);
+            handle.set_flush_lock(self.flush_lock.clone());
+            Ok(handle)
         }
     }
 
@@ -1867,7 +1904,12 @@ mod plugin_backend {
             DatabaseHandle::sync(h, false).map_err(|_| vars::SQLITE_IOERR_FSYNC)
         }
 
-        fn close(&self, h: TurboliteHandle) -> VfsResult<()> {
+        fn close(&self, mut h: TurboliteHandle) -> VfsResult<()> {
+            // Persist any dirty local state to the cache-dir manifest so that a
+            // clean close is durable even when SQLite skipped xSync
+            // (e.g. PRAGMA synchronous=OFF). This is a local-only commit: it
+            // does not upload to remote storage (A6).
+            let _ = h.close_local_commit();
             // TurboliteHandle's Drop releases locks and tears down handle state.
             drop(h);
             Ok(())

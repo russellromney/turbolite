@@ -29,11 +29,21 @@ pub fn import_sqlite_file(
     file_path: &Path,
 ) -> io::Result<Manifest> {
     use std::os::unix::fs::FileExt;
+
+    use fs2::FileExt as _;
+
     let backend_ref = backend.as_ref();
     let runtime_ref = &runtime;
 
-    // Open the file and read SQLite header to get page size and page count
+    // Open the file and take an exclusive lock so SQLite cannot modify the
+    // source database while we read it twice (walk + upload).
     let file = File::open(file_path)?;
+    file.try_lock_exclusive().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("source database is locked by another process: {e}"),
+        )
+    })?;
     let file_len = file.metadata()?.len();
 
     // SQLite header: page size at offset 16 (2 bytes, big-endian)

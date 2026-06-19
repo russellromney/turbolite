@@ -7,13 +7,15 @@
 //! mode (there's no remote I/O to parallelise).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hadb_storage::StorageBackend;
+use tokio::sync::watch;
 
 use super::async_rt::block_on;
 use super::cache_tracking::SubChunkId;
@@ -160,27 +162,47 @@ fn clear_lookahead_group(lookahead_frame_ids: &parking_lot::Mutex<HashSet<SubChu
         .retain(|id| id.group_id != group_id);
 }
 
-fn coalesced_frame_runs(frames: &[usize], frame_table: &[FrameEntry]) -> Vec<Vec<usize>> {
+fn coalesced_frame_runs(frames: &[usize], frame_table: &[FrameEntry]) -> Option<Vec<Vec<usize>>> {
     let mut runs: Vec<Vec<usize>> = Vec::new();
     for &frame_idx in frames {
         let Some(entry) = frame_table.get(frame_idx) else {
             continue;
         };
+        // Reject malformed frame tables whose byte range would overflow.
+        entry.offset.checked_add(u64::from(entry.len))?;
         if let Some(last_run) = runs.last_mut() {
             if let Some(&prev_idx) = last_run.last() {
                 if let Some(prev) = frame_table.get(prev_idx) {
-                    if prev_idx + 1 == frame_idx
-                        && prev.offset.saturating_add(u64::from(prev.len)) == entry.offset
-                    {
-                        last_run.push(frame_idx);
-                        continue;
+                    if prev_idx + 1 == frame_idx {
+                        let prev_end = prev.offset.checked_add(u64::from(prev.len))?;
+                        if prev_end == entry.offset {
+                            last_run.push(frame_idx);
+                            continue;
+                        }
                     }
                 }
             }
         }
         runs.push(vec![frame_idx]);
     }
-    runs
+    Some(runs)
+}
+
+/// Run a storage future on the tokio runtime, but abort if the pool's
+/// cancellation token fires. Returns `None` when cancelled so the caller
+/// can finish the job without writing stale bytes during shutdown.
+fn block_on_cancellable<T>(
+    runtime: &tokio::runtime::Handle,
+    cancel_rx: &mut watch::Receiver<()>,
+    fut: impl Future<Output = T>,
+) -> Option<T> {
+    block_on(runtime, async {
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => None,
+            res = fut => Some(res),
+        }
+    })
 }
 
 fn mark_decoded_page_types(
@@ -698,6 +720,9 @@ pub(crate) struct PrefetchPool {
     lookahead_frame_ids: Arc<parking_lot::Mutex<HashSet<SubChunkId>>>,
     max_queued: Arc<AtomicU64>,
     io_budget: Arc<RemoteIoBudget>,
+    /// Cancellation token shared by all workers. On Drop we signal it so
+    /// in-flight storage futures abort instead of blocking shutdown.
+    cancel_tx: watch::Sender<()>,
 }
 
 impl PrefetchPool {
@@ -733,6 +758,7 @@ impl PrefetchPool {
         let active_frame_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let lookahead_frame_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let max_queued = Arc::new(AtomicU64::new(0));
+        let (cancel_tx, _cancel_rx) = watch::channel(());
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
@@ -752,6 +778,7 @@ impl PrefetchPool {
             let shared_manifest = Arc::clone(&shared_manifest);
             let shutdown = Arc::clone(&shutdown);
             let in_flight = Arc::clone(&in_flight);
+            let cancel_tx = cancel_tx.clone();
             let replay_gate = Arc::clone(&replay_gate);
             let replay_epoch = Arc::clone(&replay_epoch);
             let metrics = Arc::clone(&metrics);
@@ -803,6 +830,7 @@ impl PrefetchPool {
                 // pre-replay bytes over the freshly-replayed ones.
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
+                    let mut cancel_rx = cancel_tx.subscribe();
                     metrics.wait_before_fetch(job.queued_at.elapsed());
 
                     if let Some(frame_indices) = job.frame_indices.as_ref() {
@@ -855,11 +883,23 @@ impl PrefetchPool {
                                 .get(&frame_idx)
                                 .expect("filtered to override frames");
                             let fetch_start = Instant::now();
-                            let compressed_frame = match storage_helpers::get_page_group(
-                                storage.as_ref(),
+                            let compressed_frame_result = match block_on_cancellable(
                                 &runtime,
-                                &ovr.key,
+                                &mut cancel_rx,
+                                storage.get(&ovr.key),
                             ) {
+                                Some(Ok(v)) => Ok(v),
+                                Some(Err(e)) => Err(io::Error::other(format!(
+                                    "storage get {}: {e}",
+                                    ovr.key
+                                ))),
+                                None => {
+                                    metrics.cancelled(&job.tree_name);
+                                    failed = true;
+                                    break;
+                                }
+                            };
+                            let compressed_frame = match compressed_frame_result {
                                 Ok(Some(bytes)) => bytes,
                                 Ok(None) => {
                                     metrics.missing_object(&job.tree_name);
@@ -922,86 +962,132 @@ impl PrefetchPool {
                             .copied()
                             .filter(|idx| !job.overrides.contains_key(idx))
                             .collect();
-                        for run in coalesced_frame_runs(&base_frames_to_fetch, &job.frame_table) {
-                            let first_idx = run[0];
-                            let last_idx = *run.last().expect("run is non-empty");
-                            let first = &job.frame_table[first_idx];
-                            let last = &job.frame_table[last_idx];
-                            let total_len =
-                                (last.offset + u64::from(last.len) - first.offset) as u32;
-                            let fetch_start = Instant::now();
-                            let range_bytes = match storage_helpers::range_get(
-                                storage.as_ref(),
-                                &runtime,
-                                &job.key,
-                                first.offset,
-                                total_len,
-                            ) {
-                                Ok(Some(bytes)) => bytes,
-                                Ok(None) => {
-                                    metrics.missing_object(&job.tree_name);
-                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
-                                    failed = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    if !shutdown.load(Ordering::Acquire) {
-                                        eprintln!(
-                                            "[prefetch-frame] gid={} frames={:?} fetch error: {}",
-                                            gid, run, e
-                                        );
-                                    }
-                                    metrics.fetch_error(&job.tree_name);
-                                    metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
-                                    failed = true;
-                                    break;
-                                }
-                            };
-                            fetched_bytes += range_bytes.len() as u64;
-                            metrics.traffic_success(
-                                PrefetchTrafficClass::PrefetchFrame,
-                                range_bytes.len() as u64,
-                                fetch_start.elapsed(),
-                            );
-
-                            for frame_idx in run {
-                                let entry = &job.frame_table[frame_idx];
-                                let start = (entry.offset - first.offset) as usize;
-                                let end = start + entry.len as usize;
-                                let Some(compressed_frame) = range_bytes.get(start..end) else {
+                        if let Some(runs) =
+                            coalesced_frame_runs(&base_frames_to_fetch, &job.frame_table)
+                        {
+                            for run in runs {
+                                let first_idx = run[0];
+                                let last_idx = *run.last().expect("run is non-empty");
+                                let first = &job.frame_table[first_idx];
+                                let last = &job.frame_table[last_idx];
+                                let Some(total_len) = last
+                                    .offset
+                                    .checked_add(u64::from(last.len))
+                                    .and_then(|end| end.checked_sub(first.offset))
+                                else {
                                     metrics.decode_error(&job.tree_name);
                                     failed = true;
                                     break;
                                 };
-                                let decompressed = match decode_seekable_subchunk(
-                                    compressed_frame,
-                                    #[cfg(feature = "zstd")]
-                                    decoder_dict.as_ref(),
-                                    &keys::aad_page_group(gid),
-                                    encryption_key.as_ref().as_ref(),
+                                if total_len > u64::from(u32::MAX) {
+                                    metrics.decode_error(&job.tree_name);
+                                    failed = true;
+                                    break;
+                                }
+                                let total_len = total_len as u32;
+                                let fetch_start = Instant::now();
+                                let range_result = match block_on_cancellable(
+                                    &runtime,
+                                    &mut cancel_rx,
+                                    storage.range_get(&job.key, first.offset, total_len),
                                 ) {
-                                    Ok(bytes) => bytes,
-                                    Err(e) => {
-                                        if !shutdown.load(Ordering::Acquire) {
-                                            eprintln!(
-                                                "[prefetch-frame] gid={} frame={} decode error: {}",
-                                                gid, frame_idx, e
-                                            );
-                                        }
-                                        metrics.decode_error(&job.tree_name);
+                                    Some(Ok(v)) => storage_helpers::validate_range_get_result(
+                                        &job.key,
+                                        first.offset,
+                                        total_len,
+                                        v,
+                                    ),
+                                    Some(Err(e)) => Err(io::Error::other(format!(
+                                        "storage range_get {}: {e}",
+                                        job.key
+                                    ))),
+                                    None => {
+                                        metrics.cancelled(&job.tree_name);
                                         failed = true;
                                         break;
                                     }
                                 };
-                                decoded_frames.push((
-                                    frame_idx,
-                                    decompressed,
-                                    compressed_frame.len() as u64,
-                                ));
+                                let range_bytes = match range_result {
+                                    Ok(Some(bytes)) => bytes,
+                                    Ok(None) => {
+                                        metrics.missing_object(&job.tree_name);
+                                        metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                        failed = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        if !shutdown.load(Ordering::Acquire) {
+                                            eprintln!(
+                                                "[prefetch-frame] gid={} frames={:?} fetch error: {}",
+                                                gid, run, e
+                                            );
+                                        }
+                                        metrics.fetch_error(&job.tree_name);
+                                        metrics.traffic_error(PrefetchTrafficClass::PrefetchFrame);
+                                        failed = true;
+                                        break;
+                                    }
+                                };
+                                fetched_bytes += range_bytes.len() as u64;
+                                metrics.traffic_success(
+                                    PrefetchTrafficClass::PrefetchFrame,
+                                    range_bytes.len() as u64,
+                                    fetch_start.elapsed(),
+                                );
+
+                                for frame_idx in run {
+                                    let entry = &job.frame_table[frame_idx];
+                                    let Some(start_in_run) =
+                                        entry.offset.checked_sub(first.offset)
+                                    else {
+                                        metrics.decode_error(&job.tree_name);
+                                        failed = true;
+                                        break;
+                                    };
+                                    let start = start_in_run as usize;
+                                    let Some(end) = start.checked_add(entry.len as usize) else {
+                                        metrics.decode_error(&job.tree_name);
+                                        failed = true;
+                                        break;
+                                    };
+                                    let Some(compressed_frame) = range_bytes.get(start..end) else {
+                                        metrics.decode_error(&job.tree_name);
+                                        failed = true;
+                                        break;
+                                    };
+                                    let decompressed = match decode_seekable_subchunk(
+                                        compressed_frame,
+                                        #[cfg(feature = "zstd")]
+                                        decoder_dict.as_ref(),
+                                        &keys::aad_page_group(gid),
+                                        encryption_key.as_ref().as_ref(),
+                                    ) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            if !shutdown.load(Ordering::Acquire) {
+                                                eprintln!(
+                                                    "[prefetch-frame] gid={} frame={} decode error: {}",
+                                                    gid, frame_idx, e
+                                                );
+                                            }
+                                            metrics.decode_error(&job.tree_name);
+                                            failed = true;
+                                            break;
+                                        }
+                                    };
+                                    decoded_frames.push((
+                                        frame_idx,
+                                        decompressed,
+                                        compressed_frame.len() as u64,
+                                    ));
+                                }
+                                if failed {
+                                    break;
+                                }
                             }
-                            if failed {
-                                break;
-                            }
+                        } else {
+                            metrics.decode_error(&job.tree_name);
+                            failed = true;
                         }
                         drop(_io_permit);
                         if failed {
@@ -1120,15 +1206,25 @@ impl PrefetchPool {
                     let worker_start = Instant::now();
 
                     let fetch_start = Instant::now();
-                    let pg_data = match block_on(&runtime, storage.get(&job.key)) {
-                        Ok(data) => data,
-                        Err(e) => {
+                    let pg_data = match block_on_cancellable(
+                        &runtime,
+                        &mut cancel_rx,
+                        storage.get(&job.key),
+                    ) {
+                        Some(Ok(data)) => data,
+                        Some(Err(e)) => {
                             if !shutdown.load(Ordering::Acquire) {
                                 eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
                             }
                             cache.unclaim_if_fetching(gid);
                             metrics.fetch_error(&job.tree_name);
                             metrics.traffic_error(PrefetchTrafficClass::PrefetchGroup);
+                            finish(gid);
+                            continue;
+                        }
+                        None => {
+                            cache.unclaim_if_fetching(gid);
+                            metrics.cancelled(&job.tree_name);
                             finish(gid);
                             continue;
                         }
@@ -1221,9 +1317,13 @@ impl PrefetchPool {
                                 override_failed = true;
                                 break;
                             };
-                            let ovr_data = match block_on(&runtime, storage.get(&ovr.key)) {
-                                Ok(Some(data)) => data,
-                                Ok(None) => {
+                            let ovr_data = match block_on_cancellable(
+                                &runtime,
+                                &mut cancel_rx,
+                                storage.get(&ovr.key),
+                            ) {
+                                Some(Ok(Some(data))) => data,
+                                Some(Ok(None)) => {
                                     turbolite_debug!(
                                         "[prefetch] gid={} override frame {} key '{}' not found",
                                         gid, frame_idx, ovr.key,
@@ -1234,7 +1334,7 @@ impl PrefetchPool {
                                     override_failed = true;
                                     break;
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     if !shutdown.load(Ordering::Acquire) {
                                         eprintln!(
                                             "[prefetch] gid={} override frame {} fetch error: {}",
@@ -1244,6 +1344,12 @@ impl PrefetchPool {
                                     cache.unclaim_if_fetching(gid);
                                     metrics.fetch_error(&job.tree_name);
                                     metrics.traffic_error(PrefetchTrafficClass::PrefetchOverride);
+                                    override_failed = true;
+                                    break;
+                                }
+                                None => {
+                                    cache.unclaim_if_fetching(gid);
+                                    metrics.cancelled(&job.tree_name);
                                     override_failed = true;
                                     break;
                                 }
@@ -1425,6 +1531,7 @@ impl PrefetchPool {
             lookahead_frame_ids,
             max_queued,
             io_budget,
+            cancel_tx,
         }
     }
 
@@ -1451,17 +1558,18 @@ impl PrefetchPool {
             self.metrics.closed();
             return PrefetchSubmitOutcome::Closed;
         }
+        // Hold the queue lock across the group-state check and insert to close
+        // the TOCTOU window where two submitters could queue the same cold group.
+        let mut queued = self.queued_gids.lock();
         if cache.group_state(gid) != GroupState::None {
             self.metrics.skipped_state(&tree_name);
             return PrefetchSubmitOutcome::SkippedState;
         }
-        {
-            let mut queued = self.queued_gids.lock();
-            if !queued.insert(gid) {
-                self.metrics.skipped_state(&tree_name);
-                return PrefetchSubmitOutcome::SkippedState;
-            }
+        if !queued.insert(gid) {
+            self.metrics.skipped_state(&tree_name);
+            return PrefetchSubmitOutcome::SkippedState;
         }
+        drop(queued);
         self.note_max_queued();
         // Snapshot the replay epoch at submission. The worker re-reads
         // it under the replay_gate read lock before its final cache
@@ -1538,8 +1646,11 @@ impl PrefetchPool {
         }
 
         let present = cache.tracker.lock().present.clone();
-        let active = self.active_frame_ids.lock();
+        // Standardize lock order: queued_frame_ids before active_frame_ids. This
+        // matches the order used by worker completion (finish_frame) and avoids
+        // AB-BA deadlocks between submitters and completers.
         let mut queued = self.queued_frame_ids.lock();
+        let active = self.active_frame_ids.lock();
         let mut accepted_frames = Vec::new();
         for frame_idx in frames {
             let Some(id) = sub_chunk_id_for_frame(gid, frame_idx) else {
@@ -1823,27 +1934,42 @@ impl PrefetchPool {
         self.max_queued.fetch_max(queued as u64, Ordering::Relaxed);
     }
 
-    /// Wait until all in-flight prefetch jobs complete.
+    /// Default upper bound for `wait_idle`. Long enough for ordinary tests
+    /// and teardown, but prevents indefinite hangs on stuck remote I/O.
+    const WAIT_IDLE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Wait until all in-flight prefetch jobs complete, or the timeout expires.
     ///
     /// Workers decrement `in_flight` when they finish a job, so the atomic
     /// is the source of truth. The done channel is best-effort wake-up: if
     /// a wake-up was dropped because the channel was full, we still make
     /// progress via the short timeout.
-    pub(crate) fn wait_idle(&self) {
+    ///
+    /// Returns `true` if all jobs finished before the timeout, `false` if the
+    /// caller should proceed without waiting any longer.
+    pub(crate) fn wait_idle(&self) -> bool {
+        self.wait_idle_timeout(Self::WAIT_IDLE_DEFAULT_TIMEOUT)
+    }
+
+    fn wait_idle_timeout(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = self.in_flight.load(Ordering::Acquire);
             if remaining == 0 {
-                break;
+                return true;
             }
+            let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
             // Sleep until a worker rings the bell, or 50ms — whichever first.
             // Either way we re-check in_flight on the next iteration.
             match self
                 .done_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
+                .recv_timeout(timeout.min(Duration::from_millis(50)))
             {
                 Ok(_gid) => {}
                 Err(flume::RecvTimeoutError::Timeout) => {}
-                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Err(flume::RecvTimeoutError::Disconnected) => return true,
             }
         }
     }
@@ -1852,17 +1978,29 @@ impl PrefetchPool {
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         // Signal shutdown so workers suppress spurious fetch/decode/write
-        // error logs while the runtime/storage is torn down.
+        // error logs while the runtime/storage is torn down, then fire the
+        // cancellation token so in-flight storage futures abort instead of
+        // blocking the join below.
         self.shutdown.store(true, Ordering::Release);
-        // Drain all in-flight work before shutting down the channel.
-        self.wait_idle();
+        let _ = self.cancel_tx.send(());
+
+        // Bounded teardown: if remote I/O is stuck and the workers cannot
+        // finish promptly, detach them rather than hanging the process.
+        let finished = self.wait_idle_timeout(Duration::from_secs(5));
 
         let (dead_tx, _) = flume::bounded(0);
         drop(std::mem::replace(&mut self.job_tx, dead_tx));
         while self.done_rx.try_recv().is_ok() {}
         let mut workers = self.workers.lock();
-        for handle in workers.drain(..) {
-            let _ = handle.join();
+        if finished {
+            for handle in workers.drain(..) {
+                let _ = handle.join();
+            }
+        } else {
+            // Timed out: drop the join handles to detach the threads. The
+            // cancelled workers will exit on their own once their current
+            // storage future is dropped.
+            workers.drain(..);
         }
     }
 }

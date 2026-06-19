@@ -229,6 +229,10 @@ pub(crate) fn default_pages_per_group() -> u32 {
 
 // Local sidecar metadata lives in {cache_dir}/local_state.msgpack.
 
+/// Maximum manifest payload size accepted by decoders (256 MiB). Manifests are
+/// tiny metadata; anything larger is either corrupt or a DoS attempt.
+pub(crate) const MAX_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
+
 /// Persist a `Manifest` to the local cache directory as a warm cache for cold
 /// reopens. Atomic write (tmp + rename). Used by local mode as the
 /// authoritative source and by remote mode as a hint for warm reconnect.
@@ -242,12 +246,20 @@ pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> i
 /// plain msgpack-encoded [`Manifest`] values. Older wrapper formats are not
 /// migrated by this experimental substrate.
 pub(crate) fn decode_manifest_bytes(data: &[u8]) -> io::Result<Manifest> {
-    rmp_serde::from_slice::<Manifest>(data).map_err(|e| {
+    if data.len() > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manifest payload too large: {} bytes", data.len()),
+        ));
+    }
+    let manifest = rmp_serde::from_slice::<Manifest>(data).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("deserialize manifest: {e}"),
         )
-    })
+    })?;
+    manifest.validate_field_ranges()?;
+    Ok(manifest)
 }
 
 /// Load a locally-cached `Manifest`. `Ok(None)` if absent. Callers that need
@@ -311,13 +323,19 @@ impl Manifest {
     }
 
     pub(crate) fn total_groups(&self) -> u64 {
+        // B-tree-aware manifests explicitly list their groups; the positional
+        // formula is only a fallback for legacy/empty manifests.
         if !self.group_pages.is_empty() {
             return self.group_pages.len() as u64;
         }
-        if self.pages_per_group == 0 || self.page_count == 0 {
+        Self::total_groups_for(self.page_count, self.pages_per_group)
+    }
+
+    pub(crate) fn total_groups_for(page_count: u64, pages_per_group: u32) -> u64 {
+        if pages_per_group == 0 || page_count == 0 {
             return 0;
         }
-        self.page_count.div_ceil(self.pages_per_group as u64)
+        page_count.div_ceil(pages_per_group as u64)
     }
 
     /// Build the reverse index (page_num -> PageLocation) from group_pages.
@@ -456,6 +474,50 @@ impl Manifest {
         }
         self.normalize_overrides();
         self.build_page_index();
+    }
+
+    /// Validate load-bearing scalar and vector bounds on a decoded manifest.
+    /// This is the post-decode safety gate shared by the local msgpack decoder
+    /// and the canonical CBOR wire decoder.
+    pub(crate) fn validate_field_ranges(&self) -> io::Result<()> {
+        if self.page_size != 0 && !super::staging::is_valid_page_size(self.page_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid manifest page_size: {}", self.page_size),
+            ));
+        }
+        if self.pages_per_group > 16_384 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pages_per_group {} exceeds 16384", self.pages_per_group),
+            ));
+        }
+        if self.page_count > u64::MAX / 65_536 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("page_count {} exceeds allowed maximum", self.page_count),
+            ));
+        }
+        let keys_len = self.page_group_keys.len();
+        if self.frame_tables.len() > keys_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame_tables length exceeds page_group_keys length",
+            ));
+        }
+        if self.subframe_overrides.len() > keys_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "subframe_overrides length exceeds page_group_keys length",
+            ));
+        }
+        if self.group_pages.len() > keys_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "group_pages length exceeds page_group_keys length",
+            ));
+        }
+        Ok(())
     }
 }
 

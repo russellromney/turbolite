@@ -1,0 +1,25 @@
+# Fly config for benchmarking s3sqlite against turbolite.
+# Deploy with:
+#   fly deploy --config benchmark/fly-s3sqlite.toml --app turbolite-tiered-bench
+
+app = "turbolite-tiered-bench"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "warn"
+  BENCH_BIN = "run_s3sqlite_bench.sh"
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "100000 --page-size 65536 --queries post,profile,who-liked,mutual,idx-filter,scan-filter --iterations 10 --warmup 2 --per-query-timeout 300"
+
+[[mounts]]
+  source = "bench_data"
+  destination = "/data"
+
+[[vm]]
+  size = "performance-8x"
+  memory = "16gb"

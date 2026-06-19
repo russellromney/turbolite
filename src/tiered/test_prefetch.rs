@@ -1474,11 +1474,27 @@ fn optional_prefetch_workers_drop_busy_permit_without_claiming_or_hanging() {
     while backend.started.load(Ordering::Acquire) == 0 {
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(25));
-
-    assert_eq!(backend.started.load(Ordering::Acquire), 1);
+    // The second worker is racing to discover that the single prefetch I/O
+    // permit is already held. Poll until that observation is recorded rather
+    // than assuming a fixed 25 ms sleep is enough under heavy default-thread
+    // parallelism.
+    let poll_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let started = backend.started.load(Ordering::Acquire);
+        assert_eq!(
+            started, 1,
+            "only one optional prefetch may start remote I/O"
+        );
+        if pool.stats_json()["permit_unavailable"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < poll_deadline,
+            "second worker never observed a busy prefetch permit"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(cache.group_state(1), GroupState::None);
-    assert_eq!(pool.stats_json()["permit_unavailable"], 1);
 
     backend.release.store(true, Ordering::Release);
     pool.wait_idle();
@@ -1610,5 +1626,199 @@ fn legacy_blocking_submit_would_park_foreground_when_queue_full() {
     assert!(
         start.elapsed() >= Duration::from_millis(125),
         "old blocking optional admission parks the caller under queue pressure"
+    );
+}
+
+// --- D1/D7 regression tests ---
+
+#[test]
+fn prefetch_pool_drop_does_not_hang_on_stuck_remote_io() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend_concrete = Arc::new(BlockingPayloadBackend {
+        release: AtomicBool::new(false),
+        started: AtomicU64::new(0),
+        payload: test_encode_group(64, 4, 9),
+    });
+    let backend: Arc<dyn StorageBackend> = backend_concrete.clone();
+    let pool = test_pool(Arc::clone(&cache), Arc::clone(&backend), 8, 1, 0);
+
+    let outcome = submit_test_job(&pool, &cache, 0);
+    assert_eq!(outcome, PrefetchSubmitOutcome::Accepted);
+
+    // Wait until the worker is actually stuck in the storage future.
+    let started = Instant::now();
+    while backend_concrete.started.load(Ordering::Acquire) == 0
+        && started.elapsed() < Duration::from_secs(1)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        backend_concrete.started.load(Ordering::Acquire) > 0,
+        "worker should have started the stuck remote I/O"
+    );
+
+    // Drop must complete quickly even though the backend never releases.
+    let start = Instant::now();
+    drop(pool);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "PrefetchPool::drop hung on stuck remote I/O"
+    );
+}
+
+#[test]
+fn submit_optional_prevents_duplicate_queued_groups() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap());
+    let backend_concrete = Arc::new(BlockingPayloadBackend {
+        release: AtomicBool::new(false),
+        started: AtomicU64::new(0),
+        payload: test_encode_group(64, 4, 9),
+    });
+    let backend: Arc<dyn StorageBackend> = backend_concrete.clone();
+    let pool = Arc::new(test_pool(
+        Arc::clone(&cache),
+        Arc::clone(&backend),
+        100,
+        10,
+        0,
+    ));
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let pool = Arc::clone(&pool);
+        let cache = Arc::clone(&cache);
+        handles.push(std::thread::spawn(move || {
+            submit_test_job(&pool, &cache, 0)
+        }));
+    }
+    let accepted = handles
+        .into_iter()
+        .filter_map(|h| h.join().ok())
+        .filter(|o| *o == PrefetchSubmitOutcome::Accepted)
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "only one concurrent submit_optional should queue the same cold gid"
+    );
+
+    // D1: teardown also must not hang with the still-blocked worker.
+    let start = Instant::now();
+    drop(pool);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "PrefetchPool::drop hung after duplicate-prevention test"
+    );
+}
+
+// --- D2 regression test ---
+
+#[test]
+fn submit_frame_batch_lock_order_no_deadlock() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16, None, Vec::new()).unwrap());
+    let backend: Arc<dyn StorageBackend> = Arc::new(RangePayloadBackend {
+        payload: vec![0u8; 1024],
+        full_gets: AtomicU64::new(0),
+        range_gets: AtomicU64::new(0),
+    });
+    let pool = Arc::new(test_pool(
+        Arc::clone(&cache),
+        Arc::clone(&backend),
+        128,
+        8,
+        0,
+    ));
+
+    let frame_table = vec![
+        FrameEntry {
+            offset: 0,
+            len: 512,
+        },
+        FrameEntry {
+            offset: 512,
+            len: 512,
+        },
+    ];
+    let group_page_nums = vec![0, 1, 2, 3];
+
+    let submit_pool = Arc::clone(&pool);
+    let check_pool = Arc::clone(&pool);
+    let cache2 = Arc::clone(&cache);
+
+    let submit = std::thread::spawn(move || {
+        for _ in 0..200 {
+            submit_pool.submit_frame_batch(
+                None,
+                0,
+                "g0".to_string(),
+                frame_table.clone(),
+                64,
+                2,
+                group_page_nums.clone(),
+                vec![0, 1],
+                HashMap::new(),
+                0,
+                &cache2,
+            );
+        }
+    });
+    let check = std::thread::spawn(move || {
+        for _ in 0..200 {
+            check_pool.pending_frame_indices_for_gid(0);
+            check_pool.is_frame_pending(0, 0);
+        }
+    });
+
+    submit.join().expect("submit thread should not deadlock");
+    check.join().expect("check thread should not deadlock");
+    pool.wait_idle();
+}
+
+// --- D3 regression tests ---
+
+#[test]
+fn coalesced_frame_runs_rejects_overflowing_entries() {
+    let table = vec![FrameEntry {
+        offset: u64::MAX,
+        len: 1,
+    }];
+    assert!(
+        coalesced_frame_runs(&[0], &table).is_none(),
+        "offset+len overflow must be rejected"
+    );
+}
+
+#[test]
+fn coalesced_frame_runs_rejects_overflowing_run_length() {
+    // Two entries that each look valid in isolation but whose combined run
+    // length would overflow if naively computed.
+    let table = vec![
+        FrameEntry { offset: 0, len: 1 },
+        FrameEntry {
+            offset: u64::MAX - 1,
+            len: 5,
+        },
+    ];
+    assert!(
+        coalesced_frame_runs(&[0, 1], &table).is_none(),
+        "run length overflow must be rejected"
+    );
+}
+
+#[test]
+fn coalesced_frame_runs_still_coalesces_valid_contiguous_frames() {
+    let table = vec![
+        FrameEntry { offset: 0, len: 10 },
+        FrameEntry {
+            offset: 10,
+            len: 20,
+        },
+        FrameEntry { offset: 50, len: 5 },
+    ];
+    assert_eq!(
+        coalesced_frame_runs(&[0, 1, 2], &table),
+        Some(vec![vec![0, 1], vec![2]])
     );
 }

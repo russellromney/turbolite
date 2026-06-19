@@ -171,7 +171,7 @@ pub(crate) fn recover_wal_from_shared_state(
     let incr_keys = safe_block_on(runtime_handle, async {
         let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("S3Backend: {}", e)))?;
 
         use hadb_storage::StorageBackend;
         let db_name = wal_prefix
@@ -188,7 +188,7 @@ pub(crate) fn recover_wal_from_shared_state(
         storage
             .list(&incr_prefix, Some(&start_key))
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("list WAL: {}", e)))
+            .map_err(|e| io::Error::other(format!("list WAL: {}", e)))
     })?;
 
     if incr_keys.is_empty() {
@@ -212,7 +212,7 @@ pub(crate) fn recover_wal_from_shared_state(
     let applied = safe_block_on(runtime_handle, async {
         let storage = hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("S3Backend: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("S3Backend: {}", e)))?;
 
         use hadb_storage::StorageBackend;
         let mut count = 0u64;
@@ -226,13 +226,13 @@ pub(crate) fn recover_wal_from_shared_state(
                 .get(key)
                 .await
                 .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("download {}: {}", key, e))
+                    io::Error::other(format!("download {}: {}", key, e))
                 })?
                 .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("WAL segment {} disappeared between list and get", key),
-                    )
+                    io::Error::other(format!(
+                        "WAL segment {} disappeared between list and get",
+                        key
+                    ))
                 })?;
             match walrust_core::ltx::apply_changeset_to_db(&data, &recovery_path, prev_checksum) {
                 Ok(result) => {
@@ -247,10 +247,7 @@ pub(crate) fn recover_wal_from_shared_state(
                     break;
                 }
                 Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("apply {}: {}", key, e),
-                    ));
+                    return Err(io::Error::other(format!("apply {}: {}", key, e)));
                 }
             }
         }
@@ -275,13 +272,10 @@ pub(crate) fn recover_wal_from_shared_state(
     let mut pages_loaded = 0u64;
     for pnum in 0..recovered_page_count {
         let mut buf = vec![0u8; page_size as usize];
-        if file
-            .read_exact_at(&mut buf, pnum * page_size as u64)
-            .is_ok()
+        if file.read_exact_at(&mut buf, pnum * page_size as u64).is_ok()
+            && cache.write_page(pnum, &buf).is_ok()
         {
-            if cache.write_page(pnum, &buf).is_ok() {
-                pages_loaded += 1;
-            }
+            pages_loaded += 1;
         }
     }
 

@@ -26,6 +26,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::Arc;
 
 use crate::settings::{
     turbolite_current_queue_clone, turbolite_settings_queue_free_cb, turbolite_settings_queue_push,
@@ -212,7 +213,7 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
         }
 
         let fn_name = c"turbolite_config_set";
-        sqlite3_create_function_v2(
+        let rc = sqlite3_create_function_v2(
             db,
             fn_name.as_ptr(),
             2,
@@ -222,7 +223,19 @@ pub unsafe extern "C" fn turbolite_install_config_functions(db: *mut sqlite3) ->
             None,
             None,
             Some(turbolite_settings_queue_free_cb),
-        )
+        );
+        if rc != SQLITE_OK {
+            // sqlite3_create_function_v2 did not take ownership of pApp; if we
+            // leave the raw pointer dangling the Arc is leaked. Reconstruct and
+            // drop it so the queue is freed.
+            let _ = unsafe {
+                Arc::from_raw(
+                    queue
+                        as *const std::sync::Mutex<Vec<turbolite::tiered::settings::SettingUpdate>>,
+                )
+            };
+        }
+        rc
     })
 }
 

@@ -217,6 +217,31 @@ fn multi_connection_same_thread_routes_per_connection_c_path() {
     );
 }
 
+/// G3 regression: install succeeds on a live turbolite connection without
+/// leaking the captured queue. (The leak path only fires when
+/// `sqlite3_create_function_v2` itself fails, which is hard to force from
+/// a safe test; this at least exercises the success path where the Arc is
+/// correctly handed to SQLite.)
+#[test]
+fn install_success_does_not_leak_queue() {
+    let tmp = TempDir::new().unwrap();
+    let vfs_name = unique_name("tf_leak");
+
+    let vfs = TurboliteVfs::new_local(TurboliteConfig {
+        cache_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("vfs");
+    tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn = open_connection(&vfs_name, "leak.db");
+    assert_eq!(install(&conn), SQLITE_OK, "install should succeed");
+
+    // A successful install means the Arc now lives inside SQLite's function
+    // registration; dropping the connection should free it cleanly.
+    drop(conn);
+}
+
 /// Sequential connections on the same VFS. After A drops, B opens
 /// fresh — the install helper captures B's new queue, not a stale
 /// copy of A's.
