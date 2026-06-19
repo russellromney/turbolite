@@ -338,37 +338,29 @@ fn flush_inner(
                     }
                     let data = if let Some(staged) = staged_pages.get(&pnum) {
                         staged.clone()
-                    } else if cache.is_present(pnum) {
+                    } else {
                         let mut buf = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut buf).is_ok() {
+                        if cache.read_page_if_present(pnum, &mut buf)? {
                             buf
+                        } else if let Some(ref base) = existing_pages {
+                            match base.get(pos) {
+                                Some(page) => page.clone(),
+                                None => {
+                                    return Err(io::Error::other(format!(
+                                        "flush: override frame page {} in group {} missing from fetched base",
+                                        pnum, gid
+                                    )));
+                                }
+                            }
                         } else {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "flush: override frame read failed for page {} in group {}",
+                                    "flush: page {} in group {} is missing and has no backend source",
                                     pnum, gid
                                 ),
                             ));
                         }
-                    } else if let Some(ref base) = existing_pages {
-                        match base.get(pos) {
-                            Some(page) => page.clone(),
-                            None => {
-                                return Err(io::Error::other(format!(
-                                    "flush: override frame page {} in group {} missing from fetched base",
-                                    pnum, gid
-                                )));
-                            }
-                        }
-                    } else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "flush: page {} in group {} is missing and has no backend source",
-                                pnum, gid
-                            ),
-                        ));
                     };
                     frame_pages.push((pnum, data));
                 }
@@ -408,15 +400,13 @@ fn flush_inner(
                 }
                 if let Some(staged_data) = staged_pages.get(&pnum) {
                     pages[i] = Some(staged_data.clone());
-                } else if cache.is_present(pnum) {
+                } else {
                     let mut page_buf = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut page_buf).is_ok() {
+                    if cache.read_page_if_present(pnum, &mut page_buf)? {
                         pages[i] = Some(page_buf);
                     } else {
                         need_merge = true;
                     }
-                } else {
-                    need_merge = true;
                 }
             }
 
@@ -601,15 +591,11 @@ fn flush_inner(
                     if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
                         continue;
                     }
+                    let mut b = vec![0u8; page_size as usize];
                     let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
                         Some(staged_data.clone())
-                    } else if cache.is_present(pnum) {
-                        let mut b = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut b).is_ok() {
-                            Some(b)
-                        } else {
-                            None
-                        }
+                    } else if cache.read_page_if_present(pnum, &mut b)? {
+                        Some(b)
                     } else {
                         None
                     };
@@ -772,17 +758,19 @@ fn flush_inner(
     };
     storage_helpers::put_manifest(backend, runtime, &new_manifest)?;
 
-    // 7. Commit to shared state
+    // 7. Persist local manifest + clear dirty_groups file BEFORE updating shared
+    //    state. If local persistence fails, the in-memory manifest remains the old
+    //    one and the next VFS open will not start from a stale local file.
+    manifest::persist_manifest_local(&cache.cache_dir, &new_manifest).map_err(|e| {
+        io::Error::other(format!("flush: failed to persist local manifest: {}", e))
+    })?;
+    manifest::persist_dirty_groups(&cache.cache_dir, &[]).map_err(|e| {
+        io::Error::other(format!("flush: failed to clear dirty_groups: {}", e))
+    })?;
+
+    // 8. Commit to shared state (in-memory)
     cache.set_group_pages(new_manifest.group_pages.clone());
     shared_manifest.store(Arc::new(new_manifest.clone()));
-
-    // 8. Persist local manifest + clear dirty_groups file (flush complete)
-    if let Err(e) = manifest::persist_manifest_local(&cache.cache_dir, &new_manifest) {
-        eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
-    }
-    if let Err(e) = manifest::persist_dirty_groups(&cache.cache_dir, &[]) {
-        eprintln!("[flush] ERROR: failed to clear dirty_groups: {}", e);
-    }
 
     let _ = cache.persist_bitmap();
 

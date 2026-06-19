@@ -166,52 +166,12 @@ struct LoadableCacheIndex {
 
 // ===== DiskCache (sub-chunk-level cache with tiered eviction) =====
 
-/// Multi-generation deferred-free buffer for mem_cache page allocations.
-/// A freed Box<[u8]> is pushed to the current generation; on rotation it moves
-/// into a ring of older generations and the oldest generation is dropped. The
-/// extra generations give concurrent readers that loaded a pointer just before
-/// a swap enough time to finish copying before the underlying Box is dropped.
-///
-/// Note: the 64-generation ring is a heuristic, not a formal hazard-pointer or
-/// epoch guarantee. A reader descheduled across >=64 cache mutations could in
-/// principle see use-after-free. In practice the reader critical section is a
-/// bounded memcpy, and 64 generations is far larger than any realistic kernel
-/// preemption window, so this is treated as safe-by-assumption rather than
-/// provably safe.
-const DEFERRED_FREE_GENERATIONS: usize = 64;
-
-struct DeferredFrees {
-    current: Vec<Box<[u8]>>,
-    older: std::collections::VecDeque<Vec<Box<[u8]>>>,
-}
-
-impl DeferredFrees {
-    fn new() -> Self {
-        Self {
-            current: Vec::new(),
-            older: std::collections::VecDeque::with_capacity(DEFERRED_FREE_GENERATIONS),
-        }
-    }
-
-    fn defer_free(&mut self, page: Box<[u8]>) {
-        self.current.push(page);
-    }
-
-    /// Rotate generations: current enters the ring and the oldest ring entry is dropped.
-    fn rotate(&mut self) {
-        let batch = std::mem::take(&mut self.current);
-        if self.older.len() >= DEFERRED_FREE_GENERATIONS {
-            self.older.pop_front();
-        }
-        self.older.push_back(batch);
-    }
-
-    fn clear(&mut self) {
-        self.current.clear();
-        self.older.clear();
-    }
-}
-
+/// Retired mem_cache page buffers are freed through `crossbeam-epoch` so that
+/// readers that loaded a pointer before a CAS swap are guaranteed to finish
+/// their copy before the underlying `Box<[u8]>` is dropped. The reader pins an
+/// epoch around the load+copy; the writer retires the old allocation via
+/// `Guard::defer`. This replaces the previous 64-generation ring heuristic with
+/// a formal epoch-based reclamation guarantee.
 /// Local NVMe page cache with sub-chunk-level tracking and tiered eviction.
 ///
 /// Pages are stored **uncompressed** in a single cache file at natural offsets.
@@ -236,20 +196,14 @@ pub(crate) struct DiskCache {
     /// AtomicPtr per page: null = not cached, non-null = pointer to page_size bytes.
     /// The Vec is wrapped in an RwLock so it can grow lazily; readers take a
     /// read lock only long enough to index and load the AtomicPtr, then copy
-    /// from the stable heap allocation while concurrent readers/installers
-    /// proceed.
+    /// from the stable heap allocation while protected by a crossbeam-epoch pin.
+    /// Installers that swap out a pointer retire the old allocation through the
+    /// same epoch collector, so a descheduled reader can never see freed memory.
     pub(crate) mem_cache: Option<RwLock<Vec<std::sync::atomic::AtomicPtr<u8>>>>,
     /// Memory budget in bytes (0 = disabled). User-controlled via TurboliteConfig.
     pub(crate) mem_cache_budget: u64,
     /// Current usage in bytes.
     pub(crate) mem_cache_bytes: std::sync::atomic::AtomicU64,
-    /// Deferred mem_cache frees from eviction. Freed in Drop or periodically.
-    /// Avoids UAF: eviction nulls the AtomicPtr instantly, defers actual
-    /// Box::drop so concurrent readers never see freed memory.
-    /// Two-generation design: a buffer survives at least one full rotation
-    /// before its Box is dropped, giving concurrent readers time to finish
-    /// copying from a pointer they loaded before the eviction.
-    deferred_frees: parking_lot::Mutex<DeferredFrees>,
     /// Generation counter: incremented on every sync/checkpoint. Handles compare
     /// their cached generation to detect stale cache state (another handle wrote).
     pub(crate) generation: std::sync::atomic::AtomicU64,
@@ -603,7 +557,6 @@ impl DiskCache {
             },
             mem_cache_budget,
             mem_cache_bytes: std::sync::atomic::AtomicU64::new(0),
-            deferred_frees: parking_lot::Mutex::new(DeferredFrees::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
             tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::RwLock::new(bitmap),
@@ -789,10 +742,12 @@ impl DiskCache {
         }
 
         // In-memory page cache: hold the read lock while indexing and copying.
-        // The pointed-to allocation is stable until a deferred-free rotation,
-        // and the extra generations give concurrent readers a wide grace period.
+        // Pin the crossbeam-epoch around the pointer load+copy so that a
+        // concurrent installer that swaps the pointer cannot reclaim the old
+        // allocation until this reader unpins.
         if let Some(ref mc) = self.mem_cache {
             let guard = mc.read();
+            let _epoch = crossbeam_epoch::pin();
             if let Some(slot) = guard.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Acquire);
                 if !ptr.is_null() {
@@ -1664,6 +1619,7 @@ impl DiskCache {
             let ps = self.page_size.load(Ordering::Relaxed) as usize;
             if ps > 0 {
                 let guard = mc.read();
+                let epoch_guard = crossbeam_epoch::pin();
                 for p in start..end {
                     if let Some(slot) = guard.get(p as usize) {
                         let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
@@ -1672,12 +1628,11 @@ impl DiskCache {
                             let boxed = unsafe {
                                 Box::from_raw(std::ptr::slice_from_raw_parts_mut(old, ps))
                             };
-                            self.defer_free(boxed);
+                            epoch_guard.defer(move || drop(boxed));
                         }
                     }
                 }
                 drop(guard);
-                self.rotate_deferred_frees();
             }
         }
     }
@@ -1912,27 +1867,28 @@ impl DiskCache {
                 bitmap.clear(pnum);
             }
         }
-        // Evict from in-memory cache: null the pointer (instant, lock-free),
-        // defer actual deallocation. Readers see null immediately and fall through
-        // to pread. No UAF risk because we don't free the old pointer here.
-        // Deferred frees are collected in deferred_frees and drained by Drop.
+        // Evict from in-memory cache: null the pointer (instant, lock-free) and
+        // retire the old allocation through the epoch collector. Readers see null
+        // immediately and fall through to pread; any reader that loaded the old
+        // pointer before the swap is protected by its epoch pin.
         if let Some(ref mc) = self.mem_cache {
             let ps = self.page_size.load(Ordering::Relaxed) as usize;
             let guard = mc.read();
+            let epoch_guard = crossbeam_epoch::pin();
             for &pnum in page_nums {
                 if let Some(slot) = guard.get(pnum as usize) {
                     let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
                     if !old.is_null() && ps > 0 {
-                        // Reconstruct the Box to defer its drop (no UAF risk)
+                        // Reconstruct the Box and retire it through the epoch
+                        // collector so concurrent readers finish before it drops.
                         let boxed =
                             unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(old, ps)) };
-                        self.defer_free(boxed);
+                        epoch_guard.defer(move || drop(boxed));
                         self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                     }
                 }
             }
             drop(guard);
-            self.rotate_deferred_frees();
         }
         // Remove from compressed cache index
         if self.cache_compression {
@@ -2065,40 +2021,28 @@ impl DiskCache {
             return;
         }
         let guard = mc.read();
+        let epoch_guard = crossbeam_epoch::pin();
         for &pn in page_nums {
             if let Some(slot) = guard.get(pn as usize) {
                 let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
                 if !old.is_null() {
-                    // Reconstruct the Box and defer its drop. A concurrent reader
-                    // may still be copying out of `old`; immediate deallocation
-                    // would be a use-after-free.
+                    // Reconstruct the Box and retire it through the epoch
+                    // collector so concurrent readers finish before it drops.
                     let boxed =
                         unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(old, ps)) };
-                    self.defer_free(boxed);
+                    epoch_guard.defer(move || drop(boxed));
                     self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                 }
             }
         }
         drop(guard);
-        self.rotate_deferred_frees();
-    }
-
-    /// Push a page buffer to the deferred-free queue.
-    fn defer_free(&self, page: Box<[u8]>) {
-        self.deferred_frees.lock().defer_free(page);
-    }
-
-    /// Rotate the deferred-free generations so evicted buffers are dropped
-    /// only after a full rotation. Called after mutating mem_cache state.
-    fn rotate_deferred_frees(&self) {
-        self.deferred_frees.lock().rotate();
     }
 
     /// Install or replace a mem_cache slot with a fresh immutable copy of `data`.
     /// Published slots are treated as immutable: on a write/promote we allocate a
     /// new buffer and CAS the AtomicPtr from the old pointer to the new one. The
-    /// old buffer (if any) is pushed to deferred_frees so concurrent readers that
-    /// loaded the old pointer before the swap can finish safely.
+    /// old buffer (if any) is retired through the epoch collector so concurrent
+    /// readers that loaded the old pointer before the swap can finish safely.
     fn install_mem_cache_page(&self, pnum: u64, data: &[u8]) {
         let mc = match self.mem_cache {
             Some(ref mc) => mc,
@@ -2138,11 +2082,12 @@ impl DiskCache {
                 if is_new {
                     self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                 } else {
-                    // Old buffer is no longer reachable from the slot; defer drop
-                    // so any concurrent reader that loaded it before the swap is safe.
+                    // Old buffer is no longer reachable from the slot; retire it
+                    // through the epoch collector so any reader that loaded it
+                    // before the swap finishes copying before the Box is dropped.
                     let boxed =
                         unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(old, ps)) };
-                    self.deferred_frees.lock().defer_free(boxed);
+                    crossbeam_epoch::pin().defer(move || drop(boxed));
                 }
             }
             Err(_) => {
@@ -2155,7 +2100,6 @@ impl DiskCache {
                 }
             }
         }
-        self.rotate_deferred_frees();
     }
 
     /// Current cache size in bytes (sub-chunk granularity).
@@ -2478,8 +2422,6 @@ impl Drop for DiskCache {
                 }
             }
         }
-        // Drain deferred frees from eviction (Box drops automatically)
-        self.deferred_frees.lock().clear();
     }
 }
 

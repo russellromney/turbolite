@@ -164,22 +164,40 @@ pub fn decode_page(blob: &[u8], codec: &PageCodec, max_page: usize) -> io::Resul
     }
     let tag = blob[0];
     let payload = maybe_decrypt(&blob[1..], codec)?;
-    match tag {
+    let page = match tag {
         CODEC_RAW => {
-            if payload.len() > max_page {
+            if payload.len() != max_page {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "raw page exceeds page size",
+                    format!(
+                        "raw page length {} does not match expected page size {}",
+                        payload.len(), max_page
+                    ),
                 ));
             }
-            Ok(payload)
+            payload
         }
-        CODEC_ZSTD => decompress_zstd(&payload, max_page),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown page codec tag {other}"),
-        )),
-    }
+        CODEC_ZSTD => {
+            let decompressed = decompress_zstd(&payload, max_page)?;
+            if decompressed.len() != max_page {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "decompressed page length {} does not match expected page size {}",
+                        decompressed.len(), max_page
+                    ),
+                ));
+            }
+            decompressed
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown page codec tag {other}"),
+            ))
+        }
+    };
+    Ok(page)
 }
 
 fn compress_page(page: &[u8], codec: &PageCodec) -> io::Result<(u8, Vec<u8>)> {
@@ -357,7 +375,7 @@ mod tests {
 
     #[test]
     fn page_roundtrip_no_compression() {
-        let page = vec![7u8; 1024];
+        let page = vec![7u8; 4096];
         let codec = PageCodec {
             compress: false,
             level: 0,

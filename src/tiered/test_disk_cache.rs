@@ -2797,38 +2797,12 @@ fn test_mem_cache_grows_lazily_for_high_page_numbers() {
 
 /// B5: deferred frees use a ring of generations; a rotation moves current
 /// into the ring and enough rotations drop the oldest generation.
-#[test]
-fn test_deferred_frees_multi_generation_rotation() {
-    let dir = TempDir::new().unwrap();
-    let cache = cache_with_mem_budget(dir.path(), 64, 4, 256);
-    let data = vec![0xAAu8; 64];
-    cache.write_page(0, &data).unwrap();
-    // Evict page 0 from mem_cache; this pushes the buffer to current and
-    // rotates at the end of clear_pages_from_mem_cache.
-    cache.clear_pages_from_mem_cache(&[0]);
-    {
-        let df = cache.deferred_frees.lock();
-        assert_eq!(df.current.len(), 0);
-        assert_eq!(df.older.iter().map(|v| v.len()).sum::<usize>(), 1);
-    }
-    // The buffer survives many rotations, then is dropped once it reaches the
-    // end of the ring.
-    for _ in 0..crate::tiered::disk_cache::DEFERRED_FREE_GENERATIONS {
-        cache.rotate_deferred_frees();
-    }
-    {
-        let df = cache.deferred_frees.lock();
-        assert_eq!(df.current.len(), 0);
-        assert_eq!(df.older.iter().map(|v| v.len()).sum::<usize>(), 0);
-    }
-}
-
 /// Concurrent readers copying from mem_cache slots must not see freed or
-/// corrupted buffers while evictions and deferred-free rotations run. This
-/// exercises the realistic case: readers hold a pointer only for a bounded
-/// memcpy, not across arbitrary scheduler delays.
+/// corrupted buffers while evictions and concurrent writes swap pointers. The
+/// epoch collector retires old allocations, so a descheduled reader is still
+/// safe even when many swap/evict cycles run.
 #[test]
-fn test_deferred_frees_concurrent_readers_while_rotating() {
+fn test_deferred_frees_concurrent_readers_while_evicting() {
     let dir = TempDir::new().unwrap();
     let cache = Arc::new(cache_with_mem_budget(dir.path(), 64, 4, 256));
     let data = vec![0xAAu8; 64];
@@ -2843,9 +2817,6 @@ fn test_deferred_frees_concurrent_readers_while_rotating() {
             barrier.wait();
             for _ in 0..1_000usize {
                 cache.clear_pages_from_mem_cache(&[0]);
-                // clear_pages_from_mem_cache already rotates once; add more
-                // rotations to stress the ring.
-                cache.rotate_deferred_frees();
             }
         })
     };
@@ -2923,7 +2894,7 @@ fn test_set_page_size_race_with_concurrent_reader_writer() {
             barrier.wait();
             for i in 0..100u64 {
                 let byte = (i % 256) as u8;
-                cache.write_page(i, &vec![byte; 64]).unwrap();
+                cache.write_page(i, &[byte; 64]).unwrap();
             }
         })
     };

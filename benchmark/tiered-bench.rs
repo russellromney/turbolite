@@ -13,6 +13,8 @@
 //! ```bash
 //! TIERED_TEST_BUCKET=turbolite-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
+
+#![allow(deprecated, clippy::too_many_arguments)]
 //!   cargo run --release --features bench-s3,zstd --bin tiered-bench
 //! ```
 
@@ -846,7 +848,7 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                 tx.commit().unwrap();
                 tx = conn.unchecked_transaction().unwrap();
                 batch = 0;
-                if (i as usize) % (batch_size * 10) == 0 {
+                if (i as usize).is_multiple_of(batch_size * 10) {
                     eprintln!(
                         "    posts: {}/{}",
                         format_number(i as usize),
@@ -920,7 +922,7 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
                 tx.commit().unwrap();
                 tx = conn.unchecked_transaction().unwrap();
                 batch = 0;
-                if (i as usize) % (batch_size * 10) == 0 && i > 0 {
+                if (i as usize).is_multiple_of(batch_size * 10) && i > 0 {
                     eprintln!(
                         "    likes: {}/{}",
                         format_number(i as usize),
@@ -1574,8 +1576,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             .expect("failed to check S3 manifest");
 
         let is_auto = cli.import.as_deref() == Some("auto");
-        if is_auto && existing_manifest.is_some() && !cli.force {
-            let m = existing_manifest.unwrap();
+        if let (true, Some(m)) = (is_auto && !cli.force, existing_manifest) {
             eprintln!(
                 "[bench] S3 data already exists at prefix '{}' ({} pages, {} groups), skipping generation",
                 s3_prefix, m.page_count, m.page_group_keys.len(),
@@ -1692,7 +1693,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
             .query_row("PRAGMA page_size", [], |r| r.get(0))
             .unwrap_or(0);
         let actual_mb = (page_count * page_sz) as f64 / (1024.0 * 1024.0);
-        let actual_groups = (page_count as u64 + ppg - 1) / ppg;
+        let actual_groups = (page_count as u64).div_ceil(ppg);
         println!(
             "  Actual DB:   {} pages x {} bytes = {:.1} MB ({} page groups)",
             page_count, page_sz, actual_mb, actual_groups
@@ -1792,7 +1793,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let should_run_query = |label: &str| -> bool {
         query_filter
             .as_ref()
-            .map_or(true, |f| f.iter().any(|q| label.contains(q.as_str())))
+            .is_none_or(|f| f.iter().any(|q| label.contains(q.as_str())))
     };
 
     // --naive overrides: disable all prefetch and plan-aware

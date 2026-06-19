@@ -13,6 +13,8 @@
 //!   --iterations 10
 //! ```
 
+#![allow(clippy::too_many_arguments)]
+
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

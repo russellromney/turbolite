@@ -182,25 +182,26 @@ pub(crate) fn put_manifest(
     runtime: &TokioHandle,
     manifest: &Manifest,
 ) -> io::Result<()> {
-    // Optimistic version check. First write (version 1) skips the fetch.
-    if manifest.version > 1 {
-        match get_manifest(backend, runtime) {
-            Ok(Some(remote)) if remote.version >= manifest.version => {
-                return Err(io::Error::other(format!(
-                    "manifest CAS conflict: remote v{} >= local v{}",
-                    remote.version, manifest.version
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // If we cannot verify the remote manifest, we must not proceed:
-                // publishing without checking the version could overwrite a newer
-                // manifest. The caller can retry after the transient read error
-                // resolves.
-                return Err(io::Error::other(format!(
-                    "manifest version check failed: cannot read remote manifest: {e}"
-                )));
-            }
+    // Optimistic version check. Always fetch the remote manifest; if one
+    // already exists with version >= the one we are writing, reject the upload.
+    // This prevents a slow/follower writer (including a creation racing with
+    // another creation) from silently clobbering an existing database.
+    match get_manifest(backend, runtime) {
+        Ok(Some(remote)) if remote.version >= manifest.version => {
+            return Err(io::Error::other(format!(
+                "manifest CAS conflict: remote v{} >= local v{}",
+                remote.version, manifest.version
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // If we cannot verify the remote manifest, we must not proceed:
+            // publishing without checking the version could overwrite a newer
+            // manifest. The caller can retry after the transient read error
+            // resolves.
+            return Err(io::Error::other(format!(
+                "manifest version check failed: cannot read remote manifest: {e}"
+            )));
         }
     }
 

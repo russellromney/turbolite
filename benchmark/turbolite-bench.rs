@@ -11,6 +11,8 @@
 //!   --preset 50mb     50MB Gutenberg corpus, 5MB cache, 10MB mmap
 //!   --preset 10mb     10MB quick test, 1MB cache, 2MB mmap
 
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -419,7 +421,7 @@ fn bench_gutenberg_db(
         let result = bench_with_corpus(
             &corpus,
             corpus_size_mb,
-            *mode,
+            mode,
             duration_secs,
             reader_threads,
             writer_threads,
@@ -939,7 +941,7 @@ fn bench_reads_concurrent(
             let conn = Connection::open_with_flags_and_vfs(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
-                &*vfs_name,
+                &vfs_name,
             )
             .map_err(|e| e.to_string())?;
 
@@ -1031,7 +1033,7 @@ fn bench_writes_concurrent(
             let conn = Connection::open_with_flags_and_vfs(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE,
-                &*vfs_name,
+                &vfs_name,
             )
             .map_err(|e| e.to_string())?;
 
@@ -1088,7 +1090,7 @@ fn bench_writes_concurrent(
     let conn = Connection::open_with_flags_and_vfs(
         &**db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE,
-        &**vfs_name,
+        vfs_name,
     )?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
 

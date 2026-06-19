@@ -272,8 +272,7 @@ pub fn rotate_encryption_key(
     if let Some(verify_key) = new_manifest.page_group_keys.iter().find(|k| !k.is_empty()) {
         let verify_blob = storage_helpers::get_page_group(backend_ref, runtime_ref, verify_key)?
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     "verification failed: newly uploaded page group not found in S3",
                 )
             })?;
@@ -290,8 +289,7 @@ pub fn rotate_encryption_key(
             let frame = &new_manifest.frame_tables[verify_gid][0];
             let end = frame.offset as usize + frame.len as usize;
             if end > verify_blob.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "verification failed: frame extends beyond blob",
                 ));
             }
@@ -309,10 +307,10 @@ pub fn rotate_encryption_key(
                 None,
             )
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("verification failed: cannot decompress new data: {}", e),
-                )
+                io::Error::other(format!(
+                    "verification failed: cannot decompress new data: {}",
+                    e
+                ))
             })?;
         } else {
             // Non-seekable: verify whole blob
@@ -329,10 +327,10 @@ pub fn rotate_encryption_key(
                 None,
             )
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("verification failed: cannot decompress new data: {}", e),
-                )
+                io::Error::other(format!(
+                    "verification failed: cannot decompress new data: {}",
+                    e
+                ))
             })?;
         }
         turbolite_debug!("[rotate] verification passed: new data is readable");

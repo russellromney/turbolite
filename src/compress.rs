@@ -281,7 +281,7 @@ pub fn encrypt_gcm_random_nonce(data: &[u8], aad: &[u8], key: &[u8; 32]) -> io::
 
     let ciphertext = cipher
         .encrypt(nonce, Payload { msg: data, aad })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {}", e)))?;
+        .map_err(|e| io::Error::other(format!("Encryption failed: {}", e)))?;
 
     // Prepend nonce to ciphertext
     let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -316,7 +316,7 @@ pub fn decrypt_gcm_random_nonce(data: &[u8], aad: &[u8], key: &[u8; 32]) -> io::
                 aad,
             },
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
+        .map_err(|e| io::Error::other(format!("Decryption failed: {}", e)))
 }
 
 // ===== AES-CTR Encryption (no size overhead) =====

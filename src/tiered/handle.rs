@@ -1871,9 +1871,8 @@ impl DatabaseHandle for TurboliteHandle {
                 let page_count = self.manifest.load().page_count;
                 if current_gen == self.cached_generation
                     && page_num < page_count
-                    && cache.is_present(page_num)
+                    && cache.read_page_if_present(page_num, buf)?
                 {
-                    cache.read_page(page_num, buf)?;
                     cache.stat_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
@@ -1881,11 +1880,21 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // 1. Check dirty pages first (new pages may not be in manifest yet).
-        // Data lives in disk cache, not in memory.
+        // Data lives in disk cache, not in memory. A dirty page has no committed
+        // backend copy, so if it was evicted between the dirty check and the read
+        // we must fail rather than fall through to backend fetch or return zeros.
         if self.dirty_page_nums.read().contains(&page_num) {
             if let Some(cache) = &self.cache {
-                cache.read_page(page_num, buf)?;
-                return Ok(());
+                if cache.read_page_if_present(page_num, buf)? {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "dirty page {} was evicted before read; restart the VFS to recover",
+                        page_num
+                    ),
+                ));
             }
         }
 
@@ -2261,8 +2270,7 @@ impl DatabaseHandle for TurboliteHandle {
                             }
 
                             // Now read the page from cache
-                            if cache.is_present(page_num) {
-                                cache.read_page(page_num, buf)?;
+                            if cache.read_page_if_present(page_num, buf)? {
                                 self.detect_interior_page(buf, page_num, cache);
                                 self.note_served_page_for_lookahead(
                                     page_num,
@@ -2362,9 +2370,8 @@ impl DatabaseHandle for TurboliteHandle {
                                 self.clear_timed_out_fetching(cache, gid);
                             }
                             pool.record_foreground_wait(wait_start.elapsed());
-                            if cache.is_present(page_num) {
+                            if cache.read_page_if_present(page_num, buf)? {
                                 self.reset_misses(current_tree_name.as_ref());
-                                cache.read_page(page_num, buf)?;
                                 self.detect_interior_page(buf, page_num, cache);
                                 self.note_served_page_for_lookahead(
                                     page_num,
@@ -2387,9 +2394,8 @@ impl DatabaseHandle for TurboliteHandle {
                                 lookahead_frame_wait_timeout(),
                             );
                             pool.record_foreground_wait(wait_start.elapsed());
-                            if installed && cache.is_present(page_num) {
+                            if installed && cache.read_page_if_present(page_num, buf)? {
                                 self.reset_misses(current_tree_name.as_ref());
-                                cache.read_page(page_num, buf)?;
                                 self.detect_interior_page(buf, page_num, cache);
                                 self.record_lookahead_hit_if_present(gid, loc, &manifest);
                                 self.note_served_page_for_lookahead(
@@ -2775,9 +2781,8 @@ impl DatabaseHandle for TurboliteHandle {
         } // end remote backend fetch block
 
         // Read the page from cache (should be present now after legacy download).
-        if cache.is_present(page_num) {
+        if cache.read_page_if_present(page_num, buf)? {
             self.reset_misses(current_tree_name.as_ref());
-            cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             self.note_served_page_for_lookahead(
                 page_num,
@@ -3461,16 +3466,14 @@ impl DatabaseHandle for TurboliteHandle {
                         let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
                         let mut need_s3_merge = false;
 
-                        // Read all pages from local cache
+                        // Read all pages from local cache atomically w.r.t. eviction.
                         for (i, &pnum) in pages_in_group.iter().enumerate() {
                             if pnum >= page_count {
                                 break;
                             }
-                            if cache.is_present(pnum) {
-                                let mut page_buf = vec![0u8; page_size as usize];
-                                if cache.read_page(pnum, &mut page_buf).is_ok() {
-                                    pages[i] = Some(page_buf);
-                                }
+                            let mut page_buf = vec![0u8; page_size as usize];
+                            if cache.read_page_if_present(pnum, &mut page_buf)? {
+                                pages[i] = Some(page_buf);
                             } else {
                                 need_s3_merge = true;
                             }
