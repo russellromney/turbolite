@@ -16,6 +16,12 @@ queued optional work, started remote prefetch, foreground full-group
 demand, foreground waits, and scan-range duplication. It intentionally
 does not model SQLite's B-tree traversal or backend retry timing.
 
+`manifest_cas.qnt` models the manifest upload compare-and-swap contract
+introduced in PR #46: `put_manifest` always reads the remote manifest and
+rejects the upload if the remote version is already >= the local version.
+The model tracks only the version counter and the writer's local view; it
+does not model page groups, chain anchors, or object-store semantics.
+
 ## Tools
 
 Use Quint 0.32.0 through `npx`:
@@ -47,9 +53,12 @@ This runs:
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cursor_chain_liveness.qnt
 npx -y @informalsystems/quint@0.32.0 typecheck specs/cloud_scan_prefetch.qnt
+npx -y @informalsystems/quint@0.32.0 typecheck specs/manifest_cas.qnt
 npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   --max-samples=200 --max-steps=8 --invariants=safety
 npx -y @informalsystems/quint@0.32.0 run specs/cloud_scan_prefetch.qnt \
+  --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
+npx -y @informalsystems/quint@0.32.0 run specs/manifest_cas.qnt \
   --max-samples=500 --max-steps=8 --invariants=safety --verbosity=0
 ```
 
@@ -166,6 +175,8 @@ violation:
 - `badWorkerBlocksBeforePermit`
 - `badRangeAndFullDuplicate`
 - `badTreeNameGatedScanRange`
+- `badSkipCasOnFirstWrite`
+- `badBlindOverwrite`
 
 `badChecksumCollisionStep` uses the spec's compact
 `payloadFingerprint` field to stand in for the full production delta
@@ -182,6 +193,12 @@ while also scheduling same-group full prefetch. The tree-name-gated
 negative covers the case where a group is part of a planned SCAN but
 the demand read misses the inferred current tree name and incorrectly
 falls back to seekable range I/O.
+
+The manifest-CAS negative steps model the regression PR #46 closed.
+`badSkipCasOnFirstWrite` represents the old behavior where `put_manifest`
+for version 1 skipped the remote version check and could overwrite an
+already-published manifest. `badBlindOverwrite` represents publishing
+without reading the remote manifest at all.
 
 For a full counterexample trace, run an individual step without
 `--verbosity=0`, for example:
@@ -219,6 +236,13 @@ npx -y @informalsystems/quint@0.32.0 run specs/cursor_chain.qnt \
   - `PrefetchPool::submit_optional`
   - `RemoteIoBudget`
   - queued versus active optional groups
+
+`manifest_cas.qnt` models this Rust surface:
+
+- `src/tiered/storage.rs`
+  - `put_manifest`
+  - the remote manifest version check that rejects uploads when
+    `remote.version >= local.version`
 
 The modeled Rust-facing properties have a matching Rust bridge target:
 
