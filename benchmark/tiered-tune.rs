@@ -13,6 +13,9 @@
 //!   --iterations 10
 //! ```
 
+// Benchmark CLIs intentionally pass many knobs through to the VFS; suppress
+// structural lints that would require invasive refactoring without improving
+// correctness.
 #![allow(clippy::too_many_arguments)]
 
 use clap::Parser;

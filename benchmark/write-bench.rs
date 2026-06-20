@@ -19,8 +19,6 @@
 //!   cargo run --release --features tiered,zstd --bin write-bench -- --scenario sustained
 //! ```
 
-#![allow(deprecated)]
-
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -383,6 +381,7 @@ struct TwoPhaseCheckpointStats {
 
 /// Two-phase checkpoint: fast local phase (holds lock briefly) + async S3 upload (no lock).
 /// Reads and writes can continue during the S3 upload phase.
+#[allow(deprecated)] // benchmarks intentionally toggle the legacy checkpoint-mode shim
 fn timed_checkpoint_two_phase(conn: &Connection, bench: &WriteBenchCtx) -> TwoPhaseCheckpointStats {
     let before = s3_snapshot(bench);
     let total_start = Instant::now();

@@ -11,6 +11,9 @@
 //!   --preset 50mb     50MB Gutenberg corpus, 5MB cache, 10MB mmap
 //!   --preset 10mb     10MB quick test, 1MB cache, 2MB mmap
 
+// Benchmark CLIs intentionally pass many knobs through to the VFS and use
+// rich per-preset types; suppress structural lints that would require
+// invasive refactoring without improving correctness.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use clap::{Parser, Subcommand};

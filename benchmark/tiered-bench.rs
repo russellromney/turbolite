@@ -14,9 +14,13 @@
 //! TIERED_TEST_BUCKET=turbolite-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
 
-#![allow(deprecated, clippy::too_many_arguments)]
 //!   cargo run --release --features bench-s3,zstd --bin tiered-bench
 //! ```
+
+// Benchmark CLIs intentionally pass many knobs through to the VFS; suppress
+// structural lints that would require invasive refactoring without improving
+// correctness.
+#![allow(clippy::too_many_arguments)]
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
@@ -24,6 +28,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
+#[allow(deprecated)] // benchmarks use the legacy checkpoint-mode shim
 use turbolite::tiered::{
     attach_integer_constraint_hints, parse_eqp_output, push_planned_accesses,
     set_local_checkpoint_only, CacheConfig, CompressionConfig, PrefetchConfig, TurboliteConfig,
@@ -938,6 +943,7 @@ fn generate_data(conn: &Connection, n_posts: usize, batch_size: usize) {
 
 /// Generate a plain SQLite DB file locally (no VFS, max speed).
 /// Uses journal_mode=OFF and synchronous=OFF for fastest possible writes.
+#[allow(deprecated)] // benchmarks intentionally use the legacy checkpoint-mode shim
 fn generate_local_db(path: &std::path::Path, n_posts: usize, batch_size: usize, page_size: u32) {
     let conn = Connection::open(path).expect("open local DB");
     conn.execute_batch(&format!(
@@ -1518,6 +1524,7 @@ fn print_remote_tails(ctx: &BenchCtx) {
 // Main benchmark runner
 // =========================================================================
 
+#[allow(deprecated)] // benchmarks intentionally use the legacy checkpoint-mode shim
 fn run_benchmark(n_posts: usize, cli: &Cli) {
     let n_users = (n_posts / 10).max(100);
     let est_bytes = n_posts as f64 * 700.0
