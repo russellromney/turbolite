@@ -7,6 +7,19 @@ module manifest_cas {
   /// a creation-time race from silently clobbering a newer (or contemporaneous)
   /// remote database.
   ///
+  /// Intentional abstractions / limitations:
+  ///   * The spec checks the version-comparison rule, not the atomicity of the
+  ///     underlying get-then-put. The real backend trait does not expose ETags,
+  ///     so a stale read followed by a write is still possible in production.
+  ///   * The spec does not model backend read errors. In the code, a failed
+  ///     `get_manifest` causes `put_manifest` to fail closed (no upload).
+  ///   * `prepareLocal` nondeterministically picks any higher version. It does
+  ///     not model a writer refreshing its view of the remote manifest before
+  ///     each prepare; the CAS step is what catches stale versions.
+  ///   * `maxRemoteVersion` is a spec-only shadow variable so that "remote
+  ///     version never regresses" can be expressed as a state invariant for the
+  ///     negative-action checks. No such counter exists in the Rust code.
+  ///
   /// The model abstracts page groups, checksums, and writers; it only tracks
   /// the monotonic version counter that the CAS guards. Version 0 means "no
   /// manifest published yet".
@@ -21,8 +34,10 @@ module manifest_cas {
   /// Remote state: the manifest version currently stored in the object store.
   /// 0 means no manifest has been published yet.
   var remoteVersion: int
-  /// Maximum remote version ever observed. Used to detect regressions in the
-  /// bad-action negative checks; normal CAS-protected uploads are monotone.
+  /// Spec-only shadow of the maximum remote version ever observed. It exists
+  /// only so the negative-action checks can express "remote version never
+  /// regresses" as a state invariant. The Rust code does not maintain this
+  /// counter; monotonicity is guaranteed by the CAS check in `put_manifest`.
   var maxRemoteVersion: int
   /// Successful uploads observed by each writer (0 means not yet published).
   var publishedVersion: Writer -> int
@@ -34,9 +49,11 @@ module manifest_cas {
     publishedVersion' = writers.mapBy(_ => 0),
   }
 
-  /// A writer prepares a new local manifest whose version is strictly greater
-  /// than their previous local version and, if they have already published,
-  /// greater than their last published remote version.
+  /// A writer prepares a new local manifest. The version is nondeterministically
+  /// chosen to be higher than the writer's own previous attempt and its own last
+  /// successful publish. This abstracts the real code's local manifest advance
+  /// (which is driven by dirty-page assignment and sync); the CAS step below is
+  /// the guard that rejects versions that have fallen behind the remote store.
   action prepareLocal = {
     nondet w = oneOf(writers)
     nondet v = oneOf(versions.filter(v =>
