@@ -18,7 +18,7 @@ If you have one database per server, use a volume. turbolite explores how to hav
 
 turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Any S3-compatible storage works (AWS S3, Tigris, R2, MinIO, etc.). It's a standard SQLite VFS operating at the page level, so most SQLite features should work: FTS, R-tree, JSON, WAL mode, etc.
 
-turbolite is also part of the broader [`hadb`](https://github.com/russellromney/hadb) ecosystem. Standalone turbolite is a storage VFS with one safe writer; if you want HA leader election plus continuous WAL replication, use it through [`haqlite-turbolite`](https://github.com/russellromney/haqlite/tree/main/haqlite-turbolite), which layers HaQLite and [`walrust`](https://github.com/russellromney/walrust) on top. That HA path is very experimental, but it is where multi-node/failover work belongs.
+turbolite is part of the broader [`hadb`](https://github.com/russellromney/hadb) ecosystem. Standalone turbolite is a storage VFS with one safe writer; if you want HA leader election plus continuous WAL replication, use it through [`haqlite-turbolite`](https://github.com/russellromney/haqlite/tree/main/haqlite-turbolite), which layers HaQLite and [`walrust`](https://github.com/russellromney/walrust) on top. That HA path is very experimental still. 
 
 If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
@@ -34,21 +34,6 @@ If you want to contribute to turbolite or find bugs, please create a pull reques
 | Full scan + filter | full table scan | 476ms | 532ms |
 
 1M posts / 100K users (~1.5GB stored) with nothing cached, every byte from S3. EC2 c5.2xlarge + S3 Express One Zone (same AZ, ~4ms GET latency). Fly performance-8x + Tigris (~25ms GET latency). Both: 8 dedicated vCPU, 16GB RAM, 7 prefetch worker threads. See [Benchmarking](#benchmarking) and [Storage backend matters](#storage-backend-matters).
-
-### vs sqlite-s3vfs
-
-[sqlite-s3vfs](https://github.com/simonw/sqlite-s3vfs) stores each SQLite page as a separate S3 object — the naive "one object per page" baseline. Both benchmarks below use the same 100K posts / 10K users dataset, 64KB pages, Fly `performance-8x` in IAD, and Tigris (`t3.storage.dev`). Cold = fresh process, empty cache, every byte from S3.
-
-| Query | sqlite-s3vfs p50 | turbolite p50 | Speedup |
-|-------|------------------|---------------|---------|
-| Post + user | 1,048ms | 139ms | **7.5x** |
-| Profile | 1,428ms | 172ms | **8.3x** |
-| Who-liked | 1,110ms | 138ms | **8.0x** |
-| Mutual friends | 1,047ms | 88ms | **11.9x** |
-| Indexed filter | 936ms | 92ms | **10.2x** |
-| Full scan + filter | 28,466ms | 108ms | **263x** |
-
-The gap is largest for scans: sqlite-s3vfs issues thousands of sequential per-page GETs, while turbolite prefetches whole page groups in parallel and uses seekable zstd compression to avoid reading the full group. Point queries win because turbolite bundles interior/index pages and fetches them in a handful of parallel range GETs instead of one round-trip per page.
 
 Benchmarks are organized by **cache level** (what's already on local disk when the query runs):
 
