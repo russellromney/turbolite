@@ -1118,6 +1118,30 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// Install manifest bytes while the caller holds this VFS's replay write
+    /// gate, without reacquiring it. This keeps materialization, installation
+    /// and replay finalization atomic with respect to SQLite readers.
+    ///
+    /// A guard from any other lock is rejected before decoding or mutation.
+    pub fn set_manifest_bytes_under_replay_write(
+        &self,
+        bytes: &[u8],
+        guard: &parking_lot::RwLockWriteGuard<'_, ()>,
+    ) -> io::Result<()> {
+        if !std::ptr::eq(
+            parking_lot::RwLockWriteGuard::rwlock(guard),
+            self.replay_gate.as_ref(),
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "manifest installation requires this VFS's replay write guard",
+            ));
+        }
+        let manifest = super::wire::decode(bytes).map_err(io::Error::from)?;
+        self.install_manifest_under_replay_write(manifest);
+        Ok(())
+    }
+
     /// Decode manifest wire bytes without mutating local VFS state.
     ///
     /// Useful for higher layers that need to inspect the currently published
@@ -1149,7 +1173,27 @@ impl TurboliteVfs {
     }
 
     /// Update the internal manifest from external state (e.g. haqlite catch-up).
-    pub fn set_manifest(&self, mut manifest: Manifest) {
+    pub fn set_manifest(&self, manifest: Manifest) {
+        // Preserve the no-op fast path: publishing an unchanged base may run
+        // while the caller's SQLite connection still holds a replay read lock.
+        {
+            let current = self.shared_manifest.load();
+            if manifest.version > 0
+                && current.version > 0
+                && (manifest.version < current.version
+                    || (manifest.version == current.version
+                        && manifest.change_counter <= current.change_counter))
+            {
+                return;
+            }
+        }
+        let _replay_guard = self.replay_gate.write();
+        // Recheck the version floor under the gate: another adoption may have
+        // advanced it while this setter waited for readers.
+        self.install_manifest_under_replay_write(manifest);
+    }
+
+    fn install_manifest_under_replay_write(&self, mut manifest: Manifest) {
         manifest.detect_and_normalize_strategy();
 
         // Refuse to downgrade. The manifest version is monotonically
@@ -1189,13 +1233,8 @@ impl TurboliteVfs {
             old.page_group_keys.clone()
         };
 
-        // Hold the replay gate across the whole cache mutation + manifest swap.
-        // Without it, an in-flight SQLite read transaction could observe a torn
-        // snapshot: groups already evicted / page 0 already rewritten while the
-        // shared manifest still points at the old version (or vice versa). This
-        // mirrors ReplayHandle::finalize, which fences finalize against readers
-        // the same way.
-        let _replay_guard = self.replay_gate.write();
+        // Both entry points hold the replay gate across cache mutation and
+        // manifest swap, so SQLite readers cannot observe a torn snapshot.
 
         if !manifest.group_pages.is_empty() {
             self.cache.set_group_pages(manifest.group_pages.clone());

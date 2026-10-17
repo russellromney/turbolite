@@ -687,6 +687,50 @@ fn set_manifest_adopts_same_version_higher_replay_cursor() {
 }
 
 #[test]
+fn manifest_adoption_requires_own_write_guard_and_keeps_version_floor() {
+    let dir = TempDir::new().unwrap();
+    let vfs = TurboliteVfs::new_local(TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut incoming = Manifest::empty();
+    incoming.version = 7;
+    incoming.change_counter = 9;
+    incoming.page_size = 4096;
+    let bytes = super::wire::encode(&incoming).unwrap();
+    let other_gate = parking_lot::RwLock::new(());
+    let other_guard = other_gate.write();
+    let err = vfs
+        .set_manifest_bytes_under_replay_write(&bytes, &other_guard)
+        .expect_err("an unrelated lock does not protect this VFS");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(vfs.manifest().version, 0);
+
+    let gate = vfs.replay_gate();
+    let guard = gate.write();
+    vfs.set_manifest_bytes_under_replay_write(&bytes, &guard)
+        .expect("adopt without reacquiring the held write lock");
+    assert_eq!(vfs.manifest().version, 7);
+    assert_eq!(vfs.manifest().change_counter, 9);
+    incoming.version = 6;
+    incoming.change_counter = 100;
+    let stale = super::wire::encode(&incoming).unwrap();
+    vfs.set_manifest_bytes_under_replay_write(&stale, &guard)
+        .unwrap();
+    assert_eq!(
+        vfs.manifest().version,
+        7,
+        "stale adoption must not downgrade"
+    );
+    drop(guard);
+    let _reader = gate.read();
+    // An unchanged-base publish must not attempt a read-to-write upgrade.
+    vfs.set_manifest(vfs.manifest());
+    assert_eq!(vfs.manifest().change_counter, 9);
+}
+
+#[test]
 fn set_manifest_preserves_pending_dirty_groups() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
